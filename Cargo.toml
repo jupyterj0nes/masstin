@@ -1,0 +1,25 @@
+[package]
+name = "masstin"
+version = "0.1.0"
+edition = "2021"
+description = "A DFIR tool that massively parses multiple forensic artifacts (evtx,linux) and displays them in a graph database. Written by Toño Díaz (@jupyterjones)"
+authors = ["Toño Díaz <c00pr@pm.me> (@jupyterjones)"]
+repository = "https://github.com/jupyterjones/masstin"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.0.32", features = ["derive"] }
+evtx = "0.8.0"
+chrono = "0.4.23"
+quick-xml = { version = "0.20", features = ["serialize"] }
+serde = { version = "1.0", features = [ "derive" ] }
+polars = { version = "0.26.1", features = ["lazy"] }
+walkdir = "2.3.2"
+neo4rs = "0.6.0"
+futures = "0.3.28"
+tokio = "1.28.0"
+rpassword = "7.2.0"
+csv = "1.2.1"
+indicatif = "0.17.3"
