@@ -71,6 +71,24 @@ Run `masstin.exe` from the command line with the following options:
 masstin.exe [OPTIONS] --action <ACTION>
 ```
 
+#### Example: Parsing Windows Logs
+
+To parse a folder of Windows logs, use the following command:
+
+```
+masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\winevt\Logs\' -o C:\cases\masstin-output.csv --overwrite
+```
+
+#### Example: Loading Data into Neo4j
+
+To load the previously parsed data into a Neo4j database, use the following command:
+
+```
+masstin.exe -a load -f C:\cases\masstin-output.csv --database localhost:7687 --user neo4j
+```
+
+Note: After running the command, you will be prompted to enter the password for the Neo4j database.
+
 ### Options:
 - `-a, --action <ACTION>`: Specify the action to perform (`parse` or `load`).
 - `-d, --directory <DIRECTORY>`: Specify directory(ies) to use. This argument can be repeated.
