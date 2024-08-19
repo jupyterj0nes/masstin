@@ -58,7 +58,7 @@ cargo build --release
 ```
 The executable can be found in ./target/release/.
 
-Alternatively, you can download the latest release directly from the releases page. 
+**Alternatively**, you can download the latest release directly from the releases page [Releases page](https://github.com/jupyterj0nes/masstin/releases)
 
 ### Usage
 
