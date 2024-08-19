@@ -58,7 +58,10 @@ cargo build --release
 ```
 The executable can be found in ./target/release/.
 
-**Alternatively**, you can download the latest release directly from the releases page [Releases page](https://github.com/jupyterj0nes/masstin/releases)
+**Alternatively**, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases). 
+
+Here, you'll find pre-built binaries for both Windows and Linux. Please note that the Linux binaries may not work on every kernel version. If you encounter issues, you might need to compile Masstin yourself using Cargo. Instructions for building from source can be found in the [Getting Started](#getting-started) section.
+
 
 ### Usage
 
