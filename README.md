@@ -103,7 +103,9 @@ masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\wi
 ```
 
 #### Linux:
+```
 masstin -a parse -d '/Velociraptor/ExtractedCollection/C/Windows/System32/winevt/Logs/' -o /investigation/masstin-output.csv --overwrite
+```
 
 ### Example: Parsing multiple Windows Logs folders and singles EVTX at once
 
