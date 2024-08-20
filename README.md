@@ -41,26 +41,32 @@ The shift to Rust significantly improved performance, achieving a 90% speed incr
 
 ## Getting Started
 
+**To get started quickly, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases).**
+
 ### Prerequisites
 
-Before you begin, ensure you have the following installed:
-- Latest version of Rust and Cargo ([Rust Installation Guide](https://www.rust-lang.org/tools/install))
-- Access to a Neo4j database
+Before you begin, ensure you have the following:
+
+- Access to a Neo4j database is only required if you want to use the graphical visualization features. If you only intend to use the `parse` mode to generate and view CSV files of unified and ordered lateral movements, Neo4j is not necessary.
+- If you plan to compile the program from source, make sure you have the latest version of Rust and Cargo installed ([Rust Installation Guide](https://www.rust-lang.org/tools/install)).
 
 ### Installation
 
-Clone the repository and build the project:
+**To get started quickly, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases).**
 
-```bash
-git clone https://github.com/yourusername/masstin.git
-cd masstin
-cargo build --release
-```
-The executable can be found in ./target/release/.
+Here, you'll find pre-built binaries for both Windows and Linux. Please note that Linux binaries may not work on every kernel version. If you encounter issues, you might need to compile Masstin yourself using Cargo. Instructions for building from source can be found below.
 
-**Alternatively**, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases). 
+If you choose to compile the program from source, follow these steps:
 
-Here, you'll find pre-built binaries for both Windows and Linux. Please note that the Linux binaries may not work on every kernel version. If you encounter issues, you might need to compile Masstin yourself using Cargo. Instructions for building from source can be found in the [Getting Started](#getting-started) section.
+1. Clone the repository and build the project:
+
+    ```bash
+    git clone https://github.com/jupyterj0nes/masstin.git
+    cd masstin
+    cargo build --release
+    ```
+
+2. The executable can be found in `./target/release/`.
 
 
 ### Usage
