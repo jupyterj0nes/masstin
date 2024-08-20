@@ -111,13 +111,13 @@ masstin -a parse -d '/Velociraptor/ExtractedCollection/C/Windows/System32/winevt
 
 To parse a folder of Windows logs from multiple machines, as well as an archived Windows log file, use the following command:
 
-Windows
+#### Windows
 ```
 masstin.exe -a parse -d 'machine1_image\C\Windows\System32\winevt\Logs' -d 'machine2_image\C\Windows\System32\winevt\Logs' -d 'machine3_image\C\Windows\System32\winevt\Logs' -d 'machine4_image\C\Windows\System32\winevt\Logs' -f 'path\to\single_archived_logs.evtx' -o C:\investigation\masstin-output.csv --overwrite
 
 ```
 
-Linux
+#### Linux
 ```
 masstin -a parse -d 'machine1_image/C/Windows/System32/winevt/Logs' -d 'machine2_image/C/Windows/System32/winevt/Logs' -d 'machine3_image/C/Windows/System32/winevt/Logs' -d 'machine4_image/C/Windows/System32/winevt/Logs' -f 'path/to/single_archived_logs.evtx' -o /investigation/masstin-output.csv --overwrite
 ```
@@ -126,8 +126,15 @@ masstin -a parse -d 'machine1_image/C/Windows/System32/winevt/Logs' -d 'machine2
 
 To load the previously parsed data into a Neo4j database, use the following command:
 
+
+#### Windows
 ```
-masstin.exe -a load -f C:\cases\masstin-output.csv --database localhost:7687 --user neo4j
+masstin.exe -a load -f C:\investigation\masstin-output.csv --database localhost:7687 --user neo4j
+```
+
+#### Linux
+```
+masstin -a load -f /investigation/masstin-output.csv --database localhost:7687 --user neo4j
 ```
 
 Note: After running the command, you will be prompted to enter the password for the Neo4j database.
