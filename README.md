@@ -45,12 +45,20 @@ The shift to Rust significantly improved performance, achieving a 90% speed incr
 
 There, you can directly download the pre-built binary for Windows (`.exe`) or Linux and run it without needing to compile from source.
 
+## Getting Started
+
+**To get started quickly, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases).**
+
+There, you can directly download the pre-built binary for Windows (`.exe`) or Linux and run it without needing to compile from source.
+
 ### Prerequisites
 
 Before you begin, ensure you have the following:
 
-- Access to a Neo4j database is only required if you want to use the graphical visualization features. If you only intend to use the `parse` mode to generate and view CSV files of unified and ordered lateral movements, Neo4j is not necessary.
-- If you plan to compile the program from source, make sure you have the latest version of Rust and Cargo installed ([Rust Installation Guide](https://www.rust-lang.org/tools/install)).
+- **Access to a Neo4j database**: This is only required if you want to use the graphical visualization features. If you only intend to use the `parse` mode to generate and view CSV files of unified and ordered lateral movements, Neo4j is not necessary. If you do need Neo4j, you can download it from [Neo4j Download Page](https://neo4j.com/download/). You only need to create a database and choose a username and password. Masstin will communicate with the Bolt service, typically offered at `localhost:7687`. You can easily verify this setting in the database properties once Neo4j is running.
+
+- **Rust and Cargo**: These are only necessary if you plan to compile the program from source. If you choose to use the pre-built binaries, you do not need to install Rust or Cargo. If you do need to compile from source, make sure you have the latest version of Rust and Cargo installed ([Rust Installation Guide](https://www.rust-lang.org/tools/install)).
+
 
 ### Installation
 
