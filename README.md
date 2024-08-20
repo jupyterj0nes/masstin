@@ -15,7 +15,7 @@
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
-  - [Usage](#usage)
+- [Usage](#usage)
 - [Neo4j and Cypher Integration](#neo4j-and-cypher-integration)
 - [Contributing](#contributing)
 - [License](#license)
@@ -58,7 +58,13 @@ Before you begin, ensure you have the following:
 
 **To get started quickly, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases).**
 
-Here, you'll find pre-built binaries for both Windows and Linux. Please note that Linux binaries may not work on every kernel version. If you encounter issues, you might need to compile Masstin yourself using Cargo. Instructions for building from source can be found below.
+On this page, you will find:
+- `masstin-v0.9.0` which is the ELF binary for Linux.
+- `masstin-v0.9.0.exe` which is the executable for Windows.
+- A ZIP file with the source code.
+- A TAR.GZ file with the source code.
+
+Please note that Linux binaries may not work on every kernel version. If you encounter issues, you might need to compile Masstin yourself using Cargo. Instructions for building from source can be found below.
 
 If you choose to compile the program from source, follow these steps:
 
@@ -70,7 +76,10 @@ If you choose to compile the program from source, follow these steps:
     cargo build --release
     ```
 
+    **Note:** After installing Rust, you may need to close and reopen your terminal or manually add Cargo to your PATH for the changes to take effect.
+
 2. The executable can be found in `./target/release/`.
+
 
 
 ## Usage
