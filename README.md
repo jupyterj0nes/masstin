@@ -111,9 +111,15 @@ masstin -a parse -d '/Velociraptor/ExtractedCollection/C/Windows/System32/winevt
 
 To parse a folder of Windows logs from multiple machines, as well as an archived Windows log file, use the following command:
 
+Windows
+```
+masstin.exe -a parse -d 'machine1_image\C\Windows\System32\winevt\Logs' -d 'machine2_image\C\Windows\System32\winevt\Logs' -d 'machine3_image\C\Windows\System32\winevt\Logs' -d 'machine4_image\C\Windows\System32\winevt\Logs' -f 'path\to\single_archived_logs.evtx' -o C:\investigation\masstin-output.csv --overwrite
 
 ```
-masstin -a parse -d 'machine1_image/C/Windows/System32/winevt/Logs' -d 'machine2_image/C/Windows/System32/winevt/Logs' -d 'machine3_image/C/Windows/System32/winevt/Logs' -d 'machine4_image/C/Windows/System32/winevt/Logs' -f 'path/to/single_archived_logs.evtx' -o /cases/masstin-output.csv --overwrite
+
+Linux
+```
+masstin -a parse -d 'machine1_image/C/Windows/System32/winevt/Logs' -d 'machine2_image/C/Windows/System32/winevt/Logs' -d 'machine3_image/C/Windows/System32/winevt/Logs' -d 'machine4_image/C/Windows/System32/winevt/Logs' -f 'path/to/single_archived_logs.evtx' -o /investigation/masstin-output.csv --overwrite
 ```
 
 ### Example: Loading Data into Neo4j
