@@ -84,18 +84,30 @@ If you choose to compile the program from source, follow these steps:
 
 ## Usage
 
-Run `masstin.exe` from the command line with the following options:
+Run `masstin` from the command line with the following options:
 
 ```
-masstin.exe [OPTIONS] --action <ACTION>
+masstin [OPTIONS] --action <ACTION>
 ```
 
-### Example: Parsing Windows Logs
+**Note**: For Windows users, just remember to use `masstin.exe` and backslashes (`\`) for paths. Linux users might find this explanation unnecessary.
+ 
+
+### Example: Parsing simple Windows Logs folder
 
 To parse a folder of Windows logs, use the following command:
 
 ```
 masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\winevt\Logs\' -o C:\cases\masstin-output.csv --overwrite
+```
+
+### Example: Parsing multiple Windows Logs folders and singles EVTX at once
+
+To parse a folder of Windows logs from multiple machines, as well as an archived Windows log file, use the following command:
+
+
+```
+masstin -a parse -d 'machine1_image/C/Windows/System32/winevt/Logs' -d 'machine2_image/C/Windows/System32/winevt/Logs' -d 'machine3_image/C/Windows/System32/winevt/Logs' -d 'machine4_image/C/Windows/System32/winevt/Logs' -f 'path/to/single_archived_logs.evtx' -o /cases/masstin-output.csv --overwrite
 ```
 
 ### Example: Loading Data into Neo4j
