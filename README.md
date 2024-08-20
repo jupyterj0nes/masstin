@@ -97,9 +97,13 @@ masstin [OPTIONS] --action <ACTION>
 
 To parse a folder of Windows logs, use the following command:
 
+#### Windows:
 ```
-masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\winevt\Logs\' -o C:\cases\masstin-output.csv --overwrite
+masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\winevt\Logs\' -o C:\investigation\masstin-output.csv --overwrite
 ```
+
+#### Linux:
+masstin -a parse -d '/Velociraptor/ExtractedCollection/C/Windows/System32/winevt/Logs/' -o /investigation/masstin-output.csv --overwrite
 
 ### Example: Parsing multiple Windows Logs folders and singles EVTX at once
 
