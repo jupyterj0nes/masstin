@@ -156,7 +156,7 @@ Note: After running the command, you will be prompted to enter the password for 
 
 Masstin integrates with Neo4j to visualize forensic data. The Cypher query language allows for advanced searching and filtering, making it easier to identify relationships and outliers. Pre-built queries and visualizations enhance the analysis process, providing a comprehensive view of the data.
 
-For detailed tips, explanations, and Cypher queries, refer to the [Neo4j and Cypher Resources](neo4j/resources/cypher_queries.md) page.
+For detailed tips, explanations, and Cypher queries, refer to the [Neo4j and Cypher Resources](neo4j-resources/cypher_queries.md) page.
 
 
 ## Contributing
