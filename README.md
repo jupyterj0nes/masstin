@@ -1,4 +1,4 @@
-# MASSTIN
+# Masstin: High-Speed DFIR Tool written in Rust and Graph Visualization in Neo4j for Comprehensive Lateral Movement Analysis
 
 <div align="center">
   <img style="padding:0;vertical-align:bottom;" height="400" width="400" src="resources/masstin_logo.png" alt="Masstin Logo"/>
