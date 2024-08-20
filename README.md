@@ -73,7 +73,7 @@ If you choose to compile the program from source, follow these steps:
 2. The executable can be found in `./target/release/`.
 
 
-### Usage
+## Usage
 
 Run `masstin.exe` from the command line with the following options:
 
@@ -81,7 +81,7 @@ Run `masstin.exe` from the command line with the following options:
 masstin.exe [OPTIONS] --action <ACTION>
 ```
 
-#### Example: Parsing Windows Logs
+### Example: Parsing Windows Logs
 
 To parse a folder of Windows logs, use the following command:
 
@@ -89,7 +89,7 @@ To parse a folder of Windows logs, use the following command:
 masstin.exe -a parse -d '\Velociraptor\ExtractedCollection\C\Windows\System32\winevt\Logs\' -o C:\cases\masstin-output.csv --overwrite
 ```
 
-#### Example: Loading Data into Neo4j
+### Example: Loading Data into Neo4j
 
 To load the previously parsed data into a Neo4j database, use the following command:
 
