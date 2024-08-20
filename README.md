@@ -45,12 +45,6 @@ The shift to Rust significantly improved performance, achieving a 90% speed incr
 
 There, you can directly download the pre-built binary for Windows (`.exe`) or Linux and run it without needing to compile from source.
 
-## Getting Started
-
-**To get started quickly, you can download the latest release directly from the [Releases page](https://github.com/jupyterj0nes/masstin/releases).**
-
-There, you can directly download the pre-built binary for Windows (`.exe`) or Linux and run it without needing to compile from source.
-
 ### Prerequisites
 
 Before you begin, ensure you have the following:
