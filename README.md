@@ -394,6 +394,44 @@ MASSTIN: IP 172.31.3.231 has been resolved to hostname: PC-ANSAE as it has been 
 ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 169/11898
 ```
 
+
+### Example navigate results in neoj
+
+Once you have created a local database, started it y open neo4k browser. Please check that you disable auto expand nodes.
+
+Yo can verify all relationships created:
+
+<div align="center">
+  <img style="padding:0;vertical-align:bottom;" src="neo4j-resources/open_browser.png" alt="Open Browser"/>
+</div>
+
+#### Filter results with known time range, users, hosts and IPS
+
+The query to filter all these items is 
+
+```
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2024-08-13T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2024-08-14T00:00:00.000000000Z")
+  AND NOT r.target_user_name ENDS WITH '$'
+  AND NOT r.target_user_name ENDS WITH 'NO_USER'
+  AND r.logon_type IN ['3','10']
+  AND (
+    (h1.name = 'PC_AYELP' OR h2.name = 'PC_AYELP')
+    OR r.target_user_name IN ['UCOONS', 'UHERDER', 'UJALAP', 'UOGLES', 'USAVES', 'USKLIM', 'USLEBS']
+    OR r.subject_user_name IN ['UCOONS', 'UHERDER', 'UJALAP', 'UOGLES', 'USAVES', 'USKLIM', 'USLEBS']
+    OR r.src_ip IN ['192_168_192_46','10_0_64_47']
+  )
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+Giving the following result:
+
+<div align="center">
+  <img style="padding:0;vertical-align:bottom;" src="neo4j-resources/ejemplo_filtro_1.png" alt="Open Browser"/>
+</div>
+
 ### Options:
 - `-a, --action <ACTION>`: Specify the action to perform (`parse` or `load`).
 - `-d, --directory <DIRECTORY>`: Specify directory(ies) to use. This argument can be repeated.
