@@ -176,7 +176,6 @@ In this example, multiple EVTX files from different machines are being merged in
 
 ```
 time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
-time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
 2020-10-28 18:17:49.979945+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
 2020-10-28 18:17:50.239635+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
 2020-10-28 18:45:24.611805+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
