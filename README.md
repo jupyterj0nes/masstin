@@ -399,6 +399,10 @@ MASSTIN: IP 172.31.3.231 has been resolved to hostname: PC-ANSAE as it has been 
 
 Once you have created a local database, started it y open neo4k browser. Please check that you disable auto expand nodes.
 
+<div align="center">
+  <img style="padding:0;vertical-align:bottom;" src="neo4j-resources/uncheck_expand_nodes.png" alt="Open Browser"/>
+</div>
+
 Yo can verify all relationships created:
 
 <div align="center">
