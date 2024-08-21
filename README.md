@@ -113,18 +113,18 @@ As we can see, events from multiple different EVTX files are merged together. Ty
 
 ```
 time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
-2024-06-10 17:53:01.545437+00:00,PC-arias,22,,,ucronk,abamp.com,10,PC-agued,PC-agued,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2024-06-10 21:16:39.419230+00:00,PC-arias,24,,,ucronk,abamp.com,10,PC-agued,PC-agued,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2024-06-10 21:18:10.181558+00:00,PC-arias,25,,,ucronk,abamp.com,10,PC-agued,PC-agued,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2024-06-10 21:18:55.645830+00:00,PC-arias,24,,,ucronk,abamp.com,10,PC-agued,PC-agued,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2024-07-08 01:56:37.410372+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 01:56:37.410374+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 01:56:38.147178+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 01:56:38.147180+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 04:02:23.610180+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 04:02:23.610182+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 04:02:48.529051+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
-2024-07-08 04:02:48.529054+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-aedes,Microsoft-Windows-SMBServer%4Security.evtx
+2024-06-10 17:53:01.545437+00:00,PC-arias,22,,,ucronk,abamp.com,10,PC-agued,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2024-06-10 21:16:39.419230+00:00,PC-arias,24,,,ucronk,abamp.com,10,PC-agued,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2024-06-10 21:18:10.181558+00:00,PC-arias,25,,,ucronk,abamp.com,10,PC-agued,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2024-06-10 21:18:55.645830+00:00,PC-arias,24,,,ucronk,abamp.com,10,PC-agued,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2024-07-08 01:56:37.410372+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 01:56:37.410374+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 01:56:38.147178+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 01:56:38.147180+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 04:02:23.610180+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 04:02:23.610182+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 04:02:48.529051+00:00,PC-arias,1009,ucrudy,,,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
+2024-07-08 04:02:48.529054+00:00,PC-arias,551,ucrudy,,unates,,3,PC-aedes,PC-10.10.20.23,Microsoft-Windows-SMBServer%4Security.evtx
 2024-07-30 13:24:48.800497+00:00,PC-arias,21,,,umages,abamp.com,10,PC-amice,PC-amice,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
 2024-07-30 13:24:49.208836+00:00,PC-arias,22,,,umages,abamp.com,10,PC-amice,PC-amice,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
 2024-07-30 19:48:37.402075+00:00,PC-arias,24,,,umages,abamp.com,10,PC-amice,PC-amice,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
@@ -176,47 +176,48 @@ In this example, multiple EVTX files from different machines are being merged in
 
 ```
 time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
-2020-10-28 18:17:49.979945+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-10-28 18:17:50.239635+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-10-28 18:45:24.611805+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-10-28 18:45:24.837268+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-10-28 19:27:52.146888+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-10-28 19:27:52.423019+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:24:45.974671+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:24:46.631128+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:29:26.895803+00:00,PC-bezil,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:26.895941+00:00,PC-bezil,30805,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:26.895945+00:00,PC-antre,30807,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:26.895981+00:00,PC-buats,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:26.895987+00:00,PC-buats,30805,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:26.895988+00:00,PC-algin,30807,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-11-28 02:29:38.117348+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:29:38.392536+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:31:28.457567+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:31:28.701927+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:39:37.394987+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:39:37.650984+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:50:59.155238+00:00,PC-arias,24,,,ulaldy,abamp.com,10,PC-bania,PC-bania,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 02:51:00.327632+00:00,PC-arias,25,,,ulaldy,abamp.com,10,PC-basts,PC-basts,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-28 23:56:48.582896+00:00,PC-arias,24,,,ulaldy,abamp.com,10,PC-basts,PC-basts,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-11-30 08:16:27.168203+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-11-30 08:16:27.171364+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-12-02 11:01:27.532930+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-12-02 11:01:27.534189+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-12-02 19:53:11.546058+00:00,PC-arias,21,,,uduros,abamp.com,10,PC-bitos,PC-bitos,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-02 19:53:11.868937+00:00,PC-arias,22,,,uduros,abamp.com,10,PC-bitos,PC-bitos,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-02 19:58:17.653812+00:00,PC-arias,21,,,uminis,abamp.com,10,PC-bezes,PC-bezes,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-02 19:58:17.980578+00:00,PC-arias,22,,,uminis,abamp.com,10,PC-bezes,PC-bezes,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-02 21:03:39.690134+00:00,PC-arias,24,,,uduros,abamp.com,10,PC-bitos,PC-bitos,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-03 03:36:03.896190+00:00,PC-arias,24,,,uminis,abamp.com,10,PC-bezes,PC-bezes,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
-2020-12-05 20:58:14.319364+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-12-05 20:58:14.322492+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,PC-bucks,Microsoft-Windows-SMBServer%4Security.evtx
-2020-12-06 08:01:28.263622+00:00,PC-acros,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-12-06 08:01:28.263714+00:00,PC-acros,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-12-06 08:01:28.264039+00:00,PC-acros,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-12-06 08:01:28.264054+00:00,PC-acros,30804,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-12-06 08:01:28.264057+00:00,PC-acros,30805,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
-2020-12-06 08:01:28.264060+00:00,PC-ashes,30807,,,,,3,PC-arias,PC-arias,Microsoft-Windows-SmbClient%4Connectivity.evtx
+time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
+2020-10-28 18:17:49.979945+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-10-28 18:17:50.239635+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-10-28 18:45:24.611805+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-10-28 18:45:24.837268+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-10-28 19:27:52.146888+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-10-28 19:27:52.423019+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:24:45.974671+00:00,PC-breys,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:24:46.631128+00:00,PC-breys,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:29:26.895803+00:00,PC-bezil,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:26.895941+00:00,PC-bezil,30805,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:26.895945+00:00,PC-antre,30807,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:26.895981+00:00,PC-buats,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:26.895987+00:00,PC-buats,30805,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:26.895988+00:00,PC-algin,30807,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-11-28 02:29:38.117348+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:29:38.392536+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:31:28.457567+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:31:28.701927+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:39:37.394987+00:00,PC-arias,21,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:39:37.650984+00:00,PC-arias,22,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:50:59.155238+00:00,PC-arias,24,,,ulaldy,abamp.com,10,PC-bania,10.2.23.12,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 02:51:00.327632+00:00,PC-arias,25,,,ulaldy,abamp.com,10,PC-basts,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-28 23:56:48.582896+00:00,PC-arias,24,,,ulaldy,abamp.com,10,PC-basts,192.168.23.34,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-11-30 08:16:27.168203+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-11-30 08:16:27.171364+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-12-02 11:01:27.532930+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-12-02 11:01:27.534189+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-12-02 19:53:11.546058+00:00,PC-arias,21,,,uduros,abamp.com,10,PC-bitos,172.10.23.32,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-02 19:53:11.868937+00:00,PC-arias,22,,,uduros,abamp.com,10,PC-bitos,172.10.23.32,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-02 19:58:17.653812+00:00,PC-arias,21,,,uminis,abamp.com,10,PC-bezes,10.2.23.55,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-02 19:58:17.980578+00:00,PC-arias,22,,,uminis,abamp.com,10,PC-bezes,10.2.23.55,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-02 21:03:39.690134+00:00,PC-arias,24,,,uduros,abamp.com,10,PC-bitos,172.10.23.32,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-03 03:36:03.896190+00:00,PC-arias,24,,,uminis,abamp.com,10,PC-bezes,10.2.23.55,Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
+2020-12-05 20:58:14.319364+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-12-05 20:58:14.322492+00:00,PC-arias,551,ucrudy,,,,3,PC-bucks,10.2.23.99,Microsoft-Windows-SMBServer%4Security.evtx
+2020-12-06 08:01:28.263622+00:00,PC-acros,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-12-06 08:01:28.263714+00:00,PC-acros,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-12-06 08:01:28.264039+00:00,PC-acros,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-12-06 08:01:28.264054+00:00,PC-acros,30804,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-12-06 08:01:28.264057+00:00,PC-acros,30805,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
+2020-12-06 08:01:28.264060+00:00,PC-ashes,30807,,,,,3,PC-arias,10.2.23.8,Microsoft-Windows-SmbClient%4Connectivity.evtx
 ```
 
 
