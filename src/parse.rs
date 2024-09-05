@@ -38,7 +38,14 @@ pub mod parse {
 
 pub fn parse_security_log(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -101,7 +108,14 @@ pub fn parse_security_log(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogDat
 pub fn parse_smb_server(file: &str,lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
     //let lateral_eventIDs = vec!["1009","551"];
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -134,7 +148,14 @@ pub fn parse_smb_server(file: &str,lateral_eventIDs: Vec<&str>) -> Vec<LogData> 
 
 pub fn parse_smb_client(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -182,7 +203,14 @@ pub fn parse_smb_client(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData>
 
 pub fn parse_smb_client_connectivity(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -230,7 +258,14 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_eventIDs: Vec<&str>) ->
 
 pub fn parse_rdp_client(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -277,7 +312,14 @@ pub fn parse_rdp_client(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData>
 
 pub fn parse_rdp_connmanager(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -310,7 +352,14 @@ pub fn parse_rdp_connmanager(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<Log
 
 pub fn parse_rdp_localsession(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -350,7 +399,14 @@ pub fn parse_rdp_localsession(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<Lo
 
 pub fn parse_rdpkore(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
     //println!("MASSTIN: Parsing {}",file);
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     for record in parser.records() {
         match record {
             Ok(r) => {
@@ -397,7 +453,14 @@ pub fn parse_rdpkore(file: &str, lateral_eventIDs: Vec<&str>) -> Vec<LogData> {
 
 
 pub fn parse_unknown(file: &str) -> Vec<LogData> {
-    let (mut parser, mut log_data) = prep_parse(file);
+    let (mut parser, mut log_data) = match prep_parse(file) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(e) => {
+            // Log or handle the error if needed, and return an empty log_data
+            // eprintln!("Error initializing parser: {}", e);
+            return vec![];
+        }
+    };
     let mut provider = String::from("");
     //if let Some(Ok(r)) = parser.records().next() {
     if let Some(Ok(r)) = parser.records().nth(1) {
@@ -419,15 +482,19 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
     log_data
 }
 
-fn prep_parse(file: &str) -> (EvtxParser<std::fs::File>, Vec<LogData>) {
+fn prep_parse(file: &str) -> Result<(EvtxParser<std::fs::File>, Vec<LogData>), Box<dyn std::error::Error>> {
     let fp = PathBuf::from(file);
     let settings = ParserSettings::default()
-    .separate_json_attributes(true)
-    .num_threads(0);
-    let mut parser = EvtxParser::from_path(fp).unwrap();
-    let mut log_data: Vec<LogData> = vec![];
-    (parser, log_data)
+        .separate_json_attributes(true)
+        .num_threads(0);
+    
+    // Handle the error when creating the parser
+    let parser = EvtxParser::from_path(fp)?;
+    let log_data: Vec<LogData> = vec![];
+    
+    Ok((parser, log_data))
 }
+
 
 fn vector_to_polars(log_data: Vec<LogData>, output : Option<&String>)  {
     let time_created_vec: Vec<String> = log_data.iter().map(|x| x.time_created.to_string()).collect();
