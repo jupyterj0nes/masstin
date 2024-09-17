@@ -7,6 +7,8 @@ use tokio;
 pub use crate::parse::*;
 mod load;
 pub use crate::load::*;
+mod merge;
+pub use crate::merge::*;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -52,6 +54,8 @@ enum ActionType {
     Parse,
     /// Loads a CSV file, previously generated with Masstin, into a Neo4j database
     Load,
+    /// Combine multiple CSV files, previously generated with Masstin, into a single, time-sorted file
+    Merge,
 }
 
 fn validate_folders(config: &Cli) -> Result<(), String> {
@@ -108,6 +112,12 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 return Err(String::from("You need to specify at least one file, database and user argument"));
             }
         },
+
+        ActionType::Merge => {
+            if config.file.len() < 2 {
+                return Err(String::from("You need to specify at least two files to merge"));
+            }
+        },
     }
 
     Ok(())
@@ -122,8 +132,8 @@ pub async fn run(config: Cli) -> Result<(), Box<dyn Error>> {
 
     match config.action{
         ActionType::Parse => parse_events(&config.file, &config.directory,config.output.as_ref()),
-        //ActionType::Load => println!("Masstin: Load functionality not implemented yet"),
         ActionType::Load =>  load_neo(&config.file, &config.database.unwrap(),&config.user.unwrap()).await,
+        ActionType::Merge => merge_files(&config.file, config.output.as_ref())?,
     }
     Ok(())
 }
