@@ -45,10 +45,11 @@ Follow these steps to create a Neo4j database and set up your user credentials:
 
 To apply a custom style to your Neo4j visualizations:
 
-1. **Style File**
-   - Save the following style configuration as `style.grass`:
+1. **Run Style command**
+   - Run the following command in neo4j browser:
 
     ```plaintext
+   :style
    node {
      diameter 110px;
      color #D9C8AE;
@@ -66,7 +67,6 @@ To apply a custom style to your Neo4j visualizations:
      text-color-internal #FFFFFF;
      caption type;
    }
-   
    node.host {
      color: #D9C8AE;
      border-color: #9AA1AC;
