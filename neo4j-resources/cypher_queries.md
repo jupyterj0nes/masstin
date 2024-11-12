@@ -49,23 +49,31 @@ To apply a custom style to your Neo4j visualizations:
    - Save the following style configuration as `style.grass`:
 
     ```plaintext
-    node {
-      diameter 110px;
-      color #A5ABB6;
-      border-color #9AA1AC;
-      border-width 2px;
-      text-color-internal #FFFFFF;
-      font-size 10px;
-    }
-    relationship {
-      color #A5ABB6;
-      shaft-width 1px;
-      font-size 8px;
-      padding 3px;
-      text-color-external #000000;
-      text-color-internal #FFFFFF;
-      caption type;
-    }
+   node {
+     diameter 110px;
+     color #D9C8AE;
+     border-color #9AA1AC;
+     border-width 2px;
+     text-color-internal #FFFFFF;
+     font-size 10px;
+   }
+   relationship {
+     color #A5ABB6;
+     shaft-width 1px;
+     font-size 8px;
+     padding 3px;
+     text-color-external #000000;
+     text-color-internal #FFFFFF;
+     caption type;
+   }
+   
+   node.host {
+     color: #D9C8AE;
+     border-color: #9AA1AC;
+     text-color-internal: #000000;
+     defaultCaption: "<id>";
+     diameter: 110px;
+   }
     ```
 
 2. **Apply the Style in Neo4j Browser**
