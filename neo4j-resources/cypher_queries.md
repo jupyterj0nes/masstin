@@ -76,14 +76,6 @@ To apply a custom style to your Neo4j visualizations:
    }
     ```
 
-2. **Apply the Style in Neo4j Browser**
-   - **Drag and Drop Method:** Drag the `style.grass` file into the Neo4j Browser window.
-   - **Command Method:** Use the following command in the Neo4j Browser:
-
-    ```cypher
-    :style load /path/to/style.grass
-    ```
-
 ## Useful Queries
 
 ### 1) RDP Logins (type 10) for Non-Machine Accounts in a Specific Time Frame
