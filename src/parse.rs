@@ -1,8 +1,8 @@
 use std::{path::PathBuf, fs::File};
-use evtx::{EvtxParser};
+use evtx::EvtxParser;
 extern crate serde;
 extern crate quick_xml;
-use serde::{Serialize,Deserialize};
+use serde::{Serialize, Deserialize};
 use quick_xml::de::from_str;
 use std::{error::Error, collections::HashMap};
 use polars::prelude::*;
@@ -36,6 +36,7 @@ const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 
 pub mod parse {}
 
+// Updated LogData struct with a new "process" column.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogData {
     time_created: String,
@@ -49,6 +50,7 @@ pub struct LogData {
     workstation_name: String,
     ip_address: String,
     filename: String,
+    process: String,
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +66,6 @@ enum EvtxLocation {
 // SECURITY LOG PARSER
 // ---------------------------------------------------------------------------------------
 pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
     if is_debug_mode() {
         println!("[DEBUG] MASSTIN: Parsing {}", file);
     }
@@ -91,6 +90,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                 };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
+                        // Extend the map with a ProcessName key.
                         let mut data_values: HashMap<String, String> = [
                             ("SubjectUserName".to_string(), String::from("")),
                             ("SubjectDomainName".to_string(), String::from("")),
@@ -98,18 +98,16 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             ("TargetDomainName".to_string(), String::from("")),
                             ("LogonType".to_string(), String::from("")),
                             ("WorkstationName".to_string(), String::from("")),
-                            ("IpAddress".to_string(), String::from(""))
+                            ("IpAddress".to_string(), String::from("")),
+                            ("ProcessName".to_string(), String::from("")),  // New key for process
                         ].iter().cloned().collect();
 
                         if let Some(event_data) = event.EventData {
                             for data in event_data.Datas {
-                                match data.Name {
-                                    Some(name) => {
-                                        if let Some(data_value) = data_values.get_mut(&name) {
-                                            *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
-                                        }
-                                    },
-                                    None => (),
+                                if let Some(name) = data.Name {
+                                    if let Some(data_value) = data_values.get_mut(&name) {
+                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                    }
                                 }
                             }
                         }
@@ -126,6 +124,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             workstation_name: data_values.get("WorkstationName").unwrap().to_string(),
                             ip_address: data_values.get("IpAddress").unwrap().to_string(),
                             filename: file.to_string(),
+                            process: data_values.get("ProcessName").unwrap().to_string(), // New column
                         });
                     }
                 }
@@ -170,6 +169,7 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             workstation_name: event.UserData.as_ref().unwrap().EventData.as_ref().unwrap().ClientName.as_ref().unwrap_or(&String::from("")).to_owned(),
                             ip_address: event.UserData.as_ref().unwrap().EventData.as_ref().unwrap().ClientName.as_ref().unwrap_or(&String::from("")).to_owned(),
                             filename: file.to_string(),
+                            process: String::from(""), // Not available in SMBServer
                         });
                     }
                 }
@@ -208,13 +208,10 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         ].iter().cloned().collect();
 
                         for data in event.EventData.unwrap().Datas {
-                            match data.Name {
-                                Some(name) => {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
-                                    }
-                                },
-                                None => (),
+                            if let Some(name) = data.Name {
+                                if let Some(data_value) = data_values.get_mut(&name) {
+                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                }
                             }
                         }
 
@@ -230,6 +227,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
                             filename: file.to_string(),
+                            process: String::from(""),
                         });
                     }
                 }
@@ -268,13 +266,10 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                         ].iter().cloned().collect();
 
                         for data in event.EventData.unwrap().Datas {
-                            match data.Name {
-                                Some(name) => {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
-                                    }
-                                },
-                                None => (),
+                            if let Some(name) = data.Name {
+                                if let Some(data_value) = data_values.get_mut(&name) {
+                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                }
                             }
                         }
 
@@ -290,6 +285,7 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
                             filename: file.to_string(),
+                            process: String::from(""),
                         });
                     }
                 }
@@ -327,13 +323,10 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         ].iter().cloned().collect();
 
                         for data in event.EventData.unwrap().Datas {
-                            match data.Name {
-                                Some(name) => {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
-                                    }
-                                },
-                                None => (),
+                            if let Some(name) = data.Name {
+                                if let Some(data_value) = data_values.get_mut(&name) {
+                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                }
                             }
                         }
 
@@ -349,6 +342,7 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
                             filename: file.to_string(),
+                            process: String::from(""),
                         });
                     }
                 }
@@ -363,45 +357,97 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
 // RDP CONNECTION MANAGER PARSER
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdp_connmanager(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    let mut log_data = Vec::new();
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing RDP ConnManager {}", file);
+    }
+    let (mut parser, _) = match prep_parse(EvtxLocation::File(file.to_string())) {
+        Ok((p, _)) => (p, ()),
+        Err(_) => return log_data,
     };
 
     for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event2 = from_str(&data).unwrap();
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: event.System.Computer.unwrap(),
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Param1.as_ref().unwrap().to_owned(),
-                            target_domain_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Param2.as_ref().unwrap().to_owned(),
-                            logon_type: String::from("10"),
-                            workstation_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Param3.as_ref().unwrap().to_owned(),
-                            ip_address: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Param3.as_ref().unwrap().to_owned(),
-                            filename: file.to_string(),
-                        });
-                    }
+        let r = match record {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let xml = r.data.as_str();
+        let event: Event2 = match from_str(&xml) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // 1) EventID presente y coincidente
+        let event_id = match event.System.EventID {
+            Some(ref id) if lateral_event_ids.contains(&id.as_str()) => id.clone(),
+            _ => continue,
+        };
+
+        // 2) TimeCreated y Computer (salen siempre en System)
+        let time_created = event
+            .System
+            .TimeCreated
+            .SystemTime
+            .unwrap_or_else(|| {
+                if is_debug_mode() {
+                    println!("[DEBUG] Missing TimeCreated in RDP ConnManager record, skipping");
                 }
-            },
-            Err(_) => (),
+                return String::new();
+            });
+        if time_created.is_empty() {
+            continue;
         }
+
+        let computer = event.System.Computer.unwrap_or_else(|| {
+            if is_debug_mode() {
+                println!("[DEBUG] Missing Computer in RDP ConnManager record, skipping");
+            }
+            String::new()
+        });
+        if computer.is_empty() {
+            continue;
+        }
+
+        // 3) UserData → EventData → UserName / ClientName
+        let (target_user, client) = if let Some(ud) = event.UserData.as_ref() {
+            if let Some(ed) = ud.EventData.as_ref() {
+                let u = ed.UserName.clone().unwrap_or_default();
+                let c = ed.ClientName.clone().unwrap_or_default();
+                (u, c)
+            } else {
+                if is_debug_mode() {
+                    println!("[DEBUG] Missing EventData in RDP ConnManager record, skipping");
+                }
+                continue;
+            }
+        } else {
+            if is_debug_mode() {
+                println!("[DEBUG] Missing UserData in RDP ConnManager record, skipping");
+            }
+            continue;
+        };
+
+        // Finalmente, construimos el LogData
+        log_data.push(LogData {
+            time_created,
+            computer,
+            event_id,
+            subject_user_name: String::new(),
+            subject_domain_name: String::new(),
+            target_user_name: target_user,
+            target_domain_name: String::new(),
+            logon_type: "10".into(),
+            workstation_name: client.clone(),
+            ip_address: client,
+            filename: file.to_string(),
+            process: String::new(),
+        });
     }
+
     log_data
 }
+
 
 // ---------------------------------------------------------------------------------------
 // RDP LOCAL SESSION MANAGER PARSER
@@ -446,6 +492,7 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
                             workstation_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
                             ip_address: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
                             filename: file.to_string(),
+                            process: String::from(""),
                         });
                     }
                 }
@@ -483,13 +530,10 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                         ].iter().cloned().collect();
 
                         for data in event.EventData.unwrap().Datas {
-                            match data.Name {
-                                Some(name) => {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
-                                    }
-                                },
-                                None => (),
+                            if let Some(name) = data.Name {
+                                if let Some(data_value) = data_values.get_mut(&name) {
+                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                }
                             }
                         }
                         log_data.push(LogData {
@@ -504,6 +548,7 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                             workstation_name: data_values.get("ClientIP").unwrap().to_string(),
                             ip_address: data_values.get("ClientIP").unwrap().to_string(),
                             filename: file.to_string(),
+                            process: String::from(""),
                         });
                     }
                 }
@@ -553,6 +598,9 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         },
         "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS" => {
             log_data = parse_rdpkore(file, RDPKORE_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-SmbClient%4Connectivity.evtx" => {
+            log_data = parse_smb_client_connectivity(file, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec())
         },
         _ => (),
     }
@@ -635,7 +683,7 @@ fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cur
         let mut file = archive.by_index(i)?;
         if file.name() == evtx_name {
             if is_debug_mode() {
-                println!("[DEBUG] EVTX found inside the ZIP: {}", evtx_name);
+                println!("[INFO] EVTX found inside the ZIP: {}", evtx_name);
             }
             file.read_to_end(&mut file_data)?;
             found = true;
@@ -766,8 +814,11 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
     let ip_address_vec: Vec<String> = log_data.iter().map(|x| x.ip_address.to_string()).collect();
     let ip_address = Series::new("src_ip", ip_address_vec);
 
-    let ip_filename_vec: Vec<String> = log_data.iter().map(|x| x.filename.to_string()).collect();
-    let filename = Series::new("log_filename", ip_filename_vec);
+    let filename_vec: Vec<String> = log_data.iter().map(|x| x.filename.to_string()).collect();
+    let filename = Series::new("log_filename", filename_vec);
+    
+    let process_vec: Vec<String> = log_data.iter().map(|x| x.process.to_string()).collect();
+    let process = Series::new("process", process_vec);
 
     let df = DataFrame::new(vec![
         time_created,
@@ -780,6 +831,7 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
         logon_type,
         workstation_name,
         ip_address,
+        process,
         filename
     ]);
     let df = df.unwrap().sort(["time_created"], false);
@@ -1058,9 +1110,7 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     for evtxfile in &vec_filenames {
         match &evtxfile {
             EvtxLocation::File(path) => {
-                // if is_debug_mode() {
-                //     println!("[INFO] Processing EVTX file: {}", path);
-                // }
+                // Optionally log processing info
             },
             EvtxLocation::ZipEntry { zip_path, evtx_name } => {
                 if is_debug_mode() {
