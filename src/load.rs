@@ -16,6 +16,30 @@ struct GroupedData {
     count: usize,
 }
 
+// ───────── helper (inline or place it above) ─────────────────────────
+fn looks_like_ip(s: &str) -> bool {
+    // IPv4 → only digits + dots; IPv6 → hex digits + colons
+    let ipv4 = s.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let ipv6 = s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
+    ipv4 || ipv6
+}
+
+// ── helper: returns the (sub-)slice that contains the leading IPv4/IPv6, if any
+fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
+    // take chars while they are digits, dots, or colons
+    let candidate = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
+        .collect::<String>();
+
+    // quick tests: at least one dot for IPv4 or one colon for IPv6
+    if candidate.contains('.') || candidate.contains(':') {
+        Some(&s[..candidate.len()])
+    } else {
+        None
+    }
+}
+
 pub async fn load_neo(files: &Vec<String>, database: &String, user: &String) {
     let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
     let graph = Graph::new(database, user, &pass).await.unwrap();
@@ -41,19 +65,25 @@ pub async fn load_neo(files: &Vec<String>, database: &String, user: &String) {
             let mut row: Vec<&str> = line.split(',').collect();
             row.pop();
     
-            if row[1].contains('.') && row[1].chars().any(|c| c.is_ascii_alphabetic()) {
-                row[1] = row[1].split('.').next().unwrap_or(row[1]);
-                //println!("Converted!: {}", row[1])
-            }
-    
-            if row[8].contains('.') && row[8].chars().any(|c| c.is_ascii_alphabetic()) {
-                row[8] = row[8].split('.').next().unwrap_or(row[8]);
-                //println!("Converted!: {}", row[8])
+            // dst_computer (row[1])
+            if let Some(ip) = extract_leading_ip(row[1]) {
+                row[1] = ip;                                     // keep full IP (e.g. 192.168.129.4)
+            } else if row[1].contains('.') && !looks_like_ip(row[1]) {
+                row[1] = row[1].split('.').next().unwrap_or(row[1]);  // keep only first label of FQDN
             }
 
-            if row[9].contains('.') && row[9].chars().any(|c| c.is_ascii_alphabetic()) {
+            // src_computer (row[8])
+            if let Some(ip) = extract_leading_ip(row[8]) {
+                row[8] = ip;
+            } else if row[8].contains('.') && !looks_like_ip(row[8]) {
+                row[8] = row[8].split('.').next().unwrap_or(row[8]);
+            }
+
+            // src_ip (row[9]) – rarely a hostname, but same safeguard
+            if let Some(ip) = extract_leading_ip(row[9]) {
+                row[9] = ip;
+            } else if row[9].contains('.') && !looks_like_ip(row[9]) {
                 row[9] = row[9].split('.').next().unwrap_or(row[9]);
-                //println!("Converted!: {}", row[8])
             }
 
             if row[1].contains(':') {

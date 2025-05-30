@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDateTime;
 
-const MASSTIN_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename";
+const MASSTIN_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 
 pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), Box<dyn Error>> {
     let mut merged_lines: Vec<(NaiveDateTime, String)> = Vec::new();
@@ -31,7 +31,7 @@ pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), B
                 let fields: Vec<&str> = content.split(',').collect();
                 
                 // Ensure the line has the correct number of fields
-                if fields.len() != 11 {
+                if fields.len() != 12 {
                     continue; // Skip malformed lines
                 }
 
