@@ -857,9 +857,8 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
 // ---------------------------------------------------------------------------------------
 // SEARCH FOR EVTX FILES IN DIRECTORIES (AND ZIP)
 // ---------------------------------------------------------------------------------------
-fn find_evtx_files(directories: &Vec<String>) -> Vec<EvtxLocation> {
-    let mut evtx_files = vec![];
-    let keywords = ["triage", "kape", "velociraptor"];
+fn find_evtx_files(directories: &[String]) -> Vec<EvtxLocation> {
+    let mut evtx_files = Vec::new();
 
     for directory in directories {
         let path = Path::new(directory);
@@ -870,33 +869,25 @@ fn find_evtx_files(directories: &Vec<String>) -> Vec<EvtxLocation> {
         for entry in WalkDir::new(path) {
             if let Ok(entry) = entry {
                 let path = entry.path();
-                if path.is_file() {
-                    let ext = path.extension().and_then(|e| e.to_str());
+                if !path.is_file() {
+                    continue;
+                }
 
-                    // Case 1: If it's an EVTX file in the filesystem
-                    if ext == Some("evtx") {
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("evtx") => {
                         if let Some(path_str) = path.to_str() {
                             evtx_files.push(EvtxLocation::File(path_str.to_string()));
                         }
                     }
-
-                    // Case 2: If it's a ZIP with a keyword, search for EVTX inside
-                    if ext == Some("zip") {
-                        if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
-                            if keywords.iter().any(|&kw| file_name.to_lowercase().contains(kw)) {
-                                if is_debug_mode() {
-                                    println!("[DEBUG] ZIP detected with keyword: {}", file_name);
-                                }
-                                if let Some(zip_evtx_files) = list_evtx_in_zip(path, None) {
-                                    evtx_files.extend(zip_evtx_files);
-                                } else {
-                                    if is_debug_mode() {
-                                        println!("[DEBUG] No EVTX files found in ZIP: {}", file_name);
-                                    }
-                                }
-                            }
+                    Some("zip") => {
+                        if is_debug_mode() {
+                            println!("[DEBUG] ZIP detected: {}", path.display());
+                        }
+                        if let Some(found) = list_evtx_in_zip(path, None) {
+                            evtx_files.extend(found);
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -909,110 +900,128 @@ fn find_evtx_files(directories: &Vec<String>) -> Vec<EvtxLocation> {
     evtx_files
 }
 
-// ---------------------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // LIST EVTX FILES INSIDE A ZIP
-// ---------------------------------------------------------------------------------------
-fn list_evtx_in_zip(zip_path: &Path, parent_zip: Option<String>) -> Option<Vec<EvtxLocation>> {
-    if is_debug_mode() {
-        println!("[DEBUG] Exploring ZIP: {:?}", zip_path);
-    }
+// -----------------------------------------------------------------------------
+fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec<EvtxLocation>> {
+    let mut evtx_files = Vec::<EvtxLocation>::new();
 
-    let file = match File::open(zip_path) {
-        Ok(f) => f,
-        Err(e) => {
-            println!("[ERROR] Could not open ZIP: {:?} -> {}", zip_path, e);
-            return None;
-        }
+    // Abrimos el ZIP raíz
+    let file = File::open(zip_path).map_err(|e| {
+        println!("[ERROR] Could not open ZIP {:?}: {}", zip_path, e);
+    }).ok()?;
+    let mut archive = ZipArchive::new(file).map_err(|e| {
+        println!("[ERROR] Could not read ZIP {:?}: {}", zip_path, e);
+    }).ok()?;
+
+    // Ruta acumulada:  zip1 -> zip2 -> ... -> actual.zip
+    let this_chain = match &parent_chain {
+        Some(c) => format!("{} -> {}", c, zip_path.to_string_lossy()),
+        None     => zip_path.to_string_lossy().to_string(),
     };
 
-    let mut archive = match ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("[ERROR] Could not read ZIP: {:?} -> {}", zip_path, e);
-            return None;
-        }
-    };
-
-    let mut evtx_files = vec![];
-    let mut nested_zips = vec![];
-
+    // Recorremos todas las entradas
     for i in 0..archive.len() {
-        match archive.by_index(i) {
-            Ok(mut file) => {
-                let file_name = file.name().to_string();
-                if file_name.ends_with(".evtx") {
-                    // Build the full path preserving the hierarchy
-                    let full_zip_path = match &parent_zip {
-                        Some(parent) => format!("{} -> {}", parent, zip_path.to_string_lossy()),
-                        None => zip_path.to_string_lossy().to_string(),
-                    };
-                    if is_debug_mode() {
-                        println!("[INFO] EVTX found inside the ZIP: {}", file_name);
-                    }
-                    evtx_files.push(EvtxLocation::ZipEntry {
-                        zip_path: full_zip_path,
-                        evtx_name: file_name,
-                    });
-                } else if file_name.ends_with(".zip") {
-                    if is_debug_mode() {
-                        println!("[DEBUG] Nested ZIP detected: {}", file_name);
-                    }
-                    let mut nested_zip_data = Vec::new();
-                    if let Err(e) = file.read_to_end(&mut nested_zip_data) {
-                        println!("[ERROR] Could not read nested ZIP: {} -> {}", file_name, e);
-                        continue;
-                    }
-                    nested_zips.push((file_name, nested_zip_data));
-                }
-            },
+        let mut entry = match archive.by_index(i) {
+            Ok(f)  => f,
             Err(e) => {
-                println!("[ERROR] Could not read a file in the ZIP: {} -> {}", i, e);
+                println!("[ERROR] Reading file {} in {:?}: {}", i, zip_path, e);
+                continue;
             }
-        }
-    }
+        };
 
-    // Process nested ZIPs
-    for (nested_zip_name, nested_zip_data) in nested_zips {
-        if is_debug_mode() {
-            println!("[INFO] Exploring nested ZIP: {}", nested_zip_name);
-        }
+        let name = entry.name().to_owned();
 
-        let cursor = Cursor::new(nested_zip_data);
-        match ZipArchive::new(cursor) {
-            Ok(mut nested_archive) => {
-                for j in 0..nested_archive.len() {
-                    if let Ok(nested_file) = nested_archive.by_index(j) {
-                        let nested_file_name = nested_file.name().to_string();
-                        if nested_file_name.ends_with(".evtx") {
-                            let full_zip_path = match &parent_zip {
-                                Some(parent) => format!("{} -> {} -> {}", parent, zip_path.to_string_lossy(), nested_zip_name),
-                                None => format!("{} -> {}", zip_path.to_string_lossy(), nested_zip_name),
-                            };
-                            if is_debug_mode() {
-                                println!("[INFO] EVTX found in nested ZIP: {}", nested_file_name);
-                            }
-                            evtx_files.push(EvtxLocation::ZipEntry {
-                                zip_path: full_zip_path,
-                                evtx_name: nested_file_name,
-                            });
-                        }
-                    }
+        if name.ends_with(".evtx") {
+            // Encontrado un EVTX
+            if is_debug_mode() {
+                println!("[INFO] EVTX found: {} inside {}", name, zip_path.display());
+            }
+            evtx_files.push(EvtxLocation::ZipEntry {
+                zip_path: this_chain.clone(),
+                evtx_name: name,
+            });
+        } else if name.ends_with(".zip") {
+            // ZIP anidado → lo leemos en memoria y llamamos recursivamente
+            let mut nested_data = Vec::with_capacity(entry.size() as usize);
+            if entry.read_to_end(&mut nested_data).is_err() {
+                println!("[ERROR] Could not read nested ZIP {}", name);
+                continue;
+            }
+            let mut nested_archive = match ZipArchive::new(Cursor::new(nested_data)) {
+                Ok(a)  => a,
+                Err(e) => {
+                    println!("[ERROR] Opening nested ZIP {}: {}", name, e);
+                    continue;
                 }
-            },
-            Err(e) => {
-                println!("[ERROR] Could not open the nested ZIP: {} -> {}", nested_zip_name, e);
+            };
+
+            // Creamos un Cursor temporal para pasarlo a la función recursiva
+            let tmp_path = zip_path.with_file_name(name.clone());
+            // El Cursor anterior ya tiene los datos, sólo necesitamos una ruta “ficticia”
+            // para llevar la cuenta de la jerarquía.
+            if let Some(mut deeper) =
+                recurse_zip(&mut nested_archive, &this_chain, &name)
+            {
+                evtx_files.append(&mut deeper);
             }
         }
     }
 
     if evtx_files.is_empty() {
-        println!("[WARNING] No EVTX files found in ZIP: {:?}", zip_path);
         None
     } else {
-        println!("[INFO] Total EVTX files found (including nested ZIPs): {}", evtx_files.len());
         Some(evtx_files)
     }
 }
+
+// -----------------------------------------------------------------------------
+// Helper recursivo para ZIPs anidados ilimitadamente
+// -----------------------------------------------------------------------------
+fn recurse_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    parent_chain: &str,
+    current_zip_name: &str,
+) -> Option<Vec<EvtxLocation>> {
+    let mut evtx_files = Vec::<EvtxLocation>::new();
+
+    for i in 0..archive.len() {
+        let mut entry = match archive.by_index(i) {
+            Ok(f)  => f,
+            Err(_) => continue,
+        };
+        let name = entry.name().to_owned();
+
+        if name.ends_with(".evtx") {
+            evtx_files.push(EvtxLocation::ZipEntry {
+                zip_path: format!("{} -> {}", parent_chain, current_zip_name),
+                evtx_name: name,
+            });
+        } else if name.ends_with(".zip") {
+            // ZIP dentro de ZIP dentro de ZIP…​
+            let mut nested_data = Vec::with_capacity(entry.size() as usize);
+            if entry.read_to_end(&mut nested_data).is_err() {
+                continue;
+            }
+            if let Ok(mut deeper_archive) = ZipArchive::new(Cursor::new(nested_data)) {
+                if let Some(mut deeper) = recurse_zip(
+                    &mut deeper_archive,
+                    &format!("{} -> {}", parent_chain, current_zip_name),
+                    &name,
+                ) {
+                    evtx_files.append(&mut deeper);
+                }
+            }
+        }
+    }
+
+    if evtx_files.is_empty() {
+        None
+    } else {
+        Some(evtx_files)
+    }
+}
+
 
 // ---------------------------------------------------------------------------------------
 // GENERIC PARSE FUNCTION FOR A GIVEN EvtxLocation

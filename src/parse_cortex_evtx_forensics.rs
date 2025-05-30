@@ -52,24 +52,31 @@ pub async fn parse_cortex_evtx_forensics_data(
     start_time: Option<&String>,
     end_time: Option<&String>,
 ) -> Result<(), Box<dyn Error>> {
-    let token = prompt_for_api_key()?;
+    let (token, x_xdr_auth_id) = prompt_for_api_key_and_id()?;
 
-    // Convert user-supplied date/time (UTC) to epoch ms
-    let from_time_epoch = if let Some(s) = start_time {
-        datetime_to_epoch_millis(s)?
-    } else {
-        (Utc::now() - chrono::Duration::days(30)).timestamp_millis()
+
+        // 1) turn CLI parameters into epochs
+    let epoch_start = match start_time {
+        Some(s) if !s.is_empty() => Some(to_epoch_secs(s)?),
+        _ => None,
     };
-    let to_time_epoch = if let Some(s) = end_time {
-        datetime_to_epoch_millis(s)?
-    } else {
-        Utc::now().timestamp_millis()
+    let epoch_end = match end_time {
+        Some(s) if !s.is_empty() => Some(to_epoch_secs(s)?),
+        _ => None,
     };
 
-    if debug {
-        eprintln!("[DEBUG] from_time_epoch: {}", from_time_epoch);
-        eprintln!("[DEBUG] to_time_epoch: {}", to_time_epoch);
-    }
+    // 2) build an additional XQL filter only if both limits exist
+    let time_filter = if let (Some(start), Some(end)) = (epoch_start, epoch_end) {
+        // Timestamp ≤ end  AND  Timestamp ≥ start
+        format!(
+            r#"| filter (timestamp_diff(to_timestamp({end}), Timestamp, "SECOND") > 0) and
+                     (timestamp_diff(Timestamp,      to_timestamp({start}), "SECOND") > 0 )"#
+        )
+    } else {
+        String::new()  // no extra limit
+    };
+
+    
 
     let client = Client::new();
 
@@ -79,32 +86,36 @@ pub async fn parse_cortex_evtx_forensics_data(
     let get_stream_url = format!("{}/public_api/v1/xql/get_query_results_stream", base_url.trim_end_matches('/'));
 
     // Headers
-    let headers = build_headers(&token);
+    let headers = build_headers(&token, &x_xdr_auth_id)?;
 
     // NUEVA QUERY basada en tu especificación
-    let query_payload = json!({
-        "request_data": {
-            "query": r#"dataset = forensics_event_log 
+    let query_string = format!(
+        r#"config case_sensitive = false timeframe=365d |
+       dataset = forensics_event_log 
                     | filter event_id in (4624,4625,4648,21,22,24,25,1009,551,31001,30803,30804,30805,30806,30807,30808,1024,1102,1149) and source in ("Security","Microsoft-Windows-TerminalServices-LocalSessionManager/Operational","Microsoft-Windows-SMBServer/Security","Microsoft-Windows-SmbClient/Security","Microsoft-Windows-TerminalServices-RDPClient/Operational","Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational") 
                     | filter message not in ("""::""", null, """""","-")
                     | alter lt = if(event_id in (4624,4625), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión):\s*(\d+)"), 0),event_id=4648,"runas",event_id in (21,22,24,25,1024,1102,1149),"10","3")
-                    | alter srcip = if(event_id in (4624,4625,21,22,24,25,1149,1009,551),arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Client Name|Nombre de.? cliente):\s*([\w.-]+)"), 0))
+                    | alter srcip = if(event_id in (4624,4625,21,22,24,25,1149,1009,551),arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Client Name|Nombre de.? cliente):\s*\\*([\w.-]+)"), 0))
                     | alter process = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso):\s*([^\r\n]+)"), 0))
-                    | alter source_host = if(event_id in (4624,4625),arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo):\s*([\w.-]+)"), 0),event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102),host_name)
+                    | alter source_host = if(event_id in (4624,4625),arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo):\s*\\*([\w.-]+)"), 0),event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102),host_name)
                     | alter subject_name = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Name|Firmante:.*?Nombre de cuenta):\s*([\w.\-$]+)"), 0))
                     | alter subject_domain = if(event_id in (4624,4625,4648),arrayindex(regextract(message , "(?si)(?:Subject:.*?Account Domain|Firmante:.*?Dominio de cuenta):\s*([\w.\-$ ]+)"), 0))
                     | alter target_user = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Name|Nuevo inicio de sesión:.*?Nombre de cuenta|Account For Which Logon Failed:.*?Account Name|Cuenta con error de inicio de sesión:.*?Nombre de cuenta|Account Whose Credentials Were Used:.*?Account Name|Cuenta cuyas credenciales se usaron:.*?Nombre de cuenta):\s*([\w.\-$]+)"), 0),event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|User|Usuario):\s(?:[^\s\\]+)\\([^\s]+)"), 0))
                     | alter target_domain = if(event_id in (4624,4625,4648),arrayindex(regextract(message , "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta):\s*([\w.\-$]+)"), 0),event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
-                    | alter dst_host = if(event_id in (4624,4625,21,22,24,25,1149),host_name,event_id=4648,arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino):\s*([\w.-]+)"), 0),event_id in (31001,30803,30804,30805,30806,30807),arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor):\s\\(.+)"), 0),event_id=30808,arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido):\s\\(.+)"), 0),event_id in (1102),arrayindex(regextract(message, "(?i)(?:server|servidor)\s+([\w.-]+)\b"), 0))
-                    | fields _time, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process"#,
-            "tenants": [],
-            "timeframe": {
-                "from": from_time_epoch,
-                "to": to_time_epoch
-            }
+                    | alter dst_host = if(event_id in (4624,4625,21,22,24,25,1149),host_name,event_id=4648,arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino):\s*\\*([\w.-]+)"), 0),event_id in (31001,30803,30804,30805,30806,30807),arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor):\s\\*(.+)"), 0),event_id=30808,arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido):\s\\*(.+)"), 0),event_id in (1102),arrayindex(regextract(message, "(?i)(?:server|servidor)\s+([\w.-]+)\b"), 0))
+                    | alter Timestamp  = to_timestamp(event_generated, "millis")
+                    {time_filter}
+                    | filter ((`source_host` not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost") or srcip not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost")) and dst_host not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost"))
+                    | filter (dst_host != source_host) and (dst_host != srcip )
+                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process"#);
+
+    let query_payload = json!({
+        "request_data": {
+            "query":   query_string,
+            "tenants": []
         }
     });
-
+    
     if debug {
         eprintln!("[DEBUG] POSTing query to: {}", start_query_url);
         eprintln!("[DEBUG] Payload: {}", query_payload);
@@ -281,9 +292,9 @@ fn parse_ndjson(data: &str, debug: bool) -> Result<Vec<Value>, Box<dyn Error>> {
 // Time extraction
 // ----------------------------------------------
 fn get_timestamp(record: &Value) -> Option<i64> {
-    if let Some(ts) = record.get("_time").and_then(|v| v.as_i64()) {
+    if let Some(ts) = record.get("Timestamp").and_then(|v| v.as_i64()) {
         Some(ts)
-    } else if let Some(ts_str) = record.get("_time").and_then(|v| v.as_str()) {
+    } else if let Some(ts_str) = record.get("Timestamp").and_then(|v| v.as_str()) {
         if let Ok(dt) = Utc.datetime_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.f UTC") {
             Some(dt.timestamp_millis())
         } else if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
@@ -319,10 +330,10 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
 // ----------------------------------------------
 fn process_record(record: &Value, debug: bool) -> Vec<String> {
     // Extraer `_time` como timestamp formateado en RFC 3339 (UTC)
-    let time_created = if let Some(ts) = record.get("_time").and_then(|v| v.as_i64()) {
+    let time_created = if let Some(ts) = record.get("Timestamp").and_then(|v| v.as_i64()) {
         let dt = Utc.timestamp_millis(ts);
         dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
-    } else if let Some(time_str) = record.get("_time").and_then(|v| v.as_str()) {
+    } else if let Some(time_str) = record.get("Timestamp").and_then(|v| v.as_str()) {
         // Try to parse a string in the format "YYYY-MM-DD HH:MM:SS.mmm UTC"
         if let Ok(dt) = Utc.datetime_from_str(time_str, "%Y-%m-%d %H:%M:%S%.f UTC") {
             dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
@@ -375,31 +386,58 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
 // ----------------------------------------------
 // Pide la API key al usuario
 // ----------------------------------------------
-fn prompt_for_api_key() -> Result<String, Box<dyn Error>> {
+/// Prompts the user for an API key and returns it as a `String`.
+fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
+    // Prompt for API Key ID
+    print!("Enter your Cortex/XDR API Key ID (numeric): ");
+    stdout().flush()?;
+    let mut api_key_id_input = String::new();
+    stdin().read_line(&mut api_key_id_input)?;
+    let api_key_id: u32 = api_key_id_input.trim().parse()?; // 👈 fuerza número
+
+    // Prompt for API Key
     print!("Enter your Cortex/XDR API Key: ");
     stdout().flush()?;
-    let mut token = String::new();
-    stdin().read_line(&mut token)?;
-    Ok(token.trim().to_string())
+    let mut api_key = String::new();
+    stdin().read_line(&mut api_key)?;
+    let api_key = api_key.trim().to_string();
+
+    Ok((api_key, api_key_id.to_string())) // 👈 lo devuelves como string
 }
 
 // ----------------------------------------------
 // Construye los headers
 // ----------------------------------------------
-fn build_headers(token: &str) -> HeaderMap {
+/// Builds the necessary headers for the Cortex/XDR API requests.
+fn build_headers(token: &str, x_xdr_auth_id: &str) -> Result<HeaderMap, Box<dyn Error>> {
+
     use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
     let mut headers = HeaderMap::new();
-    headers.insert("x-xdr-auth-id", HeaderValue::from_str("5").unwrap());
-    headers.insert("Authorization", HeaderValue::from_str(token).unwrap());
+
+    // Example: "x-xdr-auth-id" is often a static integer, e.g., "5".
+    //headers.insert("x-xdr-auth-id", HeaderValue::from_str("194").unwrap());
+    headers.insert("x-xdr-auth-id", HeaderValue::from_str(x_xdr_auth_id.trim())?);
+    headers.insert("Authorization", HeaderValue::from_str(token)?);
+
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // If the server supports gzip, add this header.
     headers.insert("Accept-Encoding", HeaderValue::from_static("gzip"));
-    headers
+    Ok(headers)
 }
 
-// ----------------------------------------------
-// Convierte "YYYY-MM-DD HH:MM:SS" a epoch ms
-// ----------------------------------------------
-fn datetime_to_epoch_millis(dt_str: &str) -> Result<i64, Box<dyn Error>> {
-    let naive = chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S")?;
-    Ok(DateTime::<Utc>::from_utc(naive, Utc).timestamp_millis())
+// Convert clap-supplied date-time (with or without “ -0000”) to epoch *seconds*
+fn to_epoch_secs(ts: &str) -> Result<i64, Box<dyn Error>> {
+    let trimmed = ts.trim();
+
+    // First try with a timezone offset (e.g. "2025-02-01 17:12:00 -0000")
+    if let Ok(dt) = DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S %z") {
+        return Ok(dt.timestamp());
+    }
+
+    // Fallback: treat a naive string (no offset) as UTC
+    let naive = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")?;
+    Ok(DateTime::<Utc>::from_utc(naive, Utc).timestamp())
 }
+
+
+
