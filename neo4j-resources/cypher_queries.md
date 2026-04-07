@@ -1,95 +1,150 @@
 # Neo4j and Cypher Resources
 
-## Setting Up Neo4j Database
+## Important: Data Transformations
 
-Follow these steps to create a Neo4j database and set up your user credentials:
+When masstin loads data into Neo4j, certain character transformations are applied due to Cypher language restrictions:
 
-1. **Download and Install Neo4j**
-   - Go to the [Neo4j Download Page](https://neo4j.com/download/) and download the appropriate version for your operating system.
-   - Install Neo4j by following the instructions provided for your platform.
+- **Dots (`.`) are replaced with underscores (`_`)** — e.g., `10.10.1.50` becomes `10_10_1_50`
+- **Hyphens (`-`) are replaced with underscores (`_`)** — e.g., `SRV-FILE01` becomes `SRV_FILE01`
+- **Spaces are replaced with underscores (`_`)**
+- **All text is converted to UPPERCASE**
+- **The `@` symbol and everything after it is removed** from usernames
 
-2. **Create a New Database**
-   - Open the Neo4j application.
-   - On the initial screen, click "Create a new project" if this is your first time running Neo4j.
-   - Follow the prompts to create a new database. You will be asked to enter a database name, a username, and a password. Make sure to remember these credentials as you will need them later.
+Keep this in mind when writing Cypher queries — use the transformed values (e.g., `WS_HR02` instead of `WS-HR02`, `10_10_1_80` instead of `10.10.1.80`).
 
-3. **Configure Neo4j**
-   - After creating your database, ensure that the database is running. You can check this from the Neo4j Desktop application.
+## Setting Up Neo4j
 
-## Accessing Neo4j Browser
+1. Download and install Neo4j from the [Neo4j Download Page](https://neo4j.com/download/)
+2. Create a new database with a username and password
+3. Ensure the database is running — masstin communicates via Bolt, typically at `localhost:7687`
+4. Access Neo4j Browser at `http://localhost:7474`
 
-### On Windows
+**Tip:** Disable the option to automatically expand nodes in Neo4j Browser settings to avoid overloading the visualization.
 
-1. **Open Neo4j Desktop Application**
-   - Launch Neo4j Desktop from your Start menu or desktop shortcut.
-   - Click on the database you created to open the database management screen.
+## Cypher Queries
 
-2. **Open Neo4j Browser**
-   - Click the "Open" button next to the database name.
-   - This will open the Neo4j Browser in your default web browser.
+### 1) View all lateral movement
 
-### On Linux
-
-1. **Open Your Web Browser**
-   - Neo4j typically runs on port 7474. Open your preferred web browser.
-
-2. **Access Neo4j Browser**
-   - Navigate to `http://localhost:7474`.
-   - This will open the Neo4j Browser where you can interact with your database.
-
-## Configuring Neo4j Browser
-
-**Tip:** To avoid overloading your system, disable the option to automatically expand nodes in the Neo4j Browser. This setting can be found in the Neo4j Browser settings menu.
-
-## Applying a Custom Style
-
-To apply a custom style to your Neo4j visualizations:
-
-1. **Run Style command**
-   - Run the following command in neo4j browser:
-
-    ```plaintext
-   :style
-   node {
-     diameter 110px;
-     color #D9C8AE;
-     border-color #9AA1AC;
-     border-width 2px;
-     text-color-internal #FFFFFF;
-     font-size 10px;
-   }
-   relationship {
-     color #A5ABB6;
-     shaft-width 1px;
-     font-size 8px;
-     padding 3px;
-     text-color-external #000000;
-     text-color-internal #FFFFFF;
-     caption type;
-   }
-   node.host {
-     color: #D9C8AE;
-     border-color: #9AA1AC;
-     text-color-internal: #000000;
-     defaultCaption: "<id>";
-     diameter: 110px;
-   }
-    ```
-
-## Useful Queries
-
-### 1) RDP Logins (type 10) for Non-Machine Accounts in a Specific Time Frame
+The most basic query — shows the entire graph with all connections:
 
 ```cypher
 MATCH (h1:host)-[r]->(h2:host)
-WHERE datetime(r.time) >= datetime("2024-07-24T19:00:00.000000000Z")
-  AND datetime(r.time) <= datetime("2024-07-26T00:00:00.000000000Z")
-  AND NOT r.target_user_name ENDS WITH '$'
-  AND r.logon_type='10'
+RETURN h1, r, h2
+```
+
+### 2) Filter by time range
+
+This is the most powerful feature of masstin's Neo4j integration. Since masstin groups connections by source, destination, user, and logon type — and stores the earliest timestamp — filtering by time range automatically removes all previously established connections, revealing only new lateral movement in that window.
+
+This is critical during incident response: if you know the attacker gained access on March 12th, filtering from that date forward shows you only the connections that appeared during the attack, cutting through the noise of months of legitimate activity.
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-12T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-13T00:00:00.000000000Z")
 RETURN h1, r, h2
 ORDER BY datetime(r.time)
- ```
+```
 
-This query retrieves RDP logins (logon type 10) that are not machine accounts and occurred within the specified time frame.
+### 3) Filter by time range excluding machine accounts
 
-For more information on Cypher queries, please refer to the [official Cypher documentation](https://neo4j.com/docs/cypher-manual/current/).
+Machine accounts (ending in `$`) and connections without a resolved user (`NO_USER`) generate significant noise. This query filters them out to focus on human-initiated lateral movement:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-12T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-13T00:00:00.000000000Z")
+  AND NOT r.target_user_name ENDS WITH '$'
+  AND NOT r.target_user_name = 'NO_USER'
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 4) RDP-only connections (logon type 10)
+
+Isolate Remote Desktop connections, which are often the primary method of interactive lateral movement:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-12T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-13T00:00:00.000000000Z")
+  AND NOT r.target_user_name ENDS WITH '$'
+  AND r.logon_type = '10'
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 5) Network logons only (logon type 3 — SMB, PsExec, WMI)
+
+Logon type 3 captures SMB share access, PsExec execution, WMI remote commands, and similar network-based lateral movement:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-12T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-13T00:00:00.000000000Z")
+  AND NOT r.target_user_name ENDS WITH '$'
+  AND r.logon_type = '3'
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 6) Service accounts by naming convention
+
+If your organization uses a naming convention for service accounts (e.g., `SVC_`), you can isolate their activity to verify whether it's legitimate:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-10T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-14T00:00:00.000000000Z")
+  AND (
+    r.target_user_name STARTS WITH 'SVC'
+    OR r.subject_user_name STARTS WITH 'SVC'
+  )
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 7) Filter by specific users, hosts, and IPs
+
+When you've identified suspicious accounts or machines, use this query to trace their complete activity. Remember to use the transformed values (underscores, uppercase):
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2026-03-12T00:00:00.000000000Z")
+  AND datetime(r.time) <= datetime("2026-03-13T00:00:00.000000000Z")
+  AND NOT r.target_user_name ENDS WITH '$'
+  AND NOT r.target_user_name = 'NO_USER'
+  AND r.logon_type IN ['3', '10']
+  AND (
+    (h1.name = 'WS_HR02' OR h2.name = 'WS_HR02')
+    OR r.target_user_name IN ['ADM_DOMAIN', 'M_LOPEZ']
+    OR r.subject_user_name IN ['ADM_DOMAIN', 'M_LOPEZ']
+    OR r.src_ip IN ['10_99_88_77', '10_10_1_80']
+  )
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 8) Find all machines a specific user touched
+
+Trace the complete path of a single user through the network:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE r.target_user_name = 'ADM_DOMAIN'
+RETURN h1, r, h2
+ORDER BY datetime(r.time)
+```
+
+### 9) Find the most connected nodes (potential targets or pivots)
+
+Identify which machines have the most incoming connections — these are either high-value targets or pivot points:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+RETURN h2.name AS target, COUNT(r) AS connections
+ORDER BY connections DESC
+LIMIT 10
+```
+
+For more information on Cypher queries, refer to the [official Cypher documentation](https://neo4j.com/docs/cypher-manual/current/).
