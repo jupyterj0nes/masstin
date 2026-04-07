@@ -78,13 +78,18 @@ Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux ar
 | `btmp` | Failed login attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `lastlog` | Last login per user | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 
-### Winlogbeat & Cortex XDR
+### Winlogbeat
 
 | Source | What it tracks | Article |
 |--------|---------------|---------|
-| Winlogbeat JSON | All 28 Event IDs from JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Winlogbeat JSON | All 28 Windows Event IDs in JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+
+### Cortex XDR
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
 | Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
-| Cortex XDR EVTX Forensics | Forensic event logs via XQL queries | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+| Cortex XDR EVTX Forensics | Forensic event logs collected by forensic agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 
 ## Quick Start
 
@@ -101,40 +106,26 @@ cargo build --release
 
 ## Usage
 
-### Parse: Generate a lateral movement timeline
+### Parse Windows: Generate a lateral movement timeline
 
 Parses Windows EVTX files from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
 
+> **Note:** The legacy command `parse` is still supported as an alias for backwards compatibility.
+
 ```bash
 # Single directory (or compressed triage package)
-masstin -a parse -d /evidence/logs/ -o timeline.csv
+masstin -a parse-windows -d /evidence/logs/ -o timeline.csv
 
 # Multiple machines
-masstin -a parse -d /machine1/logs -d /machine2/logs -o timeline.csv --overwrite
+masstin -a parse-windows -d /machine1/logs -d /machine2/logs -o timeline.csv --overwrite
 
 # Individual EVTX files
-masstin -a parse -f Security.evtx -f System.evtx -o timeline.csv
+masstin -a parse-windows -f Security.evtx -f System.evtx -o timeline.csv
 
 # Time filtering
-masstin -a parse -d /evidence/ -o timeline.csv \
+masstin -a parse-windows -d /evidence/ -o timeline.csv \
   --start-time "2024-08-12 00:00:00" \
   --end-time "2024-08-14 00:00:00"
-```
-
-### Load: Visualize in Neo4j
-
-Uploads a previously generated CSV into a Neo4j graph database. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise.
-
-```bash
-masstin -a load -f timeline.csv --database localhost:7687 --user neo4j
-```
-
-### Merge: Combine multiple timelines
-
-Merges multiple CSV files into a single time-sorted timeline. Useful when artifacts were parsed from different sources or at different times.
-
-```bash
-masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
 ```
 
 ### Parse Linux logs
@@ -167,6 +158,22 @@ masstin -a parse-cortex --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
 masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
   --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
   -o cortex-evtx.csv
+```
+
+### Merge: Combine multiple timelines
+
+Merges multiple CSV files into a single time-sorted timeline. Useful when artifacts were parsed from different sources or at different times.
+
+```bash
+masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
+```
+
+### Load: Visualize in Neo4j
+
+Uploads a previously generated CSV into a Neo4j graph database. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise.
+
+```bash
+masstin -a load -f timeline.csv --database localhost:7687 --user neo4j
 ```
 
 ## Output Format
@@ -210,7 +217,7 @@ For more Cypher queries, see the [Cypher Resources](neo4j-resources/cypher_queri
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse` \| `load` \| `merge` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-linux` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load` |
 | `-d, --directory` | Directories to process (repeatable) |
 | `-f, --file` | Individual files to process (repeatable) |
 | `-o, --output` | Output file path |
