@@ -1,0 +1,74 @@
+// Masstin - Lateral Movement Graph Style for Memgraph Lab
+// https://weinvestigateanything.com
+
+// Color palette for distinct node labels
+Define(COLOR_PALETTE, AsArray(
+  #DD2222, #FB6E00, #FFC500, #720096,
+  #5E4FA2, #3288BD, #66C2A5, #ABDDA4,
+  #E6F598, #FEE08B, #D53E4F, #9E0142
+))
+Define(COLOR_PALETTE_ITER, AsIterator(COLOR_PALETTE))
+
+Define(RandomColor, Function(RGB(RandomInt(255), RandomInt(255), RandomInt(255))))
+Define(GetNextColor, Function(
+  Coalesce(Next(COLOR_PALETTE_ITER), RandomColor())
+))
+
+Define(ColorByLabel, AsMap())
+Define(GetColorByLabel, Function(labels, Coalesce(
+  Get(ColorByLabel, labels),
+  Set(ColorByLabel, labels, GetNextColor())
+)))
+Define(JoinLabels, Function(labels, Join(Sort(labels), ":")))
+
+// Node style: large circles with white text inside
+@NodeStyle {
+  Define(COLOR, GetColorByLabel(JoinLabels(Labels(node))))
+
+  size: 35
+  color: COLOR
+  color-hover: Lighter(COLOR)
+  color-selected: Darker(COLOR)
+  border-width: 2
+  border-color: #1D1D1D
+  font-size: 7
+  font-color: #FFFFFF
+}
+
+@NodeStyle Greater(Size(Labels(node)), 0) {
+  label: Format(":{}", Join(Labels(node), " :"))
+}
+
+@NodeStyle HasProperty(node, "name") {
+  label: AsText(Property(node, "name"))
+}
+
+// Edge style: blue user labels to distinguish from node names
+@EdgeStyle {
+  color: #AAAAAA
+  color-hover: #1D1D1D
+  color-selected: #1D1D1D
+  width: 0.4
+  width-hover: 0.9
+  width-selected: 0.9
+  font-size: 3.5
+  font-color: #1565C0
+  label: Property(edge, "target_user_name")
+}
+
+// View styles
+@ViewStyle {
+  view: "default"
+  background-color: #FFFFFF00
+  map-tile-layer: "detailed"
+}
+
+@ViewStyle {
+  view: "force"
+  background-color: #FFFFFF00
+  map-tile-layer: "detailed"
+  force-physics-enabled: False
+  force-link-distance: 50
+  force-repel-force: -100
+  force-collision-radius: 15
+}
