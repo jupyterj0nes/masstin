@@ -8,7 +8,7 @@
 
   [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
   [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-  [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)]()
+  [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 
 </div>
 
@@ -48,7 +48,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Auto IP→hostname** | Frequency-based resolution from the logs themselves |
 | **Connection grouping** | Reduces noise by grouping repetitive connections between the same hosts |
 | **Time filtering** | Filter by start/end time at parse level |
-| **Cross-platform** | Windows & Linux static binaries, zero dependencies |
+| **Cross-platform** | Windows, Linux & macOS — zero dependencies |
 | **Merge mode** | Combine multiple CSV outputs into one sorted timeline |
 
 ## Supported Artifacts
