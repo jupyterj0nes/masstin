@@ -70,13 +70,13 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 ## Winlogbeat JSON
 
-[Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/)
+[Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
 
 Parses all 28 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
 
 ## Cortex XDR
 
-[Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/)
+[Full article →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/)
 
 ### Network Events (via API)
 

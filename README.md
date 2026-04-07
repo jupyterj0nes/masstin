@@ -80,9 +80,9 @@ Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux ar
 
 | Source | What it tracks | Article |
 |--------|---------------|---------|
-| Winlogbeat JSON | All 28 Event IDs from JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
-| Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
-| Cortex XDR EVTX Forensics | Forensic event logs via XQL queries | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
+| Winlogbeat JSON | All 28 Event IDs from JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+| Cortex XDR EVTX Forensics | Forensic event logs via XQL queries | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 
 ## Quick Start
 
