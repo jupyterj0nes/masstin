@@ -177,7 +177,7 @@ Uploads a previously generated CSV into a graph database for visual investigatio
 masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
 
 # Memgraph
-masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph
+masstin -a load-memgraph -f timeline.csv --database localhost:7687
 ```
 
 > **Note:** The legacy command `load` is still supported as an alias for `load-neo4j`.
@@ -220,7 +220,7 @@ Masstin supports two graph databases. Both use the Cypher query language and the
 | **Install** | Via Docker — requires WSL 2 + Docker Desktop (see below) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker compose` with `memgraph/memgraph-mage` + `memgraph/lab` |
 | **Start** | `iwr https://windows.memgraph.com \| iex` (starts DB + Lab via docker compose) | `sudo systemctl start memgraph` | — | Runs automatically |
 | **Browser** | `http://localhost:3000` (Memgraph Lab) | `http://localhost:3000` | `http://localhost:3000` | `http://localhost:3000` |
-| **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | Same as Linux | Same as Linux |
+| **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687` | Same as Linux | Same as Linux |
 
 > **Note:** Memgraph runs in-memory. Data is lost on restart unless [snapshots are configured](https://memgraph.com/docs/fundamentals/data-durability).
 
