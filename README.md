@@ -217,12 +217,67 @@ Masstin supports two graph databases. Both use the Cypher query language and the
 
 | Step | Windows | Linux | macOS | Docker (all platforms) |
 |------|---------|-------|-------|------------------------|
-| **Install** | Download [MSI installer](https://memgraph.com/download/) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
-| **Start** | Start the Memgraph service | `sudo systemctl start memgraph` | — | Runs automatically |
+| **Install** | Via Docker — requires WSL 2 + Docker Desktop (see below) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
+| **Start** | `docker run -d --name memgraph -p 7687:7687 -p 7444:7444 -p 3000:3000 memgraph/memgraph-platform` | `sudo systemctl start memgraph` | — | Runs automatically |
 | **Browser** | `http://localhost:3000` (Memgraph Lab) | `http://localhost:3000` | `http://localhost:3000` | `http://localhost:3000` |
 | **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | Same as Linux | Same as Linux |
 
 > **Note:** Memgraph runs in-memory. Data is lost on restart unless [snapshots are configured](https://memgraph.com/docs/fundamentals/data-durability).
+
+#### Windows prerequisites for Memgraph (WSL 2 + Docker)
+
+On Windows, Memgraph runs inside a Docker container, and Docker Desktop requires WSL 2. The dependency chain is: **WSL 2 → Docker Desktop → Memgraph container**.
+
+**1. Enable WSL 2** — Open PowerShell as Administrator:
+
+```powershell
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+```
+
+Restart your PC, then:
+
+```powershell
+wsl --update
+wsl --set-default-version 2
+wsl --install
+```
+
+**2. Install Docker Desktop** — Download from [docker.com](https://www.docker.com/products/docker-desktop/). Select "Use WSL 2 instead of Hyper-V" during installation. Restart if prompted.
+
+**3. Run Memgraph:**
+
+```powershell
+docker run -d --name memgraph -p 7687:7687 -p 7444:7444 -p 3000:3000 memgraph/memgraph-platform
+```
+
+<details>
+<summary><strong>Troubleshooting WSL / Docker on Windows</strong></summary>
+
+**Docker Desktop distro installation timeout** (`DockerDesktop/Wsl/CommandTimedOut`):
+
+Run `wsl --status`. If you see `ERROR_SERVICE_DOES_NOT_EXIST`, the WSL service is not registered. Fix:
+
+```powershell
+sc.exe create WslService binPath= 'C:\Program Files\WSL\wslservice.exe' start= auto
+sc.exe start WslService
+wsl --install
+```
+
+**wsl --update fails: "The older version cannot be removed"** (error 1603):
+
+A previous WSL installation left a corrupted MSI entry. Fix:
+
+```powershell
+winget uninstall "Windows Subsystem for Linux"
+wsl --install
+```
+
+If `winget` is not available, find the product GUID in `%TEMP%\wsl-install-logs.txt` (look for the `MIGRATE` property) and run `msiexec /x "{GUID}" /qn`, then `wsl --install`.
+
+For the full troubleshooting guide, see [Memgraph: In-Memory Visualization](https://weinvestigateanything.com/en/tools/memgraph-visualization/).
+
+</details>
 
 ### Querying the graph
 
