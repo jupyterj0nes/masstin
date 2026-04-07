@@ -7,8 +7,10 @@ use std::io::Read;
 mod parse;
 use tokio;
 pub use crate::parse::*;
-mod load;
-pub use crate::load::*;
+mod load_neo4j;
+pub use crate::load_neo4j::*;
+mod load_memgraph;
+pub use crate::load_memgraph::*;
 mod merge;
 pub use crate::merge::*;
 use serde_json::Value;
@@ -91,8 +93,11 @@ enum ActionType {
     /// Parses Windows EVTX files from single files or directories and outputs a CSV
     #[value(alias = "parse")]
     ParseWindows,
-    /// Loads a previously generated CSV file into a Neo4j database
-    Load,
+    /// Loads a previously generated CSV file into a Neo4j graph database
+    #[value(alias = "load")]
+    LoadNeo4j,
+    /// Loads a previously generated CSV file into a Memgraph graph database
+    LoadMemgraph,
     /// Merges multiple CSV files (previously generated) into a single time-sorted file
     Merge,
     /// Parses Winlogbeat JSON logs
@@ -124,8 +129,16 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseWindows => {
             parse_events(&config.file, &config.directory, config.output.as_ref());
         }
-        ActionType::Load => {
-            load_neo(
+        ActionType::LoadNeo4j => {
+            load_neo4j(
+                &config.file,
+                &config.database.as_ref().unwrap(),
+                &config.user.as_ref().unwrap(),
+            )
+            .await;
+        }
+        ActionType::LoadMemgraph => {
+            load_memgraph(
                 &config.file,
                 &config.database.as_ref().unwrap(),
                 &config.user.as_ref().unwrap(),
@@ -255,7 +268,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 }
             }
         }
-        ActionType::Load => {
+        ActionType::LoadNeo4j | ActionType::LoadMemgraph => {
             // For Load, we need at least one file, plus the database and user
             if config.file.is_empty() || config.database.is_none() || config.user.is_none() {
                 return Err(String::from(
