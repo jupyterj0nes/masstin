@@ -312,6 +312,21 @@ RETURN h1, r, h2
   <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
 </div>
 
+**Memgraph** — temporal path reconstruction (from `10_99_88_77` to `SRV_BACKUP`):
+
+```cypher
+MATCH path = (start:host {name:'10_99_88_77'})-[*]->(end:host {name:'SRV_BACKUP'})
+WHERE ALL(i IN range(0, size(relationships(path))-2)
+  WHERE localDateTime(relationships(path)[i].time) < localDateTime(relationships(path)[i+1].time))
+RETURN path
+ORDER BY length(path)
+LIMIT 5
+```
+
+<div align="center">
+  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction in Memgraph"/>
+</div>
+
 For the full query catalog (10 queries including temporal path reconstruction), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
 
 ## All Options
