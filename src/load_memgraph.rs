@@ -1,7 +1,5 @@
 use neo4rs::*;
 use futures::stream::*;
-use rpassword::read_password;
-use std::io::{self, prelude::*};
 use indicatif::ProgressBar;
 use std::collections::HashSet;
 use std::collections::HashMap;
@@ -41,8 +39,14 @@ fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
 }
 
 pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String) {
-    let pass = rpassword::prompt_password("MASSTIN - Enter Memgraph database password: ").unwrap();
-    let graph = Graph::new(database, user, &pass).await.unwrap();
+    let config = ConfigBuilder::default()
+        .uri(database)
+        .user(user)
+        .password("")
+        .db("memgraph")
+        .build()
+        .unwrap();
+    let graph = Graph::connect(config).await.unwrap();
     for file in files {
         let file_contents: String = std::fs::read_to_string(file).unwrap();
         let mut lines: Vec<&str> = file_contents.lines().collect();
@@ -183,7 +187,7 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
                 row[1].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 if relation_type.chars().next().unwrap_or(' ').is_digit(10) { format!("u{}", relation_type) } else { relation_type.to_string() }
                     .replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
-                row[0].replace(" utc", "").replace(" ", "T"),
+                row[0].replace(" utc", "").replace(" ", "T").trim_end_matches('Z'),
                 row[7].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 row[8].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 row[9].replace(".", "_").replace("-", "_").replace(" ", "_"),

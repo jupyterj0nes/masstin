@@ -138,10 +138,11 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             .await;
         }
         ActionType::LoadMemgraph => {
+            let default_user = String::from("");
             load_memgraph(
                 &config.file,
                 &config.database.as_ref().unwrap(),
-                &config.user.as_ref().unwrap(),
+                config.user.as_ref().unwrap_or(&default_user),
             )
             .await;
         }
@@ -268,11 +269,17 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 }
             }
         }
-        ActionType::LoadNeo4j | ActionType::LoadMemgraph => {
-            // For Load, we need at least one file, plus the database and user
+        ActionType::LoadNeo4j => {
             if config.file.is_empty() || config.database.is_none() || config.user.is_none() {
                 return Err(String::from(
                     "For the Load action, you must specify at least one file, a database, and a user.",
+                ));
+            }
+        }
+        ActionType::LoadMemgraph => {
+            if config.file.is_empty() || config.database.is_none() {
+                return Err(String::from(
+                    "For the Load Memgraph action, you must specify at least one file and a database.",
                 ));
             }
         }
