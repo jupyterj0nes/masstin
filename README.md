@@ -217,9 +217,8 @@ Masstin supports two graph databases. Both use the Cypher query language and the
 
 | Step | Windows | Linux | macOS | Docker (all platforms) |
 |------|---------|-------|-------|------------------------|
-| **Install** | Via Docker — requires WSL 2 + Docker Desktop (see below) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker run -d -p 7687:7687 -p 7444:7444 memgraph/memgraph-mage` |
-| **Start** | See Windows prerequisites below | `sudo systemctl start memgraph` | — | Runs automatically |
-| **Lab (web UI)** | `docker run -d -p 3000:3000 memgraph/lab` or [desktop app](https://memgraph.com/download) | Same | Same | `docker run -d -p 3000:3000 memgraph/lab` |
+| **Install** | Via Docker — requires WSL 2 + Docker Desktop (see below) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker compose` with `memgraph/memgraph-mage` + `memgraph/lab` |
+| **Start** | `iwr https://windows.memgraph.com \| iex` (starts DB + Lab via docker compose) | `sudo systemctl start memgraph` | — | Runs automatically |
 | **Browser** | `http://localhost:3000` (Memgraph Lab) | `http://localhost:3000` | `http://localhost:3000` | `http://localhost:3000` |
 | **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | Same as Linux | Same as Linux |
 
@@ -246,14 +245,13 @@ wsl --install
 
 **2. Install Docker Desktop** — Download from [docker.com](https://www.docker.com/products/docker-desktop/). Select "Use WSL 2 instead of Hyper-V" during installation. Restart if prompted.
 
-**3. Run Memgraph** (database + web interface as separate containers):
+**3. Install and run Memgraph:**
 
 ```powershell
-docker run -d --name memgraph -p 7687:7687 -p 7444:7444 memgraph/memgraph-mage
-docker run -d --name memgraph-lab -p 3000:3000 memgraph/lab
+iwr https://windows.memgraph.com | iex
 ```
 
-Open `http://localhost:3000` and connect to `localhost:7687`.
+This downloads a `docker-compose.yml` and starts the database (`memgraph/memgraph-mage`) and the web interface (`memgraph/lab`). Open `http://localhost:3000` — Memgraph Lab is ready.
 
 <details>
 <summary><strong>Troubleshooting WSL / Docker on Windows</strong></summary>
