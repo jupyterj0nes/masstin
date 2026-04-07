@@ -14,7 +14,7 @@
 
 ---
 
-**Masstin** is a high-speed DFIR tool written in Rust that parses forensic artifacts and unifies lateral movement data into a single chronological timeline. It supports Windows EVTX, Linux logs, Winlogbeat JSON, and Cortex XDR — all merged into one CSV, ready for analysis or Neo4j graph visualization.
+**Masstin** is a high-speed DFIR tool written in Rust that parses forensic artifacts and unifies lateral movement data into a single chronological timeline. It supports Windows EVTX, Linux logs, Winlogbeat JSON, and EDR APIs — all merged into one CSV, ready for analysis or graph database visualization (Neo4j, Memgraph).
 
 Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff) — the guardian dog from the mountains of León, Spain. Like its namesake, Masstin watches over your network and tracks every movement.
 
@@ -44,7 +44,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Multi-artifact parsing** | 28 Windows Event IDs + Linux logs + Winlogbeat JSON + Cortex XDR |
 | **Unified timeline** | All sources merged into a single chronological CSV |
 | **Compressed triage support** | Processes compressed packages from Velociraptor or Cortex XDR Offline Collector, recursively decompressing and identifying EVTX files — even archived logs with duplicate filenames |
-| **Neo4j integration** | Direct upload with Cypher queries for graph-based investigation |
+| **Graph database support** | Direct upload to Neo4j or Memgraph with Cypher queries for graph-based investigation |
 | **Auto IP→hostname** | Frequency-based resolution from the logs themselves |
 | **Connection grouping** | Reduces noise by grouping repetitive connections between the same hosts |
 | **Time filtering** | Filter by start/end time at parse level |
@@ -210,22 +210,43 @@ All actions produce a unified CSV:
 
 ## Graph Visualization (Neo4j / Memgraph)
 
-Masstin supports two graph databases: **Neo4j** and **Memgraph**. Both use the Cypher query language and the same queries work on both platforms with minor differences. After loading data, use the included [Cypher queries](neo4j-resources/cypher_queries.md) to explore the graph:
+Masstin supports two graph databases. Both use the Cypher query language and the same queries work on both with minor differences.
+
+### Installing Neo4j
+
+| Platform | Installation |
+|----------|-------------|
+| **Windows** | Download from [neo4j.com/download](https://neo4j.com/download/). Install Neo4j Desktop, create a database, and start it. Access the browser at `http://localhost:7474` |
+| **Linux** | `sudo apt install neo4j` or download from [neo4j.com/download](https://neo4j.com/download/). Start with `sudo systemctl start neo4j`. Access at `http://localhost:7474` |
+| **macOS** | `brew install neo4j` or download from [neo4j.com/download](https://neo4j.com/download/). Start with `neo4j start`. Access at `http://localhost:7474` |
+| **Docker** | `docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j` |
+
+### Installing Memgraph
+
+| Platform | Installation |
+|----------|-------------|
+| **Windows** | Download the MSI installer from [memgraph.com/download](https://memgraph.com/download/). Install and start the service. Access Memgraph Lab at `http://localhost:3000` |
+| **Linux** | `sudo apt install memgraph` or download from [memgraph.com/download](https://memgraph.com/download/). Start with `sudo systemctl start memgraph`. Access Lab at `http://localhost:3000` |
+| **macOS** | Use Docker (recommended): `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
+| **Docker (all platforms)** | `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
+
+### Querying the graph
+
+After loading data with `load-neo4j` or `load-memgraph`, use Cypher queries to explore lateral movement:
 
 ```cypher
 MATCH (h1:host)-[r]->(h2:host)
 WHERE datetime(r.time) >= datetime("2024-08-12T00:00:00Z")
-  AND datetime(r.time) <= datetime("2024-08-13T20:00:00Z")
-  AND r.target_user_name STARTS WITH 'SVC'
+  AND datetime(r.time) <= datetime("2024-08-13T00:00:00Z")
 RETURN h1, r, h2
 ORDER BY datetime(r.time)
 ```
 
 <div align="center">
-  <img src="neo4j-resources/neo4j_output1.png" alt="Neo4j lateral movement graph"/>
+  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph"/>
 </div>
 
-For more Cypher queries, see the [Cypher Resources](neo4j-resources/cypher_queries.md).
+For the full query catalog (10 queries including temporal path reconstruction), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
 
 ## All Options
 
