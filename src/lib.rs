@@ -108,7 +108,11 @@ enum ActionType {
 // -----------------------------------------------------------------------------
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
-pub async fn run(config: Cli) -> Result<(), Box<dyn Error>> {
+pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
+    // Normalize directory paths: remove trailing slashes/backslashes and canonicalize
+    config.directory = config.directory.iter().map(|d| normalize_path(d)).collect();
+    config.file = config.file.iter().map(|f| normalize_path(f)).collect();
+
     validate_folders(&config)?;
 
     // Enable or disable debug mode in other modules
@@ -387,6 +391,22 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
     }
 
     false
+}
+
+// -----------------------------------------------------------------------------
+//   Normalizes a file or directory path:
+//   - Strips trailing slashes and backslashes
+//   - Canonicalizes if possible (resolves ., .., symlinks)
+//   - Falls back to trimmed path if canonicalization fails
+// -----------------------------------------------------------------------------
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
+    let trimmed = if trimmed.is_empty() { path } else { trimmed };
+    match std::fs::canonicalize(trimmed) {
+        Ok(canonical) => canonical.to_string_lossy().to_string()
+            .trim_start_matches(r"\\?\").to_string(),
+        Err(_) => trimmed.to_string(),
+    }
 }
 
 // -----------------------------------------------------------------------------
