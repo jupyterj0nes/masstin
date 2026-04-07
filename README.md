@@ -296,7 +296,11 @@ ORDER BY datetime(r.time)
 ```
 
 <div align="center">
-  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph"/>
+  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph in Neo4j"/>
+  <br><em>Neo4j Browser</em>
+  <br><br>
+  <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
+  <br><em>Memgraph Lab</em>
 </div>
 
 For the full query catalog (10 queries including temporal path reconstruction), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
