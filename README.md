@@ -1,4 +1,4 @@
-# Masstin
+# Masstin — Lateral movement tracker for anything!
 
 <div align="center">
   <img src="resources/masstin_logo.png" alt="Masstin Logo" width="600"/>
