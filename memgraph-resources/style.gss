@@ -1,9 +1,13 @@
 // Masstin - Lateral Movement Graph Style for Memgraph Lab
 // https://weinvestigateanything.com
+//
+// Node labels in black (font-size 3.5), edge labels in blue (font-size 2)
+// to visually distinguish machine names from user names.
+// Node color: Palo Alto Networks orange (#FB6E00).
 
-// Color palette for distinct node labels
+// Color palette
 Define(COLOR_PALETTE, AsArray(
-  #DD2222, #FB6E00, #FFC500, #720096,
+  #FB6E00, #DD2222, #FFC500, #720096,
   #5E4FA2, #3288BD, #66C2A5, #ABDDA4,
   #E6F598, #FEE08B, #D53E4F, #9E0142
 ))
@@ -21,18 +25,18 @@ Define(GetColorByLabel, Function(labels, Coalesce(
 )))
 Define(JoinLabels, Function(labels, Join(Sort(labels), ":")))
 
-// Node style: large circles with white text inside
+// Node style
 @NodeStyle {
   Define(COLOR, GetColorByLabel(JoinLabels(Labels(node))))
 
-  size: 35
+  size: 6
   color: COLOR
   color-hover: Lighter(COLOR)
   color-selected: Darker(COLOR)
-  border-width: 2
+  border-width: 0.6
   border-color: #1D1D1D
-  font-size: 7
-  font-color: #FFFFFF
+  font-size: 3.5
+  font-color: #1D1D1D
 }
 
 @NodeStyle Greater(Size(Labels(node)), 0) {
@@ -43,15 +47,15 @@ Define(JoinLabels, Function(labels, Join(Sort(labels), ":")))
   label: AsText(Property(node, "name"))
 }
 
-// Edge style: blue user labels to distinguish from node names
+// Edge style: user names in blue, smaller font
 @EdgeStyle {
-  color: #AAAAAA
+  color: #999999
   color-hover: #1D1D1D
   color-selected: #1D1D1D
-  width: 0.4
+  width: 0.3
   width-hover: 0.9
   width-selected: 0.9
-  font-size: 3.5
+  font-size: 2
   font-color: #1565C0
   label: Property(edge, "target_user_name")
 }
