@@ -38,6 +38,7 @@ struct LogData {
     logon_type: String,
     workstation_name: String,
     ip_address: String,
+    process: String,
     filename: String,
 }
 
@@ -93,6 +94,7 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
         logon_type: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or("").to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("WorkstationName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("IpAddress")).and_then(|ip| ip.as_str()).unwrap_or("").to_string(),
+        process: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ProcessName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -109,6 +111,7 @@ fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -125,6 +128,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -141,6 +145,7 @@ fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -157,6 +162,7 @@ fn parse_rdp_client_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Value")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -173,6 +179,7 @@ fn parse_rdp_connmanager_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param3")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -197,6 +204,7 @@ fn parse_rdp_localsession_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Address")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -213,6 +221,7 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientIP")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
+        process: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -252,6 +261,7 @@ fn df_from_logdata(log_data: &[LogData]) -> DataFrame {
     let logon_type = Series::new("logon_type", log_data.iter().map(|x| x.logon_type.clone()).collect::<Vec<String>>());
     let workstation_name = Series::new("src_computer", log_data.iter().map(|x| x.workstation_name.clone()).collect::<Vec<String>>());
     let ip_address = Series::new("src_ip", log_data.iter().map(|x| x.ip_address.clone()).collect::<Vec<String>>());
+    let process = Series::new("process", log_data.iter().map(|x| x.process.clone()).collect::<Vec<String>>());
     let filename = Series::new("log_filename", log_data.iter().map(|x| x.filename.clone()).collect::<Vec<String>>());
 
     let df = DataFrame::new(vec![
@@ -265,6 +275,7 @@ fn df_from_logdata(log_data: &[LogData]) -> DataFrame {
         logon_type,
         workstation_name,
         ip_address,
+        process,
         filename,
     ])
     .unwrap();
