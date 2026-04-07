@@ -285,7 +285,9 @@ For the full troubleshooting guide, see [Memgraph: In-Memory Visualization](http
 
 ### Querying the graph
 
-After loading data, use Cypher queries to explore lateral movement. The same queries work on both Neo4j and Memgraph:
+After loading data, use Cypher queries to explore lateral movement.
+
+**Neo4j** — filter by time range with `datetime()`:
 
 ```cypher
 MATCH (h1:host)-[r]->(h2:host)
@@ -297,10 +299,17 @@ ORDER BY datetime(r.time)
 
 <div align="center">
   <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph in Neo4j"/>
-  <br><em>Neo4j Browser</em>
-  <br><br>
+</div>
+
+**Memgraph** — view all lateral movement:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+RETURN h1, r, h2
+```
+
+<div align="center">
   <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
-  <br><em>Memgraph Lab</em>
 </div>
 
 For the full query catalog (10 queries including temporal path reconstruction), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
