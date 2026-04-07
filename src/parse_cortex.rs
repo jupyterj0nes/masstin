@@ -44,7 +44,7 @@ pub async fn parse_cortex_data(
     let default_start = String::new();
     let cortex_start_str = start_time.unwrap_or(&default_start);
 
-    let default_end = String::new();
+    let default_end: String = String::new();
     let cortex_end_str = end_time.unwrap_or(&default_end);
 
     
