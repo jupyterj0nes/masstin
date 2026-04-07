@@ -219,7 +219,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 let output_path = std::path::Path::new(output);
 
                 if let Some(parent) = output_path.parent() {
-                    if !parent.exists() {
+                    if parent != std::path::Path::new("") && !parent.exists() {
                         return Err(format!(
                             "Parent folder of output file {} does not exist.",
                             output_path.display()
@@ -283,7 +283,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if let Some(output) = config.output.as_ref() {
                 let output_path = std::path::Path::new(output);
                 if let Some(parent) = output_path.parent() {
-                    if !parent.exists() {
+                    if parent != std::path::Path::new("") && !parent.exists() {
                         return Err(format!(
                             "Parent folder of output file {} does not exist.",
                             output_path.display()
@@ -316,7 +316,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if let Some(output) = config.output.as_ref() {
                 let output_path = std::path::Path::new(output);
                 if let Some(parent) = output_path.parent() {
-                    if !parent.exists() {
+                    if parent != std::path::Path::new("") && !parent.exists() {
                         return Err(format!(
                             "Parent folder of output file {} does not exist.",
                             output_path.display()
