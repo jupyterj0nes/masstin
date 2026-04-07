@@ -147,4 +147,25 @@ ORDER BY connections DESC
 LIMIT 10
 ```
 
-For more information on Cypher queries, refer to the [official Cypher documentation](https://neo4j.com/docs/cypher-manual/current/).
+### 10) Temporal path between two hosts
+
+This is one of the most powerful queries for incident reconstruction. It finds all paths between two hosts where **each hop is chronologically later than the previous one** — giving you the actual attack chain as it happened in time:
+
+```cypher
+MATCH path = (start:host {name:'10_99_88_77'})-[*]->(end:host {name:'SRV_BACKUP'})
+WHERE ALL(i IN range(0, size(relationships(path))-2)
+  WHERE datetime(relationships(path)[i].time) < datetime(relationships(path)[i+1].time))
+RETURN path
+ORDER BY length(path)
+LIMIT 5
+```
+
+Replace the start and end host names with your own. The result shows the attacker's progression through the network, validated temporally:
+
+<div align="center">
+  <img src="neo4j-resources/temporal_path.png" alt="Temporal path showing attack chain"/>
+</div>
+
+For more Cypher queries and detailed documentation, visit the [Neo4j and Cypher guide](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) at We Investigate Anything.
+
+For more information on the Cypher language, refer to the [official Cypher documentation](https://neo4j.com/docs/cypher-manual/current/).
