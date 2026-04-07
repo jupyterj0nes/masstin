@@ -20,22 +20,69 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 > Evolved from [Sabonis](https://github.com/jupyterj0nes/sabonis) (Python), rewritten in Rust for ~90% faster performance.
 
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Supported Artifacts](#supported-artifacts)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [Output Format](#output-format)
+- [Neo4j Visualization](#neo4j-visualization)
+- [All Options](#all-options)
+- [Roadmap](#roadmap)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact](#contact)
+
 ## Key Features
 
 | Feature | Description |
 |---------|-------------|
-| **Multi-artifact parsing** | EVTX, Linux logs, Winlogbeat JSON, Cortex XDR |
+| **Multi-artifact parsing** | 28 Windows Event IDs + Linux logs + Winlogbeat JSON + Cortex XDR |
 | **Unified timeline** | All sources merged into a single chronological CSV |
-| **Compressed triage support** | Processes compressed triage packages from Velociraptor or Cortex XDR Offline Collector, recursively decompressing and identifying EVTX files — even when archived logs share the same filename |
-| **Neo4j integration** | Direct upload for graph visualization with Cypher queries |
-| **Auto IP→hostname resolution** | Frequency-based resolution from the logs themselves |
-| **Connection grouping** | Reduces noise by grouping repetitive connections |
-| **Cross-platform** | Windows & Linux, no dependencies (static binary) |
+| **Compressed triage support** | Processes compressed packages from Velociraptor or Cortex XDR Offline Collector, recursively decompressing and identifying EVTX files — even archived logs with duplicate filenames |
+| **Neo4j integration** | Direct upload with Cypher queries for graph-based investigation |
+| **Auto IP→hostname** | Frequency-based resolution from the logs themselves |
+| **Connection grouping** | Reduces noise by grouping repetitive connections between the same hosts |
+| **Time filtering** | Filter by start/end time at parse level |
+| **Cross-platform** | Windows & Linux static binaries, zero dependencies |
 | **Merge mode** | Combine multiple CSV outputs into one sorted timeline |
 
-## Roadmap
+## Supported Artifacts
 
-- **Event reconstruction**: Reconstruct events even when EVTX logs have been cleared or tampered with on the system. *(Coming soon)*
+Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux artifacts, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
+
+### Windows EVTX
+
+| Source | Event IDs | What it tracks | Article |
+|--------|-----------|---------------|---------|
+| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779 | Logons, logoffs, Kerberos, NTLM, RDP reconnect | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **RdpCoreTS** | 131 | RDP transport negotiation | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+
+### Linux
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
+| `/var/log/secure`, `/var/log/messages` | SSH success, failure, connections | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/audit/audit.log` | Authentication via audit subsystem | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `utmp` / `wtmp` | Active and historical login sessions | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `btmp` | Failed login attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `lastlog` | Last login per user | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+
+### Winlogbeat & Cortex XDR
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
+| Winlogbeat JSON | All 28 Event IDs from JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
+| Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
+| Cortex XDR EVTX Forensics | Forensic event logs via XQL queries | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-cortex-xdr-artifacts/) |
 
 ## Quick Start
 
@@ -54,7 +101,7 @@ cargo build --release
 
 ### Parse: Generate a lateral movement timeline
 
-Parses Windows EVTX files from directories or individual files, extracting lateral movement events (RDP, SMB, WinRM, logons, service installations, etc.) and merging them into a single chronological CSV. Supports processing compressed triage packages directly — masstin will recursively decompress and identify all EVTX files, handling archived logs with duplicate filenames.
+Parses Windows EVTX files from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
 
 ```bash
 # Single directory (or compressed triage package)
@@ -74,7 +121,7 @@ masstin -a parse -d /evidence/ -o timeline.csv \
 
 ### Load: Visualize in Neo4j
 
-Uploads a previously generated CSV into a Neo4j graph database. During the load, masstin automatically resolves IPs to hostnames using frequency analysis from the logs themselves, and groups repetitive connections to reduce noise in the graph.
+Uploads a previously generated CSV into a Neo4j graph database. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise.
 
 ```bash
 masstin -a load -f timeline.csv --database localhost:7687 --user neo4j
@@ -82,7 +129,7 @@ masstin -a load -f timeline.csv --database localhost:7687 --user neo4j
 
 ### Merge: Combine multiple timelines
 
-Merges multiple CSV files (previously generated by masstin) into a single time-sorted timeline. Useful when you've parsed artifacts from different sources or at different times and need a unified view.
+Merges multiple CSV files into a single time-sorted timeline. Useful when artifacts were parsed from different sources or at different times.
 
 ```bash
 masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
@@ -90,7 +137,7 @@ masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
 
 ### Parse Linux logs
 
-Parses Linux system logs and accounting entries (auth.log, wtmp, btmp, lastlog, etc.) to extract authentication events, SSH sessions, and lateral movement indicators from Linux hosts.
+Parses Linux system logs and accounting entries (`secure`, `messages`, `audit.log`, `utmp`, `wtmp`, `btmp`, `lastlog`) to extract SSH sessions and authentication events.
 
 ```bash
 masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
@@ -98,7 +145,7 @@ masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
 
 ### Parse Winlogbeat JSON
 
-Parses Winlogbeat JSON logs forwarded to Elasticsearch. Useful when EVTX files are unavailable but the organization has Winlogbeat-based log forwarding in place — masstin extracts the same lateral movement data from the JSON format.
+Parses Winlogbeat JSON logs forwarded to Elasticsearch. Extracts the same lateral movement data from JSON format when EVTX files are unavailable.
 
 ```bash
 masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
@@ -106,7 +153,7 @@ masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
 
 ### Parse Cortex XDR
 
-Queries the Cortex XDR API directly to retrieve network connection data or EVTX forensic artifacts collected by Cortex agents. This enables lateral movement analysis without needing to manually export data from the Cortex console.
+Queries the Cortex XDR API directly to retrieve network connection data or EVTX forensic artifacts collected by Cortex agents.
 
 ```bash
 # Network connection data
@@ -120,20 +167,29 @@ masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetw
   -o cortex-evtx.csv
 ```
 
-## CSV Output Format
+## Output Format
 
-```
-time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,log_filename
-```
+All actions produce a unified CSV:
 
-Events from all sources are merged and sorted chronologically. This means you'll see TerminalServices, SMB, Security, and other events interleaved in a single timeline — exactly what you need to reconstruct lateral movement.
+| Column | Description |
+|--------|-------------|
+| `time_created` | Event timestamp (UTC) |
+| `dst_computer` | Destination hostname |
+| `event_id` | Windows Event ID or equivalent |
+| `subject_user_name` | Source user account |
+| `subject_domain_name` | Source domain |
+| `target_user_name` | Target user account |
+| `target_domain_name` | Target domain |
+| `logon_type` | 3 (Network/SMB), 10 (RDP), SSH |
+| `src_computer` | Source hostname |
+| `src_ip` | Source IP address |
+| `log_filename` | Original log file |
 
 ## Neo4j Visualization
 
 After loading data, use the included [Cypher queries](neo4j-resources/cypher_queries.md) to explore the graph:
 
 ```cypher
-// Service accounts in a time range
 MATCH (h1:host)-[r]->(h2:host)
 WHERE datetime(r.time) >= datetime("2024-08-12T00:00:00Z")
   AND datetime(r.time) <= datetime("2024-08-13T20:00:00Z")
@@ -146,32 +202,35 @@ ORDER BY datetime(r.time)
   <img src="neo4j-resources/neo4j_output1.png" alt="Neo4j lateral movement graph"/>
 </div>
 
-For more Cypher queries and tips, see the [Cypher Resources](neo4j-resources/cypher_queries.md).
+For more Cypher queries, see the [Cypher Resources](neo4j-resources/cypher_queries.md).
 
 ## All Options
 
-```
-Options:
-  -a, --action <ACTION>         parse | load | merge | parser-elastic | parse-cortex | parse-cortex-evtx-forensics | parse-linux
-  -d, --directory <DIRECTORY>   Directories to process (repeatable)
-  -f, --file <FILE>             Individual files to process (repeatable)
-  -o, --output <OUTPUT>         Output file path
-      --database <DATABASE>     Neo4j URL (e.g., localhost:7687)
-  -u, --user <USER>             Neo4j user
-      --cortex-url <URL>        Cortex API base URL
-      --start-time <TIME>       Filter start: "YYYY-MM-DD HH:MM:SS"
-      --end-time <TIME>         Filter end: "YYYY-MM-DD HH:MM:SS"
-      --filter-cortex-ip <IP>   Filter by IP in Cortex queries
-      --overwrite               Overwrite output file if it exists
-      --stdout                  Print output to stdout only
-      --debug                   Print debug information
-  -h, --help                    Print help
-  -V, --version                 Print version
-```
+| Option | Description |
+|--------|-------------|
+| `-a, --action` | `parse` \| `load` \| `merge` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-linux` |
+| `-d, --directory` | Directories to process (repeatable) |
+| `-f, --file` | Individual files to process (repeatable) |
+| `-o, --output` | Output file path |
+| `--database` | Neo4j URL (e.g., `localhost:7687`) |
+| `-u, --user` | Neo4j user |
+| `--cortex-url` | Cortex API base URL |
+| `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` |
+| `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` |
+| `--filter-cortex-ip` | Filter by IP in Cortex queries |
+| `--overwrite` | Overwrite output file if it exists |
+| `--stdout` | Print output to stdout only |
+| `--debug` | Print debug information |
+
+## Roadmap
+
+- [ ] **Event reconstruction** — Reconstruct lateral movement events even when EVTX logs have been cleared or tampered with on the system
 
 ## Documentation
 
-For in-depth guides, artifact explanations, and investigation walkthroughs, visit the full documentation at **[weinvestigateanything.com](https://weinvestigateanything.com)**.
+For in-depth guides, artifact deep dives, and investigation walkthroughs:
+
+**[weinvestigateanything.com](https://weinvestigateanything.com)**
 
 ## Contributing
 
@@ -183,4 +242,4 @@ GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
 
 ## Contact
 
-**Toño Díaz** ([@jupyterj0nes](https://github.com/jupyterj0nes)) — [LinkedIn](https://www.linkedin.com/in/antoniodiazcastano/) — [weinvestigateanything.com](https://weinvestigateanything.com)
+**Toño Díaz** ([@jupyterj0nes](https://github.com/jupyterj0nes)) · [LinkedIn](https://www.linkedin.com/in/antoniodiazcastano/) · [weinvestigateanything.com](https://weinvestigateanything.com)
