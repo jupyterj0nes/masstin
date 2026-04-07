@@ -88,8 +88,9 @@ pub struct Cli {
 // -----------------------------------------------------------------------------
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum ActionType {
-    /// Parses EVTX files from single files or directories and outputs a CSV
-    Parse,
+    /// Parses Windows EVTX files from single files or directories and outputs a CSV
+    #[value(alias = "parse")]
+    ParseWindows,
     /// Loads a previously generated CSV file into a Neo4j database
     Load,
     /// Merges multiple CSV files (previously generated) into a single time-sorted file
@@ -116,7 +117,7 @@ pub async fn run(config: Cli) -> Result<(), Box<dyn Error>> {
 
     // Match the selected action and call the corresponding function
     match config.action {
-        ActionType::Parse => {
+        ActionType::ParseWindows => {
             parse_events(&config.file, &config.directory, config.output.as_ref());
         }
         ActionType::Load => {
@@ -170,7 +171,7 @@ pub async fn run(config: Cli) -> Result<(), Box<dyn Error>> {
 fn validate_folders(config: &Cli) -> Result<(), String> {
     // Check the action
     match config.action {
-        ActionType::Parse | ActionType::ParserElastic | ActionType::ParseLinux => {
+        ActionType::ParseWindows | ActionType::ParserElastic | ActionType::ParseLinux => {
             // For these actions, at least one file or directory is required
             if config.directory.is_empty() && config.file.is_empty() {
                 return Err(String::from(
@@ -183,7 +184,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 if !std::path::Path::new(file).exists() {
                     return Err(format!("File {} does not exist.", file));
                 }
-                if config.action == ActionType::Parse {
+                if config.action == ActionType::ParseWindows {
                     // Check if EVTX
                     if !is_evtx_file(file) {
                         return Err(format!(
