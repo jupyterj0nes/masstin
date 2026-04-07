@@ -40,8 +40,8 @@ fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
     }
 }
 
-pub async fn load_neo(files: &Vec<String>, database: &String, user: &String) {
-    let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
+pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String) {
+    let pass = rpassword::prompt_password("MASSTIN - Enter Memgraph database password: ").unwrap();
     let graph = Graph::new(database, user, &pass).await.unwrap();
     for file in files {
         let file_contents: String = std::fs::read_to_string(file).unwrap();
@@ -178,7 +178,7 @@ pub async fn load_neo(files: &Vec<String>, database: &String, user: &String) {
             let formatted_query = format!(
                 "MERGE (origin:host{{name:'{}'}})
                 MERGE (destination:host{{name:'{}'}})
-                MERGE (origin)-[r:{}{{time:datetime('{}'), logon_type:'{}', src_computer:'{}', src_ip:'{}', target_user_name:'{}', target_domain_name:'{}', subject_user_name:'{}', subject_domain_name:'{}', count:'{}'}}]->(destination)",
+                MERGE (origin)-[r:{}{{time:localDateTime('{}'), logon_type:'{}', src_computer:'{}', src_ip:'{}', target_user_name:'{}', target_domain_name:'{}', subject_user_name:'{}', subject_domain_name:'{}', count:'{}'}}]->(destination)",
                 hostname.replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
                 row[1].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 if relation_type.chars().next().unwrap_or(' ').is_digit(10) { format!("u{}", relation_type) } else { relation_type.to_string() }
