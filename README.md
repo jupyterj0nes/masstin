@@ -168,12 +168,26 @@ Merges multiple CSV files into a single time-sorted timeline. Useful when artifa
 masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
 ```
 
-### Load: Visualize in Neo4j
+### Load into Neo4j
 
 Uploads a previously generated CSV into a Neo4j graph database. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise.
 
 ```bash
-masstin -a load -f timeline.csv --database localhost:7687 --user neo4j
+masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
+```
+
+> **Note:** The legacy command `load` is still supported as an alias for `load-neo4j`.
+
+### Load into Memgraph
+
+Same functionality as Neo4j loading, but targeting a Memgraph in-memory graph database. Memgraph offers faster query performance and can be deployed with a single Docker command.
+
+```bash
+# Start Memgraph (Docker)
+docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform
+
+# Load data
+masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph
 ```
 
 ## Output Format
@@ -194,9 +208,9 @@ All actions produce a unified CSV:
 | `src_ip` | Source IP address |
 | `log_filename` | Original log file |
 
-## Neo4j Visualization
+## Graph Visualization (Neo4j / Memgraph)
 
-After loading data, use the included [Cypher queries](neo4j-resources/cypher_queries.md) to explore the graph:
+Masstin supports two graph databases: **Neo4j** and **Memgraph**. Both use the Cypher query language and the same queries work on both platforms with minor differences. After loading data, use the included [Cypher queries](neo4j-resources/cypher_queries.md) to explore the graph:
 
 ```cypher
 MATCH (h1:host)-[r]->(h2:host)
@@ -217,7 +231,7 @@ For more Cypher queries, see the [Cypher Resources](neo4j-resources/cypher_queri
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
 | `-d, --directory` | Directories to process (repeatable) |
 | `-f, --file` | Individual files to process (repeatable) |
 | `-o, --output` | Output file path |
@@ -246,6 +260,8 @@ Masstin's full documentation lives at **[We Investigate Anything](https://weinve
 - [Linux forensic artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) — SSH, utmp, wtmp, btmp
 - [Winlogbeat artifacts](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) — JSON log parsing
 - [Cortex XDR artifacts](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) — Network and forensic agent modes
+- [Neo4j and Cypher guide](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) — Cypher queries and time filtering
+- [Memgraph guide](https://weinvestigateanything.com/en/tools/memgraph-visualization/) — In-memory graph visualization
 
 ## Contributing
 
