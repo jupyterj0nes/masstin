@@ -5,7 +5,7 @@ edition = "2021"
 description = "A DFIR tool that massively parses multiple forensic artifacts (evtx,linux) and displays them in a graph database. Written by Toño Díaz (@jupyterjones)"
 authors = ["Toño Díaz <c00pr@pm.me> (@jupyterjones)"]
 repository = "https://github.com/jupyterjones/masstin"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
