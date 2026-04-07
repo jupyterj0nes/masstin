@@ -168,27 +168,19 @@ Merges multiple CSV files into a single time-sorted timeline. Useful when artifa
 masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
 ```
 
-### Load into Neo4j
+### Load into graph database
 
-Uploads a previously generated CSV into a Neo4j graph database. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise.
+Uploads a previously generated CSV into a graph database for visual investigation. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise. See the [Graph Visualization](#graph-visualization-neo4j--memgraph) section below for installation instructions.
 
 ```bash
+# Neo4j
 masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
+
+# Memgraph
+masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph
 ```
 
 > **Note:** The legacy command `load` is still supported as an alias for `load-neo4j`.
-
-### Load into Memgraph
-
-Same functionality as Neo4j loading, but targeting a Memgraph in-memory graph database. Memgraph offers faster query performance and can be deployed with a single Docker command.
-
-```bash
-# Start Memgraph (Docker)
-docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform
-
-# Load data
-masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph
-```
 
 ## Output Format
 
@@ -212,27 +204,29 @@ All actions produce a unified CSV:
 
 Masstin supports two graph databases. Both use the Cypher query language and the same queries work on both with minor differences.
 
-### Installing Neo4j
+### Neo4j
 
-| Platform | Installation |
-|----------|-------------|
-| **Windows** | Download from [neo4j.com/download](https://neo4j.com/download/). Install Neo4j Desktop, create a database, and start it. Access the browser at `http://localhost:7474` |
-| **Linux** | `sudo apt install neo4j` or download from [neo4j.com/download](https://neo4j.com/download/). Start with `sudo systemctl start neo4j`. Access at `http://localhost:7474` |
-| **macOS** | `brew install neo4j` or download from [neo4j.com/download](https://neo4j.com/download/). Start with `neo4j start`. Access at `http://localhost:7474` |
-| **Docker** | `docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j` |
+| Step | Windows | Linux | macOS | Docker (all platforms) |
+|------|---------|-------|-------|------------------------|
+| **Install** | Download [Neo4j Desktop](https://neo4j.com/download/) and install | `sudo apt install neo4j` or [download](https://neo4j.com/download/) | `brew install neo4j` or [download](https://neo4j.com/download/) | `docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j` |
+| **Start** | Open Neo4j Desktop, create a database, click Start | `sudo systemctl start neo4j` | `neo4j start` | Runs automatically |
+| **Browser** | `http://localhost:7474` | `http://localhost:7474` | `http://localhost:7474` | `http://localhost:7474` |
+| **Load data** | `masstin.exe -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j` | `masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j` | Same as Linux | Same as Linux |
 
-### Installing Memgraph
+### Memgraph
 
-| Platform | Installation |
-|----------|-------------|
-| **Windows** | Download the MSI installer from [memgraph.com/download](https://memgraph.com/download/). Install and start the service. Access Memgraph Lab at `http://localhost:3000` |
-| **Linux** | `sudo apt install memgraph` or download from [memgraph.com/download](https://memgraph.com/download/). Start with `sudo systemctl start memgraph`. Access Lab at `http://localhost:3000` |
-| **macOS** | Use Docker (recommended): `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
-| **Docker (all platforms)** | `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
+| Step | Windows | Linux | macOS | Docker (all platforms) |
+|------|---------|-------|-------|------------------------|
+| **Install** | Download [MSI installer](https://memgraph.com/download/) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker run -p 7687:7687 -p 3000:3000 memgraph/memgraph-platform` |
+| **Start** | Start the Memgraph service | `sudo systemctl start memgraph` | — | Runs automatically |
+| **Browser** | `http://localhost:3000` (Memgraph Lab) | `http://localhost:3000` | `http://localhost:3000` | `http://localhost:3000` |
+| **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687 --user memgraph` | Same as Linux | Same as Linux |
+
+> **Note:** Memgraph runs in-memory. Data is lost on restart unless [snapshots are configured](https://memgraph.com/docs/fundamentals/data-durability).
 
 ### Querying the graph
 
-After loading data with `load-neo4j` or `load-memgraph`, use Cypher queries to explore lateral movement:
+After loading data, use Cypher queries to explore lateral movement. The same queries work on both Neo4j and Memgraph:
 
 ```cypher
 MATCH (h1:host)-[r]->(h2:host)
