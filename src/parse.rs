@@ -843,7 +843,6 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
                 .has_header(true)
                 .finish(&mut df.unwrap())
                 .unwrap();
-            println!("Output written to {}", output_path);
         },
         None => {
             CsvWriter::new(io::stdout())
@@ -1095,12 +1094,17 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
 // MAIN FUNCTION TO PARSE EVENTS
 // ---------------------------------------------------------------------------------------
 pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>) {
+    let start_time = std::time::Instant::now();
+
     if is_debug_mode() {
         println!("[INFO] Starting event processing...");
     }
 
     let mut log_data: Vec<LogData> = vec![];
     let mut vec_filenames: Vec<EvtxLocation> = vec![];
+
+    // Phase 1: Search for artifacts
+    crate::banner::print_search_start();
 
     if is_debug_mode() {
         println!("[INFO] Adding individual EVTX files...");
@@ -1110,18 +1114,31 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     if is_debug_mode() {
         println!("[INFO] Searching for EVTX files in provided directories...");
     }
+    let dir_count = directories.len();
+    let file_count = files.len();
     vec_filenames.extend(find_evtx_files(directories)); // includes EVTX in ZIP
+
+    // Count ZIPs vs direct files for the summary
+    let zip_count = vec_filenames.iter().filter(|f| matches!(f, EvtxLocation::ZipEntry { .. })).count();
+    let total_evtx = vec_filenames.len();
+
+    crate::banner::print_search_results(total_evtx, zip_count, dir_count, file_count);
 
     if is_debug_mode() {
         println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());
     }
 
+    // Phase 2: Process artifacts
+    crate::banner::print_processing_start();
+    let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
+
     for evtxfile in &vec_filenames {
         match &evtxfile {
             EvtxLocation::File(path) => {
-                // Optionally log processing info
+                crate::banner::progress_set_message(&pb, path);
             },
             EvtxLocation::ZipEntry { zip_path, evtx_name } => {
+                crate::banner::progress_set_message(&pb, evtx_name);
                 if is_debug_mode() {
                     println!("[INFO] Processing EVTX inside ZIP:");
                     println!("       ZIP: {}", zip_path);
@@ -1135,13 +1152,21 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
             println!("[INFO] Obtained {} events from the file.", parsed_logs.len());
         }
         log_data.extend(parsed_logs);
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
     }
 
+    // Phase 3: Generate output
+    crate::banner::print_output_start();
+    let total_events = log_data.len();
     vector_to_polars(log_data, output);
+
+    crate::banner::print_summary(total_events, output.map(|s| s.as_str()), start_time);
 }
 
 // ---------------------------------------------------------------------------------------
