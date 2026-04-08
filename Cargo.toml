@@ -3,7 +3,7 @@ name = "masstin"
 version = "0.9.2"
 edition = "2021"
 description = "Lateral movement tracker for anything! A DFIR tool that parses forensic artifacts and visualizes lateral movement in graph databases. Written by Toño Díaz (@jupyterjones)"
-authors = ["Toño Díaz <c00pr@pm.me> (@jupyterjones)"]
+authors = ["Tono Diaz (@jupyterj0nes)"]
 repository = "https://github.com/jupyterjones/masstin"
 license = "AGPL-3.0-only"
 

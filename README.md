@@ -156,6 +156,24 @@ masstin -a parse-linux -d /evidence/triage_package/ -o linux-timeline.csv
 
 Masstin transparently reports all inferences: hostname identification (from `/etc/hostname`, `dmesg`, or the syslog header), year inference (from `dpkg.log`, `wtmp`, or file modification date), and password-protected ZIP extraction.
 
+### Parse forensic images (E01/dd) with VSS recovery
+
+Opens forensic disk images directly — no mounting needed. Finds NTFS partitions (GPT/MBR), extracts EVTX from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
+
+```bash
+# Single image with VSS recovery
+masstin -a parse-image-windows -f HRServer.e01 -o timeline.csv
+
+# Multiple images for large-scale incident
+masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.e01 -f Desktop.e01 -o incident.csv
+```
+
+<div align="center">
+  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
+</div>
+
+Uses the [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) crate for cross-platform VSS access. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+
 ### Parse Winlogbeat JSON
 
 Parses Winlogbeat JSON logs forwarded to Elasticsearch. Extracts the same lateral movement data from JSON format when EVTX files are unavailable.
@@ -369,7 +387,7 @@ For the full query catalog (10 queries including temporal path reconstruction), 
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image-windows` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
 | `-d, --directory` | Directories to process (repeatable) |
 | `-f, --file` | Individual files to process (repeatable) |
 | `-o, --output` | Output file path |
