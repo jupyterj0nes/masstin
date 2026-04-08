@@ -72,11 +72,15 @@ Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux ar
 
 | Source | What it tracks | Article |
 |--------|---------------|---------|
-| `/var/log/secure`, `/var/log/messages` | SSH success, failure, connections | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/auth.log` (Debian/Ubuntu) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/secure` (RHEL/CentOS) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/messages` | SSH events via syslog | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `/var/log/audit/audit.log` | Authentication via audit subsystem | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `utmp` / `wtmp` | Active and historical login sessions | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `btmp` | Failed login attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `lastlog` | Last login per user | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+
+> **Note:** Both RFC3164 (legacy syslog: `Mar 16 08:25:22 hostname ...`) and RFC5424 (structured syslog) timestamp formats are supported. Masstin can also process compressed triage packages (ZIP) recursively, including password-protected archives using common forensic passwords.
 
 ### Winlogbeat
 
@@ -136,10 +140,14 @@ The output shows three phases: **[1/3]** scans directories and compressed packag
 
 ### Parse Linux logs
 
-Parses Linux system logs and accounting entries (`secure`, `messages`, `audit.log`, `utmp`, `wtmp`, `btmp`, `lastlog`) to extract SSH sessions and authentication events.
+Parses Linux system logs and accounting entries to extract SSH sessions and authentication events. Supports both Debian/Ubuntu (`auth.log`) and RHEL/CentOS (`secure`) log formats, with both RFC3164 (legacy syslog) and RFC5424 (structured) timestamp formats. Like `parse-windows`, it recursively decompresses ZIP archives, including password-protected packages commonly used in CTFs and forensic triage distributions.
 
 ```bash
+# Directory with extracted logs
 masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
+
+# Compressed forensic package (auto-extracts, supports passwords)
+masstin -a parse-linux -d /evidence/triage_package/ -o linux-timeline.csv
 ```
 
 ### Parse Winlogbeat JSON
