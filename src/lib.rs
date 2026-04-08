@@ -22,6 +22,8 @@ mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;
 mod parse_linux;
 pub use crate::parse_linux::*;
+mod parse_image_windows;
+pub use crate::parse_image_windows::*;
 pub mod banner;
 pub use crate::banner::*;
 
@@ -112,8 +114,10 @@ enum ActionType {
     ParseCortex,
     /// Parses Cortex EVTX Forensics data by calling the specified API
     ParseCortexEvtxForensics,
-    /// Parses Linux logs and accounting entries  
+    /// Parses Linux logs and accounting entries
     ParseLinux,
+    /// Parses EVTX files from forensic disk images (E01/dd)
+    ParseImageWindows,
 }
 
 // -----------------------------------------------------------------------------
@@ -188,6 +192,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 
         ActionType::ParseLinux => {
             parse_linux(&config.file, &config.directory, config.output.as_ref());
+        }
+        ActionType::ParseImageWindows => {
+            parse_image_windows(&config.file, config.output.as_ref());
         }
     }
 
@@ -278,6 +285,13 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                         }
                     }
                 }
+            }
+        }
+        ActionType::ParseImageWindows => {
+            if config.file.is_empty() {
+                return Err(String::from(
+                    "For parse-image-windows, you must specify at least one image file with -f.",
+                ));
             }
         }
         ActionType::LoadNeo4j => {
