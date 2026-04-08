@@ -104,6 +104,10 @@ cargo build --release
 # Binary at ./target/release/masstin
 ```
 
+<div align="center">
+  <img src="resources/masstin_cli_output.png" alt="Masstin CLI output"/>
+</div>
+
 ## Usage
 
 ### Parse Windows: Generate a lateral movement timeline

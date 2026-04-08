@@ -1050,7 +1050,9 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
     // Check existence only for disk files, not for ZIP entries
     if let EvtxLocation::File(ref path) = file {
         if File::open(PathBuf::from(path)).is_err() {
-            println!("[ERROR] Could not access file: {}", path);
+            if is_debug_mode() {
+                println!("[ERROR] Could not access file: {}", path);
+            }
             return Vec::new();
         }
     }
@@ -1131,31 +1133,34 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     // Phase 2: Process artifacts
     crate::banner::print_processing_start();
     let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
+    let mut skipped: usize = 0;
+    let mut parsed_files: usize = 0;
+    let mut artifact_details: Vec<(String, usize)> = Vec::new();
 
     for evtxfile in &vec_filenames {
-        match &evtxfile {
-            EvtxLocation::File(path) => {
-                crate::banner::progress_set_message(&pb, path);
-            },
-            EvtxLocation::ZipEntry { zip_path, evtx_name } => {
-                crate::banner::progress_set_message(&pb, evtx_name);
-                if is_debug_mode() {
-                    println!("[INFO] Processing EVTX inside ZIP:");
-                    println!("       ZIP: {}", zip_path);
-                    println!("       EVTX: {}", evtx_name);
-                }
-            }
-        }
+        let name = match &evtxfile {
+            EvtxLocation::File(path) => path.clone(),
+            EvtxLocation::ZipEntry { evtx_name, .. } => evtx_name.clone(),
+        };
+        crate::banner::progress_set_message(&pb, &name);
 
         let parsed_logs = parselog(evtxfile.clone());
-        if is_debug_mode() {
-            println!("[INFO] Obtained {} events from the file.", parsed_logs.len());
+        let count = parsed_logs.len();
+        if count == 0 {
+            skipped += 1;
+        } else {
+            parsed_files += 1;
+            artifact_details.push((name.clone(), count));
+            if is_debug_mode() {
+                println!("[INFO] {} events from {}", count, name);
+            }
         }
         log_data.extend(parsed_logs);
         pb.inc(1);
     }
 
     pb.finish_and_clear();
+    crate::banner::print_artifact_detail(&artifact_details);
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
@@ -1166,7 +1171,7 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     let total_events = log_data.len();
     vector_to_polars(log_data, output);
 
-    crate::banner::print_summary(total_events, output.map(|s| s.as_str()), start_time);
+    crate::banner::print_summary(total_events, parsed_files, skipped, output.map(|s| s.as_str()), start_time);
 }
 
 // ---------------------------------------------------------------------------------------
