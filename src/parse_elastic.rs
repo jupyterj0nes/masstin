@@ -285,19 +285,18 @@ fn df_from_logdata(log_data: &[LogData]) -> DataFrame {
 
 /// **Main function called from `lib.rs` to parse Winlogbeat events**
 pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>) {
+    let start_time = std::time::Instant::now();
+
     if is_debug_mode() {
         println!("[INFO] Starting Winlogbeat event processing...");
     }
 
     let mut log_data: Vec<LogData> = vec![];
+    let mut all_files: Vec<String> = files.clone();
 
-    // Process individual files
-    for file in files {
-        let parsed_logs = parse_winlogbeat_json(file);
-        log_data.extend(parsed_logs);
-    }
+    // Phase 1: Search for artifacts
+    crate::banner::print_search_start();
 
-    // Process directories
     for directory in directories {
         let path = Path::new(directory);
         if path.exists() && path.is_dir() {
@@ -305,16 +304,46 @@ pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, outp
                 let entry = entry.unwrap();
                 let file_path = entry.path();
                 if file_path.is_file() {
-                    let parsed_logs = parse_winlogbeat_json(file_path.to_str().unwrap());
-                    log_data.extend(parsed_logs);
+                    all_files.push(file_path.to_string_lossy().to_string());
                 }
             }
         }
     }
 
+    crate::banner::print_search_results(all_files.len(), 0, directories.len(), files.len());
+
+    // Phase 2: Process artifacts
+    crate::banner::print_processing_start();
+    let pb = crate::banner::create_progress_bar(all_files.len() as u64);
+    let mut parsed_count: usize = 0;
+    let mut skipped: usize = 0;
+    let mut artifact_details: Vec<(String, usize)> = Vec::new();
+
+    for file in &all_files {
+        crate::banner::progress_set_message(&pb, file);
+        let parsed_logs = parse_winlogbeat_json(file);
+        let count = parsed_logs.len();
+        if count == 0 {
+            skipped += 1;
+        } else {
+            parsed_count += 1;
+            artifact_details.push((file.clone(), count));
+        }
+        log_data.extend(parsed_logs);
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+    crate::banner::print_artifact_detail(&artifact_details);
+
     if is_debug_mode() {
         println!("[INFO] Extracted events: {}", log_data.len());
     }
 
+    // Phase 3: Generate output
+    crate::banner::print_output_start();
+    let total_events = log_data.len();
     vector_to_polars(log_data, output);
+
+    crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
 }

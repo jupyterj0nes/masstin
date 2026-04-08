@@ -418,7 +418,11 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
 
 // ────────────────────────── main entry point ─────────────────────────────────
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
-    // 1) Build initial target list from explicit files and recursive dir walk
+    let start_time = std::time::Instant::now();
+
+    // Phase 1: Search for artifacts
+    crate::banner::print_search_start();
+
     let mut targets: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     for root in dirs {
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -448,6 +452,9 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     }
     targets.sort();
     targets.dedup();
+
+    crate::banner::print_search_results(targets.len(), 0, dirs.len(), files.len());
+
     if is_debug_mode() {
         println!("[DEBUG] {} candidate files", targets.len());
     }
@@ -455,11 +462,19 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     // 2) hostname cache
     let mut root2host: HashMap<PathBuf, String> = HashMap::new();
 
-    // 3) Parse each file
+    // Phase 2: Process artifacts
+    crate::banner::print_processing_start();
+    let pb = crate::banner::create_progress_bar(targets.len() as u64);
+
     let mut collected = Vec::<RawEvt>::new();
-    let mut stats_total = 0;
-    let mut stats_kept = 0;
-    for path in targets {
+    let mut parsed_count: usize = 0;
+    let mut skipped: usize = 0;
+    let mut artifact_details: Vec<(String, usize)> = Vec::new();
+
+    for path in &targets {
+        let path_str = path.to_string_lossy().to_string();
+        crate::banner::progress_set_message(&pb, &path_str);
+
         // find root dir (upwards until "log" folder)
         let mut cur = path.parent().unwrap_or(Path::new("/"));
         while cur.parent().is_some() && cur.file_name() != Some(OsStr::new("log")) {
@@ -479,11 +494,6 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
             );
         }
 
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
         let fname = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -492,35 +502,49 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
 
         let mut parsed: Vec<RawEvt> = Vec::new();
         if ["utmp", "wtmp", "btmp", "lastlog"].contains(&fname.as_str()) {
-            parsed = parse_utmp_file(&path, &dst_host, true);
+            parsed = parse_utmp_file(path, &dst_host, true);
         } else if fname.starts_with("secure") {
-            parsed = parse_secure_or_messages(&path, &dst_host, true);
+            parsed = parse_secure_or_messages(path, &dst_host, true);
         } else if fname.starts_with("messages") {
-            parsed = parse_secure_or_messages(&path, &dst_host, true);
+            parsed = parse_secure_or_messages(path, &dst_host, true);
         } else if fname.starts_with("audit.log") {
-            parsed = parse_audit(&path, &dst_host, true);
+            parsed = parse_audit(path, &dst_host, true);
         }
 
-        stats_total += parsed.len();
-        collected.extend(parsed.clone());
-        stats_kept += parsed.len();
+        let count = parsed.len();
+        if count == 0 {
+            skipped += 1;
+        } else {
+            parsed_count += 1;
+            artifact_details.push((path_str, count));
+        }
+        collected.extend(parsed);
 
         if is_debug_mode() {
-            let kept = parsed.len();
             println!(
-                "        {:<8} total {:>5} kept {:>5}",
+                "        {:<8} events {:>5}",
                 fname.split('.').next().unwrap_or("log"),
-                kept,
-                kept
+                count,
             );
         }
+
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
+    crate::banner::print_artifact_detail(&artifact_details);
+
     if is_debug_mode() {
         println!(
-            "[DEBUG] SUMMARY  total {:>6}  kept {:>6}",
-            stats_total, stats_kept
+            "[DEBUG] SUMMARY  total {:>6}",
+            collected.len()
         );
     }
 
+    // Phase 3: Generate output
+    crate::banner::print_output_start();
+    let total_events = collected.len();
     build_dataframe(&collected, output);
+
+    crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
 }
