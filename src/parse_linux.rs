@@ -536,12 +536,19 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     let df = DataFrame::new(vec![
         Series::new("time_created", col(|r| r.ts_rfc3339.clone())),
         Series::new("dst_computer", col(|r| r.dst_host.clone())),
+        Series::new("event_type", col(|r| {
+            match r.evt.as_str() {
+                "SSH_SUCCESS" | "LOGIN" => "SUCCESSFUL_LOGON".to_string(),
+                "SSH_FAILED" | "FAILED_LOGIN" => "FAILED_LOGON".to_string(),
+                "SSH_CONNECT" => "CONNECT".to_string(),
+                "LOGOUT" => "LOGOFF".to_string(),
+                _ => "CONNECT".to_string(),
+            }
+        })),
         Series::new("event_id", col(|r| r.evt.clone())),
-        Series::new("subject_user_name", vec![""; rows.len()]),
-        Series::new("subject_domain_name", vec![""; rows.len()]),
+        Series::new("logon_type", vec![""; rows.len()]),
         Series::new("target_user_name", col(|r| r.user.clone())),
         Series::new("target_domain_name", vec![""; rows.len()]),
-        Series::new("logon_type", vec![""; rows.len()]),
         Series::new(
             "src_computer",
             col(|r| if looks_like_ip(&r.remote) { "".into() } else { r.remote.clone() }),
@@ -550,7 +557,10 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             "src_ip",
             col(|r| if looks_like_ip(&r.remote) { r.remote.clone() } else { "".into() }),
         ),
-        Series::new("process", col(|r| r.tty_or_proc.clone())),
+        Series::new("subject_user_name", vec![""; rows.len()]),
+        Series::new("subject_domain_name", vec![""; rows.len()]),
+        Series::new("logon_id", vec![""; rows.len()]),
+        Series::new("detail", col(|r| r.tty_or_proc.clone())),
         Series::new("log_filename", col(|r| r.filename.clone())),
     ])
     .unwrap()

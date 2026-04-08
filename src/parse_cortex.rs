@@ -13,15 +13,17 @@ use tokio::time::sleep;
 static FINAL_COLUMNS: &[&str] = &[
     "time_created",
     "dst_computer",
+    "event_type",
     "event_id",
-    "subject_user_name",
-    "subject_domain_name",
+    "logon_type",
     "target_user_name",
     "target_domain_name",
-    "logon_type",
     "src_computer",
     "src_ip",
-    "process",
+    "subject_user_name",
+    "subject_domain_name",
+    "logon_id",
+    "detail",
     "log_filename",
 ];
 
@@ -567,8 +569,14 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         ("".to_string(), action_remote_ip.clone())
     };
 
-    // Process: use actor_process_command_line, replacing commas with semicolons.
-    let process = actor_process_command_line.replace(",", ";");
+    // detail: use actor_process_command_line, replacing commas with semicolons.
+    let detail = actor_process_command_line.replace(",", ";");
+
+    // event_type fixed for Cortex network.
+    let event_type = "CONNECT".to_string();
+
+    // logon_id empty for Cortex.
+    let logon_id = "".to_string();
 
     // log_filename fixed.
     let log_filename = "cortex_xdr_network".to_string();
@@ -576,15 +584,17 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     vec![
         time_created,
         dst_computer,
+        event_type,
         event_id,
-        subject_user_name,
-        subject_domain_name,
+        logon_type,
         target_user_name,
         target_domain_name,
-        logon_type,
         src_computer,
         src_ip,
-        process,
+        subject_user_name,
+        subject_domain_name,
+        logon_id,
+        detail,
         log_filename,
     ]
 }

@@ -36,11 +36,12 @@ const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 
 pub mod parse {}
 
-// Updated LogData struct with a new "process" column.
+// Updated LogData struct with event_type, logon_id, and detail columns.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogData {
     time_created: String,
     computer: String,
+    event_type: String,
     event_id: String,
     subject_user_name: String,
     subject_domain_name: String,
@@ -49,8 +50,9 @@ pub struct LogData {
     logon_type: String,
     workstation_name: String,
     ip_address: String,
+    logon_id: String,
     filename: String,
-    process: String,
+    detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +92,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                 };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
-                        // Extend the map with a ProcessName key.
+                        // Extend the map with ProcessName, Status, SubStatus, TargetLogonId keys.
                         let mut data_values: HashMap<String, String> = [
                             ("SubjectUserName".to_string(), String::from("")),
                             ("SubjectDomainName".to_string(), String::from("")),
@@ -99,7 +101,10 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             ("LogonType".to_string(), String::from("")),
                             ("WorkstationName".to_string(), String::from("")),
                             ("IpAddress".to_string(), String::from("")),
-                            ("ProcessName".to_string(), String::from("")),  // New key for process
+                            ("ProcessName".to_string(), String::from("")),
+                            ("Status".to_string(), String::from("")),
+                            ("SubStatus".to_string(), String::from("")),
+                            ("TargetLogonId".to_string(), String::from("")),
                         ].iter().cloned().collect();
 
                         if let Some(event_data) = event.EventData {
@@ -112,9 +117,35 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             }
                         }
 
+                        // Classify event_type based on event ID
+                        let status = data_values.get("Status").unwrap().as_str();
+                        let event_type = match event_id.as_str() {
+                            "4624" => "SUCCESSFUL_LOGON".to_string(),
+                            "4625" => "FAILED_LOGON".to_string(),
+                            "4634" => "LOGOFF".to_string(),
+                            "4647" => "LOGOFF".to_string(),
+                            "4648" => "SUCCESSFUL_LOGON".to_string(),
+                            "4768" | "4769" | "4776" => {
+                                if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
+                            },
+                            "4770" => "SUCCESSFUL_LOGON".to_string(),
+                            "4771" => "FAILED_LOGON".to_string(),
+                            "4778" => "SUCCESSFUL_LOGON".to_string(),
+                            "4779" => "LOGOFF".to_string(),
+                            _ => "".to_string(),
+                        };
+
+                        // Determine detail column
+                        let detail = match event_id.as_str() {
+                            "4624" | "4648" => data_values.get("ProcessName").unwrap().to_string(),
+                            "4625" => data_values.get("SubStatus").unwrap().to_string(),
+                            _ => String::from(""),
+                        };
+
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: event.System.Computer.unwrap(),
+                            event_type,
                             event_id,
                             subject_user_name: data_values.get("SubjectUserName").unwrap().to_string(),
                             subject_domain_name: data_values.get("SubjectDomainName").unwrap().to_string(),
@@ -123,8 +154,9 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             logon_type: data_values.get("LogonType").unwrap().to_string(),
                             workstation_name: data_values.get("WorkstationName").unwrap().to_string(),
                             ip_address: data_values.get("IpAddress").unwrap().to_string(),
+                            logon_id: data_values.get("TargetLogonId").unwrap().to_string(),
                             filename: file.to_string(),
-                            process: data_values.get("ProcessName").unwrap().to_string(), // New column
+                            detail,
                         });
                     }
                 }
@@ -157,9 +189,15 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                 let event: Event2 = from_str(&data).unwrap();
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
+                        let event_type = match event_id.as_str() {
+                            "1009" => "CONNECT".to_string(),
+                            "551" => "FAILED_LOGON".to_string(),
+                            _ => "CONNECT".to_string(),
+                        };
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: event.System.Computer.unwrap(),
+                            event_type,
                             event_id,
                             subject_user_name: event.System.Security.unwrap().UserID.as_ref().unwrap_or(&String::from("")).to_owned(),
                             subject_domain_name: String::from(""),
@@ -168,8 +206,9 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             logon_type: String::from("3"),
                             workstation_name: event.UserData.as_ref().unwrap().EventData.as_ref().unwrap().ClientName.as_ref().unwrap_or(&String::from("")).to_owned(),
                             ip_address: event.UserData.as_ref().unwrap().EventData.as_ref().unwrap().ClientName.as_ref().unwrap_or(&String::from("")).to_owned(),
+                            logon_id: String::from(""),
                             filename: file.to_string(),
-                            process: String::from(""), // Not available in SMBServer
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -218,6 +257,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: data_values.get("ServerName").unwrap().to_string(),
+                            event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -226,8 +266,9 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             logon_type: String::from("3"),
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            logon_id: String::from(""),
                             filename: file.to_string(),
-                            process: String::from(""),
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -276,6 +317,7 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: data_values.get("ServerName").unwrap().to_string(),
+                            event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -284,8 +326,9 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                             logon_type: String::from("3"),
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            logon_id: String::from(""),
                             filename: file.to_string(),
-                            process: String::from(""),
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -333,6 +376,7 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: data_values.get("Value").unwrap().to_string(),
+                            event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -341,8 +385,9 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             logon_type: String::from("10"),
                             workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            logon_id: String::from(""),
                             filename: file.to_string(),
-                            process: String::from(""),
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -432,6 +477,7 @@ pub fn parse_rdp_connmanager(file: &str, lateral_event_ids: Vec<&str>) -> Vec<Lo
         log_data.push(LogData {
             time_created,
             computer,
+            event_type: "SUCCESSFUL_LOGON".to_string(),
             event_id,
             subject_user_name: String::new(),
             subject_domain_name: String::new(),
@@ -440,8 +486,9 @@ pub fn parse_rdp_connmanager(file: &str, lateral_event_ids: Vec<&str>) -> Vec<Lo
             logon_type: "10".into(),
             workstation_name: client.clone(),
             ip_address: client,
+            logon_id: String::new(),
             filename: file.to_string(),
-            process: String::new(),
+            detail: String::new(),
         });
     }
 
@@ -480,9 +527,21 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
                             remoteuser = parts[1].to_string();
                         }
 
+                        let event_type = match event_id.as_str() {
+                            "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
+                            "24" => "LOGOFF".to_string(),
+                            _ => "CONNECT".to_string(),
+                        };
+                        // Try to extract SessionId for logon_id
+                        let session_id = event.UserData.as_ref()
+                            .and_then(|ud| ud.EventXML.as_ref())
+                            .and_then(|xml| xml.Param1.as_ref())
+                            .cloned()
+                            .unwrap_or_default();
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: event.System.Computer.unwrap(),
+                            event_type,
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -491,8 +550,9 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
                             logon_type: String::from("10"),
                             workstation_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
                             ip_address: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
+                            logon_id: session_id,
                             filename: file.to_string(),
-                            process: String::from(""),
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -539,6 +599,7 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: event.System.Computer.unwrap(),
+                            event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -547,8 +608,9 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                             logon_type: String::from("10"),
                             workstation_name: data_values.get("ClientIP").unwrap().to_string(),
                             ip_address: data_values.get("ClientIP").unwrap().to_string(),
+                            logon_id: String::from(""),
                             filename: file.to_string(),
-                            process: String::from(""),
+                            detail: String::from(""),
                         });
                     }
                 }
@@ -790,14 +852,14 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
     let computer_vec: Vec<String> = log_data.iter().map(|x| x.computer.to_string()).collect();
     let computer = Series::new("dst_computer", computer_vec);
 
+    let event_type_vec: Vec<String> = log_data.iter().map(|x| x.event_type.to_string()).collect();
+    let event_type = Series::new("event_type", event_type_vec);
+
     let event_id_vec: Vec<String> = log_data.iter().map(|x| x.event_id.to_string()).collect();
     let event_id = Series::new("event_id", event_id_vec);
 
-    let subject_user_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_user_name.to_string()).collect();
-    let subject_user_name = Series::new("subject_user_name", subject_user_name_vec);
-
-    let subject_domain_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_domain_name.to_string()).collect();
-    let subject_domain_name = Series::new("subject_domain_name", subject_domain_name_vec);
+    let logon_type_vec: Vec<String> = log_data.iter().map(|x| x.logon_type.to_string()).collect();
+    let logon_type = Series::new("logon_type", logon_type_vec);
 
     let target_user_name_vec: Vec<String> = log_data.iter().map(|x| x.target_user_name.to_string()).collect();
     let target_user_name = Series::new("target_user_name", target_user_name_vec);
@@ -805,33 +867,41 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
     let target_domain_name_vec: Vec<String> = log_data.iter().map(|x| x.target_domain_name.to_string()).collect();
     let target_domain_name = Series::new("target_domain_name", target_domain_name_vec);
 
-    let logon_type_vec: Vec<String> = log_data.iter().map(|x| x.logon_type.to_string()).collect();
-    let logon_type = Series::new("logon_type", logon_type_vec);
-
     let workstation_name_vec: Vec<String> = log_data.iter().map(|x| x.workstation_name.to_string()).collect();
     let workstation_name = Series::new("src_computer", workstation_name_vec);
 
     let ip_address_vec: Vec<String> = log_data.iter().map(|x| x.ip_address.to_string()).collect();
     let ip_address = Series::new("src_ip", ip_address_vec);
 
+    let subject_user_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_user_name.to_string()).collect();
+    let subject_user_name = Series::new("subject_user_name", subject_user_name_vec);
+
+    let subject_domain_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_domain_name.to_string()).collect();
+    let subject_domain_name = Series::new("subject_domain_name", subject_domain_name_vec);
+
+    let logon_id_vec: Vec<String> = log_data.iter().map(|x| x.logon_id.to_string()).collect();
+    let logon_id = Series::new("logon_id", logon_id_vec);
+
+    let detail_vec: Vec<String> = log_data.iter().map(|x| x.detail.to_string()).collect();
+    let detail = Series::new("detail", detail_vec);
+
     let filename_vec: Vec<String> = log_data.iter().map(|x| x.filename.to_string()).collect();
     let filename = Series::new("log_filename", filename_vec);
-    
-    let process_vec: Vec<String> = log_data.iter().map(|x| x.process.to_string()).collect();
-    let process = Series::new("process", process_vec);
 
     let df = DataFrame::new(vec![
         time_created,
         computer,
+        event_type,
         event_id,
-        subject_user_name,
-        subject_domain_name,
+        logon_type,
         target_user_name,
         target_domain_name,
-        logon_type,
         workstation_name,
         ip_address,
-        process,
+        subject_user_name,
+        subject_domain_name,
+        logon_id,
+        detail,
         filename
     ]);
     let df = df.unwrap().sort(["time_created"], false);

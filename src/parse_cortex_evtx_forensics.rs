@@ -29,15 +29,17 @@ pub fn is_debug_mode() -> bool {
 static FINAL_COLUMNS: &[&str] = &[
     "time_created",
     "dst_computer",
+    "event_type",
     "event_id",
-    "subject_user_name",
-    "subject_domain_name",
+    "logon_type",
     "target_user_name",
     "target_domain_name",
-    "logon_type",
     "src_computer",
     "src_ip",
-    "process",
+    "subject_user_name",
+    "subject_domain_name",
+    "logon_id",
+    "detail",
     "log_filename",
 ];
 
@@ -386,6 +388,29 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
 
     let process = record.get("process").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+    // Classify event_type based on event_id (same mapping as Security.evtx)
+    let event_type = match event_id.as_str() {
+        "4624" => "SUCCESSFUL_LOGON".to_string(),
+        "4625" => "FAILED_LOGON".to_string(),
+        "4648" => "SUCCESSFUL_LOGON".to_string(),
+        "21" | "22" | "25" | "1149" => "SUCCESSFUL_LOGON".to_string(),
+        "24" => "LOGOFF".to_string(),
+        "1024" | "1102" | "131" => "CONNECT".to_string(),
+        "1009" | "31001" | "30803" | "30804" | "30805" | "30806" | "30807" | "30808" => "CONNECT".to_string(),
+        "551" => "FAILED_LOGON".to_string(),
+        _ => "CONNECT".to_string(),
+    };
+
+    // detail: for 4624/4648 use process, for 4625 use SubStatus (not available in Cortex query, use process as fallback)
+    let detail = match event_id.as_str() {
+        "4624" | "4648" => process.clone(),
+        "4625" => process.clone(),
+        _ => String::new(),
+    };
+
+    // logon_id empty for Cortex forensics
+    let logon_id = "".to_string();
+
     // Nombre del log fijo
     let log_filename = "cortex_evtx_forensics".to_string();
 
@@ -393,15 +418,17 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     vec![
         time_created,
         dst_computer,
+        event_type,
         event_id,
-        subject_user_name,
-        subject_domain_name,
+        logon_type,
         target_user_name,
         target_domain_name,
-        logon_type,
         src_computer,
         src_ip,
-        process,
+        subject_user_name,
+        subject_domain_name,
+        logon_id,
+        detail,
         log_filename,
     ]
 }

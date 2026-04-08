@@ -30,6 +30,7 @@ const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 struct LogData {
     time_created: String,
     computer: String,
+    event_type: String,
     event_id: String,
     subject_user_name: String,
     subject_domain_name: String,
@@ -38,7 +39,8 @@ struct LogData {
     logon_type: String,
     workstation_name: String,
     ip_address: String,
-    process: String,
+    logon_id: String,
+    detail: String,
     filename: String,
 }
 
@@ -83,18 +85,49 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
 
 /// **Specific functions to extract data by event type**
 fn parse_security_event(json: &Value, file_path: &str) -> LogData {
+    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let ed = json.get("winlog").and_then(|w| w.get("event_data"));
+    let status = ed.and_then(|d| d.get("Status")).and_then(|s| s.as_str()).unwrap_or("");
+    let sub_status = ed.and_then(|d| d.get("SubStatus")).and_then(|s| s.as_str()).unwrap_or("");
+    let process_name = ed.and_then(|d| d.get("ProcessName")).and_then(|n| n.as_str()).unwrap_or("");
+    let target_logon_id = ed.and_then(|d| d.get("TargetLogonId")).and_then(|n| n.as_str()).unwrap_or("");
+
+    let event_type = match event_id_str.as_str() {
+        "4624" => "SUCCESSFUL_LOGON".to_string(),
+        "4625" => "FAILED_LOGON".to_string(),
+        "4634" => "LOGOFF".to_string(),
+        "4647" => "LOGOFF".to_string(),
+        "4648" => "SUCCESSFUL_LOGON".to_string(),
+        "4768" | "4769" | "4776" => {
+            if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
+        },
+        "4770" => "SUCCESSFUL_LOGON".to_string(),
+        "4771" => "FAILED_LOGON".to_string(),
+        "4778" => "SUCCESSFUL_LOGON".to_string(),
+        "4779" => "LOGOFF".to_string(),
+        _ => "".to_string(),
+    };
+
+    let detail = match event_id_str.as_str() {
+        "4624" | "4648" => process_name.to_string(),
+        "4625" => sub_status.to_string(),
+        _ => String::new(),
+    };
+
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
-        subject_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("SubjectUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        subject_domain_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("SubjectDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("TargetUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("TargetDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        logon_type: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or("").to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("WorkstationName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("IpAddress")).and_then(|ip| ip.as_str()).unwrap_or("").to_string(),
-        process: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ProcessName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type,
+        event_id: event_id_str,
+        subject_user_name: ed.and_then(|d| d.get("SubjectUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        subject_domain_name: ed.and_then(|d| d.get("SubjectDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        target_user_name: ed.and_then(|d| d.get("TargetUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        target_domain_name: ed.and_then(|d| d.get("TargetDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        logon_type: ed.and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or("").to_string(),
+        workstation_name: ed.and_then(|d| d.get("WorkstationName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        ip_address: ed.and_then(|d| d.get("IpAddress")).and_then(|ip| ip.as_str()).unwrap_or("").to_string(),
+        logon_id: target_logon_id.to_string(),
+        detail,
         filename: file_path.to_string(),
     }
 }
@@ -103,6 +136,7 @@ fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type: "CONNECT".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -111,7 +145,8 @@ fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -120,6 +155,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type: "CONNECT".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -128,16 +164,24 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
 
 fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
+    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let event_type = match event_id_str.as_str() {
+        "1009" => "CONNECT".to_string(),
+        "551" => "FAILED_LOGON".to_string(),
+        _ => "CONNECT".to_string(),
+    };
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_type,
+        event_id: event_id_str,
         subject_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: "".to_string(),
@@ -145,7 +189,8 @@ fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "3".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -154,6 +199,7 @@ fn parse_rdp_client_event(json: &Value, file_path: &str) -> LogData {
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type: "CONNECT".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -162,7 +208,8 @@ fn parse_rdp_client_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Value")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -171,6 +218,7 @@ fn parse_rdp_connmanager_event(json: &Value, file_path: &str) -> LogData {
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type: "SUCCESSFUL_LOGON".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -179,7 +227,8 @@ fn parse_rdp_connmanager_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param3")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -193,10 +242,18 @@ fn parse_rdp_localsession_event(json: &Value, file_path: &str) -> LogData {
         ("".to_string(), remote_user)
     };
 
+    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let event_type = match event_id_str.as_str() {
+        "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
+        "24" => "LOGOFF".to_string(),
+        _ => "CONNECT".to_string(),
+    };
+
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_type,
+        event_id: event_id_str,
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name,
@@ -204,7 +261,8 @@ fn parse_rdp_localsession_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Address")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -213,6 +271,7 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        event_type: "CONNECT".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -221,7 +280,8 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
         logon_type: "10".to_string(),
         workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientIP")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
-        process: "".to_string(),
+        logon_id: "".to_string(),
+        detail: "".to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -253,29 +313,33 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
 fn df_from_logdata(log_data: &[LogData]) -> DataFrame {
     let time_created = Series::new("time_created", log_data.iter().map(|x| x.time_created.clone()).collect::<Vec<String>>());
     let computer = Series::new("dst_computer", log_data.iter().map(|x| x.computer.clone()).collect::<Vec<String>>());
+    let event_type = Series::new("event_type", log_data.iter().map(|x| x.event_type.clone()).collect::<Vec<String>>());
     let event_id = Series::new("event_id", log_data.iter().map(|x| x.event_id.clone()).collect::<Vec<String>>());
-    let subject_user_name = Series::new("subject_user_name", log_data.iter().map(|x| x.subject_user_name.clone()).collect::<Vec<String>>());
-    let subject_domain_name = Series::new("subject_domain_name", log_data.iter().map(|x| x.subject_domain_name.clone()).collect::<Vec<String>>());
+    let logon_type = Series::new("logon_type", log_data.iter().map(|x| x.logon_type.clone()).collect::<Vec<String>>());
     let target_user_name = Series::new("target_user_name", log_data.iter().map(|x| x.target_user_name.clone()).collect::<Vec<String>>());
     let target_domain_name = Series::new("target_domain_name", log_data.iter().map(|x| x.target_domain_name.clone()).collect::<Vec<String>>());
-    let logon_type = Series::new("logon_type", log_data.iter().map(|x| x.logon_type.clone()).collect::<Vec<String>>());
     let workstation_name = Series::new("src_computer", log_data.iter().map(|x| x.workstation_name.clone()).collect::<Vec<String>>());
     let ip_address = Series::new("src_ip", log_data.iter().map(|x| x.ip_address.clone()).collect::<Vec<String>>());
-    let process = Series::new("process", log_data.iter().map(|x| x.process.clone()).collect::<Vec<String>>());
+    let subject_user_name = Series::new("subject_user_name", log_data.iter().map(|x| x.subject_user_name.clone()).collect::<Vec<String>>());
+    let subject_domain_name = Series::new("subject_domain_name", log_data.iter().map(|x| x.subject_domain_name.clone()).collect::<Vec<String>>());
+    let logon_id = Series::new("logon_id", log_data.iter().map(|x| x.logon_id.clone()).collect::<Vec<String>>());
+    let detail = Series::new("detail", log_data.iter().map(|x| x.detail.clone()).collect::<Vec<String>>());
     let filename = Series::new("log_filename", log_data.iter().map(|x| x.filename.clone()).collect::<Vec<String>>());
 
     let df = DataFrame::new(vec![
         time_created,
         computer,
+        event_type,
         event_id,
-        subject_user_name,
-        subject_domain_name,
+        logon_type,
         target_user_name,
         target_domain_name,
-        logon_type,
         workstation_name,
         ip_address,
-        process,
+        subject_user_name,
+        subject_domain_name,
+        logon_id,
+        detail,
         filename,
     ])
     .unwrap();

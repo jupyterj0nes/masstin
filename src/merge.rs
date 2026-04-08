@@ -4,7 +4,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDateTime;
 
-const MASSTIN_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
+const MASSTIN_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
+const MASSTIN_HEADER_OLD: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 
 pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), Box<dyn Error>> {
     let mut merged_lines: Vec<(NaiveDateTime, String)> = Vec::new();
@@ -18,7 +19,7 @@ pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), B
         // Read the first line to verify the header
         let mut lines = reader.lines();
         if let Some(Ok(header)) = lines.next() {
-            if header != MASSTIN_HEADER {
+            if header != MASSTIN_HEADER && header != MASSTIN_HEADER_OLD {
                 return Err(Box::from(format!("File {} does not have the correct Masstin header", file_path)));
             }
         } else {
@@ -30,8 +31,8 @@ pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), B
             if let Ok(content) = line {
                 let fields: Vec<&str> = content.split(',').collect();
                 
-                // Ensure the line has the correct number of fields
-                if fields.len() != 12 {
+                // Ensure the line has the correct number of fields (14 for new format, 12 for old)
+                if fields.len() != 14 && fields.len() != 12 {
                     continue; // Skip malformed lines
                 }
 
