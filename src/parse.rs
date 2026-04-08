@@ -25,7 +25,7 @@ pub fn is_debug_mode() -> bool {
 }
 
 // Event IDs for various logs
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779"];
+const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
 const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
 const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
@@ -105,6 +105,8 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             ("Status".to_string(), String::from("")),
                             ("SubStatus".to_string(), String::from("")),
                             ("TargetLogonId".to_string(), String::from("")),
+                            ("ShareName".to_string(), String::from("")),
+                            ("RelativeTargetName".to_string(), String::from("")),
                         ].iter().cloned().collect();
 
                         if let Some(event_data) = event.EventData {
@@ -132,13 +134,24 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             "4771" => "FAILED_LOGON".to_string(),
                             "4778" => "SUCCESSFUL_LOGON".to_string(),
                             "4779" => "LOGOFF".to_string(),
-                            _ => "".to_string(),
+                            "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
+                            _ => "CONNECT".to_string(),
                         };
 
                         // Determine detail column
+                        let share_name = data_values.get("ShareName").unwrap().to_string();
+                        let relative_target = data_values.get("RelativeTargetName").unwrap().to_string();
                         let detail = match event_id.as_str() {
                             "4624" | "4648" => data_values.get("ProcessName").unwrap().to_string(),
                             "4625" => data_values.get("SubStatus").unwrap().to_string(),
+                            "5140" => share_name,
+                            "5145" => {
+                                if relative_target.is_empty() {
+                                    share_name
+                                } else {
+                                    format!("{}\\{}", share_name, relative_target)
+                                }
+                            },
                             _ => String::from(""),
                         };
 
@@ -190,7 +203,7 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let event_type = match event_id.as_str() {
-                            "1009" => "CONNECT".to_string(),
+                            "1009" => "SUCCESSFUL_LOGON".to_string(),
                             "551" => "FAILED_LOGON".to_string(),
                             _ => "CONNECT".to_string(),
                         };
@@ -243,7 +256,8 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
                             ("UserName".to_string(), String::from("")),
-                            ("ServerName".to_string(), String::from(""))
+                            ("ServerName".to_string(), String::from("")),
+                            ("ShareName".to_string(), String::from("")),
                         ].iter().cloned().collect();
 
                         for data in event.EventData.unwrap().Datas {
@@ -257,7 +271,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap(),
                             computer: data_values.get("ServerName").unwrap().to_string(),
-                            event_type: "CONNECT".to_string(),
+                            event_type: "SUCCESSFUL_LOGON".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
@@ -268,7 +282,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
                             logon_id: String::from(""),
                             filename: file.to_string(),
-                            detail: String::from(""),
+                            detail: data_values.get("ShareName").unwrap().to_string(),
                         });
                     }
                 }

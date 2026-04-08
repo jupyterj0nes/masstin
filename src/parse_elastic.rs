@@ -17,7 +17,7 @@ pub fn is_debug_mode() -> bool {
 }
 
 /// **Event IDs sorted by log type**
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779"];
+const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
 const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
 const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
@@ -105,12 +105,21 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
         "4771" => "FAILED_LOGON".to_string(),
         "4778" => "SUCCESSFUL_LOGON".to_string(),
         "4779" => "LOGOFF".to_string(),
-        _ => "".to_string(),
+        "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
+        _ => "CONNECT".to_string(),
     };
+
+    let share_name = ed.and_then(|d| d.get("ShareName")).and_then(|s| s.as_str()).unwrap_or("");
+    let relative_target = ed.and_then(|d| d.get("RelativeTargetName")).and_then(|s| s.as_str()).unwrap_or("");
 
     let detail = match event_id_str.as_str() {
         "4624" | "4648" => process_name.to_string(),
         "4625" => sub_status.to_string(),
+        "5140" => share_name.to_string(),
+        "5145" => {
+            if relative_target.is_empty() { share_name.to_string() }
+            else { format!("{}\\{}", share_name, relative_target) }
+        },
         _ => String::new(),
     };
 
@@ -133,20 +142,21 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
 }
 
 fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
+    let ed = json.get("winlog").and_then(|w| w.get("event_data"));
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "CONNECT".to_string(),
+        event_type: "SUCCESSFUL_LOGON".to_string(),
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
-        target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        target_user_name: ed.and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         target_domain_name: "".to_string(),
         logon_type: "3".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        workstation_name: ed.and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: "".to_string(),
         logon_id: "".to_string(),
-        detail: "".to_string(),
+        detail: ed.and_then(|d| d.get("ShareName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         filename: file_path.to_string(),
     }
 }
@@ -173,7 +183,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
 fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
     let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
     let event_type = match event_id_str.as_str() {
-        "1009" => "CONNECT".to_string(),
+        "1009" => "SUCCESSFUL_LOGON".to_string(),
         "551" => "FAILED_LOGON".to_string(),
         _ => "CONNECT".to_string(),
     };

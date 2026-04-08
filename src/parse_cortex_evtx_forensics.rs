@@ -396,7 +396,9 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         "21" | "22" | "25" | "1149" => "SUCCESSFUL_LOGON".to_string(),
         "24" => "LOGOFF".to_string(),
         "1024" | "1102" | "131" => "CONNECT".to_string(),
-        "1009" | "31001" | "30803" | "30804" | "30805" | "30806" | "30807" | "30808" => "CONNECT".to_string(),
+        "1009" | "31001" => "SUCCESSFUL_LOGON".to_string(),
+        "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
+        "30803" | "30804" | "30805" | "30806" | "30807" | "30808" => "CONNECT".to_string(),
         "551" => "FAILED_LOGON".to_string(),
         _ => "CONNECT".to_string(),
     };
