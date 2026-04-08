@@ -39,17 +39,21 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 ## Key Features
 
-| Feature | Description |
-|---------|-------------|
-| **Multi-artifact parsing** | 28 Windows Event IDs + Linux logs + Winlogbeat JSON + Cortex XDR |
-| **Unified timeline** | All sources merged into a single chronological CSV |
-| **Compressed triage support** | Processes compressed packages from Velociraptor or Cortex XDR Offline Collector, recursively decompressing and identifying EVTX files — even archived logs with duplicate filenames |
-| **Graph database support** | Direct upload to Neo4j or Memgraph with Cypher queries for graph-based investigation |
-| **Auto IP→hostname** | Frequency-based resolution from the logs themselves |
-| **Connection grouping** | Reduces noise by grouping repetitive connections between the same hosts |
-| **Time filtering** | Filter by start/end time at parse level |
-| **Cross-platform** | Windows, Linux & macOS — zero dependencies |
-| **Merge mode** | Combine multiple CSV outputs into one sorted timeline |
+| Feature | Description | Details |
+|---------|-------------|---------|
+| **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| **Forensic image analysis** | Open E01/dd images directly, find NTFS partitions (GPT/MBR), extract EVTX — no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
+| **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
+| **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data merged with `merge` — one timeline across OS boundaries | |
+| **Compressed triage support** | Recursive ZIP extraction with auto-detection of forensic passwords | |
+| **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution | |
+| **Temporal path reconstruction** | Cypher query to find the chronologically coherent attacker route between two nodes | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
+| **Session correlation** | `logon_id` field for matching logon/logoff to determine session duration | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
+| **Linux smart inference** | Auto-detects hostname, infers year from `dpkg.log`, supports Debian and RHEL, RFC3164 and RFC5424 | [Linux artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| **Silent mode** | `--silent` flag for Velociraptor, SOAR and automation integration | |
+| **Cross-platform** | Windows, Linux & macOS — zero dependencies, single binary | |
 
 ## Supported Artifacts
 
