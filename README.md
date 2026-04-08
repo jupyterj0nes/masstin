@@ -150,6 +150,12 @@ masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
 masstin -a parse-linux -d /evidence/triage_package/ -o linux-timeline.csv
 ```
 
+<div align="center">
+  <img src="resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
+</div>
+
+Masstin transparently reports all inferences: hostname identification (from `/etc/hostname`, `dmesg`, or the syslog header), year inference (from `dpkg.log`, `wtmp`, or file modification date), and password-protected ZIP extraction.
+
 ### Parse Winlogbeat JSON
 
 Parses Winlogbeat JSON logs forwarded to Elasticsearch. Extracts the same lateral movement data from JSON format when EVTX files are unavailable.
