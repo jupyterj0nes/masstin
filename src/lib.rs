@@ -22,6 +22,8 @@ mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;
 mod parse_linux;
 pub use crate::parse_linux::*;
+pub mod banner;
+pub use crate::banner::*;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -64,6 +66,10 @@ pub struct Cli {
     /// If specified, print debug information
     #[arg(long)]
     debug: bool,
+
+    /// Silent mode: suppress all output except CSV data (for automation/Velociraptor integration)
+    #[arg(long)]
+    silent: bool,
 
     /// Cortex API base URL (must start with 'api-' if using parse_cortex)
     #[arg(long)]
@@ -120,9 +126,14 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 
     validate_folders(&config)?;
 
-    // Enable or disable debug mode in other modules
+    // Enable or disable debug/silent mode
     crate::parse::set_debug_mode(config.debug);
     crate::parse_elastic::set_debug_mode(config.debug);
+    crate::banner::set_silent_mode(config.silent);
+
+    // Print banner
+    let action_name = format!("{:?}", config.action);
+    crate::banner::print_banner(&action_name);
 
     // Match the selected action and call the corresponding function
     match config.action {
