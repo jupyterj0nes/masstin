@@ -132,6 +132,8 @@ masstin -a parse-windows -d /evidence/ -o timeline.csv \
   <img src="resources/masstin_cli_output.png" alt="Masstin CLI output — parse-windows"/>
 </div>
 
+The output shows three phases: **[1/3]** scans directories and compressed packages to discover EVTX artifacts, **[2/3]** processes each artifact and shows progress, then lists every source that produced events with its count, and **[3/3]** generates the sorted CSV timeline. The final summary shows how many artifacts were parsed, how many were skipped (no relevant events or access denied), total events collected, and execution time. Use `--silent` to suppress all output for automation.
+
 ### Parse Linux logs
 
 Parses Linux system logs and accounting entries (`secure`, `messages`, `audit.log`, `utmp`, `wtmp`, `btmp`, `lastlog`) to extract SSH sessions and authentication events.
