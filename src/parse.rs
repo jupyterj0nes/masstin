@@ -24,6 +24,31 @@ pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(Ordering::SeqCst)
 }
 
+/// Translate Windows SubStatus hex codes to human-readable failure reasons
+fn translate_substatus(code: &str) -> String {
+    let desc = match code.to_lowercase().as_str() {
+        "0xc000006a" => "Wrong password",
+        "0xc0000064" => "User does not exist",
+        "0xc0000072" => "Account disabled",
+        "0xc0000234" => "Account locked out",
+        "0xc0000070" => "Logon outside allowed hours",
+        "0xc000006d" => "Bad username or auth info",
+        "0xc0000071" => "Expired password",
+        "0xc0000224" => "Password must change",
+        "0xc0000193" => "Account expired",
+        "0xc000015b" => "Logon type not granted",
+        "0xc000006e" => "Unknown user or bad password",
+        "0xc0000133" => "Clock skew too great",
+        "0xc0000005" => "Access denied",
+        _ => "",
+    };
+    if desc.is_empty() {
+        code.to_string()
+    } else {
+        format!("{} ({})", desc, code)
+    }
+}
+
 // Event IDs for various logs
 const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
@@ -143,7 +168,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                         let relative_target = data_values.get("RelativeTargetName").unwrap().to_string();
                         let detail = match event_id.as_str() {
                             "4624" | "4648" => data_values.get("ProcessName").unwrap().to_string(),
-                            "4625" => data_values.get("SubStatus").unwrap().to_string(),
+                            "4625" => translate_substatus(data_values.get("SubStatus").unwrap()),
                             "5140" => share_name,
                             "5145" => {
                                 if relative_target.is_empty() {
@@ -859,7 +884,29 @@ fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(E
 // ---------------------------------------------------------------------------------------
 // CREATE POLARS DATAFRAME AND WRITE/PRINT CSV
 // ---------------------------------------------------------------------------------------
-fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
+fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
+    // Deduplicate events (e.g., same event from live volume and VSS snapshot)
+    // Key: (time_created, dst_computer, event_id, event_type, target_user_name, src_ip)
+    // Prefer live volume events over VSS (shorter filename = no "vss_" in path)
+    let log_data = {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped: Vec<LogData> = Vec::with_capacity(log_data.len());
+        // Sort: live events first (shorter filenames), VSS after
+        let mut sorted = log_data;
+        sorted.sort_by(|a, b| a.filename.len().cmp(&b.filename.len()));
+        for item in sorted {
+            let key = format!("{}|{}|{}|{}|{}|{}",
+                item.time_created, item.computer, item.event_id,
+                item.event_type, item.target_user_name, item.ip_address);
+            if seen.insert(key) {
+                deduped.push(item);
+            }
+        }
+        deduped
+    };
+
+    let deduped_count = log_data.len();
+
     let time_created_vec: Vec<String> = log_data.iter().map(|x| x.time_created.to_string()).collect();
     let time_created = Series::new("time_created", time_created_vec);
 
@@ -935,6 +982,8 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
                 .unwrap();
         },
     }
+
+    deduped_count
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1252,10 +1301,14 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
 
     // Phase 3: Generate output
     crate::banner::print_output_start();
-    let total_events = log_data.len();
-    vector_to_polars(log_data, output);
+    let total_before_dedup = log_data.len();
+    let total_after_dedup = vector_to_polars(log_data, output);
+    let deduped = total_before_dedup - total_after_dedup;
+    if deduped > 0 {
+        crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
+    }
 
-    crate::banner::print_summary(total_events, parsed_files, skipped, output.map(|s| s.as_str()), start_time);
+    crate::banner::print_summary(total_after_dedup, parsed_files, skipped, output.map(|s| s.as_str()), start_time);
 }
 
 // ---------------------------------------------------------------------------------------

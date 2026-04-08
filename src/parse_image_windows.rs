@@ -47,24 +47,33 @@ pub fn parse_image_windows(files: &[String], output: Option<&String>) {
             }
         };
 
+        let image_name = Path::new(image_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(image_path)
+            .to_string();
+
         match evtx_dir {
             Ok(dir) => {
                 let dir_str = dir.to_string_lossy().to_string();
-                crate::banner::print_phase_result(&format!(
-                    "EVTX files extracted to temp directory"
-                ));
+                crate::banner::print_phase_result("EVTX files extracted to temp directory");
 
                 // Phase 2+3: delegate to existing parse_events
                 let dirs = vec![dir_str];
                 let empty_files: Vec<String> = vec![];
                 parse_events(&empty_files, &dirs, output);
+
+                // Replace temp paths with descriptive forensic source names
+                if let Some(out_path) = output {
+                    rewrite_log_filenames(out_path, &image_name);
+                }
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to process image {}: {}", image_path, e);
             }
         }
 
-        // Cleanup
+        // Cleanup temp directory
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
@@ -150,8 +159,15 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
                     let store_label = format!("vss_{}", s);
                     crate::banner::print_info(&format!("  Processing VSS store {}...", s));
 
+                    // Show delta info
+                    if let Ok((blocks, bytes)) = vss.store_delta_size(&mut offset_reader, s) {
+                        crate::banner::print_info(&format!("    {} changed blocks ({:.1} MB delta)",
+                            blocks, bytes as f64 / 1_048_576.0));
+                    }
+
                     match vss.store_reader(&mut offset_reader, s) {
                         Ok(mut store_reader) => {
+                            crate::banner::print_info("    Opening NTFS from VSS snapshot...");
                             // Try to parse NTFS from this VSS store
                             match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, i, s) {
                                 Ok(count) => {
@@ -514,6 +530,61 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
     }
 
     Ok(count)
+}
+
+/// Rewrite the log_filename column in the output CSV.
+/// Replaces temp paths like ".../partition_0/Security.evtx" with "ImageName.e01:live:Security.evtx"
+/// and ".../partition_0_vss_0/Security.evtx" with "ImageName.e01:vss_0:Security.evtx"
+fn rewrite_log_filenames(csv_path: &str, image_name: &str) {
+    let content = match fs::read_to_string(csv_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut output = String::with_capacity(content.len());
+    for (i, line) in content.lines().enumerate() {
+        if i == 0 {
+            // Header — pass through
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
+        // Find the last field (log_filename) and rewrite it
+        if let Some(last_comma) = line.rfind(',') {
+            let prefix = &line[..last_comma + 1];
+            let filename_field = &line[last_comma + 1..];
+
+            // Extract the EVTX filename and source (live vs vss_N)
+            let evtx_name = Path::new(filename_field)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(filename_field);
+
+            let source = if filename_field.contains("_vss_") {
+                // Extract vss index: "partition_0_vss_0" -> "vss_0"
+                if let Some(vss_pos) = filename_field.find("_vss_") {
+                    let after_vss = &filename_field[vss_pos + 1..];
+                    // Take until next path separator
+                    let end = after_vss.find(|c: char| c == '/' || c == '\\').unwrap_or(after_vss.len());
+                    &after_vss[..end]
+                } else {
+                    "vss"
+                }
+            } else {
+                "live"
+            };
+
+            output.push_str(prefix);
+            output.push_str(&format!("{}:{}:{}", image_name, source, evtx_name));
+            output.push('\n');
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    let _ = fs::write(csv_path, output);
 }
 
 /// Wrapper that adds a byte offset to all Read/Seek operations.
