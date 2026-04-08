@@ -39,6 +39,11 @@ fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
 }
 
 pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String) {
+    let start_clock = std::time::Instant::now();
+
+    // Phase 1: Connect
+    crate::banner::print_phase("1", "2", "Connecting to Memgraph...");
+    crate::banner::print_phase_detail("Database:", database);
     let config = ConfigBuilder::default()
         .uri(database)
         .user(user)
@@ -47,6 +52,8 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
         .build()
         .unwrap();
     let graph = Graph::connect(config).await.unwrap();
+    crate::banner::print_phase_result("Connected");
+
     for file in files {
         let file_contents: String = std::fs::read_to_string(file).unwrap();
         let mut lines: Vec<&str> = file_contents.lines().collect();
@@ -146,18 +153,18 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
             entry.count += 1;
         }
 
-        for (key, count) in &counts {
-            println!("{:?} has {} occurrences", key, count);
-        }
-
         // Convert the HashMap to a vector of strings
         let mut grouped_lines: Vec<String> = Vec::new();
         for ((dst_computer, subject_user_name, subject_domain_name, target_user_name, target_domain_name, logon_type, src_computer, src_ip), data) in grouped_map {
             grouped_lines.push(format!("{},{},{},{},{},{},{},{},{},{}", data.earliest_date, dst_computer, data.count, subject_user_name, subject_domain_name, target_user_name, target_domain_name, logon_type, src_computer, src_ip));
         }
 
-        // Initialize the progress bar with the correct number of lines
-        let pb = ProgressBar::new(grouped_lines.len() as u64);
+        // Phase 2: Load to database
+        let grouped_lines_count = grouped_lines.len();
+        crate::banner::print_phase("2", "2", &format!("Loading {} grouped connections to Memgraph...", grouped_lines_count));
+        let pb = crate::banner::create_progress_bar(grouped_lines_count as u64);
+        let mut errors: usize = 0;
+        let mut resolved: usize = 0;
 
         for line in grouped_lines {
             let mut row: Vec<&str> = line.split(',').collect();
@@ -170,9 +177,9 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
                 .collect();
                 
                 // Find the entry with the highest count
-                if let Some(((_, most_frequent_value), &count)) = filtered_counts.iter()
+                if let Some(((_, most_frequent_value), &_count)) = filtered_counts.iter()
                     .max_by_key(|&(_, &count)| count) {
-                    println!("MASSTIN: IP {} has been resolved to hostname: {} as it has been seen {} times.", row[9], most_frequent_value, count);
+                    resolved += 1;
                     hostname = most_frequent_value;
                 } else {
                     hostname = row[9];
@@ -205,10 +212,11 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
                     // You can add more logic here if you need to process the result
                 },
                 Err(e) => {
-                    // Print the error message and the query that failed
-                    println!("Error running the Cypher query: {:?}", e);
-                    println!("Query with error: {}", formatted_query);
-                    continue;  // Continue with the next line
+                    errors += 1;
+                    if crate::parse::is_debug_mode() {
+                        eprintln!("[ERROR] Cypher query failed: {:?}", e);
+                    }
+                    continue;
                 }
             }
 
@@ -216,7 +224,8 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
             pb.inc(1);
         }
 
-        // Finish the progress bar
-        // pb.finish_with_message("MASSTIN - File {} has been loaded");
+        pb.finish_and_clear();
+        let loaded = grouped_lines_count - errors;
+        crate::banner::print_load_summary("Memgraph", loaded, resolved, errors, start_clock);
     }
 }

@@ -52,10 +52,13 @@ pub async fn parse_cortex_evtx_forensics_data(
     start_time: Option<&String>,
     end_time: Option<&String>,
 ) -> Result<(), Box<dyn Error>> {
+    let start_clock = std::time::Instant::now();
+
+    // Phase 1: API Authentication
+    crate::banner::print_phase("1", "3", "Authenticating with Cortex XDR Forensics API...");
     let (token, x_xdr_auth_id) = prompt_for_api_key_and_id()?;
 
-
-        // 1) turn CLI parameters into epochs
+    // 1) turn CLI parameters into epochs
     let epoch_start = match start_time {
         Some(s) if !s.is_empty() => Some(to_epoch_secs(s)?),
         _ => None,
@@ -116,12 +119,18 @@ pub async fn parse_cortex_evtx_forensics_data(
         }
     });
     
+    // Phase 2: Query API
+    crate::banner::print_phase("2", "3", "Querying Cortex XDR Forensics API...");
+    if start_time.is_some() {
+        crate::banner::print_phase_detail("Time range:", &format!("{} to {}", start_time.unwrap_or(&String::new()), end_time.unwrap_or(&String::new())));
+    }
+
     if debug {
         eprintln!("[DEBUG] POSTing query to: {}", start_query_url);
         eprintln!("[DEBUG] Payload: {}", query_payload);
     }
 
-    // 1) Start the query
+    // Start the query
     let resp = client.post(&start_query_url)
         .headers(headers.clone())
         .json(&query_payload)
@@ -146,7 +155,8 @@ pub async fn parse_cortex_evtx_forensics_data(
         eprintln!("[DEBUG] Query ID: {}", query_id);
     }
 
-    // 2) Poll for results
+    // Poll for results
+    let spinner = crate::banner::create_spinner("Waiting for forensic query results...");
     let poll_payload = json!({
         "request_data": {
             "query_id": query_id,
@@ -202,6 +212,17 @@ pub async fn parse_cortex_evtx_forensics_data(
         }
     }
 
+    spinner.finish_and_clear();
+
+    // Count unique machines and artifacts for summary
+    let mut machines: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for record in &all_data {
+        if let Some(host) = record.get("host_name").and_then(|v| v.as_str()) {
+            if !host.is_empty() { machines.insert(host.to_string()); }
+        }
+    }
+    crate::banner::print_cortex_forensics_summary(machines.len(), machines.len(), all_data.len());
+
     // Sort by _time
     all_data.sort_by(|a, b| {
         let a_ts = get_timestamp(a).unwrap_or(0);
@@ -221,8 +242,11 @@ pub async fn parse_cortex_evtx_forensics_data(
         eprintln!("[DEBUG] Writing results to: {}", out_path);
     }
 
+    // Phase 3: Generate output
+    crate::banner::print_phase("3", "3", "Generating output...");
     write_processed_csv(&all_data, out_path, debug)?;
 
+    crate::banner::print_summary(all_data.len(), all_data.len(), 0, Some(out_path), start_clock);
     Ok(())
 }
 

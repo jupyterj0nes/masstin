@@ -239,6 +239,118 @@ pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Generic phase printing (for modules with custom flows)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn print_phase(step: &str, total: &str, message: &str) {
+    if is_silent() { return; }
+    eprintln!();
+    eprintln!("  {} {}",
+        style(format!("[{}/{}]", step, total)).cyan().bold(),
+        style(message).bold(),
+    );
+}
+
+pub fn print_phase_detail(label: &str, value: &str) {
+    if is_silent() { return; }
+    eprintln!("        {} {}", style(label).yellow(), value);
+}
+
+pub fn print_phase_result(message: &str) {
+    if is_silent() { return; }
+    eprintln!("        {} {}", style("=>").green().bold(), style(message).green().bold());
+}
+
+pub fn print_info(message: &str) {
+    if is_silent() { return; }
+    eprintln!("        {}", style(message).dim());
+}
+
+pub fn create_spinner(message: &str) -> ProgressBar {
+    if is_silent() {
+        return ProgressBar::hidden();
+    }
+    let sp = ProgressBar::new_spinner();
+    sp.set_draw_target(ProgressDrawTarget::stderr());
+    sp.set_style(
+        ProgressStyle::default_spinner()
+            .template("        {spinner} {msg}")
+            .unwrap()
+            .tick_chars("\u{28fb}\u{28fd}\u{28fe}\u{28f7}\u{28ef}\u{28df}\u{28bf}\u{287f} "),
+    );
+    sp.set_message(message.to_string());
+    sp.enable_steady_tick(std::time::Duration::from_millis(100));
+    sp
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Load summary (Neo4j / Memgraph)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn print_load_summary(
+    db_type: &str,
+    connections_loaded: usize,
+    hosts_resolved: usize,
+    errors: usize,
+    elapsed: Instant,
+) {
+    if is_silent() { return; }
+    let secs = elapsed.elapsed().as_secs_f64();
+
+    eprintln!();
+    eprintln!("{}", style("  ──────────────────────────────────────────────────").dim());
+    eprintln!("  {} {}", style("Database:").bold(), style(db_type).cyan());
+    eprintln!("  {} {}", style("Connections loaded:").bold(), style(connections_loaded).green().bold());
+    if hosts_resolved > 0 {
+        eprintln!("  {} {}", style("IPs resolved to hostname:").bold(), style(hosts_resolved).green());
+    }
+    if errors > 0 {
+        eprintln!("  {} {}", style("Query errors:").bold(), style(errors).red());
+    }
+    eprintln!("  {} {:.2}s", style("Completed in:").bold(), style(secs).cyan());
+    eprintln!();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Cortex API summary
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn print_cortex_network_summary(total: usize, rdp: usize, smb: usize, ssh: usize) {
+    if is_silent() { return; }
+    eprintln!();
+    eprintln!("  {} {}",
+        style("[+]").green().bold(),
+        style("Network connections retrieved:").bold(),
+    );
+    if rdp > 0 { eprintln!("        {} RDP {}", style("=>").green(), style(format!("(port 3389) - {} connections", rdp)).dim()); }
+    if smb > 0 { eprintln!("        {} SMB {}", style("=>").green(), style(format!("(port 445)  - {} connections", smb)).dim()); }
+    if ssh > 0 { eprintln!("        {} SSH {}", style("=>").green(), style(format!("(port 22)   - {} connections", ssh)).dim()); }
+    eprintln!("        {} {} total events",
+        style("=>").green().bold(),
+        style(total).green().bold(),
+    );
+}
+
+pub fn print_cortex_forensics_summary(machines: usize, artifacts: usize, events: usize) {
+    if is_silent() { return; }
+    eprintln!();
+    eprintln!("  {} {}",
+        style("[+]").green().bold(),
+        style("Forensic artifacts retrieved:").bold(),
+    );
+    eprintln!("        {} {} from {} {}",
+        style("=>").green().bold(),
+        style(format!("{} events", events)).green().bold(),
+        style(artifacts).yellow(),
+        style(format!("artifacts across {} machines", machines)).dim(),
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Parse summary (reused by parse-windows, parse-linux, parser-elastic)
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn print_summary(total_events: usize, parsed_files: usize, skipped: usize, output_path: Option<&str>, elapsed: Instant) {
     if is_silent() { return; }
     let duration = elapsed.elapsed();
