@@ -103,14 +103,66 @@ fn parse_rfc3164_timestamp(month: &str, day: &str, time: &str, file_year: i32) -
     None
 }
 
-/// Get the year from a file's modification time, or current year as fallback.
+// Regex to find a year in dpkg.log format: "2010-04-19 12:00:17"
+static YEAR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(20\d{2})-\d{2}-\d{2}\s+\d{2}:\d{2}").unwrap()
+});
+
+/// Infer the year of logs by looking at sibling files in the same directory.
+/// Priority: dpkg.log (has full dates) > wtmp (binary with epoch) > file mtime > current year.
 fn get_file_year(path: &Path) -> i32 {
+    let dir = path.parent().unwrap_or(Path::new("."));
+
+    // 1) dpkg.log — always has "YYYY-MM-DD HH:MM:SS" format
+    let dpkg_candidates = ["dpkg.log", "dpkg.log.1"];
+    for name in &dpkg_candidates {
+        let dpkg_path = dir.join(name);
+        if dpkg_path.exists() {
+            if let Ok(file) = File::open(&dpkg_path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten().take(5) {
+                    if let Some(cap) = YEAR_RE.captures(&line) {
+                        if let Ok(year) = cap[1].parse::<i32>() {
+                            if is_debug_mode() {
+                                println!("        year inferred from dpkg.log: {}", year);
+                            }
+                            return year;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) wtmp — binary with epoch timestamps, read first valid entry
+    let wtmp_path = dir.join("wtmp");
+    if wtmp_path.exists() {
+        if let Ok(metadata) = fs::metadata(&wtmp_path) {
+            if metadata.len() > 0 {
+                // Parse first utmp entry to get the year from its epoch
+                let entries = parse_utmp_file(&wtmp_path, "", false);
+                if let Some(first) = entries.first() {
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(&first.ts_rfc3339) {
+                        let year = dt.year();
+                        if is_debug_mode() {
+                            println!("        year inferred from wtmp: {}", year);
+                        }
+                        return year;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) File modification time
     if let Ok(metadata) = fs::metadata(path) {
         if let Ok(modified) = metadata.modified() {
             let dt: DateTime<Utc> = modified.into();
             return dt.year();
         }
     }
+
+    // 4) Current year
     Utc::now().year()
 }
 
