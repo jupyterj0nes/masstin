@@ -204,21 +204,26 @@ masstin -a load-memgraph -f timeline.csv --database localhost:7687
 
 ## Output Format
 
-All actions produce a unified CSV:
+All actions produce a unified CSV with 14 columns:
 
 | Column | Description |
 |--------|-------------|
-| `time_created` | Event timestamp (UTC) |
+| `time_created` | Event timestamp |
 | `dst_computer` | Destination hostname |
-| `event_id` | Windows Event ID or equivalent |
-| `subject_user_name` | Source user account |
-| `subject_domain_name` | Source domain |
+| `event_type` | Event classification: `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
+| `event_id` | Windows Event ID or equivalent (e.g., `4624`, `SSH_SUCCESS`) |
+| `logon_type` | Logon type: `3` (Network/SMB), `10` (RDP), `SSH` |
 | `target_user_name` | Target user account |
 | `target_domain_name` | Target domain |
-| `logon_type` | 3 (Network/SMB), 10 (RDP), SSH |
 | `src_computer` | Source hostname |
 | `src_ip` | Source IP address |
+| `subject_user_name` | Subject user account |
+| `subject_domain_name` | Subject domain |
+| `logon_id` | Logon ID for session correlation (e.g., `0x1A2B3C`) |
+| `detail` | Additional context: SubStatus for failed logons, process name, SSH auth method |
 | `log_filename` | Original log file |
+
+For the full event_type mapping across all Event IDs, see the [masstin documentation](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/).
 
 ## Graph Visualization (Neo4j / Memgraph)
 
