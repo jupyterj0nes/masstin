@@ -39,6 +39,10 @@ pub async fn parse_cortex_data(
     end_time: Option<&String>,
     filter_ip: Option<&String>
 ) -> Result<(), Box<dyn Error>> {
+    let start_clock = std::time::Instant::now();
+
+    // Phase 1: API Authentication
+    crate::banner::print_phase("1", "3", "Authenticating with Cortex XDR API...");
     let (token, x_xdr_auth_id) = prompt_for_api_key_and_id()?;
 
     let default_start = String::new();
@@ -97,7 +101,15 @@ pub async fn parse_cortex_data(
     });
 
 
-    // 2) Start the query
+    // Phase 2: Query API
+    crate::banner::print_phase("2", "3", "Querying Cortex XDR Network API...");
+    if filter_ip.is_some() {
+        crate::banner::print_phase_detail("Filter IP:", filter_ip.unwrap());
+    }
+    if !cortex_start_str.is_empty() {
+        crate::banner::print_phase_detail("Time range:", &format!("{} to {}", cortex_start_str, cortex_end_str));
+    }
+
     if debug {
         eprintln!("[DEBUG] Starting query with payload: {}", query_payload);
         eprintln!("[DEBUG] POST to: {}", start_query_url);
@@ -139,6 +151,7 @@ pub async fn parse_cortex_data(
     }
 
     // 4) Poll for results (up to 10 times with 5s interval)
+    let spinner = crate::banner::create_spinner("Waiting for query results...");
     let mut all_data: Vec<Value> = Vec::new();
     let mut attempt = 0;
     let max_retries = 10;
@@ -220,6 +233,21 @@ pub async fn parse_cortex_data(
         }
     }
 
+    spinner.finish_and_clear();
+
+    // Count by port type for summary
+    let mut rdp_count = 0usize;
+    let mut smb_count = 0usize;
+    let mut ssh_count = 0usize;
+    for record in &all_data {
+        let local_port = record.get("action_local_port").and_then(|v| v.as_u64()).unwrap_or(0);
+        let remote_port = record.get("action_remote_port").and_then(|v| v.as_u64()).unwrap_or(0);
+        if local_port == 3389 || remote_port == 3389 { rdp_count += 1; }
+        else if local_port == 445 || remote_port == 445 { smb_count += 1; }
+        else if local_port == 22 || remote_port == 22 { ssh_count += 1; }
+    }
+    crate::banner::print_cortex_network_summary(all_data.len(), rdp_count, smb_count, ssh_count);
+
     // Sort all_data by _time (oldest to most recent)
     all_data.sort_by(|a, b| {
         let a_ts = get_timestamp(a).unwrap_or(0);
@@ -239,8 +267,11 @@ pub async fn parse_cortex_data(
         eprintln!("[DEBUG] Writing to CSV: {}", out_path);
     }
 
+    // Phase 3: Generate output
+    crate::banner::print_phase("3", "3", "Generating output...");
     write_processed_csv(&all_data, out_path, debug)?;
 
+    crate::banner::print_summary(all_data.len(), all_data.len(), 0, Some(out_path), start_clock);
     Ok(())
 }
 
