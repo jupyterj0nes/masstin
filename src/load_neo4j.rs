@@ -182,23 +182,40 @@ pub async fn load_neo4j(files: &Vec<String>, database: &String, user: &String) {
                 }
             }
             
+            // Relationship type must be a valid Cypher identifier:
+            // replace dots, hyphens, spaces with underscores; uppercase; strip @domain
+            let rel_type_normalized = {
+                let r = if relation_type.chars().next().unwrap_or(' ').is_ascii_digit() {
+                    format!("u{}", relation_type)
+                } else {
+                    relation_type.to_string()
+                };
+                r.replace(".", "_").replace("-", "_").replace(" ", "_")
+                    .split("@").next().unwrap_or(&r).to_uppercase()
+            };
+
+            // Node names and properties: keep original values (no normalization)
+            // Only strip @domain from usernames
+            let clean_user = |s: &str| -> String {
+                s.split("@").next().unwrap_or(s).to_string()
+            };
+
             let formatted_query = format!(
                 "MERGE (origin:host{{name:'{}'}})
                 MERGE (destination:host{{name:'{}'}})
                 MERGE (origin)-[r:{}{{time:datetime('{}'), logon_type:'{}', src_computer:'{}', src_ip:'{}', target_user_name:'{}', target_domain_name:'{}', subject_user_name:'{}', subject_domain_name:'{}', count:'{}'}}]->(destination)",
-                hostname.replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
-                row[1].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                if relation_type.chars().next().unwrap_or(' ').is_digit(10) { format!("u{}", relation_type) } else { relation_type.to_string() }
-                    .replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
+                hostname,                                                    // node: original
+                row[1],                                                      // node: original
+                rel_type_normalized,                                         // rel type: normalized (Cypher requirement)
                 row[0].replace(" utc", "").replace(" ", "T"),
-                row[7].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                row[8].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                row[9].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                relation_type.replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
-                row[6].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                row[3].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                row[4].replace(".", "_").replace("-", "_").replace(" ", "_"),
-                row[2].replace(".", "_").replace("-", "_").replace(" ", "_"),
+                row[7],                                                      // property: original
+                row[8],                                                      // property: original
+                row[9],                                                      // property: original
+                clean_user(relation_type),                                   // property: strip @domain only
+                row[6],                                                      // property: original
+                clean_user(row[3]),                                          // property: strip @domain only
+                row[4],                                                      // property: original
+                row[2],                                                      // property: original
             );
             
             // Execute the query and handle possible errors
