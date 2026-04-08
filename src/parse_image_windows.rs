@@ -7,6 +7,7 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use vshadow::VssVolume;
 use crate::parse::{parse_events, is_debug_mode};
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
@@ -124,15 +125,61 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
             *partition_offset as f64 / 1_073_741_824.0
         ));
 
+        // Extract EVTX from the live (current) volume
         match extract_evtx_from_ntfs_partition(reader, *partition_offset, &evtx_output_dir, i) {
             Ok(count) => {
                 total_evtx += count;
-                crate::banner::print_info(&format!("  {} EVTX files extracted from partition {}", count, i + 1));
+                crate::banner::print_info(&format!("  {} EVTX files extracted from live volume", count));
             }
             Err(e) => {
                 if is_debug_mode() {
                     eprintln!("[DEBUG] Partition {} error: {}", i + 1, e);
                 }
+            }
+        }
+
+        // Check for Volume Shadow Copies (VSS) and extract EVTX from each
+        let mut offset_reader = OffsetReader::new(reader, *partition_offset);
+        match VssVolume::new(&mut offset_reader) {
+            Ok(vss) if vss.store_count() > 0 => {
+                crate::banner::print_phase_result(&format!(
+                    "{} Volume Shadow Copy snapshot(s) detected", vss.store_count()
+                ));
+
+                for s in 0..vss.store_count() {
+                    let store_label = format!("vss_{}", s);
+                    crate::banner::print_info(&format!("  Processing VSS store {}...", s));
+
+                    match vss.store_reader(&mut offset_reader, s) {
+                        Ok(mut store_reader) => {
+                            // Try to parse NTFS from this VSS store
+                            match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, i, s) {
+                                Ok(count) => {
+                                    total_evtx += count;
+                                    crate::banner::print_info(&format!(
+                                        "    {} EVTX files extracted from VSS store {}", count, s
+                                    ));
+                                }
+                                Err(e) => {
+                                    if is_debug_mode() {
+                                        eprintln!("[DEBUG] VSS store {} error: {}", s, e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if is_debug_mode() {
+                                eprintln!("[DEBUG] Cannot open VSS store {}: {}", s, e);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                crate::banner::print_info("No Volume Shadow Copies detected");
+            }
+            Err(_) => {
+                crate::banner::print_info("No Volume Shadow Copies detected");
             }
         }
     }
@@ -145,20 +192,79 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
     Ok(evtx_output_dir)
 }
 
-/// Find NTFS partition offsets by scanning for NTFS boot sector signatures
+/// GPT partition type GUID for Microsoft Basic Data (includes NTFS)
+const GPT_BASIC_DATA_GUID: [u8; 16] = [
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+    0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+];
+
+/// Find NTFS partition offsets by scanning MBR, GPT, and common offsets.
 fn find_ntfs_partitions<R: Read + Seek>(
     reader: &mut R,
     image_size: u64,
 ) -> Result<Vec<u64>, String> {
     let mut partitions = Vec::new();
 
-    // Strategy 1: Try MBR partition table
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut mbr_buf = [0u8; 512];
-    if reader.read_exact(&mut mbr_buf).is_ok() {
-        // Check MBR signature
-        if mbr_buf[510] == 0x55 && mbr_buf[511] == 0xAA {
-            // Parse 4 primary partition entries (offset 446, 16 bytes each)
+    if reader.read_exact(&mut mbr_buf).is_ok() && mbr_buf[510] == 0x55 && mbr_buf[511] == 0xAA {
+        // Check if this is a protective MBR (GPT disk)
+        let part0_type = mbr_buf[446 + 4];
+
+        if part0_type == 0xEE {
+            // GPT disk — parse GPT header and partition entries
+            if is_debug_mode() {
+                eprintln!("[DEBUG] GPT protective MBR detected");
+            }
+
+            // GPT header at LBA 1 (offset 512)
+            reader.seek(SeekFrom::Start(512)).map_err(|e| e.to_string())?;
+            let mut gpt_header = [0u8; 92];
+            if reader.read_exact(&mut gpt_header).is_ok() {
+                // Verify "EFI PART" signature
+                if &gpt_header[0..8] == b"EFI PART" {
+                    let entry_start_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
+                    let entry_count = u32::from_le_bytes(gpt_header[80..84].try_into().unwrap());
+                    let entry_size = u32::from_le_bytes(gpt_header[84..88].try_into().unwrap());
+
+                    if is_debug_mode() {
+                        eprintln!("[DEBUG] GPT: {} entries, {} bytes each, starting at LBA {}",
+                            entry_count, entry_size, entry_start_lba);
+                    }
+
+                    let entries_offset = entry_start_lba * 512;
+                    for i in 0..entry_count.min(128) {
+                        let entry_offset = entries_offset + (i as u64 * entry_size as u64);
+                        reader.seek(SeekFrom::Start(entry_offset)).map_err(|e| e.to_string())?;
+                        let mut entry = vec![0u8; entry_size as usize];
+                        if reader.read_exact(&mut entry).is_err() {
+                            continue;
+                        }
+
+                        // Check partition type GUID (first 16 bytes)
+                        let type_guid: [u8; 16] = entry[0..16].try_into().unwrap();
+                        if type_guid == [0u8; 16] {
+                            continue; // empty entry
+                        }
+
+                        let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+                        let partition_byte_offset = first_lba * 512;
+
+                        // Check if it's a Basic Data partition (NTFS/FAT) or just verify NTFS signature
+                        if type_guid == GPT_BASIC_DATA_GUID || verify_ntfs_signature(reader, partition_byte_offset) {
+                            if verify_ntfs_signature(reader, partition_byte_offset) {
+                                if is_debug_mode() {
+                                    eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — NTFS confirmed",
+                                        i, first_lba, partition_byte_offset);
+                                }
+                                partitions.push(partition_byte_offset);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Standard MBR — parse 4 primary partition entries
             for i in 0..4 {
                 let entry_offset = 446 + i * 16;
                 let part_type = mbr_buf[entry_offset + 4];
@@ -169,10 +275,8 @@ fn find_ntfs_partitions<R: Read + Seek>(
                     mbr_buf[entry_offset + 11],
                 ]);
 
-                // NTFS partition types: 0x07 (NTFS/HPFS/exFAT)
                 if part_type == 0x07 && lba_start > 0 {
                     let offset = lba_start as u64 * 512;
-                    // Verify NTFS signature at this offset
                     if verify_ntfs_signature(reader, offset) {
                         partitions.push(offset);
                     }
@@ -181,24 +285,10 @@ fn find_ntfs_partitions<R: Read + Seek>(
         }
     }
 
-    // Strategy 2: If no MBR partitions found, check if the image starts with NTFS directly
+    // Fallback: check if the image starts with NTFS directly (partition image)
     if partitions.is_empty() {
         if verify_ntfs_signature(reader, 0) {
             partitions.push(0);
-        }
-    }
-
-    // Strategy 3: Scan at common offsets (1MB boundary, typical GPT first partition)
-    if partitions.is_empty() {
-        let common_offsets = [
-            1_048_576,     // 1 MB (common GPT first partition)
-            32_256,        // 63 sectors (old CHS alignment)
-            65_536,        // 128 sectors
-        ];
-        for &offset in &common_offsets {
-            if offset < image_size && verify_ntfs_signature(reader, offset) {
-                partitions.push(offset);
-            }
         }
     }
 
@@ -338,6 +428,88 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
             if is_debug_mode() {
                 eprintln!("[DEBUG] Extracted: {} ({} bytes)", name, output_path.metadata().map(|m| m.len()).unwrap_or(0));
             }
+        }
+    }
+
+    Ok(count)
+}
+
+/// Extract EVTX files from a VSS store reader (which implements Read+Seek).
+fn extract_evtx_from_vss_store<R: Read + Seek>(
+    store_reader: &mut R,
+    output_dir: &Path,
+    partition_index: usize,
+    store_index: usize,
+) -> Result<usize, String> {
+    let mut ntfs = ntfs::Ntfs::new(store_reader)
+        .map_err(|e| format!("Cannot parse NTFS from VSS store: {}", e))?;
+    ntfs.read_upcase_table(store_reader)
+        .map_err(|e| format!("Cannot read upcase table from VSS: {}", e))?;
+
+    let root_dir = ntfs.root_directory(store_reader)
+        .map_err(|e| format!("Cannot read root directory from VSS: {}", e))?;
+
+    // Navigate to Windows\System32\winevt\Logs
+    let mut current_dir = root_dir;
+    for component in EVTX_LOGS_PATH {
+        let index = current_dir.directory_index(store_reader)
+            .map_err(|e| format!("Cannot read directory index: {}", e))?;
+
+        let mut found = false;
+        let mut entries = index.entries();
+        while let Some(entry) = entries.next(store_reader) {
+            let entry = entry.map_err(|e| format!("Directory entry error: {}", e))?;
+            if let Some(key) = entry.key() {
+                let file_name = key.map_err(|e| format!("Filename error: {}", e))?;
+                let name = file_name.name().to_string_lossy();
+                if name.eq_ignore_ascii_case(component) {
+                    let file_ref = entry.file_reference();
+                    current_dir = file_ref.to_file(&ntfs, store_reader)
+                        .map_err(|e| format!("Cannot open directory {}: {}", component, e))?;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(format!("Directory not found in VSS: {}", component));
+        }
+    }
+
+    let logs_index = current_dir.directory_index(store_reader)
+        .map_err(|e| format!("Cannot read Logs directory from VSS: {}", e))?;
+
+    let mut count = 0;
+    let vss_dir = output_dir.join(format!("partition_{}_vss_{}", partition_index, store_index));
+    let _ = fs::create_dir_all(&vss_dir);
+
+    let mut entries = logs_index.entries();
+    while let Some(entry) = entries.next(store_reader) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if let Some(key) = entry.key() {
+            let file_name = match key { Ok(f) => f, Err(_) => continue };
+            let name = file_name.name().to_string_lossy().to_string();
+            if !name.to_lowercase().ends_with(".evtx") { continue; }
+
+            let file_ref = entry.file_reference();
+            let ntfs_file = match file_ref.to_file(&ntfs, store_reader) { Ok(f) => f, Err(_) => continue };
+            let data_item = match ntfs_file.data(store_reader, "") { Some(Ok(d)) => d, _ => continue };
+            let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };
+            let data_value = match data_attr.value(store_reader) { Ok(v) => v, Err(_) => continue };
+            let mut attached = data_value.attach(store_reader);
+
+            let output_path = vss_dir.join(&name);
+            let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+
+            let mut buf = [0u8; 65536];
+            loop {
+                match attached.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                    Err(_) => break,
+                }
+            }
+            count += 1;
         }
     }
 
