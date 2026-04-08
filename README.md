@@ -106,10 +106,6 @@ cargo build --release
 
 ## Usage
 
-<div align="center">
-  <img src="resources/masstin_cli_output.png" alt="Masstin CLI output"/>
-</div>
-
 ### Parse Windows: Generate a lateral movement timeline
 
 Parses Windows EVTX files from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
@@ -131,6 +127,10 @@ masstin -a parse-windows -d /evidence/ -o timeline.csv \
   --start-time "2024-08-12 00:00:00" \
   --end-time "2024-08-14 00:00:00"
 ```
+
+<div align="center">
+  <img src="resources/masstin_cli_output.png" alt="Masstin CLI output — parse-windows"/>
+</div>
 
 ### Parse Linux logs
 
