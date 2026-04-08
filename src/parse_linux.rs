@@ -12,12 +12,13 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Cursor},
     mem,
     os::raw::{c_char, c_int, c_short},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+use ::zip::ZipArchive;
 use chrono::{DateTime, NaiveDateTime, Utc, Datelike};
 use crate::parse::is_debug_mode; // global flag set by --debug
 
@@ -78,6 +79,11 @@ static AUDIT_RE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+// Regex for RFC3164 syslog header: "Mar 16 08:25:22 hostname"
+static RFC3164_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^([A-Z][a-z]{2})\s+([\d ]\d)\s+(\d{2}:\d{2}:\d{2})\s+(\S+)").unwrap()
+});
+
 // ────────────────────────── utils ────────────────────────────────────────────
 fn c_chars(b: &[c_char]) -> String {
     let v: Vec<u8> = b.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
@@ -85,6 +91,27 @@ fn c_chars(b: &[c_char]) -> String {
 }
 fn looks_like_ip(s: &str) -> bool {
     IPV4_RE.is_match(s) || IPV6_COLON.is_match(s)
+}
+
+/// Parse RFC3164 syslog timestamp (no year) into RFC3339.
+/// Uses the file's modification year as a heuristic, falling back to current year.
+fn parse_rfc3164_timestamp(month: &str, day: &str, time: &str, file_year: i32) -> Option<String> {
+    let date_str = format!("{} {} {} {}", file_year, month, day.trim(), time);
+    if let Ok(dt) = NaiveDateTime::parse_from_str(&date_str, "%Y %b %d %H:%M:%S") {
+        return Some(DateTime::<Utc>::from_utc(dt, Utc).to_rfc3339());
+    }
+    None
+}
+
+/// Get the year from a file's modification time, or current year as fallback.
+fn get_file_year(path: &Path) -> i32 {
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(modified) = metadata.modified() {
+            let dt: DateTime<Utc> = modified.into();
+            return dt.year();
+        }
+    }
+    Utc::now().year()
 }
 
 // ────────────────────────── raw event holder ─────────────────────────────────
@@ -125,8 +152,8 @@ fn extract_hostname_txt(file: &Path) -> Option<String> {
 
 fn discover_hostname(root: &Path) -> String {
     // 1) dmesg
-    for entry in WalkDir::new(root).max_depth(3) {
-        let path = entry.unwrap().path().to_owned();
+    for entry in WalkDir::new(root).max_depth(3).into_iter().filter_map(Result::ok) {
+        let path = entry.path().to_owned();
         if path.file_name() == Some(OsStr::new("dmesg")) {
             if let Some(h) = extract_hostname_txt(&path) {
                 if is_debug_mode() {
@@ -234,89 +261,118 @@ fn parse_secure_or_messages(path: &Path, dst_host: &str, filter_ip: bool) -> Vec
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-    let is_secure = fname.starts_with("secure");
+    let is_secure = fname.starts_with("secure") || fname.starts_with("auth.log");
+    let file_year = get_file_year(path);
 
     if is_debug_mode() {
-        println!("    reading {} …", path.display());
+        println!("    reading {} (year hint: {}) ...", path.display(), file_year);
     }
 
     for line in open_plain_or_gzip(path).lines().flatten() {
-        // ——— Legacy syslog (RFC3164) ALWAYS SKIP ———
-        if line.len() > 15 && line.chars().take(3).all(|c| c.is_ascii_alphabetic()) {
-            let rest = &line[16..];
-            if is_secure && is_debug_mode() && (
-                   SSH_OK_RE.is_match(rest)
-                || SSH_FAIL_RE.is_match(rest)
-                || PAM_FAIL_RE.is_match(rest)
-                || XINETD_RE.is_match(rest)
-            ) {
-                println!("    [DEBUG] secure skip no-year login-line: {}", line);
+        let (when, msg) =
+        // ——— RFC3164 legacy syslog: "Mar 16 08:25:22 hostname msg..." ———
+        // Used by: /var/log/secure (RHEL/CentOS), /var/log/auth.log (Debian/Ubuntu),
+        //          /var/log/messages (all distros)
+        if let Some(cap) = RFC3164_RE.captures(&line) {
+            let month = &cap[1];
+            let day = &cap[2];
+            let time = &cap[3];
+            // Message starts after "hostname " (4th capture + space + rest)
+            let header_end = cap.get(0).unwrap().end();
+            let msg = if header_end < line.len() { &line[header_end..] } else { "" };
+            if let Some(ts) = parse_rfc3164_timestamp(month, day, time, file_year) {
+                (ts, msg.to_string())
+            } else {
+                continue;
             }
-            continue;
         }
-
-        // ——— Structured syslog/journal (RFC5424) ———
-        if line.starts_with('<') {
+        // ——— RFC5424 structured syslog: "<PRI>VERSION TIMESTAMP ..." ———
+        // Used by: systemd journal export, rsyslog with structured format
+        else if line.starts_with('<') {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 7 {
                 continue;
             }
             if let Ok(dt) = DateTime::parse_from_rfc3339(parts[1]) {
-                let when = dt.with_timezone(&Utc).to_rfc3339();
-                // slice out the " - -  ..." + message
-                let msg = &line[line.find(" - - ").unwrap_or(0)..];
+                let ts = dt.with_timezone(&Utc).to_rfc3339();
+                let msg = line[line.find(" - - ").unwrap_or(0)..].to_string();
+                (ts, msg)
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
 
-                // 1) xinetd “START: ssh” → SSH_CONNECT
-                if let Some(cap) = XINETD_RE.captures(msg) {
-                    let ip = cap[1].to_string();
-                    if !filter_ip || looks_like_ip(&ip) {
-                        out.push(RawEvt {
-                            ts_rfc3339:  when.clone(),
-                            user:        "".into(),
-                            remote:      ip,
-                            tty_or_proc: "xinetd".into(),
-                            evt:         "SSH_CONNECT".into(),
-                            filename:    path.display().to_string(),
-                            dst_host:    dst_host.into(),
-                        });
-                    }
-                    continue;
-                }
+        // Apply SSH/PAM regexes to the message part
+        // 1) xinetd "START: ssh" → SSH_CONNECT
+        if let Some(cap) = XINETD_RE.captures(&msg) {
+            let ip = cap[1].to_string();
+            if !filter_ip || looks_like_ip(&ip) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user:        "".into(),
+                    remote:      ip,
+                    tty_or_proc: "xinetd".into(),
+                    evt:         "SSH_CONNECT".into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                });
+            }
+            continue;
+        }
 
-                // 2) SSH success
-                if let Some(cap) = SSH_OK_RE.captures(msg) {
-                    let user = cap[1].to_string();
-                    let ip   = cap[2].to_string();
-                    if !filter_ip || looks_like_ip(&ip) {
-                        out.push(RawEvt {
-                            ts_rfc3339:  when.clone(),
-                            user,
-                            remote:      ip,
-                            tty_or_proc: "ssh".into(),
-                            evt:         "SSH_SUCCESS".into(),
-                            filename:    path.display().to_string(),
-                            dst_host:    dst_host.into(),
-                        });
-                    }
-                    continue;
-                }
+        // 2) SSH success: "Accepted password for user from IP"
+        if let Some(cap) = SSH_OK_RE.captures(&msg) {
+            let user = cap[1].to_string();
+            let ip   = cap[2].to_string();
+            if !filter_ip || looks_like_ip(&ip) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user,
+                    remote:      ip,
+                    tty_or_proc: "ssh".into(),
+                    evt:         "SSH_SUCCESS".into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                });
+            }
+            continue;
+        }
 
-                // 3) SSH failure
-                if let Some(cap) = SSH_FAIL_RE.captures(msg) {
-                    let user = cap[1].to_string();
-                    let ip   = cap[2].to_string();
-                    if !filter_ip || looks_like_ip(&ip) {
-                        out.push(RawEvt {
-                            ts_rfc3339:  when.clone(),
-                            user,
-                            remote:      ip,
-                            tty_or_proc: "ssh".into(),
-                            evt:         "SSH_FAILED".into(),
-                            filename:    path.display().to_string(),
-                            dst_host:    dst_host.into(),
-                        });
-                    }
-                    continue;
+        // 3) SSH failure: "Failed password for user from IP"
+        if let Some(cap) = SSH_FAIL_RE.captures(&msg) {
+            let user = cap[1].to_string();
+            let ip   = cap[2].to_string();
+            if !filter_ip || looks_like_ip(&ip) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user,
+                    remote:      ip,
+                    tty_or_proc: "ssh".into(),
+                    evt:         "SSH_FAILED".into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                });
+            }
+            continue;
+        }
+
+        // 4) PAM failure: "pam_unix(sshd:...) rhost=IP user=USER"
+        if is_secure {
+            if let Some(cap) = PAM_FAIL_RE.captures(&msg) {
+                let ip   = cap[1].to_string();
+                let user = cap[2].to_string();
+                if !filter_ip || looks_like_ip(&ip) {
+                    out.push(RawEvt {
+                        ts_rfc3339:  when.clone(),
+                        user,
+                        remote:      ip,
+                        tty_or_proc: "pam".into(),
+                        evt:         "SSH_FAILED".into(),
+                        filename:    path.display().to_string(),
+                        dst_host:    dst_host.into(),
+                    });
                 }
             }
         }
@@ -405,7 +461,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
                 .has_header(true)
                 .finish(&mut df.clone())
                 .unwrap();
-            println!("[INFO] CSV written to {}", p);
+            // Output path shown in summary
         }
         None => {
             CsvWriter::new(std::io::stdout())
@@ -417,43 +473,212 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
 }
 
 // ────────────────────────── main entry point ─────────────────────────────────
+/// Check if a filename is a Linux forensic artifact we care about
+fn is_linux_artifact(fname: &str) -> bool {
+    let lower = fname.to_lowercase();
+    matches!(lower.as_str(), "utmp" | "wtmp" | "btmp" | "lastlog" | "auth.log")
+        || lower.starts_with("secure")
+        || lower.starts_with("messages")
+        || lower.starts_with("audit.log")
+        || lower.starts_with("auth.log")
+}
+
+/// Recursively extract ZIPs (including password-protected with common forensic passwords)
+/// and return paths to extracted directories
+fn extract_zips_recursive(zip_path: &Path, dest_base: &Path) -> Vec<PathBuf> {
+    let mut extracted_dirs: Vec<PathBuf> = Vec::new();
+    let passwords: &[&[u8]] = &[b"", b"cyberdefenders.org", b"infected", b"malware", b"password"];
+
+    let file = match File::open(zip_path) {
+        Ok(f) => f,
+        Err(e) => {
+            if is_debug_mode() {
+                eprintln!("[ERROR] Could not open ZIP {:?}: {}", zip_path, e);
+            }
+            return extracted_dirs;
+        }
+    };
+
+    let mut archive = match ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(e) => {
+            if is_debug_mode() {
+                eprintln!("[ERROR] Could not read ZIP {:?}: {}", zip_path, e);
+            }
+            return extracted_dirs;
+        }
+    };
+
+    let zip_name = zip_path.file_stem().and_then(|s| s.to_str()).unwrap_or("extracted");
+    let extract_dir = dest_base.join(zip_name);
+    let _ = fs::create_dir_all(&extract_dir);
+
+    // Read the entire ZIP into memory to avoid borrow issues with passwords
+    let mut zip_bytes = Vec::new();
+    {
+        let mut f = match File::open(zip_path) {
+            Ok(f) => f,
+            Err(_) => return extracted_dirs,
+        };
+        if f.read_to_end(&mut zip_bytes).is_err() {
+            return extracted_dirs;
+        }
+    }
+
+    // Try each password — test with the first actual file (not directory)
+    let mut working_pwd: Option<&[u8]> = None;
+    {
+        let cursor = Cursor::new(&zip_bytes);
+        if let Ok(test_archive) = ZipArchive::new(cursor) {
+            // Find first non-directory entry
+            let test_idx = (0..test_archive.len()).find(|&i| {
+                let cursor2 = Cursor::new(&zip_bytes);
+                if let Ok(mut a) = ZipArchive::new(cursor2) {
+                    if let Ok(e) = a.by_index_raw(i) {
+                        return !e.is_dir();
+                    }
+                }
+                false
+            }).unwrap_or(0);
+
+            for pwd in passwords {
+                let cursor = Cursor::new(&zip_bytes);
+                if let Ok(mut pa) = ZipArchive::new(cursor) {
+                    let ok = if pwd.is_empty() {
+                        if let Ok(mut e) = pa.by_index(test_idx) {
+                            let mut buf = [0u8; 4];
+                            e.read(&mut buf).is_ok()
+                        } else { false }
+                    } else {
+                        if let Ok(Ok(mut e)) = pa.by_index_decrypt(test_idx, pwd) {
+                            let mut buf = [0u8; 4];
+                            e.read(&mut buf).is_ok()
+                        } else { false }
+                    };
+                    if ok {
+                        working_pwd = Some(pwd);
+                        if !pwd.is_empty() {
+                            crate::banner::print_info(&format!(
+                                "ZIP is password-protected, unlocked with known forensic password"
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let cursor = Cursor::new(&zip_bytes);
+    let mut archive = match ZipArchive::new(cursor) {
+        Ok(a) => a,
+        Err(_) => return extracted_dirs,
+    };
+
+    for i in 0..archive.len() {
+        let mut zip_entry = match working_pwd {
+            Some(pwd) if !pwd.is_empty() => {
+                match archive.by_index_decrypt(i, pwd) {
+                    Ok(Ok(e)) => e,
+                    _ => continue,
+                }
+            },
+            _ => {
+                match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                }
+            }
+        };
+
+        let entry_name = zip_entry.name().to_string();
+        if zip_entry.is_dir() {
+            let dir_path = extract_dir.join(&entry_name);
+            let _ = fs::create_dir_all(&dir_path);
+            continue;
+        }
+
+        let out_path = extract_dir.join(&entry_name);
+        if let Some(parent) = out_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        // Extract file
+        let mut buf = Vec::new();
+        if zip_entry.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if fs::write(&out_path, &buf).is_err() {
+            continue;
+        }
+
+        // If it's a nested ZIP, recurse
+        let ext = out_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if ext == "zip" {
+            let nested = extract_zips_recursive(&out_path, &extract_dir);
+            extracted_dirs.extend(nested);
+        }
+    }
+
+    extracted_dirs.push(extract_dir);
+    extracted_dirs
+}
+
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     let start_time = std::time::Instant::now();
 
-    // Phase 1: Search for artifacts
+    // Phase 1: Search for artifacts (with ZIP support)
     crate::banner::print_search_start();
 
     let mut targets: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    let mut zip_count: usize = 0;
+
+    // Create temp dir for ZIP extraction
+    let temp_dir = std::env::temp_dir().join("masstin_linux_extract");
+    let _ = fs::create_dir_all(&temp_dir);
+
+    // Collect additional dirs from ZIP extraction
+    let mut all_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+
+    // First pass: find ZIPs and extract them
     for root in dirs {
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let p = entry.into_path();
-            if !p.is_file() {
-                continue;
+            if !p.is_file() { continue; }
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if ext == "zip" {
+                if is_debug_mode() {
+                    println!("[DEBUG] ZIP detected: {}", p.display());
+                }
+                zip_count += 1;
+                let extracted = extract_zips_recursive(&p, &temp_dir);
+                all_dirs.extend(extracted);
             }
-            let fname = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if matches!(
-                fname.as_str(),
-                "utmp" | "wtmp" | "btmp" | "lastlog"
-            ) || fname.starts_with("secure")
-                || fname.starts_with("messages")
-                || fname.starts_with("audit.log")
-            {
+        }
+    }
+
+    // Second pass: find Linux artifacts in all dirs (original + extracted)
+    for root in &all_dirs {
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            let p = entry.into_path();
+            if !p.is_file() { continue; }
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if is_linux_artifact(fname) {
                 targets.push(p);
             }
         }
     }
+
     if targets.is_empty() {
         eprintln!("[WARN] no candidate logs found");
+        // Cleanup temp dir
+        let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
     targets.sort();
     targets.dedup();
 
-    crate::banner::print_search_results(targets.len(), 0, dirs.len(), files.len());
+    crate::banner::print_search_results_labeled(targets.len(), zip_count, dirs.len(), files.len(), "Linux log artifacts");
 
     if is_debug_mode() {
         println!("[DEBUG] {} candidate files", targets.len());
@@ -503,7 +728,7 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
         let mut parsed: Vec<RawEvt> = Vec::new();
         if ["utmp", "wtmp", "btmp", "lastlog"].contains(&fname.as_str()) {
             parsed = parse_utmp_file(path, &dst_host, true);
-        } else if fname.starts_with("secure") {
+        } else if fname.starts_with("secure") || fname.starts_with("auth.log") {
             parsed = parse_secure_or_messages(path, &dst_host, true);
         } else if fname.starts_with("messages") {
             parsed = parse_secure_or_messages(path, &dst_host, true);
@@ -547,4 +772,7 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     build_dataframe(&collected, output);
 
     crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
+
+    // Cleanup temp extraction dir
+    let _ = fs::remove_dir_all(&temp_dir);
 }

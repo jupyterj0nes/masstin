@@ -146,7 +146,11 @@ pub fn print_search_start() {
     );
 }
 
-pub fn print_search_results(evtx_count: usize, zip_count: usize, dir_count: usize, file_count: usize) {
+pub fn print_search_results(artifact_count: usize, zip_count: usize, dir_count: usize, file_count: usize) {
+    print_search_results_labeled(artifact_count, zip_count, dir_count, file_count, "artifacts");
+}
+
+pub fn print_search_results_labeled(artifact_count: usize, zip_count: usize, dir_count: usize, file_count: usize, label: &str) {
     if is_silent() { return; }
     if dir_count > 0 {
         eprintln!("        {} directories scanned", style(dir_count).yellow());
@@ -157,9 +161,10 @@ pub fn print_search_results(evtx_count: usize, zip_count: usize, dir_count: usiz
     if zip_count > 0 {
         eprintln!("        {} compressed packages found", style(zip_count).yellow());
     }
-    eprintln!("        {} {} EVTX artifacts found",
+    eprintln!("        {} {} {} found",
         style("=>").green().bold(),
-        style(evtx_count).green().bold(),
+        style(artifact_count).green().bold(),
+        label,
     );
 }
 

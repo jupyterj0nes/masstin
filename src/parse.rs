@@ -1124,7 +1124,7 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     let zip_count = vec_filenames.iter().filter(|f| matches!(f, EvtxLocation::ZipEntry { .. })).count();
     let total_evtx = vec_filenames.len();
 
-    crate::banner::print_search_results(total_evtx, zip_count, dir_count, file_count);
+    crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
 
     if is_debug_mode() {
         println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());

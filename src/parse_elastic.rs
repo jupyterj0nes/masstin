@@ -310,7 +310,7 @@ pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, outp
         }
     }
 
-    crate::banner::print_search_results(all_files.len(), 0, directories.len(), files.len());
+    crate::banner::print_search_results_labeled(all_files.len(), 0, directories.len(), files.len(), "Winlogbeat artifacts");
 
     // Phase 2: Process artifacts
     crate::banner::print_processing_start();
