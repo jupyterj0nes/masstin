@@ -151,13 +151,31 @@ fn extract_hostname_txt(file: &Path) -> Option<String> {
 }
 
 fn discover_hostname(root: &Path) -> String {
-    // 1) dmesg
+    // 1) /etc/hostname — most reliable on modern Linux
+    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(Result::ok) {
+        let path = entry.path().to_owned();
+        if path.file_name() == Some(OsStr::new("hostname"))
+            && path.parent().map(|p| p.ends_with("etc")).unwrap_or(false)
+        {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let h = content.trim().to_string();
+                if !h.is_empty() {
+                    if is_debug_mode() {
+                        println!("        hostname from /etc/hostname @ {}  ->  {}", path.display(), h);
+                    }
+                    return h;
+                }
+            }
+        }
+    }
+
+    // 2) dmesg
     for entry in WalkDir::new(root).max_depth(3).into_iter().filter_map(Result::ok) {
         let path = entry.path().to_owned();
         if path.file_name() == Some(OsStr::new("dmesg")) {
             if let Some(h) = extract_hostname_txt(&path) {
                 if is_debug_mode() {
-                    println!("        hostname from dmesg @ {}  →  {}", path.display(), h);
+                    println!("        hostname from dmesg @ {}  ->  {}", path.display(), h);
                 }
                 return h;
             }
@@ -167,13 +185,37 @@ fn discover_hostname(root: &Path) -> String {
         {
             if let Some(h) = extract_hostname_txt(&path) {
                 if is_debug_mode() {
-                    println!("        hostname from /etc/hosts @ {}  →  {}", path.display(), h);
+                    println!("        hostname from /etc/hosts @ {}  ->  {}", path.display(), h);
                 }
                 return h;
             }
         }
     }
-    // 2) fallback to folder name
+
+    // 3) Extract hostname from the first RFC3164 syslog line in any log file
+    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(Result::ok) {
+        let path = entry.path().to_owned();
+        if !path.is_file() { continue; }
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if is_linux_artifact(&fname) {
+            if let Ok(file) = File::open(&path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten().take(20) {
+                    if let Some(cap) = RFC3164_RE.captures(&line) {
+                        let hostname = cap[4].to_string();
+                        if !hostname.is_empty() && hostname != "-" {
+                            if is_debug_mode() {
+                                println!("        hostname from log header @ {}  ->  {}", path.display(), hostname);
+                            }
+                            return hostname;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4) fallback to folder name
     root.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
@@ -706,10 +748,28 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
             cur = cur.parent().unwrap();
         }
         let root = cur.parent().unwrap_or(cur).to_path_buf();
-        let dst_host = root2host
+        let mut dst_host = root2host
             .entry(root.clone())
             .or_insert_with(|| discover_hostname(&root))
             .clone();
+
+        // Fallback: if hostname is still unknown/generic, extract from the log's RFC3164 header
+        if dst_host == "unknown" || dst_host == "C:" || dst_host.len() <= 2 {
+            if let Ok(file) = File::open(path) {
+                let reader = BufReader::new(file);
+                for line in reader.lines().flatten().take(20) {
+                    if let Some(cap) = RFC3164_RE.captures(&line) {
+                        let h = cap[4].to_string();
+                        if !h.is_empty() && h != "-" {
+                            dst_host = h;
+                            // Update cache so we don't re-detect for same root
+                            root2host.insert(root.clone(), dst_host.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         if is_debug_mode() {
             println!(
