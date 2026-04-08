@@ -15,6 +15,19 @@ struct GroupedData {
 }
 
 // ───────── helper (inline or place it above) ─────────────────────────
+/// Strip timezone suffix for Memgraph localDateTime().
+/// Handles: "Z", "+00:00", "-05:00", etc.
+fn strip_timezone(ts: &str) -> String {
+    let ts = ts.trim_end_matches('Z');
+    if ts.len() > 6 {
+        let tail = &ts[ts.len()-6..];
+        if (tail.starts_with('+') || tail.starts_with('-')) && tail.contains(':') {
+            return ts[..ts.len()-6].to_string();
+        }
+    }
+    ts.to_string()
+}
+
 fn looks_like_ip(s: &str) -> bool {
     // IPv4 → only digits + dots; IPv6 → hex digits + colons
     let ipv4 = s.chars().all(|c| c.is_ascii_digit() || c == '.');
@@ -194,7 +207,7 @@ pub async fn load_memgraph(files: &Vec<String>, database: &String, user: &String
                 row[1].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 if relation_type.chars().next().unwrap_or(' ').is_digit(10) { format!("u{}", relation_type) } else { relation_type.to_string() }
                     .replace(".", "_").replace("-", "_").replace(" ", "_").split("@").next().unwrap(),
-                row[0].replace(" utc", "").replace(" ", "T").trim_end_matches('Z'),
+                strip_timezone(&row[0].replace(" utc", "").replace(" ", "T")),
                 row[7].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 row[8].replace(".", "_").replace("-", "_").replace(" ", "_"),
                 row[9].replace(".", "_").replace("-", "_").replace(" ", "_"),
