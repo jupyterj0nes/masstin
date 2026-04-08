@@ -123,9 +123,9 @@ fn get_file_year(path: &Path) -> i32 {
                 for line in reader.lines().flatten().take(5) {
                     if let Some(cap) = YEAR_RE.captures(&line) {
                         if let Ok(year) = cap[1].parse::<i32>() {
-                            if is_debug_mode() {
-                                println!("        year inferred from dpkg.log: {}", year);
-                            }
+                            crate::banner::print_info(&format!(
+                                "Year inferred: {} (from dpkg.log)", year
+                            ));
                             return year;
                         }
                     }
@@ -144,9 +144,9 @@ fn get_file_year(path: &Path) -> i32 {
                 if let Some(first) = entries.first() {
                     if let Ok(dt) = DateTime::parse_from_rfc3339(&first.ts_rfc3339) {
                         let year = dt.year();
-                        if is_debug_mode() {
-                            println!("        year inferred from wtmp: {}", year);
-                        }
+                        crate::banner::print_info(&format!(
+                            "Year inferred: {} (from wtmp)", year
+                        ));
                         return year;
                     }
                 }
@@ -158,12 +158,20 @@ fn get_file_year(path: &Path) -> i32 {
     if let Ok(metadata) = fs::metadata(path) {
         if let Ok(modified) = metadata.modified() {
             let dt: DateTime<Utc> = modified.into();
-            return dt.year();
+            let year = dt.year();
+            crate::banner::print_info(&format!(
+                "Year inferred: {} (from file modification date)", year
+            ));
+            return year;
         }
     }
 
     // 4) Current year
-    Utc::now().year()
+    let year = Utc::now().year();
+    crate::banner::print_info(&format!(
+        "Year inferred: {} (current year - no date source found)", year
+    ));
+    year
 }
 
 // ────────────────────────── raw event holder ─────────────────────────────────
@@ -212,9 +220,9 @@ fn discover_hostname(root: &Path) -> String {
             if let Ok(content) = fs::read_to_string(&path) {
                 let h = content.trim().to_string();
                 if !h.is_empty() {
-                    if is_debug_mode() {
-                        println!("        hostname from /etc/hostname @ {}  ->  {}", path.display(), h);
-                    }
+                    crate::banner::print_info(&format!(
+                        "Hostname identified: {} (from /etc/hostname)", h
+                    ));
                     return h;
                 }
             }
@@ -226,9 +234,9 @@ fn discover_hostname(root: &Path) -> String {
         let path = entry.path().to_owned();
         if path.file_name() == Some(OsStr::new("dmesg")) {
             if let Some(h) = extract_hostname_txt(&path) {
-                if is_debug_mode() {
-                    println!("        hostname from dmesg @ {}  ->  {}", path.display(), h);
-                }
+                crate::banner::print_info(&format!(
+                    "Hostname identified: {} (from dmesg)", h
+                ));
                 return h;
             }
         }
@@ -236,9 +244,9 @@ fn discover_hostname(root: &Path) -> String {
         if path.file_name() == Some(OsStr::new("hosts")) && path.parent().map(|p| p.ends_with("etc")).unwrap_or(false)
         {
             if let Some(h) = extract_hostname_txt(&path) {
-                if is_debug_mode() {
-                    println!("        hostname from /etc/hosts @ {}  ->  {}", path.display(), h);
-                }
+                crate::banner::print_info(&format!(
+                    "Hostname identified: {} (from /etc/hosts)", h
+                ));
                 return h;
             }
         }
@@ -256,9 +264,9 @@ fn discover_hostname(root: &Path) -> String {
                     if let Some(cap) = RFC3164_RE.captures(&line) {
                         let hostname = cap[4].to_string();
                         if !hostname.is_empty() && hostname != "-" {
-                            if is_debug_mode() {
-                                println!("        hostname from log header @ {}  ->  {}", path.display(), hostname);
-                            }
+                            crate::banner::print_info(&format!(
+                                "Hostname identified: {} (from syslog header)", hostname
+                            ));
                             return hostname;
                         }
                     }
@@ -349,14 +357,14 @@ fn parse_timestamp_syslog(fragment: &str, default_year: i32) -> Option<String> {
     }
     None
 }
-fn parse_secure_or_messages(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
+fn parse_secure_or_messages(path: &Path, dst_host: &str, filter_ip: bool, year_hint: Option<i32>) -> Vec<RawEvt> {
     let mut out = Vec::new();
     let fname = path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_lowercase();
     let is_secure = fname.starts_with("secure") || fname.starts_with("auth.log");
-    let file_year = get_file_year(path);
+    let file_year = year_hint.unwrap_or_else(|| get_file_year(path));
 
     if is_debug_mode() {
         println!("    reading {} (year hint: {}) ...", path.display(), file_year);
@@ -789,6 +797,7 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
     let mut artifact_details: Vec<(String, usize)> = Vec::new();
+    let mut year_cache: HashMap<PathBuf, i32> = HashMap::new();
 
     for path in &targets {
         let path_str = path.to_string_lossy().to_string();
@@ -813,8 +822,10 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
                     if let Some(cap) = RFC3164_RE.captures(&line) {
                         let h = cap[4].to_string();
                         if !h.is_empty() && h != "-" {
+                            crate::banner::print_info(&format!(
+                                "Hostname identified: {} (from syslog header)", h
+                            ));
                             dst_host = h;
-                            // Update cache so we don't re-detect for same root
                             root2host.insert(root.clone(), dst_host.clone());
                             break;
                         }
@@ -837,13 +848,23 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
             .unwrap_or("")
             .to_lowercase();
 
+        // Get cached year for this directory (only infer + print once)
+        let dir_key = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let cached_year = if year_cache.contains_key(&dir_key) {
+            Some(*year_cache.get(&dir_key).unwrap())
+        } else {
+            let y = get_file_year(path);
+            year_cache.insert(dir_key, y);
+            Some(y)
+        };
+
         let mut parsed: Vec<RawEvt> = Vec::new();
         if ["utmp", "wtmp", "btmp", "lastlog"].contains(&fname.as_str()) {
             parsed = parse_utmp_file(path, &dst_host, true);
         } else if fname.starts_with("secure") || fname.starts_with("auth.log") {
-            parsed = parse_secure_or_messages(path, &dst_host, true);
+            parsed = parse_secure_or_messages(path, &dst_host, true, cached_year);
         } else if fname.starts_with("messages") {
-            parsed = parse_secure_or_messages(path, &dst_host, true);
+            parsed = parse_secure_or_messages(path, &dst_host, true, cached_year);
         } else if fname.starts_with("audit.log") {
             parsed = parse_audit(path, &dst_host, true);
         }
