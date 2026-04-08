@@ -210,9 +210,9 @@ All actions produce a unified CSV with 14 columns:
 |--------|-------------|
 | `time_created` | Event timestamp |
 | `dst_computer` | Destination hostname |
-| `event_type` | Event classification: `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
-| `event_id` | Windows Event ID or equivalent (e.g., `4624`, `SSH_SUCCESS`) |
-| `logon_type` | Logon type: `3` (Network/SMB), `10` (RDP), `SSH` |
+| `event_type` | Event classification (see below) |
+| `event_id` | Original Event ID from the source (e.g., `4624`, `SSH_SUCCESS`) |
+| `logon_type` | Windows logon type as reported by the event (e.g., `2`, `3`, `10`) |
 | `target_user_name` | Target user account |
 | `target_domain_name` | Target domain |
 | `src_computer` | Source hostname |
@@ -223,7 +223,16 @@ All actions produce a unified CSV with 14 columns:
 | `detail` | Additional context: SubStatus for failed logons, process name, SSH auth method |
 | `log_filename` | Original log file |
 
-For the full event_type mapping across all Event IDs, see the [masstin documentation](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/).
+### Event Type Categories
+
+| event_type | Meaning |
+|---|---|
+| `SUCCESSFUL_LOGON` | Authentication succeeded — user authenticated correctly and session was established |
+| `FAILED_LOGON` | Authentication failed — incorrect credentials, locked account, or pre-auth failure |
+| `LOGOFF` | Session ended — user logged off or session was disconnected |
+| `CONNECT` | Connection event — network-level connection with no authentication result |
+
+For the complete Event ID to event_type mapping across all 28+ Event IDs, see the [full documentation](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/).
 
 ## Graph Visualization (Neo4j / Memgraph)
 
