@@ -25,15 +25,14 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 ## Table of Contents
 
 - [Key Features](#key-features)
-- [Supported Artifacts](#supported-artifacts)
-- [Quick Start](#quick-start)
+- [Install](#install)
 - [Usage](#usage)
 - [Output Format](#output-format)
-- [Neo4j Visualization](#neo4j-visualization)
+- [Graph Visualization](#graph-visualization-neo4j--memgraph)
 - [All Options](#all-options)
-- [Roadmap](#roadmap)
+- [Supported Artifacts](#supported-artifacts)
 - [Documentation](#documentation)
-- [Contributing](#contributing)
+- [Roadmap](#roadmap)
 - [License](#license)
 - [Contact](#contact)
 
@@ -41,12 +40,12 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 | Feature | Description | Details |
 |---------|-------------|---------|
-| **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
 | **Bulk image processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, extracts EVTX + UAL from live + VSS of each, and generates a single unified timeline. One command, entire incident. | |
-| **Forensic image analysis** | Open E01, dd/raw, and VMDK (sparse, flat, split) images directly — pure Rust, no external tools, no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Forensic image analysis** | Open E01, dd/raw, and VMDK (sparse, flat, split, VMFS/ESXi) images directly — pure Rust, no external tools, no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
+| **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data merged with `merge` — one timeline across OS boundaries | |
@@ -56,51 +55,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Session correlation** | `logon_id` field for matching logon/logoff to determine session duration | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Linux smart inference** | Auto-detects hostname, infers year from `dpkg.log`, supports Debian and RHEL, RFC3164 and RFC5424 | [Linux artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | **Silent mode** | `--silent` flag for Velociraptor, SOAR and automation integration | |
-| **Cross-platform** | Windows, Linux & macOS — zero dependencies, single binary | |
-
-## Supported Artifacts
-
-Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux artifacts, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
-
-### Windows EVTX
-
-| Source | Event IDs | What it tracks | Article |
-|--------|-----------|---------------|---------|
-| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140, 5145 | Logons, logoffs, Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
-| **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **RdpCoreTS** | 131 | RDP transport negotiation | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-
-### Linux
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| `/var/log/auth.log` (Debian/Ubuntu) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/secure` (RHEL/CentOS) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/messages` | SSH events via syslog | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/audit/audit.log` | Authentication via audit subsystem | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `utmp` / `wtmp` | Active and historical login sessions | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `btmp` | Failed login attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `lastlog` | Last login per user | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-
-> **Note:** Both RFC3164 (legacy syslog: `Mar 16 08:25:22 hostname ...`) and RFC5424 (structured syslog) timestamp formats are supported. Masstin can also process compressed triage packages (ZIP) recursively, including password-protected archives using common forensic passwords.
-
-### Winlogbeat
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| Winlogbeat JSON | All 28 Windows Event IDs in JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
-
-### Cortex XDR
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
-| Cortex XDR EVTX Forensics | Forensic event logs collected by forensic agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+| **Cross-platform** | Windows, Linux & macOS — single binary | |
 
 ## Install
 
@@ -129,7 +84,7 @@ cargo build --release
 
 ### Parse Windows: Generate a lateral movement timeline
 
-Parses Windows EVTX files from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
+Parses Windows EVTX files and UAL databases from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
 
 > **Note:** The legacy command `parse` is still supported as an alias for backwards compatibility.
 
@@ -142,36 +97,23 @@ masstin -a parse-windows -d /machine1/logs -d /machine2/logs -o timeline.csv --o
 
 # Individual EVTX files
 masstin -a parse-windows -f Security.evtx -f System.evtx -o timeline.csv
-
-# Time filtering
-masstin -a parse-windows -d /evidence/ -o timeline.csv \
-  --start-time "2024-08-12 00:00:00" \
-  --end-time "2024-08-14 00:00:00"
 ```
 
 <div align="center">
   <img src="resources/masstin_cli_output.png" alt="Masstin CLI output — parse-windows"/>
 </div>
 
-The output shows three phases: **[1/3]** scans directories and compressed packages to discover EVTX artifacts, **[2/3]** processes each artifact and shows progress, then lists every source that produced events with its count, and **[3/3]** generates the sorted CSV timeline. The final summary shows how many artifacts were parsed, how many were skipped (no relevant events or access denied), total events collected, and execution time. Use `--silent` to suppress all output for automation.
-
 ### Parse Linux logs
 
-Parses Linux system logs and accounting entries to extract SSH sessions and authentication events. Supports both Debian/Ubuntu (`auth.log`) and RHEL/CentOS (`secure`) log formats, with both RFC3164 (legacy syslog) and RFC5424 (structured) timestamp formats. Like `parse-windows`, it recursively decompresses ZIP archives, including password-protected packages commonly used in CTFs and forensic triage distributions.
+Parses Linux system logs and accounting entries to extract SSH sessions and authentication events. Supports both Debian/Ubuntu (`auth.log`) and RHEL/CentOS (`secure`) log formats, with both RFC3164 (legacy syslog) and RFC5424 (structured) timestamp formats.
 
 ```bash
-# Directory with extracted logs
 masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
-
-# Compressed forensic package (auto-extracts, supports passwords)
-masstin -a parse-linux -d /evidence/triage_package/ -o linux-timeline.csv
 ```
 
 <div align="center">
   <img src="resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
 </div>
-
-Masstin transparently reports all inferences: hostname identification (from `/etc/hostname`, `dmesg`, or the syslog header), year inference (from `dpkg.log`, `wtmp`, or file modification date), and password-protected ZIP extraction.
 
 ### Parse forensic images (E01/dd/VMDK) with VSS recovery
 
@@ -181,7 +123,7 @@ Opens forensic disk images directly — no mounting needed. Supports **E01**, **
 # Single image
 masstin -a parse-image-windows -f HRServer.e01 -o timeline.csv
 
-# VMDK directly (split sparse, flat, monolithic)
+# VMDK directly (split sparse, flat, monolithic, VMFS)
 masstin -a parse-image-windows -f "Windows Server 2019.vmdk" -o timeline.csv
 
 # Multiple images
@@ -222,8 +164,6 @@ masstin -a parse-image-windows -d D: -d E: -o timeline.csv
 # Scan all NTFS volumes on the system
 masstin -a parse-image-windows --all-volumes -o timeline.csv
 ```
-
-Masstin transparently reports every step: volume detection, NTFS confirmation, EVTX count from live, VSS stores found, and EVTX recovered from each snapshot. Duplicates across live and VSS are automatically deduplicated by Polars.
 
 > **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
 
@@ -272,15 +212,11 @@ masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetw
 
 ### Merge: Combine multiple timelines
 
-Merges multiple CSV files into a single time-sorted timeline. Useful when artifacts were parsed from different sources or at different times.
-
 ```bash
 masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
 ```
 
 ### Load into graph database
-
-Uploads a previously generated CSV into a graph database for visual investigation. Automatically resolves IPs to hostnames using frequency analysis, and groups repetitive connections to reduce noise. See the [Graph Visualization](#graph-visualization-neo4j--memgraph) section below for installation instructions.
 
 ```bash
 # Neo4j
@@ -290,8 +226,6 @@ masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
 masstin -a load-memgraph -f timeline.csv --database localhost:7687
 ```
 
-> **Note:** The legacy command `load` is still supported as an alias for `load-neo4j`.
-
 ## Output Format
 
 All actions produce a unified CSV with 14 columns:
@@ -300,29 +234,20 @@ All actions produce a unified CSV with 14 columns:
 |--------|-------------|
 | `time_created` | Event timestamp |
 | `dst_computer` | Destination hostname |
-| `event_type` | Event classification (see below) |
-| `event_id` | Original Event ID from the source (e.g., `4624`, `SSH_SUCCESS`) |
-| `logon_type` | Windows logon type as reported by the event (e.g., `2`, `3`, `10`) |
+| `event_type` | Event classification: `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
+| `event_id` | Original Event ID (e.g., `4624`, `SSH_SUCCESS`, `SMB`, `RDP`) |
+| `logon_type` | Windows logon type (e.g., `2`, `3`, `10`) |
 | `target_user_name` | Target user account |
 | `target_domain_name` | Target domain |
 | `src_computer` | Source hostname |
 | `src_ip` | Source IP address |
 | `subject_user_name` | Subject user account |
 | `subject_domain_name` | Subject domain |
-| `logon_id` | Logon ID for session correlation (e.g., `0x1A2B3C`) |
-| `detail` | Additional context: SubStatus for failed logons, process name, SSH auth method |
-| `log_filename` | Original log file |
+| `logon_id` | Logon ID for session correlation |
+| `detail` | Additional context: SubStatus, process name, SSH auth method, UAL role |
+| `log_filename` | Source file (e.g., `HRServer.e01:vss_0:Security.evtx`) |
 
-### Event Type Categories
-
-| event_type | Meaning |
-|---|---|
-| `SUCCESSFUL_LOGON` | Authentication succeeded — user authenticated correctly and session was established |
-| `FAILED_LOGON` | Authentication failed — incorrect credentials, locked account, or pre-auth failure |
-| `LOGOFF` | Session ended — user logged off or session was disconnected |
-| `CONNECT` | Connection event — network-level connection with no authentication result |
-
-For the complete Event ID to event_type mapping across all 28+ Event IDs, see the [full documentation](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/).
+For the complete Event ID mapping, see [CSV Format and Event Classification](https://weinvestigateanything.com/en/tools/masstin-csv-format/).
 
 ## Graph Visualization (Neo4j / Memgraph)
 
@@ -352,7 +277,8 @@ Masstin supports two graph databases. Both use the Cypher query language and the
 >
 > <div align="center"><img src="memgraph-resources/memgraph_save_style.png" alt="Save masstin style as default in Memgraph Lab" width="600"/></div>
 
-#### Windows prerequisites for Memgraph (WSL 2 + Docker)
+<details>
+<summary><strong>Windows prerequisites for Memgraph (WSL 2 + Docker)</strong></summary>
 
 On Windows, Memgraph runs inside a Docker container, and Docker Desktop requires WSL 2. The dependency chain is: **WSL 2 → Docker Desktop → Memgraph container**.
 
@@ -381,64 +307,13 @@ iwr https://windows.memgraph.com | iex
 
 This downloads a `docker-compose.yml` and starts the database (`memgraph/memgraph-mage`) and the web interface (`memgraph/lab`). Open `http://localhost:3000` — Memgraph Lab is ready.
 
-<details>
-<summary><strong>Troubleshooting WSL / Docker on Windows</strong></summary>
-
-**Docker Desktop distro installation timeout** (`DockerDesktop/Wsl/CommandTimedOut`):
-
-Run `wsl --status`. If you see `ERROR_SERVICE_DOES_NOT_EXIST`, the WSL service is not registered. Fix:
-
-```powershell
-sc.exe create WslService binPath= 'C:\Program Files\WSL\wslservice.exe' start= auto
-sc.exe start WslService
-wsl --install
-```
-
-**wsl --update fails: "The older version cannot be removed"** (error 1603):
-
-A previous WSL installation left a corrupted MSI entry. Fix:
-
-```powershell
-winget uninstall "Windows Subsystem for Linux"
-wsl --install
-```
-
-If `winget` is not available, find the product GUID in `%TEMP%\wsl-install-logs.txt` (look for the `MIGRATE` property) and run `msiexec /x "{GUID}" /qn`, then `wsl --install`.
-
-For the full troubleshooting guide, see [Memgraph: In-Memory Visualization](https://weinvestigateanything.com/en/tools/memgraph-visualization/).
-
 </details>
 
 ### Querying the graph
 
-After loading data, use Cypher queries to explore lateral movement.
+After loading data, use Cypher queries to explore lateral movement. For the full query catalog, see the [Cypher Resources](neo4j-resources/cypher_queries.md).
 
-**Neo4j** — filter by time range with `datetime()`:
-
-```cypher
-MATCH (h1:host)-[r]->(h2:host)
-WHERE datetime(r.time) >= datetime("2024-08-12T00:00:00Z")
-  AND datetime(r.time) <= datetime("2024-08-13T00:00:00Z")
-RETURN h1, r, h2
-ORDER BY datetime(r.time)
-```
-
-<div align="center">
-  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph in Neo4j"/>
-</div>
-
-**Memgraph** — view all lateral movement:
-
-```cypher
-MATCH (h1:host)-[r]->(h2:host)
-RETURN h1, r, h2
-```
-
-<div align="center">
-  <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
-</div>
-
-**Memgraph** — temporal path reconstruction (from `10_99_88_77` to `SRV_BACKUP`):
+**Temporal path reconstruction** (from `10_99_88_77` to `SRV_BACKUP`):
 
 ```cypher
 MATCH path = (start:host {name:'10_99_88_77'})-[*]->(end:host {name:'SRV_BACKUP'})
@@ -453,47 +328,99 @@ LIMIT 5
   <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction in Memgraph"/>
 </div>
 
-For the full query catalog (10 queries including temporal path reconstruction), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
-
 ## All Options
 
 | Option | Description |
 |--------|-------------|
 | `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image-windows` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
-| `-d, --directory` | Directories to process (repeatable) |
-| `-f, --file` | Individual files to process (repeatable) |
+| `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
+| `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
 | `-o, --output` | Output file path |
-| `--database` | Neo4j URL (e.g., `localhost:7687`) |
-| `-u, --user` | Neo4j user |
-| `--cortex-url` | Cortex API base URL |
+| `--database` | Graph database URL (e.g., `localhost:7687`) |
+| `-u, --user` | Database user (Neo4j) |
+| `--cortex-url` | Cortex XDR API base URL |
 | `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` |
 | `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` |
 | `--filter-cortex-ip` | Filter by IP in Cortex queries |
+| `--all-volumes` | Scan all NTFS volumes on the system (parse-image-windows, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
 | `--stdout` | Print output to stdout only |
 | `--debug` | Print debug information |
+| `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
+
+## Supported Artifacts
+
+Masstin parses **30+ Windows Event IDs** across **9 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
+
+### Windows EVTX
+
+| Source | Event IDs | What it tracks | Article |
+|--------|-----------|---------------|---------|
+| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140, 5145 | Logons, logoffs, Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **RdpCoreTS** | 131 | RDP transport negotiation | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+
+### UAL (User Access Logging)
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
+| `SystemIdentity.mdb` | Server hostname, role mappings | [Read more →](https://weinvestigateanything.com/en/tools/masstin-ual/) |
+| `Current.mdb` + `{GUID}.mdb` | Username, source IP, role, access count, first/last seen (up to 3 years) | [Read more →](https://weinvestigateanything.com/en/tools/masstin-ual/) |
+
+### Linux
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
+| `/var/log/auth.log` (Debian/Ubuntu) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/secure` (RHEL/CentOS) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/messages` | SSH events via syslog | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `/var/log/audit/audit.log` | Authentication via audit subsystem | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| `utmp` / `wtmp` / `btmp` / `lastlog` | Login sessions, failed attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+
+### Winlogbeat & Cortex XDR
+
+| Source | What it tracks | Article |
+|--------|---------------|---------|
+| Winlogbeat JSON | All Windows Event IDs in JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Cortex XDR Network | RDP, SMB, SSH connections via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+| Cortex XDR EVTX Forensics | Forensic event logs from agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+
+## Documentation
+
+Full documentation at **[We Investigate Anything](https://weinvestigateanything.com)** — bilingual DFIR knowledge base (English/Spanish).
+
+### Tools
+
+| Topic | Article |
+|-------|---------|
+| Masstin main page | [weinvestigateanything.com — masstin](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/) |
+| CSV format and event classification | [CSV Format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
+| Forensic images and VSS recovery | [VSS Recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| User Access Logging (UAL) | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
+| vshadow-rs — pure Rust VSS parser | [vshadow-rs](https://weinvestigateanything.com/en/tools/vshadow-rs/) |
+| Neo4j and Cypher guide | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
+| Memgraph guide | [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) |
+
+### Artifacts
+
+| Artifact | Article |
+|----------|---------|
+| Security.evtx (14 Event IDs) | [Security.evtx](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| Terminal Services EVTX (RDP) | [Terminal Services](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| SMB EVTX (Server + Client) | [SMB Events](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| Linux forensic artifacts | [Linux](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| Winlogbeat JSON | [Winlogbeat](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Cortex XDR | [Cortex](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 
 ## Roadmap
 
-- [ ] **Event reconstruction** — Reconstruct lateral movement events even when EVTX logs have been cleared or tampered with on the system
-
-## Documentation - We Investigate Anything
-
-Masstin's full documentation lives at **[We Investigate Anything](https://weinvestigateanything.com)** (WIA), a bilingual DFIR knowledge base (English/Spanish). There you'll find:
-
-- [Masstin main page](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/) — complete tool guide
-- [Security.evtx events](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) — 12 Event IDs explained
-- [Terminal Services events](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) — RDP session lifecycle
-- [SMB events](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) — Server and client artifacts
-- [Linux forensic artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) — SSH, utmp, wtmp, btmp
-- [Winlogbeat artifacts](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) — JSON log parsing
-- [Cortex XDR artifacts](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) — Network and forensic agent modes
-- [Neo4j and Cypher guide](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) — Cypher queries and time filtering
-- [Memgraph guide](https://weinvestigateanything.com/en/tools/memgraph-visualization/) — In-memory graph visualization
-
-## Contributing
-
-Contributions are welcome! Fork the repository and submit pull requests.
+- [ ] VHD/VHDX image support
+- [ ] Event reconstruction from cleared logs
 
 ## License
 
