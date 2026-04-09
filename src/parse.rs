@@ -773,7 +773,7 @@ fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cur
         e
     })?;
     let mut archive = ZipArchive::new(zip_file).map_err(|e| {
-        println!("[ERROR] Could not read ZIP {}: {}", zip_path, e);
+        if is_debug_mode() { eprintln!("[DEBUG] Could not read ZIP {}: {}", zip_path, e); }
         e
     })?;
 
@@ -1040,10 +1040,10 @@ fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec
 
     // Abrimos el ZIP raíz
     let file = File::open(zip_path).map_err(|e| {
-        println!("[ERROR] Could not open ZIP {:?}: {}", zip_path, e);
+        if is_debug_mode() { eprintln!("[DEBUG] Could not open ZIP {:?}: {}", zip_path, e); }
     }).ok()?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
-        println!("[ERROR] Could not read ZIP {:?}: {}", zip_path, e);
+        if is_debug_mode() { eprintln!("[DEBUG] Could not read ZIP {:?}: {}", zip_path, e); }
     }).ok()?;
 
     // Ruta acumulada:  zip1 -> zip2 -> ... -> actual.zip
@@ -1083,7 +1083,7 @@ fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec
             let mut nested_archive = match ZipArchive::new(Cursor::new(nested_data)) {
                 Ok(a)  => a,
                 Err(e) => {
-                    println!("[ERROR] Opening nested ZIP {}: {}", name, e);
+                    if is_debug_mode() { eprintln!("[DEBUG] Opening nested ZIP {}: {}", name, e); }
                     continue;
                 }
             };

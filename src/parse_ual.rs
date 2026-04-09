@@ -108,8 +108,9 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> Vec<Log
             }
         };
 
+        let mdb_full_path = mdb_path.to_string_lossy().to_string();
         for row in &rows {
-            let new_events = ual_row_to_logdata_entries(row, &role_map, &server_hostname, source_label, mdb_name);
+            let new_events = ual_row_to_logdata_entries(row, &role_map, &server_hostname, &mdb_full_path);
             events.extend(new_events);
         }
     }
@@ -195,8 +196,7 @@ fn ual_row_to_logdata_entries(
     row: &HashMap<String, EseValue>,
     role_map: &HashMap<String, String>,
     server_hostname: &str,
-    source_label: &str,
-    mdb_name: &str,
+    mdb_path: &str,
 ) -> Vec<LogData> {
     let mut entries = Vec::new();
 
@@ -239,7 +239,7 @@ fn ual_row_to_logdata_entries(
     };
 
     let detail = format!("UAL: {} ({}x)", role_name, total_accesses);
-    let filename = format!("{}:UAL:{}", source_label, mdb_name);
+    let filename = mdb_path.to_string();
 
     // Entry 1: InsertDate (first access)
     if !insert_date.is_empty() {
