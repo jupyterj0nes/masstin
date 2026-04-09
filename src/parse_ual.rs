@@ -149,7 +149,7 @@ fn load_server_hostname(mdb_files: &[PathBuf]) -> String {
 fn role_to_event_id(role_name: &str) -> &'static str {
     let lower = role_name.to_lowercase();
     if lower.contains("file server") { return "SMB"; }
-    if lower.contains("remote access") { return "RDP"; }
+    if lower.contains("remote desktop") || lower.contains("remote access") { return "RDP"; }
     if lower.contains("web server") || lower.contains("ftp") { return "HTTP"; }
     if lower.contains("active directory") { return "LDAP"; }
     if lower.contains("dhcp") { return "DHCP"; }
@@ -157,6 +157,20 @@ fn role_to_event_id(role_name: &str) -> &'static str {
     if lower.contains("print") { return "PRINT"; }
     if lower.contains("certificate") { return "CERT"; }
     "UAL"
+}
+
+/// Map UAL role to Windows logon type for correlation with EVTX events
+fn role_to_logon_type(role_name: &str) -> &'static str {
+    let lower = role_name.to_lowercase();
+    if lower.contains("remote desktop") || lower.contains("remote access") { return "10"; }
+    // All other network-based roles = type 3 (Network logon)
+    if lower.contains("file server") || lower.contains("web server") || lower.contains("ftp")
+        || lower.contains("active directory") || lower.contains("dhcp")
+        || lower.contains("dns") || lower.contains("print") || lower.contains("certificate")
+    {
+        return "3";
+    }
+    ""
 }
 
 /// Load role GUID -> role name mappings from SystemIdentity.mdb
@@ -231,6 +245,7 @@ fn ual_row_to_logdata_entries(
         .unwrap_or_else(|| if role_guid.is_empty() { String::new() } else { role_guid.clone() });
 
     let event_id = role_to_event_id(&role_name).to_string();
+    let logon_type = role_to_logon_type(&role_name).to_string();
 
     let (domain, user) = if let Some(pos) = username.find('\\') {
         (username[..pos].to_string(), username[pos + 1..].to_string())
@@ -252,7 +267,7 @@ fn ual_row_to_logdata_entries(
             subject_domain_name: String::new(),
             target_user_name: user.clone(),
             target_domain_name: domain.clone(),
-            logon_type: String::new(),
+            logon_type: logon_type.clone(),
             workstation_name: String::new(),
             ip_address: ip_address.clone(),
             logon_id: String::new(),
@@ -272,7 +287,7 @@ fn ual_row_to_logdata_entries(
             subject_domain_name: String::new(),
             target_user_name: user,
             target_domain_name: domain,
-            logon_type: String::new(),
+            logon_type: logon_type.clone(),
             workstation_name: String::new(),
             ip_address,
             logon_id: String::new(),
