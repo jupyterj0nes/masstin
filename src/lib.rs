@@ -134,16 +134,20 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
-    // Normalize paths, but preserve bare drive letters (D:, F:\) for parse-image-windows
+    // Clean and normalize paths
     config.directory = config.directory.iter().map(|d| {
-        let trimmed = d.trim_end_matches(&['\\', '/'][..]);
+        let cleaned = clean_path(d);
+        let trimmed = cleaned.trim_end_matches(&['\\', '/'][..]);
         if trimmed.len() == 2 && trimmed.as_bytes()[0].is_ascii_alphabetic() && trimmed.as_bytes()[1] == b':' {
             trimmed.to_string() // Preserve "D:" as-is for volume detection
         } else {
-            normalize_path(d)
+            normalize_path(&cleaned)
         }
     }).collect();
-    config.file = config.file.iter().map(|f| normalize_path(f)).collect();
+    config.file = config.file.iter().map(|f| {
+        let cleaned = clean_path(f);
+        normalize_path(&cleaned)
+    }).collect();
 
     validate_folders(&config)?;
 
@@ -454,6 +458,39 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
     }
 
     false
+}
+
+// -----------------------------------------------------------------------------
+//   Cleans a path that may have been corrupted by shell quoting issues.
+//   e.g., PowerShell trailing \ can cause: path.vmdk" -o output.csv --overwrite
+// -----------------------------------------------------------------------------
+fn clean_path(path: &str) -> String {
+    let mut p = path.to_string();
+
+    // Remove trailing quotes
+    p = p.trim_matches('"').to_string();
+
+    // If path contains embedded arguments (shell quoting bug), truncate
+    // e.g., 'file.vmdk" -o output.csv' → 'file.vmdk'
+    if let Some(pos) = p.find("\" -") {
+        p = p[..pos].to_string();
+    }
+    if let Some(pos) = p.find("\" --") {
+        p = p[..pos].to_string();
+    }
+
+    // Strip trailing slashes
+    p = p.trim_end_matches(&['\\', '/'][..]).to_string();
+
+    // If path doesn't exist but path without trailing quote does, fix it
+    if !std::path::Path::new(&p).exists() {
+        let trimmed = p.trim_end_matches('"');
+        if std::path::Path::new(trimmed).exists() {
+            return trimmed.to_string();
+        }
+    }
+
+    p
 }
 
 // -----------------------------------------------------------------------------
