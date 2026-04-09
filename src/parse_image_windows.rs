@@ -14,7 +14,8 @@ const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
 const UAL_SUM_PATH: &[&str] = &["Windows", "System32", "LogFiles", "Sum"];
 
-/// Main entry point: parse EVTX files from forensic disk images, mounted volumes, or all volumes
+/// Main entry point: parse EVTX files from forensic disk images, mounted volumes, or all volumes.
+/// All sources are extracted to temp directories first, then parsed together into a single CSV.
 pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
     let start_time = std::time::Instant::now();
 
@@ -47,38 +48,36 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
         }
     }
 
-    // Process mounted volumes (drive letters)
+    // Phase 1: Extract EVTX + UAL from all sources into temp directories
+    let mut extracted_dirs: Vec<String> = Vec::new();
+    let mut image_names: Vec<(String, String)> = Vec::new(); // (temp_dir, image_name)
+    let base_temp = std::env::temp_dir().join("masstin_image_extract");
+    let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
+    let _ = fs::create_dir_all(&base_temp);
+
+    // Extract from mounted volumes
     for vol in &volumes {
         crate::banner::print_phase("1", "3", &format!("Opening mounted volume {}...", vol));
         crate::banner::print_info(&format!("Detected {} as a mounted volume — will extract EVTX from live filesystem and all VSS stores", vol));
 
-        let temp_dir = std::env::temp_dir().join("masstin_image_extract");
-        let _ = fs::create_dir_all(&temp_dir);
-
         let volume_label = vol.trim_end_matches(&['\\', '/'][..]).to_string();
+        let temp_dir = base_temp.join(format!("vol_{}", volume_label));
+        let _ = fs::create_dir_all(&temp_dir);
 
         match extract_evtx_from_volume(&volume_label, &temp_dir) {
             Ok(dir) => {
                 let dir_str = dir.to_string_lossy().to_string();
                 crate::banner::print_phase_result("EVTX files extracted from volume");
-
-                let dirs = vec![dir_str];
-                let empty_files: Vec<String> = vec![];
-                parse_events(&empty_files, &dirs, output);
-
-                if let Some(out_path) = output {
-                    rewrite_log_filenames(out_path, &format!("volume_{}", volume_label));
-                }
+                extracted_dirs.push(dir_str.clone());
+                image_names.push((dir_str, format!("volume_{}", volume_label)));
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to process volume {}: {}", vol, e);
             }
         }
-
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    // Process image files (existing behavior)
+    // Extract from image files — use image name as temp subdirectory
     for image_path in files {
         let ext = Path::new(image_path)
             .extension()
@@ -86,9 +85,15 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
             .unwrap_or("")
             .to_lowercase();
 
-        crate::banner::print_phase("1", "3", "Opening forensic image...");
+        let image_name = Path::new(image_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(image_path)
+            .to_string();
 
-        let temp_dir = std::env::temp_dir().join("masstin_image_extract");
+        crate::banner::print_phase("1", "3", &format!("Opening forensic image: {}...", image_name));
+
+        let temp_dir = base_temp.join(&image_name);
         let _ = fs::create_dir_all(&temp_dir);
 
         let evtx_dir = match ext.as_str() {
@@ -107,38 +112,40 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
             }
         };
 
-        let image_name = Path::new(image_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(image_path)
-            .to_string();
-
         match evtx_dir {
             Ok(dir) => {
-                let dir_str = dir.to_string_lossy().to_string();
-                crate::banner::print_phase_result("EVTX files extracted to temp directory");
-
-                let dirs = vec![dir_str];
-                let empty_files: Vec<String> = vec![];
-                parse_events(&empty_files, &dirs, output);
-
-                if let Some(out_path) = output {
-                    rewrite_log_filenames(out_path, &image_name);
-                }
+                crate::banner::print_phase_result(&format!("EVTX files extracted from {}", image_name));
+                extracted_dirs.push(dir.to_string_lossy().to_string());
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to process image {}: {}", image_path, e);
             }
         }
-
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
-    // Process real directories (existing parse-windows behavior for loose EVTX files)
-    if !real_dirs.is_empty() {
-        let empty_files: Vec<String> = vec![];
-        parse_events(&empty_files, &real_dirs, output);
+    // Add real directories (loose EVTX files)
+    for d in &real_dirs {
+        extracted_dirs.push(d.clone());
     }
+
+    if extracted_dirs.is_empty() {
+        eprintln!("[ERROR] No artifacts extracted from any source.");
+        return;
+    }
+
+    // Phase 2+3: Parse ALL extracted directories together into a single CSV
+    let empty_files: Vec<String> = vec![];
+    parse_events(&empty_files, &extracted_dirs, output);
+
+    // Rewrite log_filename: clean up temp paths to descriptive format
+    // e.g. "...masstin_image_extract/HRServer.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
+    //   → "HRServer.e01:vss_0:Security.evtx"
+    if let Some(out_path) = output {
+        rewrite_log_filenames(out_path);
+    }
+
+    // Cleanup temp directories
+    let _ = fs::remove_dir_all(&base_temp);
 }
 
 // -----------------------------------------------------------------------------
@@ -985,7 +992,12 @@ fn extract_files_from_ntfs_path<R: Read + Seek>(
 /// Rewrite the log_filename column in the output CSV.
 /// Replaces temp paths like ".../partition_0/Security.evtx" with "ImageName.e01:live:Security.evtx"
 /// and ".../partition_0_vss_0/Security.evtx" with "ImageName.e01:vss_0:Security.evtx"
-fn rewrite_log_filenames(csv_path: &str, image_name: &str) {
+/// Rewrite log_filename column: clean temp paths to descriptive format.
+/// "...masstin_image_extract/HRServer.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
+///   → "HRServer.e01:vss_0:Security.evtx"
+/// "...masstin_image_extract/HRServer.e01/evtx_extracted:UAL:Current.mdb"
+///   → "HRServer.e01:UAL:Current.mdb"
+fn rewrite_log_filenames(csv_path: &str) {
     let content = match fs::read_to_string(csv_path) {
         Ok(c) => c,
         Err(_) => return,
@@ -994,39 +1006,25 @@ fn rewrite_log_filenames(csv_path: &str, image_name: &str) {
     let mut output = String::with_capacity(content.len());
     for (i, line) in content.lines().enumerate() {
         if i == 0 {
-            // Header — pass through
             output.push_str(line);
             output.push('\n');
             continue;
         }
 
-        // Find the last field (log_filename) and rewrite it
         if let Some(last_comma) = line.rfind(',') {
             let prefix = &line[..last_comma + 1];
             let filename_field = &line[last_comma + 1..];
 
-            // Extract the EVTX filename and source (live vs vss_N)
-            let evtx_name = Path::new(filename_field)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(filename_field);
+            if !filename_field.contains("masstin_image_extract") {
+                output.push_str(line);
+                output.push('\n');
+                continue;
+            }
 
-            let source = if filename_field.contains("_vss_") {
-                // Extract vss index: "partition_0_vss_0" -> "vss_0"
-                if let Some(vss_pos) = filename_field.find("_vss_") {
-                    let after_vss = &filename_field[vss_pos + 1..];
-                    // Take until next path separator
-                    let end = after_vss.find(|c: char| c == '/' || c == '\\').unwrap_or(after_vss.len());
-                    &after_vss[..end]
-                } else {
-                    "vss"
-                }
-            } else {
-                "live"
-            };
-
+            // Extract image name: segment after "masstin_image_extract/" or "masstin_image_extract\"
+            let rewritten = rewrite_single_filename(filename_field);
             output.push_str(prefix);
-            output.push_str(&format!("{}:{}:{}", image_name, source, evtx_name));
+            output.push_str(&rewritten);
             output.push('\n');
         } else {
             output.push_str(line);
@@ -1035,6 +1033,48 @@ fn rewrite_log_filenames(csv_path: &str, image_name: &str) {
     }
 
     let _ = fs::write(csv_path, output);
+}
+
+fn rewrite_single_filename(path: &str) -> String {
+    // Split by path separators and "masstin_image_extract"
+    let normalized = path.replace('\\', "/");
+
+    // Find the image name (segment after masstin_image_extract/)
+    let marker = "masstin_image_extract/";
+    let after_marker = match normalized.find(marker) {
+        Some(pos) => &normalized[pos + marker.len()..],
+        None => return path.to_string(),
+    };
+
+    // after_marker = "HRServer_Disk0.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
+    // or "HRServer_Disk0.e01/evtx_extracted:UAL:Current.mdb"
+    let parts: Vec<&str> = after_marker.splitn(2, '/').collect();
+    let image_name = parts[0];
+    let rest = if parts.len() > 1 { parts[1] } else { "" };
+
+    // Handle UAL paths (contain ":UAL:")
+    if rest.contains(":UAL:") {
+        let ual_part = rest.rsplit(":UAL:").next().unwrap_or(rest);
+        return format!("{}:UAL:{}", image_name, ual_part);
+    }
+
+    // Get the EVTX filename
+    let evtx_name = rest.rsplit('/').next().unwrap_or(rest);
+
+    // Determine source: live or vss_N
+    let source = if rest.contains("_vss_") {
+        if let Some(vss_pos) = rest.find("_vss_") {
+            let after_vss = &rest[vss_pos + 1..];
+            let end = after_vss.find('/').unwrap_or(after_vss.len());
+            &after_vss[..end]
+        } else {
+            "vss"
+        }
+    } else {
+        "live"
+    };
+
+    format!("{}:{}:{}", image_name, source, evtx_name)
 }
 
 /// Wrapper that adds a byte offset to all Read/Seek operations.
