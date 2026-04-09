@@ -1238,6 +1238,26 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     let mut log_data: Vec<LogData> = vec![];
     let mut vec_filenames: Vec<EvtxLocation> = vec![];
 
+    // Detect drive root paths and suggest parse-image-windows for VSS
+    for dir in directories {
+        // After normalize_path, a drive root looks like "F:\" or "F:"
+        // Check: second char is ':', and path has no subdirectories beyond the root
+        let normalized = dir.replace('/', "\\");
+        let is_drive_root = normalized.len() >= 2
+            && normalized.as_bytes()[1] == b':'
+            && normalized.as_bytes()[0].is_ascii_alphabetic()
+            && (normalized.len() <= 3 || normalized.chars().filter(|c| *c == '\\').count() == 1);
+        if is_drive_root {
+            let letter = &dir[..2];
+            crate::banner::print_info(&format!(
+                "Drive {} detected — scanning as filesystem (EVTX + UAL only).", letter
+            ));
+            crate::banner::print_info(&format!(
+                "Tip: use '-a parse-image-windows -d {}' to also recover events from VSS shadow copies.", letter
+            ));
+        }
+    }
+
     // Phase 1: Search for artifacts
     crate::banner::print_search_start();
 
