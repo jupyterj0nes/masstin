@@ -457,8 +457,17 @@ fn normalize_path(path: &str) -> String {
     let trimmed = path.trim_end_matches(|c| c == '/' || c == '\\');
     let trimmed = if trimmed.is_empty() { path } else { trimmed };
     match std::fs::canonicalize(trimmed) {
-        Ok(canonical) => canonical.to_string_lossy().to_string()
-            .trim_start_matches(r"\\?\").to_string(),
+        Ok(canonical) => {
+            let s = canonical.to_string_lossy().to_string();
+            // Remove \\?\ prefix from Windows extended-length paths
+            let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+            // Fix UNC paths: \\?\UNC\server\share → \\server\share
+            if s.starts_with(r"UNC\") {
+                format!(r"\\{}", &s[4..])
+            } else {
+                s
+            }
+        }
         Err(_) => trimmed.to_string(),
     }
 }
