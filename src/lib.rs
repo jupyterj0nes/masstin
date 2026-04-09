@@ -37,15 +37,15 @@ pub use crate::parse_ual::*;
 #[derive(Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    /// Action to perform (parse, load, merge, parser_elastic, parse_cortex_network, parse_cortex_evtx_forensics)
+    /// Action to perform
     #[arg(short, long)]
     action: ActionType,
 
-    /// Directories to process (can be specified multiple times)
+    /// Directories to process — also accepts drive letters (D:) for mounted volumes
     #[arg(short, long)]
     directory: Vec<String>,
 
-    /// Individual event log files (EVTX or JSON) to process (can be specified multiple times)
+    /// Individual files to process (EVTX, JSON, .mdb, E01, dd/raw)
     #[arg(short, long)]
     file: Vec<String>,
 
@@ -106,25 +106,25 @@ pub struct Cli {
 // -----------------------------------------------------------------------------
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum ActionType {
-    /// Parses Windows EVTX files from single files or directories and outputs a CSV
+    /// Parse Windows EVTX files and UAL databases (.mdb) from directories or individual files
     #[value(alias = "parse")]
     ParseWindows,
-    /// Loads a previously generated CSV file into a Neo4j graph database
+    /// Load a CSV timeline into a Neo4j graph database
     #[value(alias = "load")]
     LoadNeo4j,
-    /// Loads a previously generated CSV file into a Memgraph graph database
+    /// Load a CSV timeline into a Memgraph graph database
     LoadMemgraph,
-    /// Merges multiple CSV files (previously generated) into a single time-sorted file
+    /// Merge multiple CSV timelines into a single chronological file
     Merge,
-    /// Parses Winlogbeat JSON logs
+    /// Parse Winlogbeat JSON logs exported from Elasticsearch
     ParserElastic,
-    /// Parses Cortex Network data by calling the specified API
+    /// Query Cortex XDR API for network connections (RDP/SMB/SSH)
     ParseCortex,
-    /// Parses Cortex EVTX Forensics data by calling the specified API
+    /// Query Cortex XDR API for forensic EVTX collections
     ParseCortexEvtxForensics,
-    /// Parses Linux logs and accounting entries
+    /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
-    /// Parses EVTX files from forensic disk images (E01/dd)
+    /// Parse from forensic images (E01/dd), mounted volumes (-d D:), or --all-volumes. Extracts EVTX + UAL from live + VSS
     ParseImageWindows,
 }
 
