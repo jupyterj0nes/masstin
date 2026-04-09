@@ -91,6 +91,10 @@ pub struct Cli {
     /// Optional IP to filter in Cortex queries (used with ParseCortex)
     #[arg(long)]
     filter_cortex_ip: Option<String>,
+
+    /// Scan all NTFS volumes on the system for VSS (parse-image-windows only, requires admin)
+    #[arg(long)]
+    all_volumes: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -194,7 +198,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             parse_linux(&config.file, &config.directory, config.output.as_ref());
         }
         ActionType::ParseImageWindows => {
-            parse_image_windows(&config.file, config.output.as_ref());
+            parse_image_windows(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
         }
     }
 
@@ -288,9 +292,9 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             }
         }
         ActionType::ParseImageWindows => {
-            if config.file.is_empty() {
+            if config.file.is_empty() && config.directory.is_empty() && !config.all_volumes {
                 return Err(String::from(
-                    "For parse-image-windows, you must specify at least one image file with -f.",
+                    "For parse-image-windows, specify image files with -f, a volume with -d (e.g. -d D:), or --all-volumes.",
                 ));
             }
         }

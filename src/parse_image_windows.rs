@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------
 //  Forensic image parser for Windows EVTX
-//  Opens E01/dd images, parses NTFS, extracts EVTX files to temp dir,
-//  then delegates to the existing parse_events() function.
+//  Opens E01/dd images or mounted volumes, parses NTFS, extracts EVTX files
+//  (live + VSS) to temp dir, then delegates to the existing parse_events().
 // -----------------------------------------------------------------------------
 
 use std::fs::{self, File};
@@ -13,12 +13,71 @@ use crate::parse::{parse_events, is_debug_mode};
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
 
-/// Main entry point: parse EVTX files from a forensic disk image (E01 or dd/raw)
-pub fn parse_image_windows(files: &[String], output: Option<&String>) {
+/// Main entry point: parse EVTX files from forensic disk images, mounted volumes, or all volumes
+pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
     let start_time = std::time::Instant::now();
 
-    crate::banner::print_phase("1", "3", "Opening forensic image...");
+    // Collect all volume letters from directories and --all-volumes
+    let mut volumes: Vec<String> = Vec::new();
+    let mut real_dirs: Vec<String> = Vec::new();
 
+    for d in directories {
+        if is_drive_letter(d) {
+            volumes.push(d.clone());
+        } else {
+            real_dirs.push(d.clone());
+        }
+    }
+
+    if all_volumes {
+        crate::banner::print_phase("1", "3", "Enumerating NTFS volumes on this system...");
+        let system_volumes = enumerate_ntfs_volumes();
+        if system_volumes.is_empty() {
+            eprintln!("[WARNING] No NTFS volumes found. Are you running as Administrator?");
+        } else {
+            crate::banner::print_info(&format!("Found {} NTFS volume(s): {}",
+                system_volumes.len(),
+                system_volumes.join(", ")));
+            for v in system_volumes {
+                if !volumes.contains(&v) {
+                    volumes.push(v);
+                }
+            }
+        }
+    }
+
+    // Process mounted volumes (drive letters)
+    for vol in &volumes {
+        crate::banner::print_phase("1", "3", &format!("Opening mounted volume {}...", vol));
+        crate::banner::print_info(&format!("Detected {} as a mounted volume — will extract EVTX from live filesystem and all VSS stores", vol));
+
+        let temp_dir = std::env::temp_dir().join("masstin_image_extract");
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let volume_label = vol.trim_end_matches(&['\\', '/'][..]).to_string();
+
+        match extract_evtx_from_volume(&volume_label, &temp_dir) {
+            Ok(dir) => {
+                let dir_str = dir.to_string_lossy().to_string();
+                crate::banner::print_phase_result("EVTX files extracted from volume");
+
+                let dirs = vec![dir_str];
+                let empty_files: Vec<String> = vec![];
+                parse_events(&empty_files, &dirs, output);
+
+                if let Some(out_path) = output {
+                    rewrite_log_filenames(out_path, &format!("volume_{}", volume_label));
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Failed to process volume {}: {}", vol, e);
+            }
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    // Process image files (existing behavior)
     for image_path in files {
         let ext = Path::new(image_path)
             .extension()
@@ -26,7 +85,8 @@ pub fn parse_image_windows(files: &[String], output: Option<&String>) {
             .unwrap_or("")
             .to_lowercase();
 
-        // Create temp dir for extracted EVTX files
+        crate::banner::print_phase("1", "3", "Opening forensic image...");
+
         let temp_dir = std::env::temp_dir().join("masstin_image_extract");
         let _ = fs::create_dir_all(&temp_dir);
 
@@ -40,7 +100,6 @@ pub fn parse_image_windows(files: &[String], output: Option<&String>) {
                 extract_evtx_from_image_raw(image_path, &temp_dir)
             }
             _ => {
-                // Try raw first, fall back to EWF
                 crate::banner::print_info(&format!("Unknown extension, trying raw then E01 ({})", image_path));
                 extract_evtx_from_image_raw(image_path, &temp_dir)
                     .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir))
@@ -58,12 +117,10 @@ pub fn parse_image_windows(files: &[String], output: Option<&String>) {
                 let dir_str = dir.to_string_lossy().to_string();
                 crate::banner::print_phase_result("EVTX files extracted to temp directory");
 
-                // Phase 2+3: delegate to existing parse_events
                 let dirs = vec![dir_str];
                 let empty_files: Vec<String> = vec![];
                 parse_events(&empty_files, &dirs, output);
 
-                // Replace temp paths with descriptive forensic source names
                 if let Some(out_path) = output {
                     rewrite_log_filenames(out_path, &image_name);
                 }
@@ -73,9 +130,299 @@ pub fn parse_image_windows(files: &[String], output: Option<&String>) {
             }
         }
 
-        // Cleanup temp directory
         let _ = fs::remove_dir_all(&temp_dir);
     }
+
+    // Process real directories (existing parse-windows behavior for loose EVTX files)
+    if !real_dirs.is_empty() {
+        let empty_files: Vec<String> = vec![];
+        parse_events(&empty_files, &real_dirs, output);
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Drive letter detection and volume enumeration
+// -----------------------------------------------------------------------------
+
+/// Check if a string is a Windows drive letter (e.g. "D:", "D:\", "E:")
+fn is_drive_letter(s: &str) -> bool {
+    let trimmed = s.trim_end_matches(&['\\', '/'][..]);
+    trimmed.len() == 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':'
+}
+
+/// Enumerate all NTFS volumes on the system (Windows only)
+fn enumerate_ntfs_volumes() -> Vec<String> {
+    let mut volumes = Vec::new();
+
+    #[cfg(windows)]
+    {
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            let root = format!("{}\\", drive);
+            let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+
+            extern "system" {
+                fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+            }
+
+            let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
+            // DRIVE_FIXED = 3, DRIVE_REMOVABLE = 2, DRIVE_REMOTE = 4
+            if drive_type == 3 || drive_type == 2 {
+                // Check if we can open it and if it's NTFS
+                let device = format!("\\\\.\\{}", drive);
+                if let Ok(fh) = File::open(&device) {
+                    let size = get_device_size_ioctl(&fh);
+                    if size > 0 {
+                        // Try to verify NTFS signature
+                        let mut sr = SectorReader::new(fh, 512, size);
+                        let mut sig = [0u8; 8];
+                        if sr.seek(SeekFrom::Start(3)).is_ok()
+                            && sr.read_exact(&mut sig).is_ok()
+                            && &sig == NTFS_SIGNATURE
+                        {
+                            volumes.push(drive);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // On Linux, check /proc/mounts for NTFS partitions
+        if let Ok(content) = fs::read_to_string("/proc/mounts") {
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[2].contains("ntfs") && parts[0].starts_with("/dev/") {
+                    volumes.push(parts[0].to_string());
+                }
+            }
+        }
+    }
+
+    volumes
+}
+
+// -----------------------------------------------------------------------------
+//  Sector-aligned reader for raw device I/O (required on Windows)
+// -----------------------------------------------------------------------------
+
+struct SectorReader {
+    inner: File,
+    sector_size: usize,
+    cache: Vec<u8>,
+    cache_start: u64,
+    cache_len: usize,
+    pos: u64,
+    size: u64,
+}
+
+impl SectorReader {
+    fn new(inner: File, sector_size: usize, size: u64) -> Self {
+        Self {
+            inner,
+            sector_size,
+            cache: vec![0u8; sector_size * 128], // 64 KB cache
+            cache_start: u64::MAX,
+            cache_len: 0,
+            pos: 0,
+            size,
+        }
+    }
+
+    fn fill_cache(&mut self, offset: u64) -> std::io::Result<()> {
+        let aligned = (offset / self.sector_size as u64) * self.sector_size as u64;
+        if self.cache_start != u64::MAX
+            && aligned >= self.cache_start
+            && aligned < self.cache_start + self.cache_len as u64
+        {
+            return Ok(());
+        }
+        self.inner.seek(SeekFrom::Start(aligned))?;
+        self.cache_len = self.inner.read(&mut self.cache)?;
+        self.cache_start = aligned;
+        Ok(())
+    }
+}
+
+impl Read for SectorReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.size > 0 && self.pos >= self.size {
+            return Ok(0);
+        }
+        let mut total = 0;
+        while total < buf.len() {
+            self.fill_cache(self.pos)?;
+            if self.cache_start == u64::MAX || self.cache_len == 0 { break; }
+            let offset_in_cache = (self.pos - self.cache_start) as usize;
+            if offset_in_cache >= self.cache_len { break; }
+            let available = self.cache_len - offset_in_cache;
+            let to_copy = (buf.len() - total).min(available);
+            buf[total..total + to_copy]
+                .copy_from_slice(&self.cache[offset_in_cache..offset_in_cache + to_copy]);
+            self.pos += to_copy as u64;
+            total += to_copy;
+        }
+        Ok(total)
+    }
+}
+
+impl Seek for SectorReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(n) => n,
+            SeekFrom::End(n) => {
+                if self.size > 0 {
+                    (self.size as i64 + n) as u64
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported, "cannot seek from end: device size unknown"));
+                }
+            }
+            SeekFrom::Current(n) => (self.pos as i64 + n) as u64,
+        };
+        Ok(self.pos)
+    }
+}
+
+#[cfg(windows)]
+fn get_device_size_ioctl(file: &File) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007405C;
+    extern "system" {
+        fn DeviceIoControl(
+            hDevice: isize, dwIoControlCode: u32,
+            lpInBuffer: *const u8, nInBufferSize: u32,
+            lpOutBuffer: *mut u8, nOutBufferSize: u32,
+            lpBytesReturned: *mut u32, lpOverlapped: *const u8,
+        ) -> i32;
+    }
+    let mut length: i64 = 0;
+    let mut returned: u32 = 0;
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as isize, IOCTL_DISK_GET_LENGTH_INFO,
+            std::ptr::null(), 0,
+            &mut length as *mut i64 as *mut u8, std::mem::size_of::<i64>() as u32,
+            &mut returned, std::ptr::null(),
+        )
+    };
+    if result != 0 && length > 0 { length as u64 } else { 0 }
+}
+
+#[cfg(not(windows))]
+fn get_device_size_ioctl(_file: &File) -> u64 { 0 }
+
+// -----------------------------------------------------------------------------
+//  Extract EVTX from a mounted volume (live + VSS)
+// -----------------------------------------------------------------------------
+
+fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+    let device_path = if drive.starts_with("\\\\.\\") {
+        drive.to_string()
+    } else {
+        format!("\\\\.\\{}", drive)
+    };
+
+    crate::banner::print_info(&format!("Opening raw volume: {}", device_path));
+
+    let fh = File::open(&device_path)
+        .map_err(|e| format!("Cannot open volume {} — are you running as Administrator? ({})", device_path, e))?;
+
+    let size = get_device_size_ioctl(&fh);
+    if size == 0 {
+        return Err(format!("Cannot read volume size for {}. Run as Administrator.", device_path));
+    }
+
+    crate::banner::print_info(&format!("Volume size: {:.2} GB", size as f64 / 1_073_741_824.0));
+
+    let mut reader = BufReader::new(SectorReader::new(fh, 512, size));
+
+    // Verify NTFS
+    if !verify_ntfs_signature(&mut reader, 0) {
+        return Err(format!("Volume {} is not NTFS", drive));
+    }
+
+    crate::banner::print_info("NTFS filesystem confirmed");
+
+    let evtx_output_dir = temp_dir.join("evtx_extracted");
+    let _ = fs::create_dir_all(&evtx_output_dir);
+    let mut total_evtx = 0;
+
+    // 1. Extract EVTX from live volume (offset 0 = start of partition)
+    crate::banner::print_info("Extracting EVTX from live volume...");
+    match extract_evtx_from_ntfs_partition(&mut reader, 0, &evtx_output_dir, 0) {
+        Ok(count) => {
+            total_evtx += count;
+            crate::banner::print_phase_result(&format!("{} EVTX files extracted from live volume", count));
+        }
+        Err(e) => {
+            crate::banner::print_info(&format!("Warning: could not extract from live volume: {}", e));
+        }
+    }
+
+    // 2. Check for VSS stores and extract from each
+    crate::banner::print_info("Checking for Volume Shadow Copy stores...");
+    match VssVolume::new(&mut reader) {
+        Ok(vss) if vss.store_count() > 0 => {
+            crate::banner::print_phase_result(&format!(
+                "{} VSS store(s) detected!", vss.store_count()
+            ));
+
+            for s in 0..vss.store_count() {
+                if let Ok(info) = vss.store_info(s) {
+                    crate::banner::print_info(&format!(
+                        "  VSS store {}: created {}", s, info.creation_time_utc()
+                    ));
+                }
+                if let Ok((blocks, bytes)) = vss.store_delta_size(&mut reader, s) {
+                    crate::banner::print_info(&format!(
+                        "    {} changed blocks ({:.1} MB delta)", blocks, bytes as f64 / 1_048_576.0
+                    ));
+                }
+
+                crate::banner::print_info(&format!("  Extracting EVTX from VSS store {}...", s));
+                match vss.store_reader(&mut reader, s) {
+                    Ok(mut store_reader) => {
+                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s) {
+                            Ok(count) => {
+                                total_evtx += count;
+                                crate::banner::print_info(&format!(
+                                    "    {} EVTX files extracted from VSS store {}", count, s
+                                ));
+                            }
+                            Err(e) => {
+                                if is_debug_mode() {
+                                    eprintln!("[DEBUG] VSS store {} error: {}", s, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if is_debug_mode() {
+                            eprintln!("[DEBUG] Cannot open VSS store {}: {}", s, e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            crate::banner::print_info("No Volume Shadow Copy stores found on this volume");
+        }
+        Err(_) => {
+            crate::banner::print_info("No Volume Shadow Copy stores found on this volume");
+        }
+    }
+
+    if total_evtx == 0 {
+        return Err(format!("No EVTX files found on volume {}", drive));
+    }
+
+    crate::banner::print_phase_result(&format!("{} EVTX files extracted total from volume {}", total_evtx, drive));
+    Ok(evtx_output_dir)
 }
 
 /// Extract EVTX from an E01 image
