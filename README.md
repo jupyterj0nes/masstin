@@ -42,7 +42,8 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | Feature | Description | Details |
 |---------|-------------|---------|
 | **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
-| **Forensic image analysis** | Open E01/dd/VMDK images directly, find NTFS partitions (GPT/MBR), extract EVTX — no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Bulk image processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, extracts EVTX + UAL from live + VSS of each, and generates a single unified timeline. One command, entire incident. | |
+| **Forensic image analysis** | Open E01, dd/raw, and VMDK (sparse, flat, split) images directly — pure Rust, no external tools, no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
@@ -162,20 +163,34 @@ masstin -a parse-linux -d /evidence/triage_package/ -o linux-timeline.csv
 
 Masstin transparently reports all inferences: hostname identification (from `/etc/hostname`, `dmesg`, or the syslog header), year inference (from `dpkg.log`, `wtmp`, or file modification date), and password-protected ZIP extraction.
 
-### Parse forensic images (E01/dd) with VSS recovery
+### Parse forensic images (E01/dd/VMDK) with VSS recovery
 
-Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (monolithic sparse, flat, and split sparse). Finds NTFS partitions (GPT/MBR), extracts EVTX from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
+Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (monolithic sparse, flat, and split sparse). Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
 
 ```bash
-# E01 image with VSS recovery
+# Single image
 masstin -a parse-image-windows -f HRServer.e01 -o timeline.csv
 
 # VMDK directly (split sparse, flat, monolithic)
 masstin -a parse-image-windows -f "Windows Server 2019.vmdk" -o timeline.csv
 
-# Multiple images for large-scale incident
+# Multiple images
 masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.vmdk -f Desktop.e01 -o incident.csv
 ```
+
+### Bulk evidence processing — one command, entire incident
+
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files, processing each one — extracting EVTX from live volumes and every VSS snapshot, parsing UAL databases, deduplicating, and merging everything into a single chronological timeline.
+
+```bash
+# Scan an entire evidence folder — finds all images automatically
+masstin -a parse-image-windows -d /evidence/all_machines/ -o full_timeline.csv
+
+# Mix: evidence folder + individual images + mounted volume
+masstin -a parse-image-windows -d /evidence/ -f extra.e01 -d F: -o timeline.csv
+```
+
+Masstin automatically filters VMDK split extents (`-s001.vmdk`) and snapshots (`-000001.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
 
 <div align="center">
   <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
