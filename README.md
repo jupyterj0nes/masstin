@@ -123,7 +123,7 @@ masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
 
 ### Parse forensic images (E01/dd/VMDK) with VSS recovery
 
-Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, and VMFS/ESXi). Pure Rust parsers for all formats — no external tools required. Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
+Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, and VMFS/ESXi). Pure Rust parsers for all formats — no external tools required. Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies using [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs), and recovers EVTX from each VSS snapshot — including events deleted by attackers. Events are deduplicated across live and VSS sources. [Full VSS documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ```bash
 # Single image
@@ -139,8 +139,6 @@ masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.vmdk -f Desktop.e01 -o in
 <div align="center">
   <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
 </div>
-
-Uses the [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) crate for cross-platform VSS access. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ### Bulk evidence processing — one command, entire incident
 
