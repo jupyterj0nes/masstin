@@ -79,12 +79,31 @@ impl VmdkReader {
                 position: 0,
             })
         } else {
-            // Try to read as text descriptor
+            // Try to read as text descriptor (limited to 64KB — descriptors are small text files)
             drop(file);
-            let descriptor = std::fs::read_to_string(path)
-                .map_err(|e| format!("Cannot read VMDK descriptor '{}': {}", path, e))?;
+            let mut file = File::open(path)
+                .map_err(|e| format!("Cannot open VMDK '{}': {}", path, e))?;
+            let mut buf = vec![0u8; 65536];
+            let n = file.read(&mut buf).map_err(|e| format!("Cannot read VMDK: {}", e))?;
+            let text = String::from_utf8_lossy(&buf[..n]);
 
-            Self::open_from_descriptor(&descriptor, base_dir)
+            if text.contains("# Disk DescriptorFile") || text.contains("createType") {
+                Self::open_from_descriptor(&text, base_dir)
+            } else {
+                // Not a descriptor — treat as raw/flat image
+                drop(file);
+                let file = File::open(path)
+                    .map_err(|e| format!("Cannot open raw VMDK: {}", e))?;
+                let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                Ok(VmdkReader {
+                    extents: vec![Extent {
+                        data: ExtentData::Flat { file, file_offset: 0 },
+                        size_bytes: size,
+                    }],
+                    total_size: size,
+                    position: 0,
+                })
+            }
         }
     }
 
@@ -118,8 +137,8 @@ impl VmdkReader {
             let extent_path = base_dir.join(filename);
             let extent_path_str = extent_path.to_string_lossy().to_string();
 
-            let extent = match extent_type {
-                "FLAT" | "flat" => {
+            let extent = match extent_type.to_uppercase().as_str() {
+                "FLAT" | "VMFS" | "VMFSRAW" | "VMFSRDM" => {
                     let f = File::open(&extent_path)
                         .map_err(|e| format!("Cannot open flat extent '{}': {}", extent_path_str, e))?;
                     Extent {
@@ -130,8 +149,23 @@ impl VmdkReader {
                         size_bytes: sectors * SECTOR_SIZE,
                     }
                 }
-                "SPARSE" | "sparse" => {
+                "SPARSE" | "VMFSSPARSE" => {
                     Self::open_sparse_extent(&extent_path_str)?
+                }
+                "ZERO" => {
+                    // Zero extent — reads return zeros, no backing file
+                    Extent {
+                        data: ExtentData::Flat {
+                            file: File::open(&extent_path).unwrap_or_else(|_| {
+                                // Zero extents don't need a file — create a dummy
+                                File::open(std::env::temp_dir().join("__masstin_zero")).unwrap_or_else(|_| {
+                                    File::open("/dev/null").unwrap()
+                                })
+                            }),
+                            file_offset: 0,
+                        },
+                        size_bytes: sectors * SECTOR_SIZE,
+                    }
                 }
                 _ => {
                     return Err(format!("Unsupported extent type: {}", extent_type));

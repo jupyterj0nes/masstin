@@ -106,9 +106,12 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
                 let lower = name.to_lowercase();
                 // Skip E01 segment files (.e02, .e03, etc.)
                 if lower.ends_with(".e01") || lower.ends_with(".ex01") { return true; }
-                // Skip VMDK split extents and snapshots — only keep base descriptors
+                // Skip VMDK split extents, snapshots, and flat data files — only keep base descriptors
                 if lower.ends_with(".vmdk") {
                     let stem = Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let stem_lower = stem.to_lowercase();
+                    // Skip flat data files: name-flat.vmdk
+                    if stem_lower.ends_with("-flat") { return false; }
                     // Skip split extents: name-sNNN.vmdk
                     if let Some(pos) = stem.rfind("-s") {
                         let after = &stem[pos + 2..];
@@ -116,7 +119,7 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
                             return false;
                         }
                     }
-                    // Skip VMware snapshots: name-NNNNNN.vmdk or name-NNNNNN-sNNN.vmdk
+                    // Skip VMware snapshots: name-NNNNNN.vmdk
                     if let Some(pos) = stem.rfind("-0") {
                         let after = &stem[pos + 1..];
                         if after.len() >= 6 && after[..6].chars().all(|c| c.is_ascii_digit()) {
