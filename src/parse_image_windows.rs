@@ -158,7 +158,7 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
             .unwrap_or(image_path)
             .to_string();
 
-        crate::banner::print_phase("1", "3", &format!("Opening forensic image: {}...", image_name));
+        crate::banner::print_info(&format!("Opening forensic image: {}...", image_name));
 
         let temp_dir = base_temp.join(&image_name);
         let _ = fs::create_dir_all(&temp_dir);
@@ -671,7 +671,7 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
     image_size: u64,
     temp_dir: &Path,
 ) -> Result<PathBuf, String> {
-    crate::banner::print_phase("1", "3", "Searching for NTFS partitions...");
+    crate::banner::print_info("Searching for NTFS partitions...");
 
     // Find NTFS partition offsets
     let partitions = find_ntfs_partitions(reader, image_size)?;

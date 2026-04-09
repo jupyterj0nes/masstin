@@ -1282,7 +1282,25 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     let zip_count = vec_filenames.iter().filter(|f| matches!(f, EvtxLocation::ZipEntry { .. })).count();
     let total_evtx = vec_filenames.len();
 
-    crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
+    // Detect UAL databases early so we can include them in the artifact count
+    let mut all_ual_files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in directories {
+        all_ual_files.extend(crate::parse_ual::find_ual_databases(dir));
+    }
+    for f in files {
+        if f.to_lowercase().ends_with(".mdb") && std::path::Path::new(f).exists() {
+            all_ual_files.push(std::path::PathBuf::from(f));
+        }
+    }
+    all_ual_files.sort();
+    all_ual_files.dedup();
+
+    if all_ual_files.is_empty() {
+        crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
+    } else {
+        crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count,
+            &format!("EVTX artifacts + {} UAL databases", all_ual_files.len()));
+    }
 
     if is_debug_mode() {
         println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());
@@ -1320,29 +1338,8 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     pb.finish_and_clear();
     crate::banner::print_artifact_detail(&artifact_details);
 
-    // Check for UAL databases — in directories and individual files
-    let mut all_ual_files: Vec<std::path::PathBuf> = Vec::new();
-
-    // From -d directories: scan for Sum subdirectories and .mdb files
-    for dir in directories {
-        all_ual_files.extend(crate::parse_ual::find_ual_databases(dir));
-    }
-
-    // From -f files: check if any are .mdb files
-    for f in files {
-        if f.to_lowercase().ends_with(".mdb") && std::path::Path::new(f).exists() {
-            all_ual_files.push(std::path::PathBuf::from(f));
-        }
-    }
-
+    // Parse UAL databases (detected earlier during artifact search)
     if !all_ual_files.is_empty() {
-        // Deduplicate by filename (short names like SYSTEM~1.MDB may duplicate)
-        all_ual_files.sort();
-        all_ual_files.dedup();
-
-        crate::banner::print_info(&format!(
-            "UAL databases detected ({} files)", all_ual_files.len()
-        ));
         let source = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
         let ual_events = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
         if !ual_events.is_empty() {
