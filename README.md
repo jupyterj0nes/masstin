@@ -71,7 +71,13 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 Go to [**Releases**](https://github.com/jupyterj0nes/masstin/releases) and download the binary for your platform. That's it.
 
-### Build from source (alternative)
+### Install from crates.io
+
+```bash
+cargo install masstin
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/jupyterj0nes/masstin.git
@@ -130,6 +136,12 @@ masstin -a parse-image-windows -f "Windows Server 2019.vmdk" -o timeline.csv
 masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.vmdk -f Desktop.e01 -o incident.csv
 ```
 
+<div align="center">
+  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
+</div>
+
+Uses the [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) crate for cross-platform VSS access. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+
 ### Bulk evidence processing — one command, entire incident
 
 Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files, processing each one — extracting EVTX from live volumes and every VSS snapshot, parsing UAL databases, deduplicating, and merging everything into a single chronological timeline.
@@ -143,12 +155,6 @@ masstin -a parse-image-windows -d /evidence/ -f extra.e01 -d F: -o timeline.csv
 ```
 
 Masstin automatically filters VMDK split extents (`-s001.vmdk`) and snapshots (`-000001.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
-
-<div align="center">
-  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
-</div>
-
-Uses the [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) crate for cross-platform VSS access. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ### Parse from mounted volumes (live disk / write-blocker)
 
@@ -311,7 +317,31 @@ This downloads a `docker-compose.yml` and starts the database (`memgraph/memgrap
 
 ### Querying the graph
 
-After loading data, use Cypher queries to explore lateral movement. For the full query catalog, see the [Cypher Resources](neo4j-resources/cypher_queries.md).
+After loading data, use Cypher queries to explore lateral movement.
+
+**Neo4j** — filter by time range:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+WHERE datetime(r.time) >= datetime("2024-08-12T00:00:00Z")
+  AND datetime(r.time) <= datetime("2024-08-13T00:00:00Z")
+RETURN h1, r, h2
+```
+
+<div align="center">
+  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph in Neo4j"/>
+</div>
+
+**Memgraph** — view all lateral movement:
+
+```cypher
+MATCH (h1:host)-[r]->(h2:host)
+RETURN h1, r, h2
+```
+
+<div align="center">
+  <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
+</div>
 
 **Temporal path reconstruction** (from `10_99_88_77` to `SRV_BACKUP`):
 
@@ -327,6 +357,8 @@ LIMIT 5
 <div align="center">
   <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction in Memgraph"/>
 </div>
+
+For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
 
 ## All Options
 
