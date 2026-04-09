@@ -81,8 +81,10 @@ fn collect_mdb_files(dir: &Path, results: &mut Vec<PathBuf>) {
 }
 
 /// Parse UAL databases and return LogData events.
-pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> Vec<LogData> {
+/// Returns (events, per_mdb_details) where per_mdb_details is Vec<(mdb_name, event_count)>
+pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> (Vec<LogData>, Vec<(String, usize)>) {
     let mut events = Vec::new();
+    let mut mdb_details: Vec<(String, usize)> = Vec::new();
 
     // Load role mappings and server hostname from SystemIdentity.mdb
     let role_map = load_role_mappings(mdb_files);
@@ -116,11 +118,11 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> Vec<Log
             events.extend(new_events);
         }
         if mdb_event_count > 0 {
-            crate::banner::print_phase_result(&format!("{} ({} events)", mdb_name, mdb_event_count));
+            mdb_details.push((mdb_name.to_string(), mdb_event_count));
         }
     }
 
-    events
+    (events, mdb_details)
 }
 
 /// Load server hostname from SystemIdentity.mdb SYSTEM_IDENTITY table

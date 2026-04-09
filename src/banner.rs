@@ -267,6 +267,16 @@ pub fn print_phase_result(message: &str) {
     eprintln!("        {} {}", style("=>").green().bold(), style(message).green().bold());
 }
 
+/// Print a search result line with green arrow + green number + white label (same style as EVTX count)
+pub fn print_search_result_line(count: usize, label: &str) {
+    if is_silent() { return; }
+    eprintln!("        {} {} {} found",
+        style("=>").green().bold(),
+        style(count).green().bold(),
+        label,
+    );
+}
+
 pub fn print_info(message: &str) {
     if is_silent() { return; }
     eprintln!("        {}", style(message).dim());

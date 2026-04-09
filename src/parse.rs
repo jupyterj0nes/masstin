@@ -1297,7 +1297,7 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
 
     crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
     if !all_ual_files.is_empty() {
-        crate::banner::print_phase_result(&format!("{} UAL databases detected", all_ual_files.len()));
+        crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
     }
 
     if is_debug_mode() {
@@ -1334,18 +1334,20 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     }
 
     pb.finish_and_clear();
-    crate::banner::print_artifact_detail(&artifact_details);
 
     // Parse UAL databases (detected earlier during artifact search)
     if !all_ual_files.is_empty() {
-        crate::banner::print_info("UAL (User Access Logging):");
         let source = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
-        let ual_events = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
+        let (ual_events, mdb_details) = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
         if !ual_events.is_empty() {
-            artifact_details.push(("UAL (User Access Logging)".to_string(), ual_events.len()));
+            for (mdb_name, count) in &mdb_details {
+                artifact_details.push((mdb_name.clone(), *count));
+            }
             log_data.extend(ual_events);
         }
     }
+
+    crate::banner::print_artifact_detail(&artifact_details);
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
