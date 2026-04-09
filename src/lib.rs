@@ -135,19 +135,27 @@ enum ActionType {
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     // Clean and normalize paths
-    config.directory = config.directory.iter().map(|d| {
-        let cleaned = clean_path(d);
-        let trimmed = cleaned.trim_end_matches(&['\\', '/'][..]);
-        if trimmed.len() == 2 && trimmed.as_bytes()[0].is_ascii_alphabetic() && trimmed.as_bytes()[1] == b':' {
-            trimmed.to_string() // Preserve "D:" as-is for volume detection
-        } else {
-            normalize_path(&cleaned)
+    config.directory = {
+        let mut dirs = Vec::new();
+        for d in &config.directory {
+            let cleaned = clean_path(d)?;
+            let trimmed = cleaned.trim_end_matches(&['\\', '/'][..]);
+            if trimmed.len() == 2 && trimmed.as_bytes()[0].is_ascii_alphabetic() && trimmed.as_bytes()[1] == b':' {
+                dirs.push(trimmed.to_string());
+            } else {
+                dirs.push(normalize_path(&cleaned));
+            }
         }
-    }).collect();
-    config.file = config.file.iter().map(|f| {
-        let cleaned = clean_path(f);
-        normalize_path(&cleaned)
-    }).collect();
+        dirs
+    };
+    config.file = {
+        let mut files = Vec::new();
+        for f in &config.file {
+            let cleaned = clean_path(f)?;
+            files.push(normalize_path(&cleaned));
+        }
+        files
+    };
 
     validate_folders(&config)?;
 
@@ -464,36 +472,28 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
 //   Cleans a path that may have been corrupted by shell quoting issues.
 //   e.g., PowerShell trailing \ can cause: path.vmdk" -o output.csv --overwrite
 // -----------------------------------------------------------------------------
-fn clean_path(path: &str) -> String {
-    let mut p = path.to_string();
+fn clean_path(path: &str) -> Result<String, String> {
+    let p = path.to_string();
 
     // Detect shell quoting corruption: path contains what looks like CLI flags
     // This happens in PowerShell when a path ends with \ inside single quotes:
     //   -d 'C:\path\' -o output.csv  →  -d receives 'C:\path" -o output.csv'
     if p.contains("\" -") || p.contains("\" --") || p.contains(" -o ") || p.contains(" --overwrite") {
-        eprintln!();
-        eprintln!("  [WARNING] Path appears corrupted by shell quoting: {}", &p[..p.len().min(80)]);
-        eprintln!("            This happens when a path ends with \\ inside single quotes in PowerShell.");
-        eprintln!("            Fix: remove the trailing \\ or use double quotes.");
-        eprintln!("            Example: -d \"C:\\evidence\\image.vmdk\"");
-        eprintln!();
-
-        // Try to salvage: cut at the first embedded flag
-        for marker in &["\" -o ", "\" --", " -o ", " --overwrite"] {
-            if let Some(pos) = p.find(marker) {
-                p = p[..pos].to_string();
-                break;
-            }
-        }
+        return Err(format!(
+            "Path corrupted by shell quoting: '{}...'\n\
+             This happens when a path ends with \\ inside single quotes in PowerShell.\n\
+             Fix: remove the trailing \\ or use double quotes.\n\
+             Example: -d \"C:\\evidence\\image.vmdk\"",
+            &p[..p.len().min(80)]
+        ));
     }
 
-    // Remove trailing quotes
-    p = p.trim_matches('"').to_string();
+    // Remove trailing quotes and slashes
+    let p = p.trim_matches('"')
+        .trim_end_matches(&['\\', '/'][..])
+        .to_string();
 
-    // Strip trailing slashes
-    p = p.trim_end_matches(&['\\', '/'][..]).to_string();
-
-    p
+    Ok(p)
 }
 
 // -----------------------------------------------------------------------------
