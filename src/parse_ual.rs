@@ -109,9 +109,14 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> Vec<Log
         };
 
         let mdb_full_path = mdb_path.to_string_lossy().to_string();
+        let mut mdb_event_count = 0;
         for row in &rows {
             let new_events = ual_row_to_logdata_entries(row, &role_map, &server_hostname, &mdb_full_path);
+            mdb_event_count += new_events.len();
             events.extend(new_events);
+        }
+        if mdb_event_count > 0 {
+            crate::banner::print_phase_result(&format!("{} ({} events)", mdb_name, mdb_event_count));
         }
     }
 

@@ -1295,11 +1295,9 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     all_ual_files.sort();
     all_ual_files.dedup();
 
-    if all_ual_files.is_empty() {
-        crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
-    } else {
-        crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count,
-            &format!("EVTX artifacts + {} UAL databases", all_ual_files.len()));
+    crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
+    if !all_ual_files.is_empty() {
+        crate::banner::print_phase_result(&format!("{} UAL databases detected", all_ual_files.len()));
     }
 
     if is_debug_mode() {
@@ -1340,13 +1338,10 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
 
     // Parse UAL databases (detected earlier during artifact search)
     if !all_ual_files.is_empty() {
+        crate::banner::print_info("UAL (User Access Logging):");
         let source = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
         let ual_events = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
         if !ual_events.is_empty() {
-            crate::banner::print_info(&format!(
-                "  {} UAL access records extracted (3-year server logon history)",
-                ual_events.len()
-            ));
             artifact_details.push(("UAL (User Access Logging)".to_string(), ual_events.len()));
             log_data.extend(ual_events);
         }
