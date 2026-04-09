@@ -44,6 +44,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
 | **Forensic image analysis** | Open E01/dd images directly, find NTFS partitions (GPT/MBR), extract EVTX — no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data merged with `merge` — one timeline across OS boundaries | |
@@ -177,6 +178,25 @@ masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.e01 -f Desktop.e01 -o inc
 </div>
 
 Uses the [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) crate for cross-platform VSS access. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+
+### Parse from mounted volumes (live disk / write-blocker)
+
+Point masstin at a drive letter and it reads the raw volume directly — extracting all EVTX from the live filesystem and from every VSS snapshot found on the disk. No need to image the disk first. Ideal for triage or when working with a write-blocker.
+
+```bash
+# Single volume (requires Administrator on Windows)
+masstin -a parse-image-windows -d D: -o timeline.csv
+
+# Multiple volumes
+masstin -a parse-image-windows -d D: -d E: -o timeline.csv
+
+# Scan all NTFS volumes on the system
+masstin -a parse-image-windows --all-volumes -o timeline.csv
+```
+
+Masstin transparently reports every step: volume detection, NTFS confirmation, EVTX count from live, VSS stores found, and EVTX recovered from each snapshot. Duplicates across live and VSS are automatically deduplicated by Polars.
+
+> **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
 
 ### Parse Winlogbeat JSON
 
