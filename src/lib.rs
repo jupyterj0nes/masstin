@@ -24,6 +24,8 @@ mod parse_linux;
 pub use crate::parse_linux::*;
 mod parse_image_windows;
 pub use crate::parse_image_windows::*;
+mod parse_image_linux;
+pub use crate::parse_image_linux::*;
 pub mod banner;
 pub use crate::banner::*;
 pub mod parse_ese;
@@ -128,6 +130,8 @@ enum ActionType {
     ParseLinux,
     /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Extracts EVTX + UAL from live + VSS
     ParseImageWindows,
+    /// Parse from Linux forensic images (E01/dd/VMDK). Extracts auth.log, secure, wtmp and other logs from ext4 partitions
+    ParseImageLinux,
 }
 
 // -----------------------------------------------------------------------------
@@ -225,6 +229,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseImageWindows => {
             parse_image_windows(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
         }
+        ActionType::ParseImageLinux => {
+            parse_image_linux(&config.file, &config.directory, config.output.as_ref());
+        }
     }
 
     Ok(())
@@ -321,6 +328,13 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if config.file.is_empty() && config.directory.is_empty() && !config.all_volumes {
                 return Err(String::from(
                     "For parse-image-windows, specify image files with -f, a volume with -d (e.g. -d D:), or --all-volumes.",
+                ));
+            }
+        }
+        ActionType::ParseImageLinux => {
+            if config.file.is_empty() && config.directory.is_empty() {
+                return Err(String::from(
+                    "For parse-image-linux, specify image files with -f or directories containing images with -d.",
                 ));
             }
         }
