@@ -165,7 +165,7 @@ Masstin transparently reports all inferences: hostname identification (from `/et
 
 ### Parse forensic images (E01/dd/VMDK) with VSS recovery
 
-Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (monolithic sparse, flat, and split sparse). Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
+Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, and VMFS/ESXi). Pure Rust parsers for all formats — no external tools required. Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies, and recovers EVTX from each VSS snapshot. Events are deduplicated across live and VSS sources.
 
 ```bash
 # Single image
