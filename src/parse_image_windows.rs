@@ -112,6 +112,10 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
                 crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
                 extract_evtx_from_image_ewf(image_path, &temp_dir)
             }
+            "vmdk" => {
+                crate::banner::print_info(&format!("Image format: VMDK ({})", image_path));
+                extract_evtx_from_image_vmdk(image_path, &temp_dir)
+            }
             "dd" | "raw" | "img" | "001" => {
                 crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
                 extract_evtx_from_image_raw(image_path, &temp_dir)
@@ -544,6 +548,18 @@ fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, Str
 fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
     let reader = ewf::EwfReader::open(image_path)
         .map_err(|e| format!("Cannot open E01: {}", e))?;
+
+    let image_size = reader.total_size();
+    crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
+
+    let mut buf_reader = BufReader::new(reader);
+    extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
+}
+
+/// Extract EVTX from a VMDK image
+fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+    let reader = crate::vmdk::VmdkReader::open(image_path)
+        .map_err(|e| format!("Cannot open VMDK: {}", e))?;
 
     let image_size = reader.total_size();
     crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));

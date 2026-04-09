@@ -30,6 +30,8 @@ pub mod parse_ese;
 pub use crate::parse_ese::*;
 mod parse_ual;
 pub use crate::parse_ual::*;
+pub mod vmdk;
+pub use crate::vmdk::*;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -124,7 +126,7 @@ enum ActionType {
     ParseCortexEvtxForensics,
     /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
-    /// Parse from forensic images (E01/dd), mounted volumes (-d D:), or --all-volumes. Extracts EVTX + UAL from live + VSS
+    /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Extracts EVTX + UAL from live + VSS
     ParseImageWindows,
 }
 
