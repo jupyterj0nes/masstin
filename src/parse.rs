@@ -969,7 +969,13 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
 
     match output {
         Some(output_path) => {
-            let mut output_file = File::create(output_path).unwrap();
+            let mut output_file = match File::create(output_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[ERROR] Cannot create output file {}: {}", output_path, e);
+                    return 0;
+                }
+            };
             CsvWriter::new(&mut output_file)
                 .has_header(true)
                 .finish(&mut df.unwrap())
@@ -1057,7 +1063,7 @@ fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec
         let mut entry = match archive.by_index(i) {
             Ok(f)  => f,
             Err(e) => {
-                println!("[ERROR] Reading file {} in {:?}: {}", i, zip_path, e);
+                if is_debug_mode() { eprintln!("[DEBUG] Reading file {} in {:?}: {}", i, zip_path, e); }
                 continue;
             }
         };
@@ -1239,16 +1245,15 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     let mut vec_filenames: Vec<EvtxLocation> = vec![];
 
     // Detect drive root paths and suggest parse-image-windows for VSS
+    // parse-windows passes "X:\" (normalized), parse-image-windows passes "X:" (no trailing \)
     for dir in directories {
-        // After normalize_path, a drive root looks like "F:\" or "F:"
-        // Check: second char is ':', and path has no subdirectories beyond the root
-        let normalized = dir.replace('/', "\\");
-        let is_drive_root = normalized.len() >= 2
-            && normalized.as_bytes()[1] == b':'
-            && normalized.as_bytes()[0].is_ascii_alphabetic()
-            && (normalized.len() <= 3 || normalized.chars().filter(|c| *c == '\\').count() == 1);
-        if is_drive_root {
-            let letter = &dir[..2];
+        let d = dir.replace('/', "\\");
+        let is_drive_with_backslash = d.len() == 3
+            && d.as_bytes()[0].is_ascii_alphabetic()
+            && d.as_bytes()[1] == b':'
+            && d.as_bytes()[2] == b'\\';
+        if is_drive_with_backslash {
+            let letter = &d[..2];
             crate::banner::print_info(&format!(
                 "Drive {} detected — scanning as filesystem (EVTX + UAL only).", letter
             ));

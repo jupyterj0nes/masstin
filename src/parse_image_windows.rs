@@ -55,24 +55,35 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
 
-    // Extract from mounted volumes
+    // Extract from mounted volumes: filesystem scan for live + raw I/O for VSS
     for vol in &volumes {
         crate::banner::print_phase("1", "3", &format!("Opening mounted volume {}...", vol));
-        crate::banner::print_info(&format!("Detected {} as a mounted volume — will extract EVTX from live filesystem and all VSS stores", vol));
+        crate::banner::print_info(&format!("Detected {} as a mounted volume — will extract EVTX + UAL from filesystem and VSS from raw volume", vol));
 
         let volume_label = vol.trim_end_matches(&['\\', '/'][..]).to_string();
+
+        // 1. Add the mounted path directly for filesystem scanning (EVTX + UAL)
+        //    This works reliably on mounted drives, just like parse-windows -d
+        //    Note: pass without trailing \ so parse_events doesn't show the VSS tip
+        extracted_dirs.push(volume_label.clone());
+        crate::banner::print_info("  Live volume: scanning filesystem for EVTX + UAL...");
+
+        // 2. Open raw volume for VSS extraction only
+        crate::banner::print_info("  VSS: opening raw volume for shadow copy recovery...");
         let temp_dir = base_temp.join(format!("vol_{}", volume_label));
         let _ = fs::create_dir_all(&temp_dir);
 
-        match extract_evtx_from_volume(&volume_label, &temp_dir) {
-            Ok(dir) => {
+        match extract_vss_only_from_volume(&volume_label, &temp_dir) {
+            Ok(Some(dir)) => {
                 let dir_str = dir.to_string_lossy().to_string();
-                crate::banner::print_phase_result("EVTX files extracted from volume");
-                extracted_dirs.push(dir_str.clone());
-                image_names.push((dir_str, format!("volume_{}", volume_label)));
+                crate::banner::print_phase_result("VSS EVTX extracted from volume");
+                extracted_dirs.push(dir_str);
+            }
+            Ok(None) => {
+                crate::banner::print_info("  No VSS stores found or no EVTX in VSS");
             }
             Err(e) => {
-                eprintln!("[ERROR] Failed to process volume {}: {}", vol, e);
+                crate::banner::print_info(&format!("  VSS extraction failed: {}", e));
             }
         }
     }
@@ -327,6 +338,93 @@ fn get_device_size_ioctl(_file: &File) -> u64 { 0 }
 // -----------------------------------------------------------------------------
 //  Extract EVTX from a mounted volume (live + VSS)
 // -----------------------------------------------------------------------------
+
+/// Extract EVTX only from VSS stores on a mounted volume (raw I/O).
+/// Returns the output directory if any EVTX were found, None if no VSS or no EVTX.
+fn extract_vss_only_from_volume(drive: &str, temp_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let device_path = if drive.starts_with("\\\\.\\") {
+        drive.to_string()
+    } else {
+        format!("\\\\.\\{}", drive)
+    };
+
+    let fh = File::open(&device_path)
+        .map_err(|e| format!("Cannot open volume {} — are you running as Administrator? ({})", device_path, e))?;
+
+    let size = get_device_size_ioctl(&fh);
+    if size == 0 {
+        return Err(format!("Cannot read volume size for {}. Run as Administrator.", device_path));
+    }
+
+    crate::banner::print_info(&format!("    Volume size: {:.2} GB", size as f64 / 1_073_741_824.0));
+
+    let mut reader = BufReader::new(SectorReader::new(fh, 512, size));
+
+    if !verify_ntfs_signature(&mut reader, 0) {
+        return Ok(None);
+    }
+
+    let evtx_output_dir = temp_dir.join("vss_extracted");
+    let _ = fs::create_dir_all(&evtx_output_dir);
+    let mut total_evtx = 0;
+
+    match VssVolume::new(&mut reader) {
+        Ok(vss) if vss.store_count() > 0 => {
+            crate::banner::print_phase_result(&format!(
+                "    {} VSS store(s) detected!", vss.store_count()
+            ));
+
+            for s in 0..vss.store_count() {
+                if let Ok(info) = vss.store_info(s) {
+                    crate::banner::print_info(&format!(
+                        "    VSS store {}: created {}", s, info.creation_time_utc()
+                    ));
+                }
+                if let Ok((blocks, bytes)) = vss.store_delta_size(&mut reader, s) {
+                    crate::banner::print_info(&format!(
+                        "      {} changed blocks ({:.1} MB delta)", blocks, bytes as f64 / 1_048_576.0
+                    ));
+                }
+
+                crate::banner::print_info(&format!("    Extracting EVTX from VSS store {}...", s));
+                match vss.store_reader(&mut reader, s) {
+                    Ok(mut store_reader) => {
+                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s) {
+                            Ok(count) => {
+                                total_evtx += count;
+                                crate::banner::print_info(&format!(
+                                    "      {} EVTX files extracted from VSS store {}", count, s
+                                ));
+                            }
+                            Err(e) => {
+                                if is_debug_mode() {
+                                    eprintln!("[DEBUG] VSS store {} error: {}", s, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if is_debug_mode() {
+                            eprintln!("[DEBUG] Cannot open VSS store {}: {}", s, e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            crate::banner::print_info("    No Volume Shadow Copy stores found");
+        }
+        Err(_) => {
+            crate::banner::print_info("    No Volume Shadow Copy stores found");
+        }
+    }
+
+    if total_evtx > 0 {
+        Ok(Some(evtx_output_dir))
+    } else {
+        Ok(None)
+    }
+}
 
 fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, String> {
     let device_path = if drive.starts_with("\\\\.\\") {

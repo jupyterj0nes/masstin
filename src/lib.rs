@@ -132,8 +132,15 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
-    // Normalize directory paths: remove trailing slashes/backslashes and canonicalize
-    config.directory = config.directory.iter().map(|d| normalize_path(d)).collect();
+    // Normalize paths, but preserve bare drive letters (D:, F:\) for parse-image-windows
+    config.directory = config.directory.iter().map(|d| {
+        let trimmed = d.trim_end_matches(&['\\', '/'][..]);
+        if trimmed.len() == 2 && trimmed.as_bytes()[0].is_ascii_alphabetic() && trimmed.as_bytes()[1] == b':' {
+            trimmed.to_string() // Preserve "D:" as-is for volume detection
+        } else {
+            normalize_path(d)
+        }
+    }).collect();
     config.file = config.file.iter().map(|f| normalize_path(f)).collect();
 
     validate_folders(&config)?;
