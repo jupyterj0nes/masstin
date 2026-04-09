@@ -64,20 +64,20 @@ pub mod parse {}
 // Updated LogData struct with event_type, logon_id, and detail columns.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct LogData {
-    time_created: String,
-    computer: String,
-    event_type: String,
-    event_id: String,
-    subject_user_name: String,
-    subject_domain_name: String,
-    target_user_name: String,
-    target_domain_name: String,
-    logon_type: String,
-    workstation_name: String,
-    ip_address: String,
-    logon_id: String,
-    filename: String,
-    detail: String,
+    pub time_created: String,
+    pub computer: String,
+    pub event_type: String,
+    pub event_id: String,
+    pub subject_user_name: String,
+    pub subject_domain_name: String,
+    pub target_user_name: String,
+    pub target_domain_name: String,
+    pub logon_type: String,
+    pub workstation_name: String,
+    pub ip_address: String,
+    pub logon_id: String,
+    pub filename: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1294,6 +1294,41 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
 
     pb.finish_and_clear();
     crate::banner::print_artifact_detail(&artifact_details);
+
+    // Check for UAL databases — in directories and individual files
+    let mut all_ual_files: Vec<std::path::PathBuf> = Vec::new();
+
+    // From -d directories: scan for Sum subdirectories and .mdb files
+    for dir in directories {
+        all_ual_files.extend(crate::parse_ual::find_ual_databases(dir));
+    }
+
+    // From -f files: check if any are .mdb files
+    for f in files {
+        if f.to_lowercase().ends_with(".mdb") && std::path::Path::new(f).exists() {
+            all_ual_files.push(std::path::PathBuf::from(f));
+        }
+    }
+
+    if !all_ual_files.is_empty() {
+        // Deduplicate by filename (short names like SYSTEM~1.MDB may duplicate)
+        all_ual_files.sort();
+        all_ual_files.dedup();
+
+        crate::banner::print_info(&format!(
+            "UAL databases detected ({} files)", all_ual_files.len()
+        ));
+        let source = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
+        let ual_events = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
+        if !ual_events.is_empty() {
+            crate::banner::print_info(&format!(
+                "  {} UAL access records extracted (3-year server logon history)",
+                ual_events.len()
+            ));
+            artifact_details.push(("UAL (User Access Logging)".to_string(), ual_events.len()));
+            log_data.extend(ual_events);
+        }
+    }
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());

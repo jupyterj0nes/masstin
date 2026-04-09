@@ -26,6 +26,10 @@ mod parse_image_windows;
 pub use crate::parse_image_windows::*;
 pub mod banner;
 pub use crate::banner::*;
+pub mod parse_ese;
+pub use crate::parse_ese::*;
+mod parse_ual;
+pub use crate::parse_ual::*;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -225,10 +229,11 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                     return Err(format!("File {} does not exist.", file));
                 }
                 if config.action == ActionType::ParseWindows {
-                    // Check if EVTX
-                    if !is_evtx_file(file) {
+                    // Check if EVTX or MDB (UAL database)
+                    let is_mdb = file.to_lowercase().ends_with(".mdb");
+                    if !is_mdb && !is_evtx_file(file) {
                         return Err(format!(
-                            "File {} does not appear to be an EVTX file.",
+                            "File {} does not appear to be an EVTX or MDB file.",
                             file
                         ));
                     }

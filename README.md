@@ -45,6 +45,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Forensic image analysis** | Open E01/dd images directly, find NTFS partitions (GPT/MBR), extract EVTX — no mounting needed | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
+| **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data merged with `merge` — one timeline across OS boundaries | |
@@ -197,6 +198,23 @@ masstin -a parse-image-windows --all-volumes -o timeline.csv
 Masstin transparently reports every step: volume detection, NTFS confirmation, EVTX count from live, VSS stores found, and EVTX recovered from each snapshot. Duplicates across live and VSS are automatically deduplicated by Polars.
 
 > **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
+
+### User Access Logging (UAL)
+
+Masstin auto-detects UAL databases (`.mdb` files from `C:\Windows\System32\LogFiles\Sum`) and extracts server access records going back **up to 3 years** — surviving event log clearing and rollover. UAL records include username, source IP, role (File Server/SMB, Remote Access/RDP, etc.), access count, and first/last seen timestamps.
+
+```bash
+# Automatic: UAL is detected when scanning directories or forensic images
+masstin -a parse-windows -d /evidence/Windows/System32/LogFiles/Sum/ -o timeline.csv
+
+# Direct: point at individual .mdb files
+masstin -a parse-windows -f Current.mdb -f SystemIdentity.mdb -o timeline.csv
+
+# From forensic images: UAL databases are extracted and parsed automatically
+masstin -a parse-image-windows -f DC01.e01 -o timeline.csv
+```
+
+Each UAL record generates two timeline entries (first seen + last seen). Server hostname is resolved from `SystemIdentity.mdb`. Roles are mapped to protocols: File Server → `SMB`, Remote Access → `RDP`, Web Server → `HTTP`, etc. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-ual/)
 
 ### Parse Winlogbeat JSON
 

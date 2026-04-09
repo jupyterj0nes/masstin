@@ -34,4 +34,5 @@ ewf = "0.2"
 ntfs = "0.4"
 mbrman = "0.6"
 vshadow = "0.2"
+libesedb = "0.2"
 

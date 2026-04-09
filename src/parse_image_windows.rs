@@ -12,6 +12,7 @@ use crate::parse::{parse_events, is_debug_mode};
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
+const UAL_SUM_PATH: &[&str] = &["Windows", "System32", "LogFiles", "Sum"];
 
 /// Main entry point: parse EVTX files from forensic disk images, mounted volumes, or all volumes
 pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
@@ -364,6 +365,15 @@ fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, Str
         }
     }
 
+    // 1b. Extract UAL databases from live volume
+    let ual_dir = evtx_output_dir.join("partition_0").join("Sum");
+    match extract_files_from_ntfs_path(&mut reader, 0, UAL_SUM_PATH, "mdb", &ual_dir) {
+        Ok(count) if count > 0 => {
+            crate::banner::print_info(&format!("  {} UAL database files extracted from live volume", count));
+        }
+        _ => {}
+    }
+
     // 2. Check for VSS stores and extract from each
     crate::banner::print_info("Checking for Volume Shadow Copy stores...");
     match VssVolume::new(&mut reader) {
@@ -492,6 +502,15 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
                     eprintln!("[DEBUG] Partition {} error: {}", i + 1, e);
                 }
             }
+        }
+
+        // Extract UAL databases from live volume
+        let ual_dir = evtx_output_dir.join(format!("partition_{}", i)).join("Sum");
+        match extract_files_from_ntfs_path(reader, *partition_offset, UAL_SUM_PATH, "mdb", &ual_dir) {
+            Ok(count) if count > 0 => {
+                crate::banner::print_info(&format!("  {} UAL database files extracted from live volume", count));
+            }
+            _ => {}
         }
 
         // Check for Volume Shadow Copies (VSS) and extract EVTX from each
@@ -862,6 +881,90 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
             let mut attached = data_value.attach(store_reader);
 
             let output_path = vss_dir.join(&name);
+            let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+
+            let mut buf = [0u8; 65536];
+            loop {
+                match attached.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                    Err(_) => break,
+                }
+            }
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+/// Extract files with a given extension from an NTFS path.
+/// Used to extract UAL .mdb files from Windows/System32/LogFiles/Sum.
+fn extract_files_from_ntfs_path<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    path_components: &[&str],
+    extension: &str,
+    output_dir: &Path,
+) -> Result<usize, String> {
+    let mut partition_reader = OffsetReader::new(reader, partition_offset);
+
+    let mut ntfs = ntfs::Ntfs::new(&mut partition_reader)
+        .map_err(|e| format!("Cannot parse NTFS: {}", e))?;
+    ntfs.read_upcase_table(&mut partition_reader)
+        .map_err(|e| format!("Cannot read upcase table: {}", e))?;
+
+    let root_dir = ntfs.root_directory(&mut partition_reader)
+        .map_err(|e| format!("Cannot read root directory: {}", e))?;
+
+    let mut current_dir = root_dir;
+    for component in path_components {
+        let index = current_dir.directory_index(&mut partition_reader)
+            .map_err(|e| format!("Cannot read directory index: {}", e))?;
+        let mut found = false;
+        let mut entries = index.entries();
+        while let Some(entry) = entries.next(&mut partition_reader) {
+            let entry = entry.map_err(|e| format!("Directory entry error: {}", e))?;
+            if let Some(key) = entry.key() {
+                let file_name = key.map_err(|e| format!("Filename error: {}", e))?;
+                let name = file_name.name().to_string_lossy();
+                if name.eq_ignore_ascii_case(component) {
+                    current_dir = entry.file_reference().to_file(&ntfs, &mut partition_reader)
+                        .map_err(|e| format!("Cannot open directory {}: {}", component, e))?;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(format!("Path not found: {}", component));
+        }
+    }
+
+    let _ = fs::create_dir_all(output_dir);
+    let dir_index = current_dir.directory_index(&mut partition_reader)
+        .map_err(|e| format!("Cannot read directory: {}", e))?;
+
+    let mut count = 0;
+    let mut entries = dir_index.entries();
+    while let Some(entry) = entries.next(&mut partition_reader) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if let Some(key) = entry.key() {
+            let file_name = match key { Ok(f) => f, Err(_) => continue };
+            let name = file_name.name().to_string_lossy().to_string();
+            if !name.to_lowercase().ends_with(&format!(".{}", extension)) { continue; }
+
+            let ntfs_file = match entry.file_reference().to_file(&ntfs, &mut partition_reader) {
+                Ok(f) => f, Err(_) => continue
+            };
+            let data_item = match ntfs_file.data(&mut partition_reader, "") {
+                Some(Ok(d)) => d, _ => continue
+            };
+            let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };
+            let data_value = match data_attr.value(&mut partition_reader) { Ok(v) => v, Err(_) => continue };
+            let mut attached = data_value.attach(&mut partition_reader);
+
+            let output_path = output_dir.join(&name);
             let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];
