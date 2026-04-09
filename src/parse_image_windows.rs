@@ -50,7 +50,7 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
 
     // Phase 1: Extract EVTX + UAL from all sources into temp directories
     let mut extracted_dirs: Vec<String> = Vec::new();
-    let mut image_names: Vec<(String, String)> = Vec::new(); // (temp_dir, image_name)
+    let mut all_image_files: Vec<String> = files.to_vec();
     let base_temp = std::env::temp_dir().join("masstin_image_extract");
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
@@ -88,8 +88,61 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
         }
     }
 
+    // Scan real directories for forensic images (E01, VMDK, dd, raw)
+    if !real_dirs.is_empty() {
+        let image_extensions = ["e01", "ex01", "vmdk", "dd", "raw", "img", "001"];
+        let mut discovered: Vec<String> = Vec::new();
+
+        for dir in &real_dirs {
+            crate::banner::print_info(&format!("Scanning {} for forensic images...", dir));
+            scan_for_images(Path::new(dir), &image_extensions, &mut discovered, 0);
+        }
+
+        if !discovered.is_empty() {
+            // Deduplicate: for E01 split files, only keep the .E01 (not .E02, .E03...)
+            // For VMDK split, only keep the descriptor (not -s001, -s002...)
+            let filtered: Vec<String> = discovered.into_iter().filter(|p| {
+                let name = Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let lower = name.to_lowercase();
+                // Skip E01 segment files (.e02, .e03, etc.)
+                if lower.ends_with(".e01") || lower.ends_with(".ex01") { return true; }
+                // Skip VMDK split extents and snapshots — only keep base descriptors
+                if lower.ends_with(".vmdk") {
+                    let stem = Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    // Skip split extents: name-sNNN.vmdk
+                    if let Some(pos) = stem.rfind("-s") {
+                        let after = &stem[pos + 2..];
+                        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                            return false;
+                        }
+                    }
+                    // Skip VMware snapshots: name-NNNNNN.vmdk or name-NNNNNN-sNNN.vmdk
+                    if let Some(pos) = stem.rfind("-0") {
+                        let after = &stem[pos + 1..];
+                        if after.len() >= 6 && after[..6].chars().all(|c| c.is_ascii_digit()) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                // For dd/raw/img, keep all
+                true
+            }).collect();
+
+            crate::banner::print_phase_result(&format!(
+                "{} forensic image(s) found in scanned directories", filtered.len()
+            ));
+            for img in &filtered {
+                crate::banner::print_info(&format!("  {}", img));
+            }
+
+            // Add discovered images to the processing list
+            all_image_files.extend(filtered);
+        }
+    }
+
     // Extract from image files — use image name as temp subdirectory
-    for image_path in files {
+    for image_path in &all_image_files {
         let ext = Path::new(image_path)
             .extension()
             .and_then(|e| e.to_str())
@@ -166,6 +219,32 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
 // -----------------------------------------------------------------------------
 //  Drive letter detection and volume enumeration
 // -----------------------------------------------------------------------------
+
+/// Recursively scan a directory for forensic image files.
+fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, depth: usize) {
+    if depth > 10 { return; } // Avoid infinite recursion
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip $RECYCLE.BIN and other system dirs
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('$') || name.starts_with('.') || name == "System Volume Information" {
+                continue;
+            }
+            scan_for_images(&path, extensions, results, depth + 1);
+        } else if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
+                    results.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+}
 
 /// Check if a string is a Windows drive letter (e.g. "D:", "D:\", "E:")
 fn is_drive_letter(s: &str) -> bool {
