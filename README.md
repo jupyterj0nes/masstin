@@ -102,11 +102,21 @@ Masstin parses **28 Windows Event IDs** across **9 EVTX sources**, plus Linux ar
 | Cortex XDR Network | RDP (3389), SMB (445), SSH (22) via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 | Cortex XDR EVTX Forensics | Forensic event logs collected by forensic agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 
-## Quick Start
+## Install
 
-Download the latest binary from the [Releases page](https://github.com/jupyterj0nes/masstin/releases) — no installation needed.
+### Download pre-built binary (recommended)
 
-Or build from source:
+> **No Rust toolchain needed.** Just download and run.
+
+| Platform | Download |
+|----------|----------|
+| Windows | [`masstin-windows.exe`](https://github.com/jupyterj0nes/masstin/releases/latest) |
+| Linux | [`masstin-linux`](https://github.com/jupyterj0nes/masstin/releases/latest) |
+| macOS | [`masstin-macos`](https://github.com/jupyterj0nes/masstin/releases/latest) |
+
+Go to [**Releases**](https://github.com/jupyterj0nes/masstin/releases) and download the binary for your platform. That's it.
+
+### Build from source (alternative)
 
 ```bash
 git clone https://github.com/jupyterj0nes/masstin.git
