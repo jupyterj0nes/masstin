@@ -467,28 +467,31 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
 fn clean_path(path: &str) -> String {
     let mut p = path.to_string();
 
+    // Detect shell quoting corruption: path contains what looks like CLI flags
+    // This happens in PowerShell when a path ends with \ inside single quotes:
+    //   -d 'C:\path\' -o output.csv  →  -d receives 'C:\path" -o output.csv'
+    if p.contains("\" -") || p.contains("\" --") || p.contains(" -o ") || p.contains(" --overwrite") {
+        eprintln!();
+        eprintln!("  [WARNING] Path appears corrupted by shell quoting: {}", &p[..p.len().min(80)]);
+        eprintln!("            This happens when a path ends with \\ inside single quotes in PowerShell.");
+        eprintln!("            Fix: remove the trailing \\ or use double quotes.");
+        eprintln!("            Example: -d \"C:\\evidence\\image.vmdk\"");
+        eprintln!();
+
+        // Try to salvage: cut at the first embedded flag
+        for marker in &["\" -o ", "\" --", " -o ", " --overwrite"] {
+            if let Some(pos) = p.find(marker) {
+                p = p[..pos].to_string();
+                break;
+            }
+        }
+    }
+
     // Remove trailing quotes
     p = p.trim_matches('"').to_string();
 
-    // If path contains embedded arguments (shell quoting bug), truncate
-    // e.g., 'file.vmdk" -o output.csv' → 'file.vmdk'
-    if let Some(pos) = p.find("\" -") {
-        p = p[..pos].to_string();
-    }
-    if let Some(pos) = p.find("\" --") {
-        p = p[..pos].to_string();
-    }
-
     // Strip trailing slashes
     p = p.trim_end_matches(&['\\', '/'][..]).to_string();
-
-    // If path doesn't exist but path without trailing quote does, fix it
-    if !std::path::Path::new(&p).exists() {
-        let trimmed = p.trim_end_matches('"');
-        if std::path::Path::new(trimmed).exists() {
-            return trimmed.to_string();
-        }
-    }
 
     p
 }
