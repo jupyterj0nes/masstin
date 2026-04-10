@@ -58,6 +58,8 @@ const RDPCLIENT_EVENT_IDS: &[&str] = &["1024","1102"];
 const RDPCONNMANAGER_EVENT_IDS: &[&str] = &["1149"];
 const RDPLOCALSESSION_EVENT_IDS: &[&str] = &["21","22","24","25"];
 const RDPKORE_EVENT_IDS: &[&str] = &["131"];
+const WINRM_EVENT_IDS: &[&str] = &["6"];
+const WMI_EVENT_IDS: &[&str] = &["5858"];
 
 pub mod parse {}
 
@@ -661,6 +663,187 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
 }
 
 // ---------------------------------------------------------------------------------------
+// WINRM PARSER (Microsoft-Windows-WinRM/Operational)
+// Event ID 6: WinRM session init on source system — connection field has destination host
+// ---------------------------------------------------------------------------------------
+pub fn parse_winrm(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing WinRM {}", file);
+    }
+
+    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(_) => {
+            return vec![];
+        }
+    };
+
+    for record in parser.records() {
+        match record {
+            Ok(r) => {
+                let data = r.data.as_str();
+                let event: Event = match from_str(&data) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if let Some(ref event_id) = event.System.EventID {
+                    if lateral_event_ids.contains(&event_id.as_str()) {
+                        let mut connection = String::new();
+
+                        if let Some(ref event_data) = event.EventData {
+                            for data in &event_data.Datas {
+                                if let Some(ref name) = data.Name {
+                                    if name == "connection" {
+                                        connection = data.body.as_ref().unwrap_or(&String::new()).clone();
+                                    }
+                                }
+                            }
+                        }
+
+                        if connection.is_empty() {
+                            continue;
+                        }
+
+                        // Parse destination from connection string
+                        // Format: "hostname/wsman?PSVersion=..." or "http://ip:5985/wsman" or just "hostname/wsman"
+                        let dst_host = extract_host_from_winrm_connection(&connection);
+
+                        // Skip empty, localhost, and self-connections
+                        if dst_host.is_empty() || dst_host.eq_ignore_ascii_case("localhost") || dst_host == "127.0.0.1" || dst_host == "::1" {
+                            continue;
+                        }
+                        let src_host = event.System.Computer.as_deref().unwrap_or("");
+                        let dst_short = dst_host.split('.').next().unwrap_or(&dst_host);
+                        let src_short = src_host.split('.').next().unwrap_or(src_host);
+                        if dst_short.eq_ignore_ascii_case(src_short) {
+                            continue;
+                        }
+
+                        log_data.push(LogData {
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: event.System.Computer.unwrap_or_default(),
+                            event_type: "CONNECT".to_string(),
+                            event_id: event_id.clone(),
+                            subject_user_name: String::new(),
+                            subject_domain_name: String::new(),
+                            target_user_name: String::new(),
+                            target_domain_name: String::new(),
+                            logon_type: String::new(),
+                            workstation_name: dst_host.clone(),
+                            ip_address: dst_host,
+                            logon_id: String::new(),
+                            filename: file.to_string(),
+                            detail: format!("WinRM: {}", connection),
+                        });
+                    }
+                }
+            },
+            Err(_) => (),
+        }
+    }
+    log_data
+}
+
+/// Extract hostname or IP from WinRM connection string.
+/// Examples: "dc01/wsman?PSVersion=5.1", "http://192.168.1.10:5985/wsman", "server.domain.com/wsman"
+fn extract_host_from_winrm_connection(connection: &str) -> String {
+    let s = connection.trim();
+    // Strip protocol prefix if present
+    let s = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")).unwrap_or(s);
+    // Take everything before the first '/'
+    let host = s.split('/').next().unwrap_or("");
+    // Strip port if present (e.g., "192.168.1.10:5985")
+    let host = host.split(':').next().unwrap_or(host);
+    host.to_string()
+}
+
+// ---------------------------------------------------------------------------------------
+// WMI PARSER (Microsoft-Windows-WMI-Activity/Operational)
+// Event ID 5858: WMI client failure — ClientMachine field identifies remote origin
+// Only produces events when ClientMachine != Computer (i.e., remote WMI)
+// ---------------------------------------------------------------------------------------
+pub fn parse_wmi(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing WMI {}", file);
+    }
+
+    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(_) => {
+            return vec![];
+        }
+    };
+
+    for record in parser.records() {
+        match record {
+            Ok(r) => {
+                let data = r.data.as_str();
+                // WMI uses UserData with Operation_ClientFailure, but serde can handle
+                // it via the generic Event struct if we extract fields manually from XML
+                let event: EventWMI = match from_str(&data) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if let Some(ref event_id) = event.System.EventID {
+                    if lateral_event_ids.contains(&event_id.as_str()) {
+                        let (client_machine, user, operation) = match event.UserData {
+                            Some(ref ud) => {
+                                let cm = ud.client_machine().unwrap_or_default();
+                                let u = ud.user().unwrap_or_default();
+                                let op = ud.operation().unwrap_or_default();
+                                (cm, u, op)
+                            }
+                            None => continue,
+                        };
+
+                        let computer = event.System.Computer.clone().unwrap_or_default();
+
+                        // Only include remote WMI: ClientMachine must differ from Computer
+                        // Compare short names to handle FQDN vs NetBIOS (e.g., "SRV01" vs "SRV01.domain.local")
+                        let cm_short = client_machine.split('.').next().unwrap_or(&client_machine);
+                        let comp_short = computer.split('.').next().unwrap_or(&computer);
+                        if client_machine.is_empty() || cm_short.eq_ignore_ascii_case(comp_short) {
+                            continue;
+                        }
+
+                        // Parse user: may be "DOMAIN\user" or just "user"
+                        let (domain, username) = if let Some(pos) = user.find('\\') {
+                            (user[..pos].to_string(), user[pos + 1..].to_string())
+                        } else {
+                            (String::new(), user.clone())
+                        };
+
+                        // Skip SYSTEM/LOCAL SERVICE noise
+                        if username == "SYSTEM" || username == "LOCAL SERVICE" || username == "NETWORK SERVICE" {
+                            continue;
+                        }
+
+                        log_data.push(LogData {
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer,
+                            event_type: "CONNECT".to_string(),
+                            event_id: event_id.clone(),
+                            subject_user_name: String::new(),
+                            subject_domain_name: String::new(),
+                            target_user_name: username,
+                            target_domain_name: domain,
+                            logon_type: String::new(),
+                            workstation_name: client_machine.clone(),
+                            ip_address: client_machine,
+                            logon_id: String::new(),
+                            filename: file.to_string(),
+                            detail: if operation.len() > 100 { format!("WMI: {}...", &operation[..100]) } else { format!("WMI: {}", operation) },
+                        });
+                    }
+                }
+            },
+            Err(_) => (),
+        }
+    }
+    log_data
+}
+
+// ---------------------------------------------------------------------------------------
 // UNKNOWN PARSER (AUTODETECT PROVIDER)
 // ---------------------------------------------------------------------------------------
 pub fn parse_unknown(file: &str) -> Vec<LogData> {
@@ -702,6 +885,12 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         },
         "Microsoft-Windows-SmbClient%4Connectivity.evtx" => {
             log_data = parse_smb_client_connectivity(file, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-WinRM" => {
+            log_data = parse_winrm(file, WINRM_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-WMI-Activity" => {
+            log_data = parse_wmi(file, WMI_EVENT_IDS.to_vec())
         },
         _ => (),
     }
@@ -1216,6 +1405,12 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
         "Microsoft-Windows-SmbClient%4Connectivity.evtx" => {
             parse_smb_client_connectivity(&file_origin, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec())
         },
+        "Microsoft-Windows-WinRM%4Operational.evtx" => {
+            parse_winrm(&file_origin, WINRM_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-WMI-Activity%4Operational.evtx" => {
+            parse_wmi(&file_origin, WMI_EVENT_IDS.to_vec())
+        },
         _ => {
             // parse_unknown(&file_origin)
             Vec::new()
@@ -1436,4 +1631,35 @@ struct EventXML {
     Param3: Option<String>,
     User: Option<String>,
     Address: Option<String>,
+}
+
+// WMI event structs — UserData contains Operation_ClientFailure (5858) or Operation_TemporaryEssStarted (5860)
+#[derive(Debug, Deserialize, PartialEq)]
+struct EventWMI {
+    System: System,
+    UserData: Option<WMIUserData>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct WMIUserData {
+    Operation_ClientFailure: Option<WMIClientFailure>,
+}
+
+impl WMIUserData {
+    fn client_machine(&self) -> Option<String> {
+        self.Operation_ClientFailure.as_ref().and_then(|f| f.ClientMachine.clone())
+    }
+    fn user(&self) -> Option<String> {
+        self.Operation_ClientFailure.as_ref().and_then(|f| f.User.clone())
+    }
+    fn operation(&self) -> Option<String> {
+        self.Operation_ClientFailure.as_ref().and_then(|f| f.Operation.clone())
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct WMIClientFailure {
+    ClientMachine: Option<String>,
+    User: Option<String>,
+    Operation: Option<String>,
 }
