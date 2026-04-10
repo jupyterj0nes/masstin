@@ -118,7 +118,7 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> (Vec<Lo
             events.extend(new_events);
         }
         if mdb_event_count > 0 {
-            mdb_details.push((mdb_name.to_string(), mdb_event_count));
+            mdb_details.push((mdb_full_path.clone(), mdb_event_count));
         }
     }
 

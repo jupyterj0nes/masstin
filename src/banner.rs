@@ -231,17 +231,73 @@ pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
         style("[+]").green().bold(),
         style("Artifacts with events:").bold(),
     );
+
+    // Group artifacts by image name (extracted from path)
+    let mut grouped: Vec<(String, Vec<(&str, usize)>)> = Vec::new();
     for (name, count) in artifacts {
+        let image = extract_image_name_from_path(name);
         let short = std::path::Path::new(name)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or(name);
-        eprintln!("        {} {} {}",
-            style("=>").green(),
-            style(short).white(),
-            style(format!("({} events)", count)).dim(),
-        );
+
+        if let Some(group) = grouped.iter_mut().find(|(img, _)| *img == image) {
+            group.1.push((short, *count));
+        } else {
+            grouped.push((image, vec![(short, *count)]));
+        }
     }
+
+    if grouped.len() == 1 {
+        // Single image — flat list (no grouping needed)
+        for (_, items) in &grouped {
+            for (short, count) in items {
+                eprintln!("        {} {} {}",
+                    style("=>").green(),
+                    style(short).white(),
+                    style(format!("({} events)", count)).dim(),
+                );
+            }
+        }
+    } else {
+        // Multiple images — group by image name
+        for (image, items) in &grouped {
+            let total: usize = items.iter().map(|(_, c)| c).sum();
+            eprintln!("        {} {} {}",
+                style("=>").green().bold(),
+                style(image).cyan().bold(),
+                style(format!("({} events total)", total)).dim(),
+            );
+            for (short, count) in items {
+                eprintln!("           {} {} {}",
+                    style("-").dim(),
+                    style(short).white(),
+                    style(format!("({})", count)).dim(),
+                );
+            }
+        }
+    }
+}
+
+/// Extract image name from artifact path.
+/// Path like ".../masstin_image_extract/HRServer_Disk0.e01/evtx_extracted/partition_0/Security.evtx"
+/// Returns "HRServer_Disk0.e01"
+fn extract_image_name_from_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let marker = "masstin_image_extract/";
+    if let Some(pos) = normalized.find(marker) {
+        let after = &normalized[pos + marker.len()..];
+        if let Some(slash) = after.find('/') {
+            return after[..slash].to_string();
+        }
+    }
+    // Fallback: try to get parent directory name
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
