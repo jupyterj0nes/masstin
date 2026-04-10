@@ -856,6 +856,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let mut total_evtx = 0;
     let tasks_dir = temp_dir.join("tasks_extracted");
     let mut total_tasks = 0;
+    let mut total_ual = 0;
 
     for (i, partition_offset) in partitions.iter().enumerate() {
         crate::banner::print_info(&format!(
@@ -882,6 +883,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         let ual_dir = evtx_output_dir.join(format!("partition_{}", i)).join("Sum");
         match extract_files_from_ntfs_path(reader, *partition_offset, UAL_SUM_PATH, "mdb", &ual_dir) {
             Ok(count) if count > 0 => {
+                total_ual += count;
                 crate::banner::print_info(&format!("  {} UAL database files extracted from live volume", count));
             }
             _ => {}
@@ -950,8 +952,13 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         }
     }
 
-    if total_evtx > 0 {
-        crate::banner::print_phase_result(&format!("{} EVTX files extracted total", total_evtx));
+    // Summary of extracted artifacts
+    let mut summary_parts = Vec::new();
+    if total_evtx > 0 { summary_parts.push(format!("{} EVTX", total_evtx)); }
+    if total_ual > 0 { summary_parts.push(format!("{} UAL", total_ual)); }
+    if total_tasks > 0 { summary_parts.push(format!("{} Tasks", total_tasks)); }
+    if !summary_parts.is_empty() {
+        crate::banner::print_phase_result(&format!("{} files extracted total", summary_parts.join(" + ")));
     }
 
     // Now process ext4 partitions (Linux)

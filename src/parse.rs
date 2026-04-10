@@ -166,11 +166,11 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                         };
 
                         // Determine detail column
-                        let share_name = data_values.get("ShareName").unwrap().to_string();
-                        let relative_target = data_values.get("RelativeTargetName").unwrap().to_string();
+                        let share_name = data_values.get("ShareName").unwrap_or(&String::new()).to_string();
+                        let relative_target = data_values.get("RelativeTargetName").unwrap_or(&String::new()).to_string();
                         let detail = match event_id.as_str() {
-                            "4624" | "4648" => data_values.get("ProcessName").unwrap().to_string(),
-                            "4625" => translate_substatus(data_values.get("SubStatus").unwrap()),
+                            "4624" | "4648" => data_values.get("ProcessName").unwrap_or(&String::new()).to_string(),
+                            "4625" => translate_substatus(data_values.get("SubStatus").unwrap_or(&String::new())),
                             "5140" => share_name,
                             "5145" => {
                                 if relative_target.is_empty() {
@@ -183,18 +183,18 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                         };
 
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: event.System.Computer.unwrap(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: event.System.Computer.unwrap_or_default(),
                             event_type,
                             event_id,
-                            subject_user_name: data_values.get("SubjectUserName").unwrap().to_string(),
-                            subject_domain_name: data_values.get("SubjectDomainName").unwrap().to_string(),
-                            target_user_name: data_values.get("TargetUserName").unwrap().to_string(),
-                            target_domain_name: data_values.get("TargetDomainName").unwrap().to_string(),
-                            logon_type: data_values.get("LogonType").unwrap().to_string(),
-                            workstation_name: data_values.get("WorkstationName").unwrap().to_string(),
-                            ip_address: data_values.get("IpAddress").unwrap().to_string(),
-                            logon_id: data_values.get("TargetLogonId").unwrap().to_string(),
+                            subject_user_name: data_values.get("SubjectUserName").unwrap_or(&String::new()).to_string(),
+                            subject_domain_name: data_values.get("SubjectDomainName").unwrap_or(&String::new()).to_string(),
+                            target_user_name: data_values.get("TargetUserName").unwrap_or(&String::new()).to_string(),
+                            target_domain_name: data_values.get("TargetDomainName").unwrap_or(&String::new()).to_string(),
+                            logon_type: data_values.get("LogonType").unwrap_or(&String::new()).to_string(),
+                            workstation_name: data_values.get("WorkstationName").unwrap_or(&String::new()).to_string(),
+                            ip_address: data_values.get("IpAddress").unwrap_or(&String::new()).to_string(),
+                            logon_id: data_values.get("TargetLogonId").unwrap_or(&String::new()).to_string(),
                             filename: file.to_string(),
                             detail,
                         });
@@ -226,7 +226,7 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event2 = from_str(&data).unwrap();
+                let event: Event2 = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let event_type = match event_id.as_str() {
@@ -235,11 +235,11 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             _ => "CONNECT".to_string(),
                         };
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: event.System.Computer.unwrap(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: event.System.Computer.unwrap_or_default(),
                             event_type,
                             event_id,
-                            subject_user_name: event.System.Security.unwrap().UserID.as_ref().unwrap_or(&String::from("")).to_owned(),
+                            subject_user_name: event.System.Security.as_ref().and_then(|s| s.UserID.as_ref()).cloned().unwrap_or_default(),
                             subject_domain_name: String::from(""),
                             target_user_name: event.UserData.as_ref().unwrap().EventData.as_ref().unwrap().UserName.as_ref().unwrap_or(&String::from("")).to_owned(),
                             target_domain_name: String::from(""),
@@ -278,7 +278,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event = from_str(&data).unwrap();
+                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
@@ -287,29 +287,31 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             ("ShareName".to_string(), String::from("")),
                         ].iter().cloned().collect();
 
-                        for data in event.EventData.unwrap().Datas {
-                            if let Some(name) = data.Name {
-                                if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                        if let Some(event_data) = event.EventData {
+                            for data in event_data.Datas {
+                                if let Some(name) = data.Name {
+                                    if let Some(data_value) = data_values.get_mut(&name) {
+                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                    }
                                 }
                             }
-                        }
+                        } else { continue; }
 
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: data_values.get("ServerName").unwrap().to_string(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: data_values.get("ServerName").unwrap_or(&String::new()).to_string(),
                             event_type: "SUCCESSFUL_LOGON".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
-                            target_user_name: data_values.get("UserName").unwrap().to_string(),
+                            target_user_name: data_values.get("UserName").unwrap_or(&String::new()).to_string(),
                             target_domain_name: String::from(""),
                             logon_type: String::from("3"),
-                            workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
-                            ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
+                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
                             logon_id: String::from(""),
                             filename: file.to_string(),
-                            detail: data_values.get("ShareName").unwrap().to_string(),
+                            detail: data_values.get("ShareName").unwrap_or(&String::new()).to_string(),
                         });
                     }
                 }
@@ -339,7 +341,7 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event = from_str(&data).unwrap();
+                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
@@ -347,7 +349,8 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                             ("ServerName".to_string(), String::from(""))
                         ].iter().cloned().collect();
 
-                        for data in event.EventData.unwrap().Datas {
+                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
+                        for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
                                     *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
@@ -356,17 +359,17 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                         }
 
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: data_values.get("ServerName").unwrap().to_string(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: data_values.get("ServerName").unwrap_or(&String::new()).to_string(),
                             event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
-                            target_user_name: data_values.get("UserName").unwrap().to_string(),
+                            target_user_name: data_values.get("UserName").unwrap_or(&String::new()).to_string(),
                             target_domain_name: String::from(""),
                             logon_type: String::from("3"),
-                            workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
-                            ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
+                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
                             logon_id: String::from(""),
                             filename: file.to_string(),
                             detail: String::from(""),
@@ -399,14 +402,15 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event = from_str(&data).unwrap();
+                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
                             ("Value".to_string(), String::from(""))
                         ].iter().cloned().collect();
 
-                        for data in event.EventData.unwrap().Datas {
+                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
+                        for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
                                     *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
@@ -415,17 +419,17 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         }
 
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: data_values.get("Value").unwrap().to_string(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: data_values.get("Value").unwrap_or(&String::new()).to_string(),
                             event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
-                            target_user_name: event.System.Security.unwrap().UserID.unwrap(),
+                            target_user_name: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
                             target_domain_name: String::from(""),
                             logon_type: String::from("10"),
-                            workstation_name: event.System.Computer.as_ref().unwrap().to_owned(),
-                            ip_address: event.System.Computer.as_ref().unwrap().to_owned(),
+                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
+                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
                             logon_id: String::from(""),
                             filename: file.to_string(),
                             detail: String::from(""),
@@ -556,11 +560,11 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event2 = from_str(&data).unwrap();
+                let event: Event2 = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut remotedomain = String::from("");
-                        let mut remoteuser = event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().User.as_ref().unwrap().to_owned();
+                        let mut remoteuser = event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.User.as_ref()).cloned().unwrap_or_default();
 
                         if remoteuser.contains("\\") {
                             let parts: Vec<&str> = remoteuser.split("\\").collect();
@@ -580,8 +584,8 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
                             .cloned()
                             .unwrap_or_default();
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: event.System.Computer.unwrap(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: event.System.Computer.unwrap_or_default(),
                             event_type,
                             event_id,
                             subject_user_name: String::from(""),
@@ -589,8 +593,8 @@ pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<L
                             target_user_name: remoteuser,
                             target_domain_name: remotedomain,
                             logon_type: String::from("10"),
-                            workstation_name: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
-                            ip_address: event.UserData.as_ref().unwrap().EventXML.as_ref().unwrap().Address.as_ref().unwrap().to_owned(),
+                            workstation_name: event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.Address.as_ref()).cloned().unwrap_or_default(),
+                            ip_address: event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.Address.as_ref()).cloned().unwrap_or_default(),
                             logon_id: session_id,
                             filename: file.to_string(),
                             detail: String::from(""),
@@ -623,14 +627,15 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
         match record {
             Ok(r) => {
                 let data = r.data.as_str();
-                let event: Event = from_str(&data).unwrap();
+                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
                 if let Some(event_id) = event.System.EventID {
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
                             ("ClientIP".to_string(), String::from(""))
                         ].iter().cloned().collect();
 
-                        for data in event.EventData.unwrap().Datas {
+                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
+                        for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
                                     *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
@@ -638,8 +643,8 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                             }
                         }
                         log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap(),
-                            computer: event.System.Computer.unwrap(),
+                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
+                            computer: event.System.Computer.unwrap_or_default(),
                             event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
@@ -647,8 +652,8 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                             target_user_name: String::from(""),
                             target_domain_name: String::from(""),
                             logon_type: String::from("10"),
-                            workstation_name: data_values.get("ClientIP").unwrap().to_string(),
-                            ip_address: data_values.get("ClientIP").unwrap().to_string(),
+                            workstation_name: data_values.get("ClientIP").unwrap_or(&String::new()).to_string(),
+                            ip_address: data_values.get("ClientIP").unwrap_or(&String::new()).to_string(),
                             logon_id: String::from(""),
                             filename: file.to_string(),
                             detail: String::from(""),
@@ -857,8 +862,9 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
     let mut provider = String::from("");
     if let Some(Ok(r)) = parser.records().nth(1) {
         let data = r.data.as_str();
-        let event: Event = from_str(&data).unwrap();
-        provider = event.System.Provider.Name.unwrap();
+        if let Ok(event) = from_str::<Event>(&data) {
+            provider = event.System.Provider.Name.unwrap_or_default();
+        }
     }
 
     match provider.as_str() {
