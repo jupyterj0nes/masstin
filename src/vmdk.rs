@@ -6,9 +6,11 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
+use flate2::read::ZlibDecoder;
 
 const SECTOR_SIZE: u64 = 512;
 const SPARSE_MAGIC: u32 = 0x564D444B; // "KDMV"
+const GD_AT_END: u64 = 0xFFFFFFFFFFFFFFFF;
 
 // -----------------------------------------------------------------------------
 //  Sparse header (parsed from first 512 bytes of a sparse extent)
@@ -20,6 +22,7 @@ struct SparseHeader {
     grain_size: u64,        // sectors per grain (power of 2)
     num_gte_per_gt: u32,    // grain table entries per grain table (typically 512)
     gd_offset: u64,         // primary grain directory offset in sectors
+    compressed: bool,       // true for streamOptimized (compressed grains)
 }
 
 // -----------------------------------------------------------------------------
@@ -35,6 +38,7 @@ enum ExtentData {
         header: SparseHeader,
         grain_directory: Vec<u32>,  // GD entries (sector offsets to grain tables)
         grain_table_cache: std::collections::HashMap<u32, Vec<u32>>, // gd_index -> grain table
+        grain_data_cache: std::collections::HashMap<u64, Vec<u8>>,  // grain_index -> decompressed data
     },
 }
 
@@ -261,7 +265,41 @@ impl VmdkReader {
         let mut file = File::open(path)
             .map_err(|e| format!("Cannot open sparse extent '{}': {}", path, e))?;
 
-        let header = Self::read_sparse_header(&mut file)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Cannot seek to start: {}", e))?;
+        let mut header = Self::read_sparse_header_at_current(&mut file)?;
+
+        // For streamOptimized: read footer to get real gd_offset
+        if header.gd_offset == GD_AT_END || header.gd_offset == 0 {
+            if !header.compressed && header.capacity > 0 {
+                return Err("Grain directory at end of file but not compressed — unsupported format".to_string());
+            }
+            // Footer (copy of header with correct gd_offset) is near the end of the file.
+            // Layout: ... | footer marker (512) | footer/header (512) | EOS marker (512) |
+            // Try reading at -1024 first (most common), then -1536
+            let file_size = file.seek(SeekFrom::End(0))
+                .map_err(|e| format!("Cannot seek to end: {}", e))?;
+
+            let mut footer_header = None;
+            for offset_from_end in &[1024u64, 1536, 2048] {
+                let pos = file_size.saturating_sub(*offset_from_end);
+                if file.seek(SeekFrom::Start(pos)).is_err() { continue; }
+                if let Ok(h) = Self::read_sparse_header_at_current(&mut file) {
+                    if h.gd_offset != GD_AT_END && h.gd_offset != 0 && h.capacity > 0 {
+                        footer_header = Some(h);
+                        break;
+                    }
+                }
+            }
+
+            let footer_header = footer_header
+                .ok_or("streamOptimized VMDK: could not find valid footer with grain directory offset")?;
+            if footer_header.gd_offset != GD_AT_END && footer_header.gd_offset != 0 {
+                header.gd_offset = footer_header.gd_offset;
+            } else {
+                return Err("streamOptimized VMDK: footer does not contain valid grain directory offset".to_string());
+            }
+        }
 
         // Load grain directory into memory
         let num_gd_entries = Self::gd_entry_count(&header);
@@ -292,6 +330,7 @@ impl VmdkReader {
                 header,
                 grain_directory,
                 grain_table_cache: std::collections::HashMap::new(),
+                grain_data_cache: std::collections::HashMap::new(),
             },
             size_bytes,
         })
@@ -301,9 +340,11 @@ impl VmdkReader {
     //  Read the 512-byte sparse header
     // -------------------------------------------------------------------------
     fn read_sparse_header(file: &mut File) -> Result<SparseHeader, String> {
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("Cannot seek to start: {}", e))?;
+        Self::read_sparse_header_at_current(file)
+    }
 
+    /// Read sparse header from current file position (does NOT seek to 0)
+    fn read_sparse_header_at_current(file: &mut File) -> Result<SparseHeader, String> {
         let mut buf = [0u8; 72]; // we only need the first 72 bytes
         file.read_exact(&mut buf)
             .map_err(|e| format!("Cannot read sparse header: {}", e))?;
@@ -329,14 +370,7 @@ impl VmdkReader {
             buf[60], buf[61], buf[62], buf[63],
         ]);
 
-        // Detect streamOptimized VMDKs (flag bit 16 = compressed grains, or gd_offset invalid)
-        // streamOptimized uses compressed grains with markers — not yet supported
-        if (flags & 0x10000) != 0 {
-            return Err("streamOptimized VMDK (compressed grains) — not yet supported".to_string());
-        }
-        if capacity > 0 && (gd_offset == 0 || gd_offset == 0xFFFFFFFFFFFFFFFF) {
-            return Err("streamOptimized VMDK (grain directory at end of file) — not yet supported".to_string());
-        }
+        let compressed = (flags & 0x10000) != 0;
 
         Ok(SparseHeader {
             version,
@@ -344,6 +378,7 @@ impl VmdkReader {
             grain_size,
             num_gte_per_gt,
             gd_offset,
+            compressed,
         })
     }
 
@@ -387,6 +422,7 @@ impl VmdkReader {
         header: &SparseHeader,
         grain_directory: &[u32],
         grain_table_cache: &mut std::collections::HashMap<u32, Vec<u32>>,
+        grain_data_cache: &mut std::collections::HashMap<u64, Vec<u8>>,
         local_offset: u64,
         buf: &mut [u8],
     ) -> io::Result<usize> {
@@ -446,10 +482,66 @@ impl VmdkReader {
             return Ok(max_read);
         }
 
-        // Read actual grain data
-        let grain_data_offset = (gt_entry as u64) * SECTOR_SIZE + offset_in_grain;
-        file.seek(SeekFrom::Start(grain_data_offset))?;
-        file.read(&mut buf[..max_read])
+        if header.compressed {
+            // StreamOptimized: grain is compressed. gt_entry points to a marker.
+            // Marker: { lba: u64, size: u32, data: [u8; size] }
+            // Decompress and cache the full grain, then copy the requested portion.
+            if let Some(cached) = grain_data_cache.get(&grain_index) {
+                let start = offset_in_grain as usize;
+                let end = (start + max_read).min(cached.len());
+                if start < cached.len() {
+                    buf[..end - start].copy_from_slice(&cached[start..end]);
+                    return Ok(end - start);
+                }
+                buf[..max_read].fill(0);
+                return Ok(max_read);
+            }
+
+            let marker_offset = (gt_entry as u64) * SECTOR_SIZE;
+            file.seek(SeekFrom::Start(marker_offset))?;
+            let mut marker_buf = [0u8; 12];
+            file.read_exact(&mut marker_buf)?;
+            let _lba = u64::from_le_bytes(marker_buf[0..8].try_into().unwrap());
+            let compressed_size = u32::from_le_bytes(marker_buf[8..12].try_into().unwrap());
+
+            if compressed_size == 0 || compressed_size > 10_000_000 {
+                // Invalid or too large — treat as zero grain
+                buf[..max_read].fill(0);
+                return Ok(max_read);
+            }
+
+            let mut compressed_data = vec![0u8; compressed_size as usize];
+            file.read_exact(&mut compressed_data)?;
+
+            // Decompress with zlib
+            let mut decoder = ZlibDecoder::new(&compressed_data[..]);
+            let grain_byte_size = (header.grain_size * SECTOR_SIZE) as usize;
+            let mut decompressed = vec![0u8; grain_byte_size];
+            let decompressed_len = decoder.read(&mut decompressed).unwrap_or(0);
+            decompressed.truncate(decompressed_len);
+
+            // Cache and return requested portion
+            let start = offset_in_grain as usize;
+            let end = (start + max_read).min(decompressed.len());
+            if start < decompressed.len() {
+                buf[..end - start].copy_from_slice(&decompressed[start..end]);
+            } else {
+                buf[..max_read].fill(0);
+            }
+
+            // Keep cache bounded (LRU-style: drop old entries if too many)
+            if grain_data_cache.len() > 1024 {
+                grain_data_cache.clear();
+            }
+            grain_data_cache.insert(grain_index, decompressed);
+
+            Ok(if start < decompressed_len { end - start } else { max_read })
+        } else {
+            // Normal sparse: read raw grain data directly
+            let grain_data_offset = (gt_entry as u64) * SECTOR_SIZE + offset_in_grain;
+            file.seek(SeekFrom::Start(grain_data_offset))?;
+            file.read(&mut buf[..max_read])
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -524,12 +616,14 @@ impl Read for VmdkReader {
                 header,
                 grain_directory,
                 grain_table_cache,
+                grain_data_cache,
             } => {
                 Self::read_sparse(
                     file,
                     header,
                     grain_directory,
                     grain_table_cache,
+                    grain_data_cache,
                     local_offset,
                     &mut buf[..read_len],
                 )?
