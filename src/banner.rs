@@ -353,7 +353,7 @@ pub fn create_spinner(message: &str) -> ProgressBar {
         ProgressStyle::default_spinner()
             .template("        {spinner} {msg}")
             .unwrap()
-            .tick_chars("\u{28fb}\u{28fd}\u{28fe}\u{28f7}\u{28ef}\u{28df}\u{28bf}\u{287f} "),
+            .tick_chars("|/-\\ "),
     );
     sp.set_message(message.to_string());
     sp.enable_steady_tick(std::time::Duration::from_millis(100));
