@@ -360,7 +360,7 @@ pub fn print_massive_warning() {
         style("Processing ALL forensic images + triage packages + loose artifacts.").dim(),
     );
     eprintln!("        {}",
-        style("The Mastin is off the leash. Stand back.").dim(),
+        style("The Masstin is off the leash. Stand back.").dim(),
     );
     eprintln!();
 }
