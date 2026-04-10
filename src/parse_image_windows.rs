@@ -997,11 +997,11 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
                 total_linux_logs += count;
                 crate::banner::print_info(&format!("  {} Linux log files extracted from ext4 partition {}", count, i));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                crate::banner::print_info(&format!("  ext4 partition {}: no log files found (auth.log, wtmp, etc.)", i));
+            }
             Err(e) => {
-                if is_debug_mode() {
-                    eprintln!("[DEBUG] ext4 partition {} error: {}", i, e);
-                }
+                crate::banner::print_info(&format!("  ext4 partition {}: {}", i, e));
             }
         }
     }
