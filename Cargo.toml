@@ -36,4 +36,5 @@ mbrman = "0.6"
 vshadow = "0.2"
 libesedb = "0.2"
 ext4-view = { version = "0.9", features = ["std"] }
+lvm2 = "0.0.3"
 

@@ -12,6 +12,13 @@ use ext4_view::{Ext4, Ext4Read};
 use crate::parse::is_debug_mode;
 use crate::parse_linux::parse_linux;
 
+/// GPT partition type GUID for Linux LVM
+/// E6D6D379-F507-44C2-A23C-238F2A3DF928 in mixed-endian encoding
+const GPT_LINUX_LVM_GUID: [u8; 16] = [
+    0x79, 0xD3, 0xD6, 0xE6, 0x07, 0xF5, 0xC2, 0x44,
+    0xA2, 0x3C, 0x23, 0x8F, 0x2A, 0x3D, 0xF9, 0x28,
+];
+
 /// GPT partition type GUID for Linux filesystem
 /// 0FC63DAF-8483-4772-8E79-3D69D8477DE4 in mixed-endian encoding
 const GPT_LINUX_FS_GUID: [u8; 16] = [
@@ -266,12 +273,150 @@ fn extract_logs_from_seekable<R: Read + Seek + 'static>(
         }
     }
 
+    // Try LVM partitions if we haven't found enough data
+    let lvm_partitions = find_lvm_partitions(reader);
+    if !lvm_partitions.is_empty() {
+        crate::banner::print_info(&format!("{} LVM partition(s) found — scanning for logical volumes...", lvm_partitions.len()));
+
+        for (li, lvm_offset) in lvm_partitions.iter().enumerate() {
+            let count = extract_logs_from_lvm(reader, *lvm_offset, li, &logs_output_dir);
+            total_files += count;
+        }
+    }
+
     if total_files == 0 {
-        return Err("No Linux log files found in any ext4 partition".to_string());
+        return Err("No Linux log files found in any partition (ext4 or LVM)".to_string());
     }
 
     crate::banner::print_phase_result(&format!("{} log files extracted total", total_files));
     Ok(logs_output_dir)
+}
+
+/// Extract logs from LVM logical volumes inside a partition.
+/// Dumps each LV with ext4 to a temp file and then processes it.
+fn extract_logs_from_lvm<R: Read + Seek + 'static>(
+    reader: &mut R,
+    lvm_offset: u64,
+    lvm_index: usize,
+    output_dir: &Path,
+) -> usize {
+    let mut total = 0;
+    let mut lvm_reader = OffsetReaderLinux::new(reader, lvm_offset);
+
+    let lvm = match lvm2::Lvm2::open(&mut lvm_reader) {
+        Ok(l) => l,
+        Err(e) => {
+            if is_debug_mode() {
+                eprintln!("[DEBUG] LVM at offset {:#x}: {:?}", lvm_offset, e);
+            }
+            return 0;
+        }
+    };
+
+    // Collect LV names first to avoid borrow issues
+    let lv_names: Vec<String> = lvm.lvs().map(|lv| lv.name().to_string()).collect();
+
+    for lv_name in &lv_names {
+        crate::banner::print_info(&format!("  LV '{}' found in LVM partition {}", lv_name, lvm_index));
+
+        // Find this LV again and dump to temp file
+        let lv = match lvm.lvs().find(|l| l.name() == lv_name.as_str()) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let mut olv = lvm.open_lv(lv, &mut lvm_reader);
+
+        // Check ext4 superblock
+        let mut sb_buf = [0u8; 2];
+        if olv.seek(SeekFrom::Start(0x438)).is_err() || olv.read_exact(&mut sb_buf).is_err() {
+            continue;
+        }
+        let magic = u16::from_le_bytes(sb_buf);
+        if magic != EXT4_SUPER_MAGIC {
+            crate::banner::print_info(&format!("    Not ext4 (magic: {:#06x}), skipping", magic));
+            continue;
+        }
+
+        crate::banner::print_info("    ext4 confirmed — extracting logs...");
+
+        // Dump LV to temp file so we can pass it to extract_logs_from_ext4_partition
+        let tmp_path = std::env::temp_dir().join(format!("masstin_lvm_{}_{}.raw", lvm_index, lv_name));
+        {
+            if olv.seek(SeekFrom::Start(0)).is_err() { continue; }
+            let mut tmp_file = match File::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
+            let mut buf = [0u8; 1048576]; // 1MB chunks
+            loop {
+                match olv.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => { if tmp_file.write_all(&buf[..n]).is_err() { break; } }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Now process the temp file as a regular ext4 partition
+        let partition_dir = output_dir.join(format!("lvm_{}_lv_{}", lvm_index, lv_name));
+        let _ = fs::create_dir_all(&partition_dir);
+
+        let mut tmp_file = match File::open(&tmp_path) { Ok(f) => f, Err(_) => continue };
+        match extract_logs_from_ext4_partition(&mut tmp_file, 0, &partition_dir) {
+            Ok(count) if count > 0 => {
+                total += count;
+                crate::banner::print_info(&format!("    {} log files extracted from LV '{}'", count, lv_name));
+            }
+            Ok(_) => {
+                crate::banner::print_info(&format!("    No log files found in LV '{}'", lv_name));
+            }
+            Err(e) => {
+                if is_debug_mode() {
+                    eprintln!("[DEBUG] LV '{}' ext4 error: {}", lv_name, e);
+                }
+            }
+        }
+
+        // Cleanup temp file
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    total
+}
+
+/// Simple offset reader for LVM partition access
+struct OffsetReaderLinux<'a, R: Read + Seek> {
+    inner: &'a mut R,
+    offset: u64,
+}
+
+impl<'a, R: Read + Seek> OffsetReaderLinux<'a, R> {
+    fn new(inner: &'a mut R, offset: u64) -> Self {
+        Self { inner, offset }
+    }
+}
+
+impl<'a, R: Read + Seek> Read for OffsetReaderLinux<'a, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<'a, R: Read + Seek> Seek for OffsetReaderLinux<'a, R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            SeekFrom::Start(p) => {
+                let actual = self.inner.seek(SeekFrom::Start(self.offset + p))?;
+                Ok(actual - self.offset)
+            }
+            SeekFrom::Current(p) => {
+                let actual = self.inner.seek(SeekFrom::Current(p))?;
+                Ok(actual.saturating_sub(self.offset))
+            }
+            SeekFrom::End(p) => {
+                let actual = self.inner.seek(SeekFrom::End(p))?;
+                Ok(actual.saturating_sub(self.offset))
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -394,6 +539,71 @@ fn find_linux_partitions<R: Read + Seek>(
     }
 
     Ok(partitions)
+}
+
+/// Find LVM partitions (MBR type 0x8E or GPT LVM GUID)
+fn find_lvm_partitions<R: Read + Seek>(
+    reader: &mut R,
+) -> Vec<u64> {
+    let mut partitions = Vec::new();
+
+    if reader.seek(SeekFrom::Start(0)).is_err() { return partitions; }
+    let mut mbr_buf = [0u8; 512];
+    if reader.read_exact(&mut mbr_buf).is_err() || mbr_buf[510] != 0x55 || mbr_buf[511] != 0xAA {
+        return partitions;
+    }
+
+    let part0_type = mbr_buf[446 + 4];
+    if part0_type == 0xEE {
+        // GPT
+        if reader.seek(SeekFrom::Start(512)).is_err() { return partitions; }
+        let mut gpt_header = [0u8; 92];
+        if reader.read_exact(&mut gpt_header).is_ok() && &gpt_header[0..8] == b"EFI PART" {
+            let entry_start_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
+            let entry_count = u32::from_le_bytes(gpt_header[80..84].try_into().unwrap());
+            let entry_size = u32::from_le_bytes(gpt_header[84..88].try_into().unwrap());
+
+            let entries_offset = entry_start_lba * 512;
+            for i in 0..entry_count.min(128) {
+                let entry_offset = entries_offset + (i as u64 * entry_size as u64);
+                if reader.seek(SeekFrom::Start(entry_offset)).is_err() { continue; }
+                let mut entry = vec![0u8; entry_size as usize];
+                if reader.read_exact(&mut entry).is_err() { continue; }
+
+                let type_guid: [u8; 16] = entry[0..16].try_into().unwrap();
+                if type_guid == GPT_LINUX_LVM_GUID {
+                    let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+                    let last_lba = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+                    let offset = first_lba * 512;
+                    let size = (last_lba - first_lba + 1) * 512;
+                    if is_debug_mode() {
+                        eprintln!("[DEBUG] GPT LVM partition {} at LBA {} (offset {:#x}, size {:.2} GB)",
+                            i, first_lba, offset, size as f64 / 1_073_741_824.0);
+                    }
+                    partitions.push(offset);
+                }
+            }
+        }
+    } else {
+        // MBR
+        for i in 0..4 {
+            let entry_offset = 446 + i * 16;
+            let part_type = mbr_buf[entry_offset + 4];
+            let lba_start = u32::from_le_bytes([
+                mbr_buf[entry_offset + 8], mbr_buf[entry_offset + 9],
+                mbr_buf[entry_offset + 10], mbr_buf[entry_offset + 11],
+            ]);
+            // 0x8E = Linux LVM
+            if part_type == 0x8E && lba_start > 0 {
+                let offset = lba_start as u64 * 512;
+                if is_debug_mode() {
+                    eprintln!("[DEBUG] MBR LVM partition {} at LBA {} (offset {:#x})", i, lba_start, offset);
+                }
+                partitions.push(offset);
+            }
+        }
+    }
+    partitions
 }
 
 /// Verify ext4 superblock magic (0xEF53) at partition_offset + 0x438
