@@ -126,6 +126,8 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     let stem_lower = stem.to_lowercase();
                     // Skip flat data files: name-flat.vmdk
                     if stem_lower.ends_with("-flat") { return false; }
+                    // Skip change tracking block files: name-ctk.vmdk
+                    if stem_lower.ends_with("-ctk") { return false; }
                     // Skip split extents: name-sNNN.vmdk
                     if let Some(pos) = stem.rfind("-s") {
                         let after = &stem[pos + 2..];
@@ -216,7 +218,14 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 }
             }
             Err(e) => {
-                eprintln!("[ERROR] Failed to process image {}: {}", image_path, e);
+                let msg = e.to_string();
+                if msg.contains("Incomplete VMDK") || msg.contains("not yet supported") {
+                    crate::banner::print_info(&format!("  Skipped {}: {}", image_name, msg));
+                } else if msg.contains("No NTFS or ext4") || msg.contains("No forensic artifacts") {
+                    crate::banner::print_info(&format!("  {} — no supported partitions found", image_name));
+                } else {
+                    eprintln!("[ERROR] Failed to process image {}: {}", image_name, msg);
+                }
             }
         }
     }

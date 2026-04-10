@@ -139,8 +139,12 @@ impl VmdkReader {
 
             let extent = match extent_type.to_uppercase().as_str() {
                 "FLAT" | "VMFS" | "VMFSRAW" | "VMFSRDM" => {
-                    let f = File::open(&extent_path)
-                        .map_err(|e| format!("Cannot open flat extent '{}': {}", extent_path_str, e))?;
+                    let f = match File::open(&extent_path) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            return Err(format!("Incomplete VMDK: flat extent '{}' not found (only descriptor was collected)", filename));
+                        }
+                    };
                     Extent {
                         data: ExtentData::Flat {
                             file: f,
@@ -310,6 +314,7 @@ impl VmdkReader {
         }
 
         let version = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let flags = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let capacity = u64::from_le_bytes([
             buf[12], buf[13], buf[14], buf[15],
             buf[16], buf[17], buf[18], buf[19],
@@ -323,6 +328,15 @@ impl VmdkReader {
             buf[56], buf[57], buf[58], buf[59],
             buf[60], buf[61], buf[62], buf[63],
         ]);
+
+        // Detect streamOptimized VMDKs (flag bit 16 = compressed grains, or gd_offset invalid)
+        // streamOptimized uses compressed grains with markers — not yet supported
+        if (flags & 0x10000) != 0 {
+            return Err("streamOptimized VMDK (compressed grains) — not yet supported".to_string());
+        }
+        if capacity > 0 && (gd_offset == 0 || gd_offset == 0xFFFFFFFFFFFFFFFF) {
+            return Err("streamOptimized VMDK (grain directory at end of file) — not yet supported".to_string());
+        }
 
         Ok(SparseHeader {
             version,
