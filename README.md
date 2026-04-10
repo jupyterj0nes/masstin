@@ -40,15 +40,15 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 | Feature | Description | Details |
 |---------|-------------|---------|
-| **Bulk image processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, extracts EVTX + UAL from live + VSS of each, and generates a single unified timeline. One command, entire incident. | |
-| **Forensic image analysis** | Open E01, dd/raw, and VMDK images directly — Windows (NTFS + VSS + UAL) and Linux (ext4) — pure Rust, no external tools, no mounting | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Unified cross-OS image parsing** | **NEW:** Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS), ext4 partitions get Linux parsing (auth.log, wtmp, etc.) — all merged into one timeline. Point `-d` at a folder with mixed Windows and Linux images and get a single chronological CSV. Zero manual steps, zero mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, auto-detects OS, extracts all forensic artifacts from live + VSS, and generates a single unified timeline. One command, entire incident. | |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
 | **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data merged with `merge` — one timeline across OS boundaries | |
+| **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data in one timeline — `parse-image` auto-merges across OS boundaries, or use `merge` for manual combination | |
 | **Compressed triage support** | Recursive ZIP extraction with auto-detection of forensic passwords | |
 | **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution | |
 | **Temporal path reconstruction** | Cypher query to find the chronologically coherent attacker route between two nodes | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
@@ -121,55 +121,47 @@ masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
   <img src="resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
 </div>
 
-### Parse Linux forensic images (E01/dd/VMDK)
+### Parse forensic images — auto-detect Windows and Linux
 
-Opens Linux forensic disk images directly and extracts authentication logs from ext4/ext3/ext2 partitions — no mounting needed. Same format support as Windows images: **E01**, **dd/raw**, and **VMDK**.
+**One command. Any OS. Any image format.** Masstin opens forensic disk images directly, auto-detects every partition type (NTFS or ext4), and applies the right parser to each — all without mounting, external tools, or manual OS identification.
 
-```bash
-# Single Linux image
-masstin -a parse-image-linux -f server.e01 -o linux-timeline.csv
+- **NTFS partitions** → Windows parsing: EVTX + UAL from live volume + VSS snapshot recovery
+- **ext4 partitions** → Linux parsing: auth.log, secure, messages, audit.log, wtmp, btmp, lastlog
 
-# VMDK directly
-masstin -a parse-image-linux -f "kali-linux.vmdk" -o timeline.csv
+All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
 
-# Scan folder for Linux images
-masstin -a parse-image-linux -d /evidence/linux_servers/ -o timeline.csv
-```
-
-Masstin detects ext4 partitions (GPT + MBR), extracts auth.log, secure, messages, audit.log, wtmp, btmp, lastlog (including rotated logs), infers hostname from `/etc/hostname` and year from `dpkg.log`.
-
-### Parse Windows forensic images (E01/dd/VMDK) with VSS recovery
-
-Opens forensic disk images directly — no mounting needed. Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, and VMFS/ESXi). Pure Rust parsers for all formats — no external tools required. Finds NTFS partitions (GPT/MBR), extracts EVTX + UAL from the live volume, detects Volume Shadow Copies using [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs), and recovers EVTX from each VSS snapshot — including events deleted by attackers. Events are deduplicated across live and VSS sources. [Full VSS documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, VMFS/ESXi). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ```bash
-# Single image
-masstin -a parse-image-windows -f HRServer.e01 -o timeline.csv
+# Single image — auto-detects OS
+masstin -a parse-image -f HRServer.e01 -o timeline.csv
 
-# VMDK directly (split sparse, flat, monolithic, VMFS)
-masstin -a parse-image-windows -f "Windows Server 2019.vmdk" -o timeline.csv
+# Mix Windows E01 + Linux VMDK — single merged timeline
+masstin -a parse-image -f DC01.e01 -f "kali-linux.vmdk" -o timeline.csv
 
-# Multiple images
-masstin -a parse-image-windows -f DC01.e01 -f SRV-FILE.vmdk -f Desktop.e01 -o incident.csv
+# Multiple images of any OS
+masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o incident.csv
 ```
 
 <div align="center">
-  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image-windows with VSS recovery"/>
+  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image with cross-OS auto-detection"/>
 </div>
 
 ### Bulk evidence processing — one command, entire incident
 
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files, processing each one — extracting EVTX from live volumes and every VSS snapshot, parsing UAL databases, deduplicating, and merging everything into a single chronological timeline.
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files. Each image is opened, partitions are auto-detected (NTFS or ext4), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
 
 ```bash
-# Scan an entire evidence folder — finds all images automatically
-masstin -a parse-image-windows -d /evidence/all_machines/ -o full_timeline.csv
+# Scan an entire evidence folder — finds all images, any OS
+masstin -a parse-image -d /evidence/all_machines/ -o full_timeline.csv
 
 # Mix: evidence folder + individual images + mounted volume
-masstin -a parse-image-windows -d /evidence/ -f extra.e01 -d F: -o timeline.csv
+masstin -a parse-image -d /evidence/ -f extra.e01 -d F: -o timeline.csv
 ```
 
 Masstin automatically filters VMDK split extents (`-s001.vmdk`) and snapshots (`-000001.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
+
+> **Backward compatibility:** The legacy commands `parse-image-windows` and `parse-image-linux` are still accepted as aliases for `parse-image`.
 
 ### Parse from mounted volumes (live disk / write-blocker)
 
@@ -177,13 +169,13 @@ Point masstin at a drive letter and it reads the raw volume directly — extract
 
 ```bash
 # Single volume (requires Administrator on Windows)
-masstin -a parse-image-windows -d D: -o timeline.csv
+masstin -a parse-image -d D: -o timeline.csv
 
 # Multiple volumes
-masstin -a parse-image-windows -d D: -d E: -o timeline.csv
+masstin -a parse-image -d D: -d E: -o timeline.csv
 
 # Scan all NTFS volumes on the system
-masstin -a parse-image-windows --all-volumes -o timeline.csv
+masstin -a parse-image --all-volumes -o timeline.csv
 ```
 
 > **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
@@ -202,7 +194,7 @@ masstin -a parse-windows -d /evidence/Windows/System32/LogFiles/Sum/ -o timeline
 masstin -a parse-windows -f Current.mdb -f SystemIdentity.mdb -o timeline.csv
 
 # From forensic images: UAL databases are extracted and parsed automatically
-masstin -a parse-image-windows -f DC01.e01 -o timeline.csv
+masstin -a parse-image -f DC01.e01 -o timeline.csv
 ```
 
 Each UAL record generates two timeline entries (first seen + last seen). Server hostname is resolved from `SystemIdentity.mdb`. Roles are mapped to protocols: File Server → `SMB`, Remote Access → `RDP`, Web Server → `HTTP`, etc. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-ual/)
@@ -379,7 +371,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image-windows` \| `parse-image-linux` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
 | `-o, --output` | Output file path |
@@ -389,7 +381,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 | `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` |
 | `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` |
 | `--filter-cortex-ip` | Filter by IP in Cortex queries |
-| `--all-volumes` | Scan all NTFS volumes on the system (parse-image-windows, requires admin) |
+| `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
 | `--stdout` | Print output to stdout only |
 | `--debug` | Print debug information |
