@@ -230,11 +230,11 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             parse_linux(&config.file, &config.directory, config.output.as_ref());
         }
         ActionType::ParseImage => {
-            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
+            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), false);
         }
         ActionType::ParseMassive => {
             crate::banner::print_massive_warning();
-            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
+            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), true);
         }
     }
 

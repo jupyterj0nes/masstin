@@ -30,7 +30,7 @@ struct ExtractedArtifacts {
 /// Main entry point: parse forensic disk images (Windows + Linux).
 /// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4→Linux logs.
 /// All sources are extracted to temp directories first, then parsed together into a single CSV.
-pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
+pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>, include_loose_artifacts: bool) {
     let start_time = std::time::Instant::now();
 
     // Collect all volume letters from directories and --all-volumes
@@ -253,9 +253,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Add real directories (loose EVTX files)
-    for d in &real_dirs {
-        extracted_dirs.push(d.clone());
+    // Add real directories for loose EVTX/log files (only in massive mode)
+    if include_loose_artifacts {
+        for d in &real_dirs {
+            extracted_dirs.push(d.clone());
+        }
     }
 
     // Extraction summary
