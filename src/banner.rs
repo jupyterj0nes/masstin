@@ -191,21 +191,27 @@ pub fn create_progress_bar(total: u64) -> ProgressBar {
         ProgressStyle::default_bar()
             .template("        [{bar:25.cyan/dim}] {pos}/{len} {spinner} {msg}")
             .unwrap()
-            .tick_chars("\u{28fb}\u{28fd}\u{28fe}\u{28f7}\u{28ef}\u{28df}\u{28bf}\u{287f} ")
-            .progress_chars("━╸─"),
+            .tick_chars("|/-\\ ")
+            .progress_chars("=>-"),
     );
     pb
 }
 
 pub fn progress_set_message(pb: &ProgressBar, filename: &str) {
+    let image = extract_image_name_from_path(filename);
     let short = std::path::Path::new(filename)
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(filename);
-    let display = if short.len() > 60 {
-        format!("{}...", &short[..57])
+    let display = if image != "unknown" && !image.is_empty() {
+        format!("{}: {}", image, short)
     } else {
         short.to_string()
+    };
+    let display = if display.len() > 80 {
+        format!("{}...", &display[..77])
+    } else {
+        display
     };
     pb.set_message(display);
 }

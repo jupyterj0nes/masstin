@@ -225,10 +225,12 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file"));
                 } else if msg.contains("not yet supported") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
+                } else if msg.contains("Empty image (0 bytes)") {
+                    crate::banner::print_info(&format!("  Skipped: empty image (0 bytes, VMFS thin disk — data not in support bundle)"));
                 } else if msg.contains("No NTFS or ext4") {
                     crate::banner::print_info(&format!("  Skipped: no NTFS or ext4 partitions found"));
-                } else if msg.contains("No forensic artifacts") {
-                    crate::banner::print_info(&format!("  Skipped: NTFS found but no EVTX/UAL/Tasks inside"));
+                } else if msg.contains("but no forensic artifacts") {
+                    crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else {
                     crate::banner::print_info(&format!("  Error: {}", msg));
                 }
@@ -872,6 +874,10 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     image_size: u64,
     temp_dir: &Path,
 ) -> Result<ExtractedArtifacts, String> {
+    if image_size == 0 {
+        return Err("Empty image (0 bytes) — VMFS thin disk data not available".to_string());
+    }
+
     // Find NTFS partition offsets
     let ntfs_partitions = find_ntfs_partitions(reader, image_size).unwrap_or_default();
     // Find ext4 partition offsets
@@ -1005,7 +1011,13 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     }
 
     if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 {
-        return Err("No forensic artifacts found in any partition".to_string());
+        let mut found = Vec::new();
+        if !ntfs_partitions.is_empty() { found.push(format!("{} NTFS", ntfs_partitions.len())); }
+        if !ext4_partitions.is_empty() { found.push(format!("{} ext4", ext4_partitions.len())); }
+        if found.is_empty() {
+            return Err("No NTFS or ext4 partitions found".to_string());
+        }
+        return Err(format!("Partitions found ({}) but no forensic artifacts inside", found.join(", ")));
     }
 
     Ok(ExtractedArtifacts {
