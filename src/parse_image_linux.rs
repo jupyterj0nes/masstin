@@ -278,6 +278,26 @@ fn extract_logs_from_seekable<R: Read + Seek + 'static>(
 //  Partition detection
 // -----------------------------------------------------------------------------
 
+/// Public wrapper for finding Linux partitions (used by parse_image unified)
+pub fn find_linux_partitions_public<R: Read + Seek>(
+    reader: &mut R,
+    image_size: u64,
+) -> Result<Vec<u64>, String> {
+    find_linux_partitions(reader, image_size)
+}
+
+/// Public wrapper for extracting Linux logs from a single ext4 partition
+pub fn extract_linux_logs_from_ext4<R: Read + Seek + 'static>(
+    reader: &mut R,
+    partition_offset: u64,
+    output_dir: &Path,
+    partition_index: usize,
+) -> Result<usize, String> {
+    let partition_dir = output_dir.join(format!("partition_{}", partition_index));
+    let _ = std::fs::create_dir_all(&partition_dir);
+    extract_logs_from_ext4_partition(reader, partition_offset, &partition_dir)
+}
+
 fn find_linux_partitions<R: Read + Seek>(
     reader: &mut R,
     _image_size: u64,
@@ -596,17 +616,16 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
 
 /// Rewrite the log_filename column in the output CSV.
 /// Replaces temp paths like ".../masstin_linux_image_extract/server.e01/logs_extracted/partition_0/var/log/auth.log"
+/// or ".../masstin_image_extract/server.e01/linux_logs_extracted/partition_0/var/log/auth.log"
 /// with "server.e01:partition_0:/var/log/auth.log"
-fn rewrite_log_filenames_linux(csv_path: &str) {
+pub fn rewrite_log_filenames_linux(csv_path: &str) {
     let content = match fs::read_to_string(csv_path) {
         Ok(c) => c,
         Err(_) => return,
     };
 
-    let marker = "masstin_linux_image_extract";
-
-    // Quick check if any rewriting is needed
-    if !content.contains(marker) {
+    // Check for either standalone or unified temp path markers
+    if !content.contains("masstin_linux_image_extract") && !content.contains("linux_logs_extracted") {
         return;
     }
 
@@ -622,7 +641,7 @@ fn rewrite_log_filenames_linux(csv_path: &str) {
             let prefix = &line[..last_comma + 1];
             let filename_field = &line[last_comma + 1..];
 
-            if !filename_field.contains(marker) {
+            if !filename_field.contains("masstin_linux_image_extract") && !filename_field.contains("linux_logs_extracted") {
                 output.push_str(line);
                 output.push('\n');
                 continue;
@@ -643,27 +662,34 @@ fn rewrite_log_filenames_linux(csv_path: &str) {
 
 fn rewrite_single_linux_filename(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    let marker = "masstin_linux_image_extract/";
 
-    let after_marker = match normalized.find(marker) {
-        Some(pos) => &normalized[pos + marker.len()..],
-        None => return path.to_string(),
-    };
+    // Try standalone marker first: masstin_linux_image_extract/<image>/logs_extracted/partition_N/...
+    if let Some(pos) = normalized.find("masstin_linux_image_extract/") {
+        let after = &normalized[pos + "masstin_linux_image_extract/".len()..];
+        let parts: Vec<&str> = after.splitn(2, '/').collect();
+        let image_name = parts[0];
+        let rest = if parts.len() > 1 { parts[1] } else { "" };
+        let rest = rest.strip_prefix("logs_extracted/").unwrap_or(rest);
+        let (partition, file_path) = match rest.find('/') {
+            Some(pos) => (&rest[..pos], &rest[pos..]),
+            None => (rest, ""),
+        };
+        return format!("{}:{}:{}", image_name, partition, file_path);
+    }
 
-    // after_marker = "server.e01/logs_extracted/partition_0/var/log/auth.log"
-    let parts: Vec<&str> = after_marker.splitn(2, '/').collect();
-    let image_name = parts[0];
-    let rest = if parts.len() > 1 { parts[1] } else { "" };
+    // Try unified marker: masstin_image_extract/<image>/linux_logs_extracted/partition_N/...
+    if let Some(pos) = normalized.find("masstin_image_extract/") {
+        let after = &normalized[pos + "masstin_image_extract/".len()..];
+        let parts: Vec<&str> = after.splitn(2, '/').collect();
+        let image_name = parts[0];
+        let rest = if parts.len() > 1 { parts[1] } else { "" };
+        let rest = rest.strip_prefix("linux_logs_extracted/").unwrap_or(rest);
+        let (partition, file_path) = match rest.find('/') {
+            Some(pos) => (&rest[..pos], &rest[pos..]),
+            None => (rest, ""),
+        };
+        return format!("{}:{}:{}", image_name, partition, file_path);
+    }
 
-    // Strip "logs_extracted/" prefix
-    let rest = rest.strip_prefix("logs_extracted/").unwrap_or(rest);
-
-    // Extract partition label and file path
-    // rest = "partition_0/var/log/auth.log"
-    let (partition, file_path) = match rest.find('/') {
-        Some(pos) => (&rest[..pos], &rest[pos..]),  // partition_0, /var/log/auth.log
-        None => (rest, ""),
-    };
-
-    format!("{}:{}:{}", image_name, partition, file_path)
+    path.to_string()
 }

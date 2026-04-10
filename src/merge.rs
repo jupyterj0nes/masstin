@@ -36,8 +36,11 @@ pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), B
                     continue; // Skip malformed lines
                 }
 
-                // Parse the time_created (assumed to be in the first column) as NaiveDateTime in ISO 8601 format
-                if let Ok(time_created) = NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S%.fZ") {
+                // Parse the time_created (first column) — supports both "...Z" and "...+00:00" formats
+                let time_created_result = NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .or_else(|_| NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S%.f+00:00"))
+                    .or_else(|_| NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S+00:00"));
+                if let Ok(time_created) = time_created_result {
                     // Only add unique lines
                     if seen_lines.insert(content.clone()) {
                         merged_lines.push((time_created, content));

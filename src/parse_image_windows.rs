@@ -9,14 +9,25 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use vshadow::VssVolume;
 use crate::parse::{parse_events, is_debug_mode};
+use crate::parse_linux::parse_linux;
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
 const UAL_SUM_PATH: &[&str] = &["Windows", "System32", "LogFiles", "Sum"];
 
-/// Main entry point: parse EVTX files from forensic disk images, mounted volumes, or all volumes.
+/// Result of extracting artifacts from a forensic image.
+/// Contains separate directories for Windows (EVTX/UAL) and Linux logs.
+struct ExtractedArtifacts {
+    /// Directory containing extracted EVTX and UAL files (may be empty)
+    evtx_dir: PathBuf,
+    /// Directory containing extracted Linux log files, if any were found
+    linux_logs_dir: Option<PathBuf>,
+}
+
+/// Main entry point: parse forensic disk images (Windows + Linux).
+/// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4→Linux logs.
 /// All sources are extracted to temp directories first, then parsed together into a single CSV.
-pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
+pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>) {
     let start_time = std::time::Instant::now();
 
     // Collect all volume letters from directories and --all-volumes
@@ -145,6 +156,8 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
     }
 
     // Extract from image files — use image name as temp subdirectory
+    let mut linux_log_dirs: Vec<String> = Vec::new();
+
     for image_path in &all_image_files {
         let ext = Path::new(image_path)
             .extension()
@@ -163,7 +176,7 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
         let temp_dir = base_temp.join(&image_name);
         let _ = fs::create_dir_all(&temp_dir);
 
-        let evtx_dir = match ext.as_str() {
+        let result = match ext.as_str() {
             "e01" | "ex01" => {
                 crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
                 extract_evtx_from_image_ewf(image_path, &temp_dir)
@@ -183,10 +196,16 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
             }
         };
 
-        match evtx_dir {
-            Ok(dir) => {
-                crate::banner::print_phase_result(&format!("EVTX files extracted from {}", image_name));
-                extracted_dirs.push(dir.to_string_lossy().to_string());
+        match result {
+            Ok(artifacts) => {
+                crate::banner::print_phase_result(&format!("Artifacts extracted from {}", image_name));
+                // Only add EVTX dir if it actually contains extracted files
+                if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    extracted_dirs.push(artifacts.evtx_dir.to_string_lossy().to_string());
+                }
+                if let Some(linux_dir) = artifacts.linux_logs_dir {
+                    linux_log_dirs.push(linux_dir.to_string_lossy().to_string());
+                }
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to process image {}: {}", image_path, e);
@@ -199,20 +218,56 @@ pub fn parse_image_windows(files: &[String], directories: &[String], all_volumes
         extracted_dirs.push(d.clone());
     }
 
-    if extracted_dirs.is_empty() {
+    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
     }
 
-    // Phase 2+3: Parse ALL extracted directories together into a single CSV
+    // Phase 2+3: Parse extracted directories and generate output CSV
     let empty_files: Vec<String> = vec![];
-    parse_events(&empty_files, &extracted_dirs, output);
+    let has_windows = !extracted_dirs.is_empty();
+    let has_linux = !linux_log_dirs.is_empty();
 
-    // Rewrite log_filename: clean up temp paths to descriptive format
-    // e.g. "...masstin_image_extract/HRServer.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
-    //   → "HRServer.e01:vss_0:Security.evtx"
-    if let Some(out_path) = output {
-        rewrite_log_filenames(out_path);
+    if has_windows && has_linux {
+        // Both OS types found — parse each separately, then merge into one CSV
+        let win_tmp = base_temp.join("_windows_output.csv");
+        let linux_tmp = base_temp.join("_linux_output.csv");
+        let win_tmp_str = win_tmp.to_string_lossy().to_string();
+        let linux_tmp_str = linux_tmp.to_string_lossy().to_string();
+
+        crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
+        parse_events(&empty_files, &extracted_dirs, Some(&win_tmp_str));
+
+        crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
+        parse_linux(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
+
+        // Rewrite log_filename paths before merging
+        rewrite_log_filenames(&win_tmp_str);
+        crate::parse_image_linux::rewrite_log_filenames_linux(&linux_tmp_str);
+
+        // Merge both CSVs into the final output (deduplicated, sorted by time_created)
+        crate::banner::print_info("Merging Windows + Linux timelines...");
+        let merge_files_list = vec![win_tmp_str.clone(), linux_tmp_str.clone()];
+        match crate::merge::merge_files(&merge_files_list, output) {
+            Ok(()) => {
+                crate::banner::print_phase_result("Merged Windows + Linux timeline generated");
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Failed to merge timelines: {}", e);
+            }
+        }
+    } else if has_windows {
+        // Windows only
+        parse_events(&empty_files, &extracted_dirs, output);
+        if let Some(out_path) = output {
+            rewrite_log_filenames(out_path);
+        }
+    } else {
+        // Linux only
+        parse_linux(&empty_files, &linux_log_dirs, output);
+        if let Some(out_path) = output {
+            crate::parse_image_linux::rewrite_log_filenames_linux(out_path);
+        }
     }
 
     // Cleanup temp directories
@@ -627,7 +682,7 @@ fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, Str
 }
 
 /// Extract EVTX from an E01 image
-fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
     let reader = ewf::EwfReader::open(image_path)
         .map_err(|e| format!("Cannot open E01: {}", e))?;
 
@@ -639,7 +694,7 @@ fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<Path
 }
 
 /// Extract EVTX from a VMDK image
-fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
     let reader = crate::vmdk::VmdkReader::open(image_path)
         .map_err(|e| format!("Cannot open VMDK: {}", e))?;
 
@@ -651,7 +706,7 @@ fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Pat
 }
 
 /// Extract EVTX from a raw/dd image
-fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
     let file = File::open(image_path)
         .map_err(|e| format!("Cannot open raw image: {}", e))?;
 
@@ -665,22 +720,31 @@ fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<Path
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
-/// Core logic: find NTFS partitions and extract EVTX files
-fn extract_evtx_from_seekable<R: Read + Seek>(
+/// Core logic: find all partitions (NTFS + ext4) and extract forensic artifacts
+fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     reader: &mut R,
     image_size: u64,
     temp_dir: &Path,
-) -> Result<PathBuf, String> {
-    crate::banner::print_info("Searching for NTFS partitions...");
+) -> Result<ExtractedArtifacts, String> {
+    crate::banner::print_info("Searching for partitions (NTFS + ext4)...");
 
     // Find NTFS partition offsets
-    let partitions = find_ntfs_partitions(reader, image_size)?;
+    let ntfs_partitions = find_ntfs_partitions(reader, image_size).unwrap_or_default();
+    // Find ext4 partition offsets
+    let ext4_partitions = crate::parse_image_linux::find_linux_partitions_public(reader, image_size).unwrap_or_default();
 
-    if partitions.is_empty() {
-        return Err("No NTFS partitions found in image".to_string());
+    if ntfs_partitions.is_empty() && ext4_partitions.is_empty() {
+        return Err("No NTFS or ext4 partitions found in image".to_string());
     }
 
-    crate::banner::print_phase_result(&format!("{} NTFS partition(s) found", partitions.len()));
+    if !ntfs_partitions.is_empty() {
+        crate::banner::print_phase_result(&format!("{} NTFS partition(s) found", ntfs_partitions.len()));
+    }
+    if !ext4_partitions.is_empty() {
+        crate::banner::print_phase_result(&format!("{} ext4 partition(s) found", ext4_partitions.len()));
+    }
+
+    let partitions = &ntfs_partitions;
 
     let evtx_output_dir = temp_dir.join("evtx_extracted");
     let _ = fs::create_dir_all(&evtx_output_dir);
@@ -769,12 +833,48 @@ fn extract_evtx_from_seekable<R: Read + Seek>(
         }
     }
 
-    if total_evtx == 0 {
-        return Err("No EVTX files found in any NTFS partition".to_string());
+    if total_evtx > 0 {
+        crate::banner::print_phase_result(&format!("{} EVTX files extracted total", total_evtx));
     }
 
-    crate::banner::print_phase_result(&format!("{} EVTX files extracted total", total_evtx));
-    Ok(evtx_output_dir)
+    // Now process ext4 partitions (Linux)
+    let mut total_linux_logs = 0;
+    let linux_logs_dir = temp_dir.join("linux_logs_extracted");
+
+    for (i, partition_offset) in ext4_partitions.iter().enumerate() {
+        crate::banner::print_info(&format!(
+            "ext4 partition {} at offset {:#x} ({:.2} GB)",
+            i + 1,
+            partition_offset,
+            *partition_offset as f64 / 1_073_741_824.0
+        ));
+
+        match crate::parse_image_linux::extract_linux_logs_from_ext4(reader, *partition_offset, &linux_logs_dir, i) {
+            Ok(count) if count > 0 => {
+                total_linux_logs += count;
+                crate::banner::print_info(&format!("  {} Linux log files extracted from ext4 partition {}", count, i));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if is_debug_mode() {
+                    eprintln!("[DEBUG] ext4 partition {} error: {}", i, e);
+                }
+            }
+        }
+    }
+
+    if total_linux_logs > 0 {
+        crate::banner::print_phase_result(&format!("{} Linux log files extracted total", total_linux_logs));
+    }
+
+    if total_evtx == 0 && total_linux_logs == 0 {
+        return Err("No forensic artifacts found in any partition".to_string());
+    }
+
+    Ok(ExtractedArtifacts {
+        evtx_dir: evtx_output_dir,
+        linux_logs_dir: if total_linux_logs > 0 { Some(linux_logs_dir) } else { None },
+    })
 }
 
 /// GPT partition type GUID for Microsoft Basic Data (includes NTFS)

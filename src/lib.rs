@@ -128,10 +128,9 @@ enum ActionType {
     ParseCortexEvtxForensics,
     /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
-    /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Extracts EVTX + UAL from live + VSS
-    ParseImageWindows,
-    /// Parse from Linux forensic images (E01/dd/VMDK). Extracts auth.log, secure, wtmp and other logs from ext4 partitions
-    ParseImageLinux,
+    /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
+    #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
+    ParseImage,
 }
 
 // -----------------------------------------------------------------------------
@@ -226,11 +225,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseLinux => {
             parse_linux(&config.file, &config.directory, config.output.as_ref());
         }
-        ActionType::ParseImageWindows => {
-            parse_image_windows(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
-        }
-        ActionType::ParseImageLinux => {
-            parse_image_linux(&config.file, &config.directory, config.output.as_ref());
+        ActionType::ParseImage => {
+            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
         }
     }
 
@@ -324,17 +320,10 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 }
             }
         }
-        ActionType::ParseImageWindows => {
+        ActionType::ParseImage => {
             if config.file.is_empty() && config.directory.is_empty() && !config.all_volumes {
                 return Err(String::from(
-                    "For parse-image-windows, specify image files with -f, a volume with -d (e.g. -d D:), or --all-volumes.",
-                ));
-            }
-        }
-        ActionType::ParseImageLinux => {
-            if config.file.is_empty() && config.directory.is_empty() {
-                return Err(String::from(
-                    "For parse-image-linux, specify image files with -f or directories containing images with -d.",
+                    "For parse-image, specify image files with -f, directories with -d, a volume with -d D:, or --all-volumes.",
                 ));
             }
         }
