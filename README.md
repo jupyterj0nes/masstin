@@ -45,7 +45,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-| **Multi-artifact parsing** | 30+ Windows Event IDs from 9 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
+| **Multi-artifact parsing** | 32+ Windows Event IDs from 11 sources + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data in one timeline — `parse-image` auto-merges across OS boundaries, or use `merge` for manual combination | |
@@ -389,7 +389,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 
 ## Supported Artifacts
 
-Masstin parses **30+ Windows Event IDs** across **9 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
+Masstin parses **32+ Windows Event IDs** across **11 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
 
 ### Windows EVTX
 
@@ -403,6 +403,8 @@ Masstin parses **30+ Windows Event IDs** across **9 EVTX sources**, plus Linux a
 | **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
 | **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
 | **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
+| **WinRM/Operational** | 6 | PowerShell Remoting session init — destination host from connection field (source system) | |
+| **WMI-Activity/Operational** | 5858 | Remote WMI execution — source machine from ClientMachine field (destination system) | |
 
 ### UAL (User Access Logging)
 
