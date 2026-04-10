@@ -187,9 +187,17 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             .unwrap_or(image_path)
             .to_string();
 
+        let file_size_str = fs::metadata(image_path)
+            .map(|m| {
+                let gb = m.len() as f64 / 1_073_741_824.0;
+                if gb >= 1.0 { format!("{:.1} GB", gb) }
+                else { format!("{:.0} MB", m.len() as f64 / 1_048_576.0) }
+            })
+            .unwrap_or_else(|_| "? size".to_string());
+
         crate::banner::print_info("");
         crate::banner::print_phase_result(&format!(
-            "Image {}/{}: {} ({})", img_idx + 1, total_images, image_name, ext.to_uppercase()
+            "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, ext.to_uppercase(), file_size_str
         ));
 
         let temp_dir = base_temp.join(&image_name);
@@ -222,13 +230,20 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 images_skipped += 1;
                 let msg = e.to_string();
                 if msg.contains("Incomplete VMDK") {
-                    crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file"));
+                    // Extract the missing flat extent filename from the error
+                    let detail = if let Some(pos) = msg.find("flat extent '") {
+                        let after = &msg[pos + 13..];
+                        if let Some(end) = after.find('\'') {
+                            format!(" (needs: {})", &after[..end])
+                        } else { String::new() }
+                    } else { String::new() };
+                    crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file{}", detail));
                 } else if msg.contains("not yet supported") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else if msg.contains("Empty image (0 bytes)") {
                     crate::banner::print_info(&format!("  Skipped: empty image (0 bytes, VMFS thin disk — data not in support bundle)"));
-                } else if msg.contains("No NTFS or ext4") {
-                    crate::banner::print_info(&format!("  Skipped: no NTFS or ext4 partitions found"));
+                } else if msg.contains("No NTFS or ext4") || msg.contains("No partitions found") {
+                    crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else if msg.contains("but no forensic artifacts") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else {
@@ -444,6 +459,45 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
             }
         }
     }
+}
+
+/// Describe partition types found in an image (for error messages when NTFS/ext4 not found)
+fn describe_partitions<R: Read + Seek>(reader: &mut R, _image_size: u64) -> String {
+    let mut types = Vec::new();
+    if reader.seek(SeekFrom::Start(0)).is_err() { return String::new(); }
+    let mut mbr_buf = [0u8; 512];
+    if reader.read_exact(&mut mbr_buf).is_err() || mbr_buf[510] != 0x55 || mbr_buf[511] != 0xAA {
+        return String::new();
+    }
+    let part0_type = mbr_buf[446 + 4];
+    if part0_type == 0xEE {
+        types.push("GPT disk".to_string());
+    } else {
+        for i in 0..4 {
+            let entry_offset = 446 + i * 16;
+            let part_type = mbr_buf[entry_offset + 4];
+            if part_type != 0 {
+                let name = match part_type {
+                    0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E => "FAT",
+                    0x05 | 0x0F | 0x85 => "Extended",
+                    0x07 => "NTFS/exFAT",
+                    0x0A => "OS/2 Boot",
+                    0x11 | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E => "Hidden FAT",
+                    0x27 => "Recovery",
+                    0x42 => "Dynamic/LDM",
+                    0x82 => "Linux swap",
+                    0x83 => "Linux",
+                    0x8E => "Linux LVM",
+                    0xA5 => "FreeBSD",
+                    0xEE => "GPT protective",
+                    0xFD => "Linux RAID",
+                    _ => "Unknown",
+                };
+                types.push(format!("MBR type 0x{:02X} ({})", part_type, name));
+            }
+        }
+    }
+    types.join(", ")
 }
 
 /// Check if a string is a Windows drive letter (e.g. "D:", "D:\", "E:")
@@ -884,7 +938,12 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let ext4_partitions = crate::parse_image_linux::find_linux_partitions_public(reader, image_size).unwrap_or_default();
 
     if ntfs_partitions.is_empty() && ext4_partitions.is_empty() {
-        return Err("No NTFS or ext4 partitions found in image".to_string());
+        // Try to report what partition types exist for debugging
+        let part_info = describe_partitions(reader, image_size);
+        if part_info.is_empty() {
+            return Err("No partitions found (no MBR/GPT detected)".to_string());
+        }
+        return Err(format!("No NTFS or ext4 found. Detected: {}", part_info));
     }
 
     let partitions = &ntfs_partitions;

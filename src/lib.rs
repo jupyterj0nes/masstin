@@ -133,6 +133,8 @@ enum ActionType {
     /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
+    /// MASSIVE mode: process EVERYTHING — forensic images + triage packages + loose EVTX/logs. Point at evidence folder, get a timeline. No mercy.
+    ParseMassive,
 }
 
 // -----------------------------------------------------------------------------
@@ -230,6 +232,10 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseImage => {
             parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
         }
+        ActionType::ParseMassive => {
+            crate::banner::print_massive_warning();
+            parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref());
+        }
     }
 
     Ok(())
@@ -322,10 +328,10 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 }
             }
         }
-        ActionType::ParseImage => {
+        ActionType::ParseImage | ActionType::ParseMassive => {
             if config.file.is_empty() && config.directory.is_empty() && !config.all_volumes {
                 return Err(String::from(
-                    "For parse-image, specify image files with -f, directories with -d, a volume with -d D:, or --all-volumes.",
+                    "For parse-image/parse-massive, specify image files with -f, directories with -d, a volume with -d D:, or --all-volumes.",
                 ));
             }
         }

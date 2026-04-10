@@ -349,6 +349,22 @@ pub fn print_separator() {
     eprintln!();
 }
 
+pub fn print_massive_warning() {
+    if is_silent() { return; }
+    eprintln!();
+    eprintln!("  {} {}",
+        style("!!!").red().bold(),
+        style("MASSIVE MODE ACTIVATED").red().bold(),
+    );
+    eprintln!("        {}",
+        style("Processing ALL forensic images + triage packages + loose artifacts.").dim(),
+    );
+    eprintln!("        {}",
+        style("The Mastin is off the leash. Stand back.").dim(),
+    );
+    eprintln!();
+}
+
 pub fn create_spinner(message: &str) -> ProgressBar {
     if is_silent() {
         return ProgressBar::hidden();
