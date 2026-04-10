@@ -282,6 +282,11 @@ pub fn print_info(message: &str) {
     eprintln!("        {}", style(message).dim());
 }
 
+pub fn print_separator() {
+    if is_silent() { return; }
+    eprintln!();
+}
+
 pub fn create_spinner(message: &str) -> ProgressBar {
     if is_silent() {
         return ProgressBar::hidden();

@@ -151,8 +151,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             crate::banner::print_phase_result(&format!(
                 "{} forensic image(s) found in scanned directories", filtered.len()
             ));
-            for img in &filtered {
-                crate::banner::print_info(&format!("  {}", img));
+
+            // List images numbered
+            for (i, img) in filtered.iter().enumerate() {
+                let name = Path::new(img).file_name().and_then(|n| n.to_str()).unwrap_or(img);
+                crate::banner::print_info(&format!("  [{}] {}", i + 1, name));
             }
 
             // Add discovered images to the processing list
@@ -160,11 +163,16 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    let total_images = all_image_files.len();
+
     // Extract from image files — use image name as temp subdirectory
     let mut linux_log_dirs: Vec<String> = Vec::new();
     let mut task_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
 
-    for image_path in &all_image_files {
+    let mut images_processed = 0;
+    let mut images_skipped = 0;
+
+    for (img_idx, image_path) in all_image_files.iter().enumerate() {
         let ext = Path::new(image_path)
             .extension()
             .and_then(|e| e.to_str())
@@ -177,33 +185,25 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             .unwrap_or(image_path)
             .to_string();
 
-        crate::banner::print_info(&format!("Opening forensic image: {}...", image_name));
+        crate::banner::print_info("");
+        crate::banner::print_phase_result(&format!(
+            "Image {}/{}: {} ({})", img_idx + 1, total_images, image_name, ext.to_uppercase()
+        ));
 
         let temp_dir = base_temp.join(&image_name);
         let _ = fs::create_dir_all(&temp_dir);
 
         let result = match ext.as_str() {
-            "e01" | "ex01" => {
-                crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
-                extract_evtx_from_image_ewf(image_path, &temp_dir)
-            }
-            "vmdk" => {
-                crate::banner::print_info(&format!("Image format: VMDK ({})", image_path));
-                extract_evtx_from_image_vmdk(image_path, &temp_dir)
-            }
-            "dd" | "raw" | "img" | "001" => {
-                crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
-                extract_evtx_from_image_raw(image_path, &temp_dir)
-            }
-            _ => {
-                crate::banner::print_info(&format!("Unknown extension, trying raw then E01 ({})", image_path));
-                extract_evtx_from_image_raw(image_path, &temp_dir)
-                    .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir))
-            }
+            "e01" | "ex01" => extract_evtx_from_image_ewf(image_path, &temp_dir),
+            "vmdk" => extract_evtx_from_image_vmdk(image_path, &temp_dir),
+            "dd" | "raw" | "img" | "001" => extract_evtx_from_image_raw(image_path, &temp_dir),
+            _ => extract_evtx_from_image_raw(image_path, &temp_dir)
+                    .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
         };
 
         match result {
             Ok(artifacts) => {
+                images_processed += 1;
                 crate::banner::print_phase_result(&format!("Artifacts extracted from {}", image_name));
                 // Only add EVTX dir if it actually contains extracted files
                 if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
@@ -218,13 +218,18 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 }
             }
             Err(e) => {
+                images_skipped += 1;
                 let msg = e.to_string();
-                if msg.contains("Incomplete VMDK") || msg.contains("not yet supported") {
-                    crate::banner::print_info(&format!("  Skipped {}: {}", image_name, msg));
-                } else if msg.contains("No NTFS or ext4") || msg.contains("No forensic artifacts") {
-                    crate::banner::print_info(&format!("  {} — no supported partitions found", image_name));
+                if msg.contains("Incomplete VMDK") {
+                    crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file"));
+                } else if msg.contains("not yet supported") {
+                    crate::banner::print_info(&format!("  Skipped: {}", msg));
+                } else if msg.contains("No NTFS or ext4") {
+                    crate::banner::print_info(&format!("  Skipped: no NTFS or ext4 partitions found"));
+                } else if msg.contains("No forensic artifacts") {
+                    crate::banner::print_info(&format!("  Skipped: NTFS found but no EVTX/UAL/Tasks inside"));
                 } else {
-                    eprintln!("[ERROR] Failed to process image {}: {}", image_name, msg);
+                    crate::banner::print_info(&format!("  Error: {}", msg));
                 }
             }
         }
@@ -235,7 +240,28 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         extracted_dirs.push(d.clone());
     }
 
-    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && task_dirs.is_empty() {
+    // Parse Scheduled Tasks before main parsing (so results appear in the extraction phase)
+    let mut all_task_events = Vec::new();
+    if !task_dirs.is_empty() {
+        crate::banner::print_info("Scanning Scheduled Tasks for remote activity...");
+        for (tdir, hostname) in &task_dirs {
+            let dirs_vec = vec![tdir.clone()];
+            let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
+            all_task_events.extend(events);
+        }
+        if !all_task_events.is_empty() {
+            crate::banner::print_phase_result(&format!("{} remotely scheduled task(s) detected", all_task_events.len()));
+        }
+    }
+
+    // Summary of extraction phase
+    if images_processed > 0 || images_skipped > 0 {
+        crate::banner::print_info(&format!(
+            "{} image(s) processed, {} skipped", images_processed, images_skipped
+        ));
+    }
+
+    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
     }
@@ -287,20 +313,17 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Parse Scheduled Tasks if any were extracted
-    if !task_dirs.is_empty() {
-        crate::banner::print_info("Scanning Scheduled Tasks for remote activity...");
-        let mut all_task_events = Vec::new();
-        for (tdir, hostname) in &task_dirs {
-            let dirs_vec = vec![tdir.clone()];
-            let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
-            all_task_events.extend(events);
+    // Append task events to the output CSV (after main parsing)
+    if !all_task_events.is_empty() {
+        if let Some(out_path) = output {
+            append_logdata_to_csv(out_path, &all_task_events);
         }
-        if !all_task_events.is_empty() {
-            if let Some(out_path) = output {
-                append_logdata_to_csv(out_path, &all_task_events);
-            }
-        }
+    }
+
+    // Suggest graph database loading
+    if let Some(out_path) = output {
+        crate::banner::print_info("");
+        crate::banner::print_info(&format!("Load into graph: masstin -a load-memgraph -f {} --database localhost:7687", out_path));
     }
 
     // Cleanup temp directories
@@ -998,10 +1021,6 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     if total_linux_logs > 0 {
         crate::banner::print_phase_result(&format!("{} Linux log files extracted total", total_linux_logs));
-    }
-
-    if total_tasks > 0 {
-        crate::banner::print_phase_result(&format!("{} Scheduled Task files extracted total", total_tasks));
     }
 
     if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 {
