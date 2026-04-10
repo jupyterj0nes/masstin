@@ -32,6 +32,8 @@ pub mod parse_ese;
 pub use crate::parse_ese::*;
 mod parse_ual;
 pub use crate::parse_ual::*;
+mod parse_tasks;
+pub use crate::parse_tasks::*;
 pub mod vmdk;
 pub use crate::vmdk::*;
 

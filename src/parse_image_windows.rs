@@ -14,6 +14,7 @@ use crate::parse_linux::parse_linux;
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
 const UAL_SUM_PATH: &[&str] = &["Windows", "System32", "LogFiles", "Sum"];
+const SCHTASKS_PATH: &[&str] = &["Windows", "System32", "Tasks"];
 
 /// Result of extracting artifacts from a forensic image.
 /// Contains separate directories for Windows (EVTX/UAL) and Linux logs.
@@ -22,6 +23,8 @@ struct ExtractedArtifacts {
     evtx_dir: PathBuf,
     /// Directory containing extracted Linux log files, if any were found
     linux_logs_dir: Option<PathBuf>,
+    /// Directory containing extracted Scheduled Task XML files, if any were found
+    tasks_dir: Option<PathBuf>,
 }
 
 /// Main entry point: parse forensic disk images (Windows + Linux).
@@ -157,6 +160,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Extract from image files — use image name as temp subdirectory
     let mut linux_log_dirs: Vec<String> = Vec::new();
+    let mut task_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
 
     for image_path in &all_image_files {
         let ext = Path::new(image_path)
@@ -206,6 +210,10 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 if let Some(linux_dir) = artifacts.linux_logs_dir {
                     linux_log_dirs.push(linux_dir.to_string_lossy().to_string());
                 }
+                if let Some(tdir) = artifacts.tasks_dir {
+                    let hostname = extract_hostname_from_evtx_dir(&artifacts.evtx_dir);
+                    task_dirs.push((tdir.to_string_lossy().to_string(), hostname));
+                }
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to process image {}: {}", image_path, e);
@@ -218,7 +226,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         extracted_dirs.push(d.clone());
     }
 
-    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() {
+    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && task_dirs.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
     }
@@ -270,8 +278,105 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    // Parse Scheduled Tasks if any were extracted
+    if !task_dirs.is_empty() {
+        crate::banner::print_info("Scanning Scheduled Tasks for remote activity...");
+        let mut all_task_events = Vec::new();
+        for (tdir, hostname) in &task_dirs {
+            let dirs_vec = vec![tdir.clone()];
+            let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
+            all_task_events.extend(events);
+        }
+        if !all_task_events.is_empty() {
+            if let Some(out_path) = output {
+                append_logdata_to_csv(out_path, &all_task_events);
+            }
+        }
+    }
+
     // Cleanup temp directories
     let _ = fs::remove_dir_all(&base_temp);
+}
+
+/// Extract hostname from extracted EVTX files by reading the Computer field from the first record.
+fn extract_hostname_from_evtx_dir(evtx_dir: &Path) -> String {
+    // Find Security.evtx or any .evtx in the extracted directory
+    let candidates = ["Security.evtx", "System.evtx"];
+    for candidate in &candidates {
+        // Search recursively in partition subdirectories
+        if let Ok(entries) = fs::read_dir(evtx_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let evtx_path = path.join(candidate);
+                    if evtx_path.exists() {
+                        if let Some(hostname) = read_hostname_from_evtx(&evtx_path) {
+                            return hostname;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Read the Computer field from the first record of an EVTX file.
+fn read_hostname_from_evtx(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).ok()?;
+    let cursor = std::io::Cursor::new(data);
+    let mut parser = evtx::EvtxParser::from_read_seek(cursor).ok()?;
+    for record in parser.records() {
+        if let Ok(r) = record {
+            let xml = r.data;
+            // Quick extraction of <Computer> from XML
+            if let Some(start) = xml.find("<Computer>") {
+                let start = start + "<Computer>".len();
+                if let Some(end) = xml[start..].find("</Computer>") {
+                    let hostname = xml[start..start + end].trim().to_string();
+                    if !hostname.is_empty() {
+                        return Some(hostname);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the most common computer name from an existing CSV (dst_computer column).
+fn extract_computer_from_csv(csv_path: &str) -> Option<String> {
+    let content = fs::read_to_string(csv_path).ok()?;
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, line) in content.lines().enumerate() {
+        if i == 0 { continue; } // skip header
+        let fields: Vec<&str> = line.splitn(3, ',').collect();
+        if fields.len() >= 2 && !fields[1].is_empty() {
+            *counts.entry(fields[1].to_string()).or_insert(0) += 1;
+        }
+        if i > 100 { break; } // sample first 100 lines
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(name, _)| name.trim_start_matches('\\').to_string())
+}
+
+/// Append LogData events to an existing CSV file.
+fn append_logdata_to_csv(csv_path: &str, events: &[crate::parse::LogData]) {
+    use std::io::Write;
+    let mut file = match fs::OpenOptions::new().append(true).open(csv_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    for e in events {
+        let line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            e.time_created, e.computer, e.event_type, e.event_id,
+            e.logon_type, e.target_user_name, e.target_domain_name,
+            e.workstation_name, e.ip_address,
+            e.subject_user_name, e.subject_domain_name,
+            e.logon_id, e.detail, e.filename);
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -749,6 +854,8 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let evtx_output_dir = temp_dir.join("evtx_extracted");
     let _ = fs::create_dir_all(&evtx_output_dir);
     let mut total_evtx = 0;
+    let tasks_dir = temp_dir.join("tasks_extracted");
+    let mut total_tasks = 0;
 
     for (i, partition_offset) in partitions.iter().enumerate() {
         crate::banner::print_info(&format!(
@@ -776,6 +883,16 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         match extract_files_from_ntfs_path(reader, *partition_offset, UAL_SUM_PATH, "mdb", &ual_dir) {
             Ok(count) if count > 0 => {
                 crate::banner::print_info(&format!("  {} UAL database files extracted from live volume", count));
+            }
+            _ => {}
+        }
+
+        // Extract Scheduled Task XML files from live volume
+        let tasks_part_dir = tasks_dir.join(format!("partition_{}", i));
+        match extract_all_files_from_ntfs_path(reader, *partition_offset, SCHTASKS_PATH, &tasks_part_dir) {
+            Ok(count) if count > 0 => {
+                total_tasks += count;
+                crate::banner::print_info(&format!("  {} Scheduled Task files extracted from live volume", count));
             }
             _ => {}
         }
@@ -867,13 +984,18 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         crate::banner::print_phase_result(&format!("{} Linux log files extracted total", total_linux_logs));
     }
 
-    if total_evtx == 0 && total_linux_logs == 0 {
+    if total_tasks > 0 {
+        crate::banner::print_phase_result(&format!("{} Scheduled Task files extracted total", total_tasks));
+    }
+
+    if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 {
         return Err("No forensic artifacts found in any partition".to_string());
     }
 
     Ok(ExtractedArtifacts {
         evtx_dir: evtx_output_dir,
         linux_logs_dir: if total_linux_logs > 0 { Some(linux_logs_dir) } else { None },
+        tasks_dir: if total_tasks > 0 { Some(tasks_dir) } else { None },
     })
 }
 
@@ -1279,6 +1401,122 @@ fn extract_files_from_ntfs_path<R: Read + Seek>(
                 }
             }
             count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
+/// Extract ALL files (no extension filter) from an NTFS path, recursively.
+/// Used to extract Scheduled Task XML files from Windows/System32/Tasks.
+fn extract_all_files_from_ntfs_path<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    path_components: &[&str],
+    output_dir: &Path,
+) -> Result<usize, String> {
+    let mut partition_reader = OffsetReader::new(reader, partition_offset);
+
+    let mut ntfs = ntfs::Ntfs::new(&mut partition_reader)
+        .map_err(|e| format!("Cannot parse NTFS: {}", e))?;
+    ntfs.read_upcase_table(&mut partition_reader)
+        .map_err(|e| format!("Cannot read upcase table: {}", e))?;
+
+    let root_dir = ntfs.root_directory(&mut partition_reader)
+        .map_err(|e| format!("Cannot read root directory: {}", e))?;
+
+    // Navigate to the target directory
+    let mut current_dir = root_dir;
+    for component in path_components {
+        let index = current_dir.directory_index(&mut partition_reader)
+            .map_err(|e| format!("Cannot read directory index: {}", e))?;
+        let mut found = false;
+        let mut entries = index.entries();
+        while let Some(entry) = entries.next(&mut partition_reader) {
+            let entry = entry.map_err(|e| format!("Directory entry error: {}", e))?;
+            if let Some(key) = entry.key() {
+                let file_name = key.map_err(|e| format!("Filename error: {}", e))?;
+                let name = file_name.name().to_string_lossy();
+                if name.eq_ignore_ascii_case(component) {
+                    current_dir = entry.file_reference().to_file(&ntfs, &mut partition_reader)
+                        .map_err(|e| format!("Cannot open directory {}: {}", component, e))?;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(format!("Path not found: {}", component));
+        }
+    }
+
+    let _ = fs::create_dir_all(output_dir);
+    extract_files_recursive(&ntfs, &current_dir, &mut partition_reader, output_dir)
+}
+
+/// Recursively extract all files from an NTFS directory.
+fn extract_files_recursive<R: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    dir: &ntfs::NtfsFile,
+    reader: &mut R,
+    output_dir: &Path,
+) -> Result<usize, String> {
+    let dir_index = dir.directory_index(reader)
+        .map_err(|e| format!("Cannot read directory: {}", e))?;
+
+    let mut count = 0;
+    let mut subdirs: Vec<(String, ntfs::NtfsFileReference)> = Vec::new();
+
+    let mut entries = dir_index.entries();
+    while let Some(entry) = entries.next(reader) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if let Some(key) = entry.key() {
+            let file_name = match key { Ok(f) => f, Err(_) => continue };
+            let name = file_name.name().to_string_lossy().to_string();
+
+            // Skip . and .. and system files
+            if name == "." || name == ".." || name.starts_with('$') { continue; }
+
+            let is_directory = file_name.is_directory();
+            if is_directory {
+                subdirs.push((name, entry.file_reference()));
+            } else {
+                // Extract file
+                let ntfs_file = match entry.file_reference().to_file(ntfs, reader) {
+                    Ok(f) => f, Err(_) => continue
+                };
+                let data_item = match ntfs_file.data(reader, "") {
+                    Some(Ok(d)) => d, _ => continue
+                };
+                let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };
+                let data_value = match data_attr.value(reader) { Ok(v) => v, Err(_) => continue };
+                let mut attached = data_value.attach(reader);
+
+                let output_path = output_dir.join(&name);
+                let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+
+                let mut buf = [0u8; 65536];
+                loop {
+                    match attached.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                        Err(_) => break,
+                    }
+                }
+                count += 1;
+            }
+        }
+    }
+
+    // Recurse into subdirectories
+    for (name, file_ref) in subdirs {
+        let subdir = match file_ref.to_file(ntfs, reader) {
+            Ok(f) => f, Err(_) => continue
+        };
+        let subdir_path = output_dir.join(&name);
+        match extract_files_recursive(ntfs, &subdir, reader, &subdir_path) {
+            Ok(c) => count += c,
+            Err(_) => {}
         }
     }
 
