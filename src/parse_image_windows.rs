@@ -204,7 +204,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         match result {
             Ok(artifacts) => {
                 images_processed += 1;
-                crate::banner::print_phase_result(&format!("Artifacts extracted from {}", image_name));
                 // Only add EVTX dir if it actually contains extracted files
                 if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
                     extracted_dirs.push(artifacts.evtx_dir.to_string_lossy().to_string());
@@ -240,7 +239,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         extracted_dirs.push(d.clone());
     }
 
-    // Parse Scheduled Tasks before main parsing (so results appear in the extraction phase)
+    // Extraction summary
+    crate::banner::print_info("");
+    crate::banner::print_info(&format!(
+        "{} image(s) processed, {} skipped", images_processed, images_skipped
+    ));
+
+    // Parse Scheduled Tasks
     let mut all_task_events = Vec::new();
     if !task_dirs.is_empty() {
         crate::banner::print_info("Scanning Scheduled Tasks for remote activity...");
@@ -252,13 +257,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         if !all_task_events.is_empty() {
             crate::banner::print_phase_result(&format!("{} remotely scheduled task(s) detected", all_task_events.len()));
         }
-    }
-
-    // Summary of extraction phase
-    if images_processed > 0 || images_skipped > 0 {
-        crate::banner::print_info(&format!(
-            "{} image(s) processed, {} skipped", images_processed, images_skipped
-        ));
     }
 
     if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() {
