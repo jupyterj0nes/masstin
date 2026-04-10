@@ -824,7 +824,9 @@ fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<Extr
         .map_err(|e| format!("Cannot open E01: {}", e))?;
 
     let image_size = reader.total_size();
-    crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
+    if is_debug_mode() {
+        eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
+    }
 
     let mut buf_reader = BufReader::new(reader);
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
@@ -836,7 +838,9 @@ fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Ext
         .map_err(|e| format!("Cannot open VMDK: {}", e))?;
 
     let image_size = reader.total_size();
-    crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
+    if is_debug_mode() {
+        eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
+    }
 
     let mut buf_reader = BufReader::new(reader);
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
@@ -851,7 +855,9 @@ fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<Extr
         .map_err(|e| format!("Cannot read file size: {}", e))?
         .len();
 
-    crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
+    if is_debug_mode() {
+        eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
+    }
 
     let mut buf_reader = BufReader::new(file);
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
@@ -863,8 +869,6 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     image_size: u64,
     temp_dir: &Path,
 ) -> Result<ExtractedArtifacts, String> {
-    crate::banner::print_info("Searching for partitions (NTFS + ext4)...");
-
     // Find NTFS partition offsets
     let ntfs_partitions = find_ntfs_partitions(reader, image_size).unwrap_or_default();
     // Find ext4 partition offsets
@@ -872,13 +876,6 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     if ntfs_partitions.is_empty() && ext4_partitions.is_empty() {
         return Err("No NTFS or ext4 partitions found in image".to_string());
-    }
-
-    if !ntfs_partitions.is_empty() {
-        crate::banner::print_phase_result(&format!("{} NTFS partition(s) found", ntfs_partitions.len()));
-    }
-    if !ext4_partitions.is_empty() {
-        crate::banner::print_phase_result(&format!("{} ext4 partition(s) found", ext4_partitions.len()));
     }
 
     let partitions = &ntfs_partitions;
@@ -889,20 +886,18 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let tasks_dir = temp_dir.join("tasks_extracted");
     let mut total_tasks = 0;
     let mut total_ual = 0;
+    let mut total_vss = 0;
 
     for (i, partition_offset) in partitions.iter().enumerate() {
-        crate::banner::print_info(&format!(
-            "Partition {} at offset {:#x} ({:.2} GB)",
-            i + 1,
-            partition_offset,
-            *partition_offset as f64 / 1_073_741_824.0
-        ));
+        if is_debug_mode() {
+            eprintln!("[DEBUG] Partition {} at offset {:#x} ({:.2} GB)",
+                i + 1, partition_offset, *partition_offset as f64 / 1_073_741_824.0);
+        }
 
         // Extract EVTX from the live (current) volume
         match extract_evtx_from_ntfs_partition(reader, *partition_offset, &evtx_output_dir, i) {
             Ok(count) => {
                 total_evtx += count;
-                crate::banner::print_info(&format!("  {} EVTX files extracted from live volume", count));
             }
             Err(e) => {
                 if is_debug_mode() {
@@ -913,52 +908,34 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
         // Extract UAL databases from live volume
         let ual_dir = evtx_output_dir.join(format!("partition_{}", i)).join("Sum");
-        match extract_files_from_ntfs_path(reader, *partition_offset, UAL_SUM_PATH, "mdb", &ual_dir) {
-            Ok(count) if count > 0 => {
-                total_ual += count;
-                crate::banner::print_info(&format!("  {} UAL database files extracted from live volume", count));
-            }
-            _ => {}
+        if let Ok(count) = extract_files_from_ntfs_path(reader, *partition_offset, UAL_SUM_PATH, "mdb", &ual_dir) {
+            total_ual += count;
         }
 
         // Extract Scheduled Task XML files from live volume
         let tasks_part_dir = tasks_dir.join(format!("partition_{}", i));
-        match extract_all_files_from_ntfs_path(reader, *partition_offset, SCHTASKS_PATH, &tasks_part_dir) {
-            Ok(count) if count > 0 => {
-                total_tasks += count;
-                crate::banner::print_info(&format!("  {} Scheduled Task files extracted from live volume", count));
-            }
-            _ => {}
+        if let Ok(count) = extract_all_files_from_ntfs_path(reader, *partition_offset, SCHTASKS_PATH, &tasks_part_dir) {
+            total_tasks += count;
         }
 
         // Check for Volume Shadow Copies (VSS) and extract EVTX from each
         let mut offset_reader = OffsetReader::new(reader, *partition_offset);
         match VssVolume::new(&mut offset_reader) {
             Ok(vss) if vss.store_count() > 0 => {
-                crate::banner::print_phase_result(&format!(
-                    "{} Volume Shadow Copy snapshot(s) detected", vss.store_count()
-                ));
-
                 for s in 0..vss.store_count() {
-                    let store_label = format!("vss_{}", s);
-                    crate::banner::print_info(&format!("  Processing VSS store {}...", s));
-
-                    // Show delta info
-                    if let Ok((blocks, bytes)) = vss.store_delta_size(&mut offset_reader, s) {
-                        crate::banner::print_info(&format!("    {} changed blocks ({:.1} MB delta)",
-                            blocks, bytes as f64 / 1_048_576.0));
+                    total_vss += 1;
+                    if is_debug_mode() {
+                        if let Ok((blocks, bytes)) = vss.store_delta_size(&mut offset_reader, s) {
+                            eprintln!("[DEBUG] VSS store {}: {} changed blocks ({:.1} MB delta)",
+                                s, blocks, bytes as f64 / 1_048_576.0);
+                        }
                     }
 
                     match vss.store_reader(&mut offset_reader, s) {
                         Ok(mut store_reader) => {
-                            crate::banner::print_info("    Opening NTFS from VSS snapshot...");
-                            // Try to parse NTFS from this VSS store
                             match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, i, s) {
                                 Ok(count) => {
                                     total_evtx += count;
-                                    crate::banner::print_info(&format!(
-                                        "    {} EVTX files extracted from VSS store {}", count, s
-                                    ));
                                 }
                                 Err(e) => {
                                     if is_debug_mode() {
@@ -975,22 +952,23 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
                     }
                 }
             }
-            Ok(_) => {
-                crate::banner::print_info("No Volume Shadow Copies detected");
-            }
-            Err(_) => {
-                crate::banner::print_info("No Volume Shadow Copies detected");
-            }
+            _ => {}
         }
     }
 
-    // Summary of extracted artifacts
-    let mut summary_parts = Vec::new();
-    if total_evtx > 0 { summary_parts.push(format!("{} EVTX", total_evtx)); }
-    if total_ual > 0 { summary_parts.push(format!("{} UAL", total_ual)); }
-    if total_tasks > 0 { summary_parts.push(format!("{} Tasks", total_tasks)); }
-    if !summary_parts.is_empty() {
-        crate::banner::print_phase_result(&format!("{} files extracted total", summary_parts.join(" + ")));
+    // Compact summary line
+    let mut parts = Vec::new();
+    parts.push(format!("{} NTFS", ntfs_partitions.len()));
+    if total_vss > 0 { parts.push(format!("{} VSS", total_vss)); }
+    if !ext4_partitions.is_empty() { parts.push(format!("{} ext4", ext4_partitions.len())); }
+    crate::banner::print_info(&format!("  Partitions: {}", parts.join(", ")));
+
+    let mut artifact_parts = Vec::new();
+    if total_evtx > 0 { artifact_parts.push(format!("{} EVTX", total_evtx)); }
+    if total_ual > 0 { artifact_parts.push(format!("{} UAL", total_ual)); }
+    if total_tasks > 0 { artifact_parts.push(format!("{} Tasks", total_tasks)); }
+    if !artifact_parts.is_empty() {
+        crate::banner::print_info(&format!("  Extracted: {}", artifact_parts.join(" + ")));
     }
 
     // Now process ext4 partitions (Linux)
