@@ -107,10 +107,12 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let image_extensions = ["e01", "ex01", "vmdk", "dd", "raw", "img", "001"];
         let mut discovered: Vec<String> = Vec::new();
 
+        let sp = crate::banner::create_spinner("Scanning for forensic images...");
+        let mut dirs_scanned: usize = 0;
         for dir in &real_dirs {
-            crate::banner::print_info(&format!("Scanning {} for forensic images...", dir));
-            scan_for_images(Path::new(dir), &image_extensions, &mut discovered, 0);
+            scan_for_images(Path::new(dir), &image_extensions, &mut discovered, 0, &sp, &mut dirs_scanned);
         }
+        sp.finish_and_clear();
 
         if !discovered.is_empty() {
             // Deduplicate: for E01 split files, only keep the .E01 (not .E02, .E03...)
@@ -415,25 +417,27 @@ fn append_logdata_to_csv(csv_path: &str, events: &[crate::parse::LogData]) {
 // -----------------------------------------------------------------------------
 
 /// Recursively scan a directory for forensic image files.
-fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, depth: usize) {
-    if depth > 10 { return; } // Avoid infinite recursion
+fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, depth: usize, spinner: &indicatif::ProgressBar, dirs_scanned: &mut usize) {
+    if depth > 10 { return; }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
+    *dirs_scanned += 1;
+    spinner.set_message(format!("{} dirs scanned, {} images found", dirs_scanned, results.len()));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip $RECYCLE.BIN and other system dirs
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('$') || name.starts_with('.') || name == "System Volume Information" {
                 continue;
             }
-            scan_for_images(&path, extensions, results, depth + 1);
+            scan_for_images(&path, extensions, results, depth + 1, spinner, dirs_scanned);
         } else if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
                     results.push(path.to_string_lossy().to_string());
+                    spinner.set_message(format!("{} dirs scanned, {} images found", dirs_scanned, results.len()));
                 }
             }
         }
