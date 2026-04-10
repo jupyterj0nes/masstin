@@ -22,11 +22,7 @@ pub fn parse_scheduled_tasks(dirs: &[String], computer_name: &str) -> Vec<LogDat
         parse_tasks_recursive(dir_path, dir, computer_name, &mut results);
     }
 
-    if !results.is_empty() {
-        crate::banner::print_phase_result(&format!(
-            "{} remotely scheduled task(s) detected", results.len()
-        ));
-    }
+    // Summary printed by caller (parse_image), not here
 
     results
 }

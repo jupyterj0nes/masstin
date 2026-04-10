@@ -245,17 +245,18 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         "{} image(s) processed, {} skipped", images_processed, images_skipped
     ));
 
-    // Parse Scheduled Tasks
+    // Parse Scheduled Tasks for remote activity
     let mut all_task_events = Vec::new();
     if !task_dirs.is_empty() {
-        crate::banner::print_info("Scanning Scheduled Tasks for remote activity...");
         for (tdir, hostname) in &task_dirs {
             let dirs_vec = vec![tdir.clone()];
             let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
             all_task_events.extend(events);
         }
         if !all_task_events.is_empty() {
-            crate::banner::print_phase_result(&format!("{} remotely scheduled task(s) detected", all_task_events.len()));
+            crate::banner::print_phase_result(&format!(
+                "{} remotely scheduled task(s) detected across all images", all_task_events.len()
+            ));
         }
     }
 
