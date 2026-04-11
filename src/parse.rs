@@ -1506,7 +1506,7 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
     }
     if !extra_events.is_empty() {
-        crate::banner::print_search_result_line(extra_events.len(), "Scheduled Task events");
+        crate::banner::print_search_result_line(extra_events.len(), "remote Scheduled Task events");
     }
 
     if is_debug_mode() {
