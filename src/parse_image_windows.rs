@@ -294,7 +294,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         all_task_events.clear();
 
         crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
-        parse_linux(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
+        crate::parse_linux::parse_linux_quiet(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
 
         // Rewrite log_filename paths before merging
         rewrite_log_filenames(&win_tmp_str);

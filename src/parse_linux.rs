@@ -737,10 +737,19 @@ fn extract_zips_recursive(zip_path: &Path, dest_base: &Path) -> Vec<PathBuf> {
 }
 
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
+    parse_linux_inner(files, dirs, output, false);
+}
+
+/// Quiet mode: skip phase headers and summary (used when integrated into parse-image mixed pipeline)
+pub fn parse_linux_quiet(files: &[String], dirs: &[String], output: Option<&String>) {
+    parse_linux_inner(files, dirs, output, true);
+}
+
+fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>, quiet: bool) {
     let start_time = std::time::Instant::now();
 
     // Phase 1: Search for artifacts (with ZIP support)
-    crate::banner::print_search_start();
+    if !quiet { crate::banner::print_search_start(); }
 
     let mut targets: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     let mut zip_count: usize = 0;
@@ -790,7 +799,9 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     targets.sort();
     targets.dedup();
 
-    crate::banner::print_search_results_labeled(targets.len(), zip_count, dirs.len(), files.len(), "Linux log artifacts");
+    if !quiet {
+        crate::banner::print_search_results_labeled(targets.len(), zip_count, dirs.len(), files.len(), "Linux log artifacts");
+    }
 
     if is_debug_mode() {
         println!("[DEBUG] {} candidate files", targets.len());
@@ -800,7 +811,7 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     let mut root2host: HashMap<PathBuf, String> = HashMap::new();
 
     // Phase 2: Process artifacts
-    crate::banner::print_processing_start();
+    if !quiet { crate::banner::print_processing_start(); }
     let pb = crate::banner::create_progress_bar(targets.len() as u64);
 
     let mut collected = Vec::<RawEvt>::new();
@@ -910,11 +921,13 @@ pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     }
 
     // Phase 3: Generate output
-    crate::banner::print_output_start();
+    if !quiet { crate::banner::print_output_start(); }
     let total_events = collected.len();
     build_dataframe(&collected, output);
 
-    crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
+    if !quiet {
+        crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
+    }
 
     // Cleanup temp extraction dir
     let _ = fs::remove_dir_all(&temp_dir);
