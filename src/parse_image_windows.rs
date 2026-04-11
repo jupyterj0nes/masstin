@@ -12,6 +12,7 @@ use crate::parse::{parse_events, is_debug_mode};
 use crate::parse_linux::parse_linux;
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
+const BITLOCKER_SIGNATURE: &[u8] = b"-FVE-FS-";
 const EVTX_LOGS_PATH: &[&str] = &["Windows", "System32", "winevt", "Logs"];
 const UAL_SUM_PATH: &[&str] = &["Windows", "System32", "LogFiles", "Sum"];
 const SCHTASKS_PATH: &[&str] = &["Windows", "System32", "Tasks"];
@@ -979,6 +980,17 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     let partitions = &ntfs_partitions;
 
+    // Check for BitLocker-encrypted partitions
+    let mut bitlocker_count = 0;
+    for partition_offset in partitions.iter() {
+        if verify_bitlocker_signature(reader, *partition_offset) {
+            bitlocker_count += 1;
+        }
+    }
+    // Also check partitions that weren't detected as NTFS (BitLocker replaces the NTFS signature)
+    // For GPT Basic Data partitions, some may have been added without NTFS signature verification
+    // so we already cover those above
+
     let evtx_output_dir = temp_dir.join("evtx_extracted");
     let _ = fs::create_dir_all(&evtx_output_dir);
     let mut total_evtx = 0;
@@ -988,6 +1000,14 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let mut total_vss = 0;
 
     for (i, partition_offset) in partitions.iter().enumerate() {
+        // Skip BitLocker-encrypted partitions — content is not readable without recovery key
+        if verify_bitlocker_signature(reader, *partition_offset) {
+            crate::banner::print_warning(&format!(
+                "  Partition {} at offset {:#x}: BitLocker encrypted — cannot extract artifacts without recovery key",
+                i + 1, partition_offset
+            ));
+            continue;
+        }
         if is_debug_mode() {
             eprintln!("[DEBUG] Partition {} at offset {:#x} ({:.2} GB)",
                 i + 1, partition_offset, *partition_offset as f64 / 1_073_741_824.0);
@@ -1057,7 +1077,15 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     // Compact summary line
     let mut parts = Vec::new();
-    parts.push(format!("{} NTFS", ntfs_partitions.len()));
+    if bitlocker_count > 0 {
+        let readable_ntfs = ntfs_partitions.len() - bitlocker_count;
+        if readable_ntfs > 0 {
+            parts.push(format!("{} NTFS", readable_ntfs));
+        }
+        parts.push(format!("{} BitLocker", bitlocker_count));
+    } else {
+        parts.push(format!("{} NTFS", ntfs_partitions.len()));
+    }
     if total_vss > 0 { parts.push(format!("{} VSS", total_vss)); }
     if !ext4_partitions.is_empty() { parts.push(format!("{} ext4", ext4_partitions.len())); }
     crate::banner::print_info(&format!("  Partitions: {}", parts.join(", ")));
@@ -1100,10 +1128,15 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 {
         let mut found = Vec::new();
-        if !ntfs_partitions.is_empty() { found.push(format!("{} NTFS", ntfs_partitions.len())); }
+        if bitlocker_count > 0 { found.push(format!("{} BitLocker-encrypted", bitlocker_count)); }
+        let readable_ntfs = ntfs_partitions.len() - bitlocker_count;
+        if readable_ntfs > 0 { found.push(format!("{} NTFS", readable_ntfs)); }
         if !ext4_partitions.is_empty() { found.push(format!("{} ext4", ext4_partitions.len())); }
         if found.is_empty() {
             return Err("No NTFS or ext4 partitions found".to_string());
+        }
+        if bitlocker_count > 0 && readable_ntfs == 0 && ext4_partitions.is_empty() {
+            return Err(format!("All NTFS partitions are BitLocker-encrypted — recovery key required to extract artifacts"));
         }
         return Err(format!("Partitions found ({}) but no forensic artifacts inside", found.join(", ")));
     }
@@ -1177,9 +1210,11 @@ fn find_ntfs_partitions<R: Read + Seek>(
                         // (some partition tools don't write the NTFS boot sector signature at offset 3)
                         if type_guid == GPT_BASIC_DATA_GUID {
                             if is_debug_mode() {
-                                let has_sig = verify_ntfs_signature(reader, partition_byte_offset);
-                                eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — Basic Data, NTFS sig: {}",
-                                    i, first_lba, partition_byte_offset, has_sig);
+                                let has_ntfs = verify_ntfs_signature(reader, partition_byte_offset);
+                                let has_bitlocker = verify_bitlocker_signature(reader, partition_byte_offset);
+                                let sig_info = if has_bitlocker { "BitLocker" } else if has_ntfs { "NTFS" } else { "unknown" };
+                                eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — Basic Data, sig: {}",
+                                    i, first_lba, partition_byte_offset, sig_info);
                             }
                             partitions.push(partition_byte_offset);
                         } else if verify_ntfs_signature(reader, partition_byte_offset) {
@@ -1206,7 +1241,8 @@ fn find_ntfs_partitions<R: Read + Seek>(
 
                 if part_type == 0x07 && lba_start > 0 {
                     let offset = lba_start as u64 * 512;
-                    if verify_ntfs_signature(reader, offset) {
+                    // Add if NTFS or BitLocker (BitLocker replaces NTFS signature but keeps partition type 0x07)
+                    if verify_ntfs_signature(reader, offset) || verify_bitlocker_signature(reader, offset) {
                         partitions.push(offset);
                     }
                 }
@@ -1214,9 +1250,9 @@ fn find_ntfs_partitions<R: Read + Seek>(
         }
     }
 
-    // Fallback: check if the image starts with NTFS directly (partition image)
+    // Fallback: check if the image starts with NTFS or BitLocker directly (partition image)
     if partitions.is_empty() {
-        if verify_ntfs_signature(reader, 0) {
+        if verify_ntfs_signature(reader, 0) || verify_bitlocker_signature(reader, 0) {
             partitions.push(0);
         }
     }
@@ -1234,6 +1270,18 @@ fn verify_ntfs_signature<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
         return false;
     }
     &sig == NTFS_SIGNATURE
+}
+
+/// Check if a volume boot record contains the BitLocker signature (-FVE-FS-) at offset 3
+fn verify_bitlocker_signature<R: Read + Seek>(reader: &mut R, offset: u64) -> bool {
+    if reader.seek(SeekFrom::Start(offset + 3)).is_err() {
+        return false;
+    }
+    let mut sig = [0u8; 8];
+    if reader.read_exact(&mut sig).is_err() {
+        return false;
+    }
+    &sig == BITLOCKER_SIGNATURE
 }
 
 /// Extract EVTX files from an NTFS partition at the given offset

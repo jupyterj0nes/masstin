@@ -356,6 +356,11 @@ pub fn print_info(message: &str) {
     eprintln!("        {}", style(message).dim());
 }
 
+pub fn print_warning(message: &str) {
+    if is_silent() { return; }
+    eprintln!("        {}", style(message).yellow());
+}
+
 pub fn print_separator() {
     if is_silent() { return; }
     eprintln!();
