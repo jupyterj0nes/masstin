@@ -258,33 +258,20 @@ pub fn print_artifact_detail_ex(artifacts: &[(String, usize)], total_images: usi
         style(title).bold(),
     );
 
-    if grouped.len() == 1 {
-        // Single image — flat list (no grouping needed)
-        for (_, items) in &grouped {
-            for (short, count) in items {
-                eprintln!("        {} {} {}",
-                    style("=>").green(),
-                    style(short).white(),
-                    style(format!("({} events)", count)).dim(),
-                );
-            }
-        }
-    } else {
-        // Multiple images — group by image name
-        for (image, items) in &grouped {
-            let total: usize = items.iter().map(|(_, c)| c).sum();
-            eprintln!("        {} {} {}",
-                style("=>").green().bold(),
-                style(image).cyan().bold(),
-                style(format!("({} events total)", total)).dim(),
+    // Always show image name + artifacts grouped
+    for (image, items) in &grouped {
+        let total: usize = items.iter().map(|(_, c)| c).sum();
+        eprintln!("        {} {} {}",
+            style("=>").green().bold(),
+            style(image).cyan().bold(),
+            style(format!("({} events total)", total)).dim(),
+        );
+        for (short, count) in items {
+            eprintln!("           {} {} {}",
+                style("-").dim(),
+                style(short).white(),
+                style(format!("({})", count)).dim(),
             );
-            for (short, count) in items {
-                eprintln!("           {} {} {}",
-                    style("-").dim(),
-                    style(short).white(),
-                    style(format!("({})", count)).dim(),
-                );
-            }
         }
     }
 }
