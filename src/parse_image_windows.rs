@@ -199,8 +199,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         crate::banner::print_phase_result(&format!(
             "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, ext.to_uppercase(), file_size_str
         ));
+        crate::banner::print_info(&format!("  {}", image_path));
 
-        let temp_dir = base_temp.join(&image_name);
+        let temp_dir = base_temp.join(format!("{}_{}", img_idx, image_name));
         let _ = fs::create_dir_all(&temp_dir);
 
         let result = match ext.as_str() {
@@ -260,24 +261,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Extraction summary
-    crate::banner::print_info("");
-    crate::banner::print_info(&format!(
-        "{} image(s) processed, {} skipped", images_processed, images_skipped
-    ));
-
-    // Parse Scheduled Tasks for remote activity
+    // Parse Scheduled Tasks for remote activity (silent — only shows if found)
     let mut all_task_events = Vec::new();
     if !task_dirs.is_empty() {
         for (tdir, hostname) in &task_dirs {
             let dirs_vec = vec![tdir.clone()];
             let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
             all_task_events.extend(events);
-        }
-        if !all_task_events.is_empty() {
-            crate::banner::print_phase_result(&format!(
-                "{} remotely scheduled task(s) detected across all images", all_task_events.len()
-            ));
         }
     }
 

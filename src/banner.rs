@@ -153,7 +153,7 @@ pub fn print_search_results(artifact_count: usize, zip_count: usize, dir_count: 
 pub fn print_search_results_labeled(artifact_count: usize, zip_count: usize, dir_count: usize, file_count: usize, label: &str) {
     if is_silent() { return; }
     if dir_count > 0 {
-        eprintln!("        {} directories scanned", style(dir_count).yellow());
+        eprintln!("        {} image(s) scanned", style(dir_count).yellow());
     }
     if file_count > 0 {
         eprintln!("        {} individual files added", style(file_count).yellow());
@@ -294,7 +294,15 @@ fn extract_image_name_from_path(path: &str) -> String {
     if let Some(pos) = normalized.find(marker) {
         let after = &normalized[pos + marker.len()..];
         if let Some(slash) = after.find('/') {
-            return after[..slash].to_string();
+            let dir_name = &after[..slash];
+            // Strip numeric prefix added for uniqueness (e.g., "0_HRServer.e01" -> "HRServer.e01")
+            if let Some(underscore) = dir_name.find('_') {
+                let prefix = &dir_name[..underscore];
+                if prefix.chars().all(|c| c.is_ascii_digit()) {
+                    return dir_name[underscore + 1..].to_string();
+                }
+            }
+            return dir_name.to_string();
         }
     }
     // Fallback: try to get parent directory name
