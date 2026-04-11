@@ -146,7 +146,22 @@ impl VmdkReader {
                     let f = match File::open(&extent_path) {
                         Ok(f) => f,
                         Err(_) => {
-                            return Err(format!("Incomplete VMDK: flat extent '{}' not found (only descriptor was collected)", filename));
+                            // Try .filepart fallback (incomplete SFTP uploads)
+                            let filepart_path = format!("{}.filepart", extent_path_str);
+                            match File::open(&filepart_path) {
+                                Ok(f) => {
+                                    eprintln!("        {}",
+                                        console::style(format!(
+                                            "WARNING: Using incomplete upload '{}.filepart' (SFTP transfer may have lacked rename permission)",
+                                            filename
+                                        )).yellow()
+                                    );
+                                    f
+                                }
+                                Err(_) => {
+                                    return Err(format!("Incomplete VMDK: flat extent '{}' not found (only descriptor was collected)", filename));
+                                }
+                            }
                         }
                     };
                     Extent {
@@ -281,7 +296,8 @@ impl VmdkReader {
                 .map_err(|e| format!("Cannot seek to end: {}", e))?;
 
             let mut footer_header = None;
-            for offset_from_end in &[1024u64, 1536, 2048] {
+            let mut debug_info = format!("file_size={}", file_size);
+            for offset_from_end in &[1024u64, 1536, 2048, 512] {
                 let pos = file_size.saturating_sub(*offset_from_end);
                 if file.seek(SeekFrom::Start(pos)).is_err() { continue; }
                 if let Ok(h) = Self::read_sparse_header_at_current(&mut file) {
@@ -289,11 +305,14 @@ impl VmdkReader {
                         footer_header = Some(h);
                         break;
                     }
+                    debug_info.push_str(&format!(", at-{}:gd={}", offset_from_end, h.gd_offset));
+                } else {
+                    debug_info.push_str(&format!(", at-{}:no_magic", offset_from_end));
                 }
             }
 
             let footer_header = footer_header
-                .ok_or("streamOptimized VMDK: could not find valid footer with grain directory offset")?;
+                .ok_or(format!("streamOptimized VMDK: no valid footer found ({}). File may be truncated", debug_info))?;
             if footer_header.gd_offset != GD_AT_END && footer_header.gd_offset != 0 {
                 header.gd_offset = footer_header.gd_offset;
             } else {

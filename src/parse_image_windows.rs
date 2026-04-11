@@ -473,7 +473,44 @@ fn describe_partitions<R: Read + Seek>(reader: &mut R, _image_size: u64) -> Stri
     }
     let part0_type = mbr_buf[446 + 4];
     if part0_type == 0xEE {
-        types.push("GPT disk".to_string());
+        // Try to read GPT partition types
+        if reader.seek(SeekFrom::Start(512)).is_ok() {
+            let mut gpt_header = [0u8; 92];
+            if reader.read_exact(&mut gpt_header).is_ok() && &gpt_header[0..8] == b"EFI PART" {
+                let entry_start_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
+                let entry_count = u32::from_le_bytes(gpt_header[80..84].try_into().unwrap());
+                let entry_size = u32::from_le_bytes(gpt_header[84..88].try_into().unwrap());
+                let mut gpt_types = Vec::new();
+                for i in 0..entry_count.min(16) {
+                    let off = entry_start_lba * 512 + (i as u64 * entry_size as u64);
+                    if reader.seek(SeekFrom::Start(off)).is_err() { break; }
+                    let mut entry = vec![0u8; entry_size as usize];
+                    if reader.read_exact(&mut entry).is_err() { break; }
+                    let guid: [u8; 16] = entry[0..16].try_into().unwrap();
+                    if guid == [0u8; 16] { continue; }
+                    let name = match guid {
+                        [0x28, 0x73, 0x2A, 0xC1, ..] => "EFI System",
+                        [0x16, 0xE3, 0xC9, 0xE3, ..] => "MS Reserved",
+                        [0xA2, 0xA0, 0xD0, 0xEB, ..] => "Basic Data (NTFS/FAT)",
+                        [0xAA, 0xC8, 0x08, 0x58, ..] => "LDM Metadata",
+                        [0xAF, 0x3D, 0xC6, 0x0F, ..] => "Linux filesystem",
+                        [0x79, 0xD3, 0xD6, 0xE6, ..] => "Linux LVM",
+                        [0x0F, 0xC6, 0x3D, 0xAF, ..] => "Linux filesystem",
+                        _ => "Unknown GPT type",
+                    };
+                    gpt_types.push(name.to_string());
+                }
+                if gpt_types.is_empty() {
+                    types.push("GPT disk (no partitions)".to_string());
+                } else {
+                    types.push(format!("GPT: {}", gpt_types.join(", ")));
+                }
+            } else {
+                types.push("GPT disk (header unreadable)".to_string());
+            }
+        } else {
+            types.push("GPT disk".to_string());
+        }
     } else {
         for i in 0..4 {
             let entry_offset = 446 + i * 16;
@@ -1046,12 +1083,10 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let linux_logs_dir = temp_dir.join("linux_logs_extracted");
 
     for (i, partition_offset) in ext4_partitions.iter().enumerate() {
-        crate::banner::print_info(&format!(
-            "ext4 partition {} at offset {:#x} ({:.2} GB)",
-            i + 1,
-            partition_offset,
-            *partition_offset as f64 / 1_073_741_824.0
-        ));
+        if is_debug_mode() {
+            eprintln!("[DEBUG] ext4 partition {} at offset {:#x} ({:.2} GB)",
+                i + 1, partition_offset, *partition_offset as f64 / 1_073_741_824.0);
+        }
 
         match crate::parse_image_linux::extract_linux_logs_from_ext4(reader, *partition_offset, &linux_logs_dir, i) {
             Ok(count) if count > 0 => {
