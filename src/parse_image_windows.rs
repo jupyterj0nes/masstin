@@ -231,7 +231,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 images_skipped += 1;
                 let msg = e.to_string();
                 if msg.contains("Incomplete VMDK") {
-                    // Extract the missing flat extent filename from the error
                     let detail = if let Some(pos) = msg.find("flat extent '") {
                         let after = &msg[pos + 13..];
                         if let Some(end) = after.find('\'') {
@@ -239,16 +238,17 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                         } else { String::new() }
                     } else { String::new() };
                     crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file{}", detail));
-                } else if msg.contains("not yet supported") {
-                    crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else if msg.contains("Empty image (0 bytes)") {
-                    crate::banner::print_info(&format!("  Skipped: empty image (0 bytes, VMFS thin disk — data not in support bundle)"));
+                    crate::banner::print_info(&format!("  Skipped: empty image (0 bytes)"));
                 } else if msg.contains("No NTFS or ext4") || msg.contains("No partitions found") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else if msg.contains("but no forensic artifacts") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else {
-                    crate::banner::print_info(&format!("  Error: {}", msg));
+                    crate::banner::print_info(&format!("  Skipped: {}", msg));
+                }
+                if is_debug_mode() {
+                    eprintln!("[DEBUG] Full error for {}: {}", image_name, msg);
                 }
             }
         }

@@ -1556,7 +1556,7 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         }
     }
 
-    crate::banner::print_artifact_detail(&artifact_details);
+    crate::banner::print_artifact_detail_ex(&artifact_details, dir_count);
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());

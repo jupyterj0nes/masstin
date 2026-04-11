@@ -224,13 +224,13 @@ pub fn print_output_start() {
 }
 
 pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
+    print_artifact_detail_ex(artifacts, 0);
+}
+
+pub fn print_artifact_detail_ex(artifacts: &[(String, usize)], total_images: usize) {
     if is_silent() { return; }
     if artifacts.is_empty() { return; }
     eprintln!();
-    eprintln!("  {} {}",
-        style("[+]").green().bold(),
-        style("Artifacts with events:").bold(),
-    );
 
     // Group artifacts by image name (extracted from path)
     let mut grouped: Vec<(String, Vec<(&str, usize)>)> = Vec::new();
@@ -247,6 +247,16 @@ pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
             grouped.push((image, vec![(short, *count)]));
         }
     }
+
+    let title = if total_images > 0 && grouped.len() < total_images {
+        format!("Artifacts with lateral movement events ({} of {} images):", grouped.len(), total_images)
+    } else {
+        "Artifacts with lateral movement events:".to_string()
+    };
+    eprintln!("  {} {}",
+        style("[+]").green().bold(),
+        style(title).bold(),
+    );
 
     if grouped.len() == 1 {
         // Single image — flat list (no grouping needed)
