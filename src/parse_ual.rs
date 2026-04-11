@@ -105,7 +105,9 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> (Vec<Lo
         let rows = match parse_ese::read_ese_table(&path_str, "CLIENTS") {
             Ok(r) => r,
             Err(e) => {
-                crate::banner::print_info(&format!("  Warning: cannot read CLIENTS from {}: {}", mdb_name, e));
+                // Truncate verbose libesedb errors to first line
+                let short_err = e.to_string().lines().next().unwrap_or("unknown error").to_string();
+                crate::banner::print_info(&format!("  Warning: cannot read UAL database {}: {}", mdb_name, short_err));
                 continue;
             }
         };

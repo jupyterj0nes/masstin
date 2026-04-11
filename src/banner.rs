@@ -152,12 +152,6 @@ pub fn print_search_results(artifact_count: usize, zip_count: usize, dir_count: 
 
 pub fn print_search_results_labeled(artifact_count: usize, zip_count: usize, dir_count: usize, file_count: usize, label: &str) {
     if is_silent() { return; }
-    if dir_count > 0 {
-        eprintln!("        {} image(s) scanned", style(dir_count).yellow());
-    }
-    if file_count > 0 {
-        eprintln!("        {} individual files added", style(file_count).yellow());
-    }
     if zip_count > 0 {
         eprintln!("        {} compressed packages found", style(zip_count).yellow());
     }

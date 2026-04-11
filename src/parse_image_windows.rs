@@ -330,6 +330,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    // Show task results after main summary
+    if !all_task_events.is_empty() {
+        crate::banner::print_phase_result(&format!(
+            "{} remotely scheduled task(s) added to timeline", all_task_events.len()
+        ));
+    }
+
     // Suggest graph database loading
     if let Some(out_path) = output {
         crate::banner::print_info("");
@@ -1171,15 +1178,21 @@ fn find_ntfs_partitions<R: Read + Seek>(
                         let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
                         let partition_byte_offset = first_lba * 512;
 
-                        // Check if it's a Basic Data partition (NTFS/FAT) or just verify NTFS signature
-                        if type_guid == GPT_BASIC_DATA_GUID || verify_ntfs_signature(reader, partition_byte_offset) {
-                            if verify_ntfs_signature(reader, partition_byte_offset) {
-                                if is_debug_mode() {
-                                    eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — NTFS confirmed",
-                                        i, first_lba, partition_byte_offset);
-                                }
-                                partitions.push(partition_byte_offset);
+                        // For Basic Data GUID, try NTFS even if signature check fails
+                        // (some partition tools don't write the NTFS boot sector signature at offset 3)
+                        if type_guid == GPT_BASIC_DATA_GUID {
+                            if is_debug_mode() {
+                                let has_sig = verify_ntfs_signature(reader, partition_byte_offset);
+                                eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — Basic Data, NTFS sig: {}",
+                                    i, first_lba, partition_byte_offset, has_sig);
                             }
+                            partitions.push(partition_byte_offset);
+                        } else if verify_ntfs_signature(reader, partition_byte_offset) {
+                            if is_debug_mode() {
+                                eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) — NTFS confirmed by signature",
+                                    i, first_lba, partition_byte_offset);
+                            }
+                            partitions.push(partition_byte_offset);
                         }
                     }
                 }
