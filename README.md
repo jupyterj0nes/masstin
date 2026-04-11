@@ -41,7 +41,9 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | Feature | Description | Details |
 |---------|-------------|---------|
 | **Unified cross-OS image parsing** | **NEW:** Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS), ext4 partitions get Linux parsing (auth.log, wtmp, etc.) — all merged into one timeline. Point `-d` at a folder with mixed Windows and Linux images and get a single chronological CSV. Zero manual steps, zero mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, auto-detects OS, extracts all forensic artifacts from live + VSS, and generates a single unified timeline. One command, entire incident. | |
+| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, auto-detects OS, extracts all forensic artifacts from live + VSS, and generates a single unified timeline. Per-image artifact grouping in the summary shows exactly which image produced which events. One command, entire incident. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **BitLocker detection** | Automatically detects BitLocker-encrypted partitions by reading the `-FVE-FS-` signature at VBR offset 3. Warns the analyst with the exact partition offset and skips encrypted volumes — no wasted time on unreadable data. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **streamOptimized VMDK** | Full support for streamOptimized VMDKs (compressed grains with zlib) commonly found in OVA exports, cloud templates and vSphere backups. Also handles incomplete SFTP uploads via `.filepart` fallback for flat VMDKs. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
@@ -130,7 +132,7 @@ masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
 
 All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
 
-Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, VMFS/ESXi). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi). Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ```bash
 # Single image — auto-detects OS
@@ -159,7 +161,18 @@ masstin -a parse-image -d /evidence/all_machines/ -o full_timeline.csv
 masstin -a parse-image -d /evidence/ -f extra.e01 -d F: -o timeline.csv
 ```
 
-Masstin automatically filters VMDK split extents (`-s001.vmdk`) and snapshots (`-000001.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
+Masstin automatically filters VMDK split extents (`-s001.vmdk`), snapshots (`-000001.vmdk`), flat data files (`-flat.vmdk`) and change tracking blocks (`-ctk.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
+
+### Parse massive — images + triage + loose artifacts in one pass
+
+When you have a mix of forensic images **and** loose EVTX/log files in the same evidence folder, `parse-massive` processes everything together. It combines `parse-image` (for E01/VMDK/dd) with directory scanning (for extracted triage packages and individual EVTX files), producing a single unified timeline.
+
+```bash
+# Process all images AND loose artifacts from evidence directories
+masstin -a parse-massive -d /evidence/ -o everything.csv
+```
+
+> **Difference from `parse-image`:** `parse-image` only processes forensic images found in `-d` directories. `parse-massive` also includes any loose EVTX and log files in those directories — useful when evidence arrives as a mix of disk images and extracted triage packages.
 
 > **Backward compatibility:** The legacy commands `parse-image-windows` and `parse-image-linux` are still accepted as aliases for `parse-image`.
 
@@ -371,7 +384,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
 | `-o, --output` | Output file path |
@@ -462,7 +475,8 @@ Full documentation at **[We Investigate Anything](https://weinvestigateanything.
 ## Roadmap
 
 - [ ] VHD/VHDX image support
-- [ ] Event reconstruction from cleared logs
+- [ ] Event reconstruction from cleared logs (EVTX record carving)
+- [ ] MountPoints2 registry hive parsing for lateral movement traces
 
 ## License
 
