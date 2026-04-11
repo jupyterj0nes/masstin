@@ -64,7 +64,7 @@ const WMI_EVENT_IDS: &[&str] = &["5858"];
 pub mod parse {}
 
 // Updated LogData struct with event_type, logon_id, and detail columns.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogData {
     pub time_created: String,
     pub computer: String,
@@ -1436,6 +1436,11 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
 // MAIN FUNCTION TO PARSE EVENTS
 // ---------------------------------------------------------------------------------------
 pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>) {
+    parse_events_ex(files, directories, output, &[]);
+}
+
+/// Parse events with optional extra LogData entries (e.g., from Scheduled Tasks)
+pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>, extra_events: &[LogData]) {
     let start_time = std::time::Instant::now();
 
     if is_debug_mode() {
@@ -1500,6 +1505,9 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
     if !all_ual_files.is_empty() {
         crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
     }
+    if !extra_events.is_empty() {
+        crate::banner::print_search_result_line(extra_events.len(), "Scheduled Task events");
+    }
 
     if is_debug_mode() {
         println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());
@@ -1552,6 +1560,13 @@ pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Opti
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
+    }
+
+    // Add extra events (e.g., Scheduled Tasks, WMI remote)
+    let extra_count = extra_events.len();
+    if extra_count > 0 {
+        log_data.extend_from_slice(extra_events);
+        parsed_files += extra_count;
     }
 
     // Phase 3: Generate output

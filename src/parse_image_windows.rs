@@ -289,7 +289,8 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let linux_tmp_str = linux_tmp.to_string_lossy().to_string();
 
         crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
-        parse_events(&empty_files, &extracted_dirs, Some(&win_tmp_str));
+        crate::parse::parse_events_ex(&empty_files, &extracted_dirs, Some(&win_tmp_str), &all_task_events);
+        all_task_events.clear();
 
         crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
         parse_linux(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
@@ -310,8 +311,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             }
         }
     } else if has_windows {
-        // Windows only
-        parse_events(&empty_files, &extracted_dirs, output);
+        // Windows only — include task events in the same pipeline
+        crate::parse::parse_events_ex(&empty_files, &extracted_dirs, output, &all_task_events);
+        all_task_events.clear(); // consumed by parse_events_ex
         if let Some(out_path) = output {
             rewrite_log_filenames(out_path);
         }
@@ -323,18 +325,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Append task events to the output CSV (after main parsing)
+    // Append remaining task events (only if not consumed by parse_events_ex)
     if !all_task_events.is_empty() {
         if let Some(out_path) = output {
             append_logdata_to_csv(out_path, &all_task_events);
         }
-    }
-
-    // Show task results after main summary
-    if !all_task_events.is_empty() {
-        crate::banner::print_phase_result(&format!(
-            "{} remotely scheduled task(s) added to timeline", all_task_events.len()
-        ));
     }
 
     // Suggest graph database loading
