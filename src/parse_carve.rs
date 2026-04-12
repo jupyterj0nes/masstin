@@ -94,31 +94,41 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
     }
 
     if all_carved_evtx.is_empty() {
-        crate::banner::print_info("");
-        crate::banner::print_info("  No EVTX chunks found in scanned images.");
+        eprintln!();
+        eprintln!("  ──────────────────────────────────────────────────");
+        eprintln!("  No EVTX chunks found in scanned images.");
+        eprintln!("  Completed in: {:.2}s", start_time.elapsed().as_secs_f64());
         let _ = fs::remove_dir_all(&base_temp);
         return;
     }
 
     // Phase 2+3: Parse carved EVTX files through the existing masstin pipeline
-    crate::banner::print_info("");
-    crate::banner::print_info(&format!(
-        "  {} synthetic EVTX files created from {} carved chunks",
-        all_carved_evtx.len(), total_chunks
+    crate::banner::print_phase("2", "3", &format!(
+        "Parsing {} carved chunks ({} synthetic EVTX files)...",
+        total_chunks, all_carved_evtx.len()
     ));
 
-    let dirs: Vec<String> = vec![base_temp.to_string_lossy().to_string()];
-    let empty_files: Vec<String> = vec![];
+    let dirs: Vec<String> = vec![];
     crate::parse::parse_events_ex(&all_carved_evtx, &dirs, output, &[]);
 
     // Cleanup
     let _ = fs::remove_dir_all(&base_temp);
 
+    // Final summary
     crate::banner::print_info("");
-    crate::banner::print_info(&format!(
-        "  Carving summary: {} chunks, {} orphan records, completed in {:.2}s",
-        total_chunks, total_orphans, start_time.elapsed().as_secs_f64()
-    ));
+    eprintln!("  ──────────────────────────────────────────────────");
+    eprintln!("  Carving results:");
+    eprintln!("    Chunks carved:    {}", total_chunks);
+    eprintln!("    Orphan records:   {} (metadata only — Tier 2)", total_orphans);
+    eprintln!("    Images scanned:   {}", files.len());
+    eprintln!("    Scan time:        {:.2}s", start_time.elapsed().as_secs_f64());
+    if let Some(out) = output {
+        eprintln!("    Output:           {}", out);
+        crate::banner::print_info("");
+        crate::banner::print_info(&format!(
+            "Load into graph: masstin -a load-memgraph -f {} --database localhost:7687", out
+        ));
+    }
 }
 
 // ─── Image format handlers ──────────────────────────────────────────────────
@@ -162,8 +172,10 @@ fn carve_from_seekable<R: Read + Seek>(
     // Accumulate chunks by provider for grouping into synthetic EVTX files
     let mut provider_chunks: std::collections::HashMap<String, Vec<Vec<u8>>> = std::collections::HashMap::new();
 
+    let image_size_gb = image_size as f64 / 1_073_741_824.0;
     let total_blocks = image_size / SCAN_BLOCK_SIZE as u64 + 1;
     let pb = crate::banner::create_progress_bar(total_blocks);
+    crate::banner::progress_set_message(&pb, &format!("Scanning {:.1} GB...", image_size_gb));
 
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
 
@@ -205,6 +217,11 @@ fn carve_from_seekable<R: Read + Seek>(
                     }
 
                     provider_chunks.entry(provider).or_default().push(chunk_data);
+
+                    // Update progress message with findings
+                    let scanned_gb = (offset + pos as u64) as f64 / 1_073_741_824.0;
+                    pb.set_message(format!("{:.1}/{:.1} GB | {} chunks found",
+                        scanned_gb, image_size_gb, chunks_found));
                 }
 
                 pos += EVTX_CHUNK_SIZE;
