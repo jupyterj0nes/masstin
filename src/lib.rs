@@ -1,4 +1,8 @@
-#![feature(alloc_error_hook)]
+// Crate-level feature gate for the optional OOM hook used by EVTX carving.
+// Only activated when the `nightly-oom-hook` Cargo feature is on, and only
+// compiles on nightly Rust. On stable (or nightly without the feature),
+// the gate is not emitted and masstin builds cleanly.
+#![cfg_attr(feature = "nightly-oom-hook", feature(alloc_error_hook))]
 
 use clap::{Parser, ValueEnum};
 use std::fs;

@@ -25,13 +25,31 @@ const EVTX_CHUNK_SIZE: usize = 65536; // 64KB
 const RECORD_MAGIC: &[u8; 4] = b"\x2a\x2a\x00\x00";
 const SCAN_BLOCK_SIZE: usize = 4 * 1024 * 1024; // 4MB read blocks
 
-/// Main entry point for carve-image action
-pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool, skip_offsets: &[u64]) {
-    // Convert OOM aborts into panics so the isolated-thread validator can recover
-    // when the evtx crate tries to allocate multi-GB buffers on corrupt BinXML.
+/// Install a global allocation error hook that converts OOM aborts into panics,
+/// so the isolated-thread validator below can recover when the evtx crate tries
+/// to allocate multi-GB buffers on corrupt BinXML.
+///
+/// On nightly with `--features nightly-oom-hook`, this is the real hook. On
+/// stable (or nightly without the feature) it's a no-op stub: allocation
+/// failures will abort the process as they would without masstin's protection.
+/// The official release binaries are built on nightly with the feature enabled.
+#[cfg(feature = "nightly-oom-hook")]
+fn install_oom_hook() {
     std::alloc::set_alloc_error_hook(|layout| {
         panic!("allocation of {} bytes failed (caught by masstin hook)", layout.size());
     });
+}
+
+#[cfg(not(feature = "nightly-oom-hook"))]
+fn install_oom_hook() {
+    // No-op on stable. carve-image still works; the catch_unwind isolation
+    // thread recovers from panics (including OOM re-raised via other paths),
+    // but a bare `abort()` from the allocator propagates out as before.
+}
+
+/// Main entry point for carve-image action
+pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool, skip_offsets: &[u64]) {
+    install_oom_hook();
 
     let start_time = std::time::Instant::now();
 

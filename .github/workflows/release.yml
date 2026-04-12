@@ -28,13 +28,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (nightly — required by the opt-in nightly-oom-hook feature)
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build with nightly-oom-hook feature enabled
+        # The released binaries enable `nightly-oom-hook` so EVTX carving
+        # can catch BinXML-triggered OOM aborts from the evtx crate and
+        # continue processing the rest of the image. End users run a
+        # normal executable — they never interact with Rust or nightly.
+        # Contributors building from source on stable can use plain
+        # `cargo build` without the feature; everything still works,
+        # only the carving OOM protection becomes a no-op.
+        run: cargo build --release --target ${{ matrix.target }} --features nightly-oom-hook
 
       - name: Rename binary (Windows)
         if: matrix.os == 'windows-latest'
