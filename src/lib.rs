@@ -36,6 +36,7 @@ mod parse_tasks;
 pub use crate::parse_tasks::*;
 mod parse_mountpoints;
 pub use crate::parse_mountpoints::*;
+pub mod parse_carve;
 pub mod vmdk;
 pub use crate::vmdk::*;
 
@@ -107,6 +108,10 @@ pub struct Cli {
     /// Scan all NTFS volumes on the system for VSS (parse-image-windows only, requires admin)
     #[arg(long)]
     all_volumes: bool,
+
+    /// Carve only unallocated space (faster). Default: carve entire disk.
+    #[arg(long)]
+    carve_unalloc: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -137,6 +142,8 @@ enum ActionType {
     ParseImage,
     /// MASSIVE mode: process EVERYTHING — forensic images + triage packages + loose EVTX/logs. Point at evidence folder, get a timeline. No mercy.
     ParseMassive,
+    /// Carve EVTX records from disk images — recovers events from unallocated space after log deletion. Use --carve-unalloc for faster unallocated-only scan.
+    CarveImage,
 }
 
 // -----------------------------------------------------------------------------
@@ -238,6 +245,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             crate::banner::print_massive_warning();
             parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), true);
         }
+        ActionType::CarveImage => {
+            crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc);
+        }
     }
 
     Ok(())
@@ -334,6 +344,13 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if config.file.is_empty() && config.directory.is_empty() && !config.all_volumes {
                 return Err(String::from(
                     "For parse-image/parse-massive, specify image files with -f, directories with -d, a volume with -d D:, or --all-volumes.",
+                ));
+            }
+        }
+        ActionType::CarveImage => {
+            if config.file.is_empty() {
+                return Err(String::from(
+                    "For carve-image, specify forensic image files with -f (E01/VMDK/dd).",
                 ));
             }
         }
