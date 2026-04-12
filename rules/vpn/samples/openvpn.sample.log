@@ -1,0 +1,7 @@
+Apr 13 09:14:22 vpn-gw01 openvpn[4712]: user 'alice' authenticated
+Apr 13 09:14:22 vpn-gw01 openvpn[4712]: alice/203.0.113.45:51212 Peer Connection Initiated with [AF_INET]203.0.113.45:51212
+Apr 13 09:17:03 vpn-gw01 openvpn[4712]: 185.220.101.45:33221 TLS: Initial packet from [AF_INET]185.220.101.45:33221
+Apr 13 09:17:04 vpn-gw01 openvpn[4712]: 185.220.101.45:33221 [charlie] AUTH_FAILED: Auth Username/Password was not provided by peer
+Apr 13 10:42:18 vpn-gw01 openvpn[4712]: alice/203.0.113.45:51212 SIGTERM[soft,remote-exit] received, client-instance exiting
+Apr 13 11:02:55 vpn-gw01 openvpn[4712]: user 'bob' authenticated
+Apr 13 11:02:55 vpn-gw01 openvpn[4712]: bob/198.51.100.12:44882 Peer Connection Initiated with [AF_INET]198.51.100.12:44882

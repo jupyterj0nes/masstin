@@ -1,0 +1,6 @@
+<166>Apr 13 09:00:15 asa-lab01 : %ASA-6-113004: AAA user authentication Successful : server = 10.0.0.5 : user = alice
+<166>Apr 13 09:00:22 asa-lab01 : %ASA-6-113005: AAA user authentication Rejected : reason = Invalid password : server = 10.0.0.5 : user = charlie : user IP = 203.0.113.99
+<166>Apr 13 09:01:03 asa-lab01 : %ASA-6-605005: Login permitted from 10.20.30.40/52341 to inside:10.0.0.1/ssh for user "admin"
+<166>Apr 13 09:01:18 asa-lab01 : %ASA-6-605004: Login denied from 185.220.101.45/33221 to outside:203.0.113.1/https for user "root"
+<166>Apr 13 09:15:00 asa-lab01 : %ASA-6-716001: Group <SSLVPN_GROUP> User <dave> IP <198.51.100.77> WebVPN session started.
+<166>Apr 13 10:45:22 asa-lab01 : %ASA-6-716002: Group <SSLVPN_GROUP> User <dave> IP <198.51.100.77> WebVPN session terminated: user requested

@@ -1,0 +1,249 @@
+# =============================================================================
+# Masstin custom parser rule — Palo Alto Networks GlobalProtect (VPN)
+# =============================================================================
+#
+# Format covered in v1:
+#   SYSTEM log (type=SYSTEM, subtype=globalprotect), legacy CSV syslog format.
+#   This is what most deployments forward via classic syslog on PAN-OS 8.x/9.x
+#   and older GlobalProtect configurations that haven't migrated to the
+#   dedicated "globalprotect" log type.
+#
+# Field layout observed in the SYSTEM log:
+#   Index  Field
+#   -----  -----
+#     0    FUTURE_USE / domain (usually "1")
+#     1    Receive Time
+#     2    Serial Number
+#     3    Type                   = "SYSTEM"
+#     4    Subtype                = "globalprotect"
+#     5    FUTURE_USE             (usually "0")
+#     6    Generated Time         <-- canonical event timestamp
+#     7    Virtual System
+#     8    Event ID               e.g. "globalprotectgateway-auth-succ"
+#     9    Object Name            (usually the gateway or portal name)
+#    10    FUTURE_USE             ("0")
+#    11    FUTURE_USE             ("0")
+#    12    Module                 ("general")
+#    13    Severity               ("informational", "medium", ...)
+#    14    Description            <-- QUOTED string with key: value, key: value, ...
+#    15    Sequence Number
+#    16    Action Flags
+#    17-22 Device group hierarchy levels
+#    23    Virtual System Name
+#    24    Device Name
+#
+# The interesting user/IP data is embedded in field 14 (Description) as a
+# quoted CSV string with "Key: value, Key: value, ..." pairs. Each parser
+# therefore uses:
+#   extract:     csv (delimiter ",", quote '"')  -> pulls out the Description
+#   sub_extract: keyvalue (pair ",", kv ":")     -> pulls user_name / login_from / ...
+#
+# References:
+#   https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/globalprotect-log-fields
+#   https://docs.paloaltonetworks.com/globalprotect/10-1/globalprotect-admin/logging-for-globalprotect-in-pan-os/event-descriptions-for-the-globalprotect-logs-in-pan-os
+#   Sample lines verified against PaloAltoNetworks/Splunk-App-Data-Generator on GitHub.
+#
+# Format NOT covered in v1 (planned for v2):
+#   PAN-OS 9.1+ dedicated "globalprotect" log type with 49+ CSV columns
+#   including srcuser, publicip, privateip, machine, hostid, client_version,
+#   client_os, reason, error, login_duration as separate fields.
+# =============================================================================
+
+meta:
+  vendor: "Palo Alto Networks"
+  product: "GlobalProtect (VPN)"
+  format: "syslog CSV — SYSTEM log subtype=globalprotect (legacy format)"
+  versions_tested: ["PAN-OS 8.1", "PAN-OS 9.0", "PAN-OS 10.x"]
+  description: "GlobalProtect VPN authentication and session events via the SYSTEM log"
+  author: "masstin community"
+  reference_url: "https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/globalprotect-log-fields"
+
+# Prefilter: only lines mentioning globalprotect pass to the per-parser matching.
+# Gives a big speedup on firewalls that also send TRAFFIC/THREAT logs to the
+# same file.
+prefilter:
+  contains_any:
+    - "globalprotectgateway-"
+    - "globalprotectportal-"
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Gateway authentication SUCCESS
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "gp-gateway-auth-succ"
+    match:
+      contains: ["globalprotectgateway-auth-succ"]
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        8: event_id_raw
+        9: gateway_name
+        14: description
+    sub_extract:
+      field: description
+      strip_before: ". "   # drop narrative prefix before the first "Key: value" pair
+      type: keyvalue
+      pair_separator: ","
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:        "${generated_time}"
+      computer:            "${gateway_name}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "GP-GW-AUTH-SUCC"
+      subject_user_name:   "${User name}"
+      target_user_name:    "${User name}"
+      workstation_name:    "${Login from}"
+      ip_address:          "${Login from}"
+      logon_type:          "VPN"
+      filename:            "${__source_file}"
+      detail:              "GlobalProtect gateway auth OK | user=${User name} from=${Login from} auth=${Auth type} os=${Client OS version}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Gateway REGISTRATION success (user logon fully established)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "gp-gateway-regist-succ"
+    match:
+      contains: ["globalprotectgateway-regist-succ"]
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        8: event_id_raw
+        9: gateway_name
+        14: description
+    sub_extract:
+      field: description
+      strip_before: ". "   # drop narrative prefix before the first "Key: value" pair
+      type: keyvalue
+      pair_separator: ","
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:        "${generated_time}"
+      computer:            "${gateway_name}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "GP-GW-REGIST-SUCC"
+      subject_user_name:   "${User name}"
+      target_user_name:    "${User name}"
+      workstation_name:    "${Login from}"
+      ip_address:          "${Login from}"
+      logon_type:          "VPN"
+      filename:            "${__source_file}"
+      detail:              "GlobalProtect gateway register (session up) | user=${User name} from=${Login from} os=${Client OS version}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Gateway or portal authentication FAILURE
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "gp-auth-fail"
+    match:
+      contains_any:
+        - "globalprotectgateway-auth-fail"
+        - "globalprotectportal-auth-fail"
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        8: event_id_raw
+        9: object_name
+        14: description
+    sub_extract:
+      field: description
+      strip_before: ". "   # drop narrative prefix before the first "Key: value" pair
+      type: keyvalue
+      pair_separator: ","
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:        "${generated_time}"
+      computer:            "${object_name}"
+      event_type:          "FAILED_LOGON"
+      event_id:            "GP-AUTH-FAIL"
+      subject_user_name:   "${User name}"
+      target_user_name:    "${User name}"
+      workstation_name:    "${Login from}"
+      ip_address:          "${Login from}"
+      logon_type:          "VPN"
+      filename:            "${__source_file}"
+      detail:              "GlobalProtect auth FAIL | user=${User name} from=${Login from} reason=${Reason}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Gateway LOGOUT
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "gp-gateway-logout"
+    match:
+      contains: ["globalprotectgateway-logout-succ"]
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        8: event_id_raw
+        9: gateway_name
+        14: description
+    sub_extract:
+      field: description
+      strip_before: ". "   # drop narrative prefix before the first "Key: value" pair
+      type: keyvalue
+      pair_separator: ","
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:        "${generated_time}"
+      computer:            "${gateway_name}"
+      event_type:          "LOGOFF"
+      event_id:            "GP-GW-LOGOUT"
+      subject_user_name:   "${User name}"
+      target_user_name:    "${User name}"
+      logon_type:          "VPN"
+      filename:            "${__source_file}"
+      detail:              "GlobalProtect gateway logout | user=${User name} reason=${Reason}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. Portal authentication SUCCESS (pre-gateway, informational)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "gp-portal-auth-succ"
+    match:
+      contains: ["globalprotectportal-auth-succ"]
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        8: event_id_raw
+        9: portal_name
+        14: description
+    sub_extract:
+      field: description
+      strip_before: ". "   # drop narrative prefix before the first "Key: value" pair
+      type: keyvalue
+      pair_separator: ","
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:        "${generated_time}"
+      computer:            "${portal_name}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "GP-PORTAL-AUTH-SUCC"
+      subject_user_name:   "${User name}"
+      target_user_name:    "${User name}"
+      workstation_name:    "${Login from}"
+      ip_address:          "${Login from}"
+      logon_type:          "VPN"
+      filename:            "${__source_file}"
+      detail:              "GlobalProtect portal auth OK | user=${User name} from=${Login from} auth=${Auth type}"

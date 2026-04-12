@@ -48,8 +48,9 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
 | **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
 | **MountPoints2 registry** | Extract NTUSER.DAT from each user profile and parse MountPoints2 registry keys — reveals which user connected to which remote share (\\\\SERVER\\SHARE), with timestamps. Survives event log clearing. Supports dirty hives with transaction log recovery (.LOG1/.LOG2). | [MountPoints2](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
-| **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Builds synthetic EVTX files from carved chunks and parses them through the full pipeline. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
+| **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Implements **Tier 1** (full 64 KB chunks) and **Tier 2** (orphan record detection); **Tier 3** (template matching for partially overwritten records) is planned. Builds synthetic EVTX files grouped by provider and parses them through the full pipeline. Hardened against upstream `evtx` crate bugs (infinite loops, multi-GB OOMs) via thread isolation + `alloc_error_hook`. Corrupted chunks can be skipped with `--skip-offsets`. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
 | **Multi-artifact parsing** | 32+ Windows Event IDs from 11 EVTX sources + Scheduled Tasks XML + MountPoints2 registry + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
+| **Custom parsers (YAML)** | `parse-custom` action parses arbitrary VPN / firewall / proxy logs via YAML rule files with 3 extractor types (csv, regex, keyvalue) and nested sub-extract. Ships with 8 researched rules and 31 sub-parsers out of the box: Palo Alto GlobalProtect (5), Palo Alto TRAFFIC with User-ID filter (2), Cisco AnyConnect (4), Cisco ASA (6), Fortinet SSL VPN (3), Fortinet FortiGate (4), OpenVPN (4), Squid proxy (3). Every rule is backed by vendor official documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema spec in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
 | **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data in one timeline — `parse-image` auto-merges across OS boundaries, or use `merge` for manual combination | |
@@ -237,6 +238,72 @@ masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetw
   --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
   -o cortex-evtx.csv
 ```
+
+### Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
+
+For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 8 researched rules in [`rules/`](rules/) that you can use out of the box.
+
+```bash
+# Run a single rule against a log file
+masstin -a parse-custom --rules rules/vpn/palo-alto-globalprotect.yaml -f vpn.log -o timeline.csv
+
+# Run the ENTIRE library — every log file is tried against every rule
+masstin -a parse-custom --rules rules/ -f vpn.log -f firewall.log -f proxy.log -o timeline.csv
+
+# Dry-run: show first matches + rejected samples, no CSV written
+masstin -a parse-custom --rules rules/vpn/palo-alto-globalprotect.yaml -f vpn.log --dry-run
+
+# Debug: preserve rejected lines sample alongside the output
+masstin -a parse-custom --rules rules/ -f vpn.log -o timeline.csv --debug
+```
+
+The library currently covers:
+
+| Rule | Parsers | Format |
+|------|---------|--------|
+| `vpn/palo-alto-globalprotect.yaml` | 5 | Palo Alto SYSTEM log subtype=globalprotect (legacy CSV syslog) |
+| `vpn/cisco-anyconnect.yaml` | 4 | Cisco ASA `%ASA-6-113039/722022/722023` + `%ASA-4-113019` |
+| `vpn/fortinet-ssl-vpn.yaml` | 3 | FortiGate `type=event subtype=vpn` (tunnel-up/down/ssl-login-fail) |
+| `vpn/openvpn.yaml` | 4 | OpenVPN free-form syslog (Peer Connection / AUTH_FAILED / SIGTERM) |
+| `firewall/palo-alto-traffic.yaml` | 2 | PAN-OS TRAFFIC log CSV — authenticated sessions (User-ID) only |
+| `firewall/cisco-asa.yaml` | 6 | ASA `113004/113005/605004/605005/716001/716002` |
+| `firewall/fortinet-fortigate.yaml` | 4 | FortiGate `subtype=system\|user` admin login, user auth |
+| `proxy/squid.yaml` | 3 | Squid access.log CONNECT tunnel, HTTP, TCP_DENIED |
+
+Every rule is researched against vendor official documentation and validated against realistic sample log lines committed under each category's `samples/` directory. See [`rules/README.md`](rules/README.md) for the full references table and [`docs/custom-parsers.md`](docs/custom-parsers.md) for the schema specification.
+
+### EVTX carving: last-resort recovery from unallocated space
+
+When the attacker cleared the logs, wiped VSS, and deleted the UAL databases, there's still one place where event data can survive: the unallocated space of the disk itself. `carve-image` scans the raw image looking for 64 KB EVTX chunks (`ElfChnk\x00` magic), validates them, groups them by provider, builds synthetic EVTX files, and feeds them through the normal masstin pipeline.
+
+```bash
+# Carve a single image
+masstin -a carve-image -f server.e01 -o carved.csv
+
+# Carve multiple images at once
+masstin -a carve-image -f DC01.e01 -f SRV-FILE.vmdk -o carved.csv
+
+# Skip known-bad offsets on a pathological E01 (corrupted EWF chunks)
+masstin -a carve-image -f broken.e01 --skip-offsets 0x6478b6000 -o carved.csv
+
+# Keep rejected synthetic EVTX files for post-mortem / upstream bug reports
+masstin -a carve-image -f image.e01 -o carved.csv --debug
+```
+
+**What it implements today:**
+- **Tier 1 — full chunk recovery**: complete 64 KB chunks recovered from unallocated space, parsed with full fidelity through the regular pipeline. Events are indistinguishable from live ones in the output.
+- **Tier 2 — orphan record detection**: individual records outside recoverable chunks are counted and reported (header metadata only; full XML reconstruction is Tier 3).
+- **Tier 3 — template matching**: planned. Will reconstruct XML from orphan records using templates harvested from Tier 1 chunks plus a common Windows template library.
+
+**Hardened against a hostile ecosystem**: the upstream `evtx` crate was designed to parse well-formed live logs, not arbitrary corrupted 64 KB buffers from unallocated space. We found three classes of bugs during development (infinite loop on malformed BinXML, two unbounded multi-GB allocations that abort the process), reported them upstream, and shipped an in-process defense:
+
+- Every chunk parse runs in an isolated worker thread with a timeout
+- `std::alloc::set_alloc_error_hook` converts allocation aborts into catchable panics
+- A validation phase walks each synthetic EVTX end-to-end before it reaches the main pipeline; files that hang, panic or OOM are rejected, the rest of the timeline proceeds unaffected
+- `--skip-offsets` lets you tell masstin to jump over a 32 MB window around a problematic E01 offset on re-runs
+- `--debug` preserves rejected synthetic EVTX files to `<output_dir>/masstin_rejected_evtx/` for post-mortem
+
+Full technical breakdown: [EVTX carving article](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/).
 
 ### Merge: Combine multiple timelines
 
@@ -478,8 +545,14 @@ Full documentation at **[We Investigate Anything](https://weinvestigateanything.
 ## Roadmap
 
 - [ ] VHD/VHDX image support
-- [ ] Event reconstruction from cleared logs (EVTX record carving)
-- [ ] MountPoints2 registry hive parsing for lateral movement traces
+- [x] ~~Event reconstruction from cleared logs (EVTX record carving)~~ — **done (Tier 1 + Tier 2 detection)**
+- [x] ~~MountPoints2 registry hive parsing for lateral movement traces~~ — **done**
+- [x] ~~Custom parser framework for VPN/firewall/proxy logs (YAML rules)~~ — **done (v1: csv/regex/keyvalue + sub-extract + strip_before)**
+- [x] ~~Initial community rule library~~ — **done (8 rules, 31 parsers: Palo Alto GP + TRAFFIC, Cisco AnyConnect + ASA, Fortinet SSL VPN + FortiGate, OpenVPN, Squid)**
+- [ ] EVTX carving Tier 3: template matching for orphan records (reconstruct XML from records whose parent chunks are gone)
+- [ ] Unallocated-only carving scan (`--carve-unalloc`) — currently scans the whole image
+- [ ] Custom parsers v2: JSON extractor, conditional map, per-rule `--validate` command
+- [ ] More community parser rules: Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall
 
 ## License
 

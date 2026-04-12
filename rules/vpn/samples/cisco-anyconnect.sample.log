@@ -1,0 +1,7 @@
+<166>Apr 13 10:15:23 asa-lab01 : %ASA-6-113039: Group <DfltGrpPolicy> User <alice> IP <203.0.113.45> AnyConnect parent session started.
+<166>Apr 13 10:15:25 asa-lab01 : %ASA-6-722022: Group <DfltGrpPolicy> User <alice> IP <203.0.113.45> TCP SVC connection established without compression
+<166>Apr 13 10:15:30 asa-lab01 : %ASA-6-113039: Group <CORP_VPN> User <bob> IP <198.51.100.12> AnyConnect parent session started.
+<166>Apr 13 10:15:31 asa-lab01 : %ASA-6-722022: Group <CORP_VPN> User <bob> IP <198.51.100.12> TCP SVC connection created accepted with compression LZS
+<166>Apr 13 11:42:18 asa-lab01 : %ASA-6-722023: Group <DfltGrpPolicy> User <alice> IP <203.0.113.45> TCP SVC connection terminated without compression
+<166>Apr 13 11:42:18 asa-lab01 : %ASA-4-113019: Group = DfltGrpPolicy, Username = alice, IP = 203.0.113.45, Session disconnected. Session Type: AnyConnect-Parent, Duration: 1h:26m:55s, Bytes xmt: 45622, Bytes rcv: 89125, Reason: User Requested
+<166>Apr 13 12:03:14 asa-lab01 : %ASA-5-113019: Group = CORP_VPN, Username = bob, IP = 198.51.100.12, Session disconnected. Session Type: SSL-Tunnel, Duration: 2h:48m:23s, Bytes xmt: 1245678, Bytes rcv: 8901234, Reason: Idle Timeout

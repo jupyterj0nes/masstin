@@ -1,0 +1,146 @@
+# =============================================================================
+# Masstin custom parser rule — Fortinet FortiGate Firewall (admin + user auth)
+# =============================================================================
+#
+# Format covered:
+#   FortiGate syslog — native key=value pairs. Non-VPN authentication events
+#   are under type=event with:
+#     subtype=system  — admin logon/logoff (GUI, SSH, API)
+#     subtype=user    — firewall auth events (FSSO, captive portal, etc.)
+#   IPsec tunnel events also live under type=event subtype=vpn but are
+#   covered in fortinet-ssl-vpn.yaml along with SSL VPN.
+#
+# Actions covered in v1 (relevant to lateral movement):
+#   action=login            → SUCCESSFUL_LOGON (admin GUI / SSH logon)
+#   action=login-failed     → FAILED_LOGON    (admin auth failure)
+#   action=logout           → LOGOFF          (admin logoff)
+#   action=authentication   → SUCCESSFUL_LOGON (firewall user auth success)
+#
+# Traffic logs (type=traffic) are NOT covered here — they are extremely
+# high-volume and only a small slice (srcuser is set, action=accept) is
+# useful for lateral movement tracking. That will be a separate rule when
+# someone has a sample log to tune against.
+#
+# References:
+#   https://docs.fortinet.com/document/fortigate/latest/fortios-log-message-reference
+# =============================================================================
+
+meta:
+  vendor: "Fortinet"
+  product: "FortiGate Firewall (admin + user auth)"
+  format: "Fortinet syslog key=value (type=event subtype=system|user)"
+  versions_tested: ["FortiOS 6.4", "FortiOS 7.0", "FortiOS 7.2", "FortiOS 7.4"]
+  description: "Admin GUI/SSH logon, user authentication events"
+  author: "masstin community"
+  reference_url: "https://docs.fortinet.com/document/fortigate/latest/fortios-log-message-reference"
+
+prefilter:
+  contains_any:
+    - "subtype=\"system\""
+    - "subtype=\"user\""
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Admin login successful
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortigate-admin-login"
+    match:
+      contains:
+        - 'subtype="system"'
+        - 'logdesc="Admin login successful"'
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "FORTI-ADMIN-LOGIN"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ui}"
+      ip_address:         "${ui}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "FortiGate admin login | user=${user} via=${ui} method=${method}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Admin login failed
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortigate-admin-login-fail"
+    match:
+      contains:
+        - 'subtype="system"'
+        - 'logdesc="Admin login failed"'
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "FORTI-ADMIN-LOGIN-FAIL"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ui}"
+      ip_address:         "${ui}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "FortiGate admin login FAIL | user=${user} via=${ui} reason=${reason} msg=${msg}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Admin logout
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortigate-admin-logout"
+    match:
+      contains:
+        - 'subtype="system"'
+        - 'logdesc="Admin logout"'
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "LOGOFF"
+      event_id:           "FORTI-ADMIN-LOGOUT"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ui}"
+      ip_address:         "${ui}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "FortiGate admin logout | user=${user} via=${ui} duration=${duration}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. User authentication (captive portal / FSSO)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortigate-user-auth"
+    match:
+      contains:
+        - 'subtype="user"'
+        - 'action="authentication"'
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "FORTI-USER-AUTH"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${srcip}"
+      ip_address:         "${srcip}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "FortiGate user auth | user=${user} src=${srcip} group=${group} method=${authproto}"

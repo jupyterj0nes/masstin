@@ -1,0 +1,133 @@
+# =============================================================================
+# Masstin custom parser rule — Cisco AnyConnect (SSL VPN on ASA / FTD)
+# =============================================================================
+#
+# Format covered:
+#   ASA / Secure Firewall syslog. All AnyConnect VPN events come in as
+#   %ASA-<sev>-<msgid> free-form messages with the relevant fields embedded
+#   in the text after the colon.
+#
+# Messages covered in v1 (relevant to lateral movement):
+#   113039 — AnyConnect parent session started (SUCCESSFUL_LOGON)
+#            Format: %ASA-6-113039: Group <group> User <user> IP <ip> AnyConnect parent session started.
+#   722022 — SVC connection established (SUCCESSFUL_LOGON variant)
+#            Format: %ASA-6-722022: Group <group> User <user> IP <ip> TCP SVC connection established without compression
+#   722023 — SVC connection terminated (LOGOFF)
+#            Format: %ASA-6-722023: Group <group> User <user> IP <ip> TCP SVC connection terminated {with|without} compression
+#   113019 — Session terminated (LOGOFF with duration)
+#            Format: %ASA-4-113019: Group = <group>, Username = <user>, IP = <ip>, Session disconnected. Session Type: ... Duration: ... Bytes xmt: ... Bytes rcv: ... Reason: ...
+#
+# Generic ASA authentication events (113004/113005/605004/605005) are
+# intentionally in cisco-asa.yaml — they're not AnyConnect specific.
+#
+# References:
+#   https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog.html
+#   https://www.manageengine.com/products/eventlog/cisco-asa-events-auditing/cisco-anyconnect-parent-session-started-113039.html
+# =============================================================================
+
+meta:
+  vendor: "Cisco"
+  product: "AnyConnect / Secure Client (SSL VPN)"
+  format: "ASA syslog %ASA-<sev>-<msgid> free-form"
+  versions_tested: ["ASA 9.x", "ASA 9.16", "FTD 7.x"]
+  description: "AnyConnect VPN session lifecycle events: parent session start, SVC connection, session terminate"
+  author: "masstin community"
+  reference_url: "https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog.html"
+
+prefilter:
+  contains_any:
+    - "ASA-6-113039"
+    - "ASA-6-722022"
+    - "ASA-6-722023"
+    - "ASA-4-113019"
+    - "ASA-5-113019"
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. AnyConnect parent session started (logon)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-ac-parent-session-start"
+    match:
+      contains: ["ASA-6-113039"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-113039:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+AnyConnect parent session started'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ASA-113039"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "AnyConnect parent session started | user=${user} group=${group} from=${ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. SVC (SSL VPN Client) connection established
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-ac-svc-connect"
+    match:
+      contains: ["ASA-6-722022"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-722022:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection (?P<state>established|created|accepted)'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ASA-722022"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "AnyConnect SVC connection ${state} | user=${user} group=${group} from=${ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. SVC connection terminated (logoff)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-ac-svc-disconnect"
+    match:
+      contains: ["ASA-6-722023"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-722023:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection terminated'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "LOGOFF"
+      event_id:           "ASA-722023"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "AnyConnect SVC connection terminated | user=${user} group=${group} from=${ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Session disconnected (logoff with duration and reason)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-ac-session-disconnect"
+    match:
+      contains_any: ["ASA-4-113019", "ASA-5-113019"]
+    extract:
+      type: regex
+      pattern: 'ASA-[45]-113019:\s*Group\s*=\s*(?P<group>[^,]+),\s*Username\s*=\s*(?P<user>[^,]+),\s*IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+),\s*Session disconnected.*?(?:Duration:\s*(?P<duration>[^,]+))?.*?(?:Reason:\s*(?P<reason>.+?))?\s*$'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "LOGOFF"
+      event_id:           "ASA-113019"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "AnyConnect session disconnected | user=${user} group=${group} from=${ip} duration=${duration} reason=${reason}"

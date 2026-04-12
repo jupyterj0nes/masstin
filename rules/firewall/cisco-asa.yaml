@@ -1,0 +1,177 @@
+# =============================================================================
+# Masstin custom parser rule — Cisco ASA / Secure Firewall (management auth)
+# =============================================================================
+#
+# Format covered:
+#   Cisco ASA / FTD syslog %ASA-<sev>-<msgid> free-form messages for management
+#   authentication events and WebVPN portal auth. AnyConnect-specific session
+#   lifecycle (113039 / 722022 / 722023 / 113019) lives in cisco-anyconnect.yaml.
+#
+# Messages covered in v1 (relevant to lateral movement):
+#   113004 — AAA user authentication Successful
+#            Format: %ASA-6-113004: AAA user authentication Successful : server = <srv> : user = <user>
+#   113005 — AAA user authentication Rejected
+#            Format: %ASA-6-113005: AAA user authentication Rejected : reason = <reason> : server = <srv> : user = <user> : user IP = <ip>
+#   605004 — Login denied
+#            Format: %ASA-6-605004: Login denied from <src>/<port> to <if>:<dst>/<svc> for user "<user>"
+#   605005 — Login permitted
+#            Format: %ASA-6-605005: Login permitted from <src>/<port> to <if>:<dst>/<svc> for user "<user>"
+#   716001 — WebVPN session started
+#            Format: %ASA-6-716001: Group <group> User <user> IP <ip> WebVPN session started.
+#   716002 — WebVPN session terminated
+#            Format: %ASA-6-716002: Group <group> User <user> IP <ip> WebVPN session terminated: reason
+#
+# References:
+#   https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog/syslogs1.html
+#   https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog/syslogs7.html
+# =============================================================================
+
+meta:
+  vendor: "Cisco"
+  product: "ASA / Secure Firewall (management + WebVPN)"
+  format: "ASA syslog %ASA-<sev>-<msgid> free-form"
+  versions_tested: ["ASA 9.x", "FTD 7.x"]
+  description: "Management authentication (AAA), login denied/permitted, WebVPN portal session lifecycle"
+  author: "masstin community"
+  reference_url: "https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog.html"
+
+prefilter:
+  contains_any:
+    - "ASA-6-113004"
+    - "ASA-6-113005"
+    - "ASA-6-605004"
+    - "ASA-6-605005"
+    - "ASA-6-716001"
+    - "ASA-6-716002"
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. AAA authentication successful
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-aaa-auth-success"
+    match:
+      contains: ["ASA-6-113004"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-113004:\s*AAA user authentication Successful\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)'
+    map:
+      time_created:       ""
+      computer:           "${server}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ASA-113004"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "ASA AAA auth OK | user=${user} server=${server}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. AAA authentication rejected
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-aaa-auth-rejected"
+    match:
+      contains: ["ASA-6-113005"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-113005:\s*AAA user authentication Rejected\s*:\s*reason\s*=\s*(?P<reason>[^:]+?)\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)(?:\s*:\s*user IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+))?'
+    map:
+      time_created:       ""
+      computer:           "${server}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "ASA-113005"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "ASA AAA auth REJECTED | user=${user} reason=${reason} server=${server} from=${ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Login denied (management access — SSH/Telnet/HTTP/etc.)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-login-denied"
+    match:
+      contains: ["ASA-6-605004"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-605004:\s*Login denied from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
+    map:
+      time_created:       ""
+      computer:           "${dst}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "ASA-605004"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${src}"
+      ip_address:         "${src}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "ASA login denied | user=${user} from=${src}:${sport} to=${dst} svc=${svc} iface=${if}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Login permitted (management access)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-login-permitted"
+    match:
+      contains: ["ASA-6-605005"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-605005:\s*Login permitted from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
+    map:
+      time_created:       ""
+      computer:           "${dst}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ASA-605005"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${src}"
+      ip_address:         "${src}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "ASA login permitted | user=${user} from=${src}:${sport} to=${dst} svc=${svc} iface=${if}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. WebVPN session started (portal auth)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-webvpn-start"
+    match:
+      contains: ["ASA-6-716001"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-716001:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session started'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ASA-716001"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "ASA WebVPN session started | user=${user} group=${group} from=${ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 6. WebVPN session terminated
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cisco-asa-webvpn-end"
+    match:
+      contains: ["ASA-6-716002"]
+    extract:
+      type: regex
+      pattern: 'ASA-6-716002:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session terminated'
+    map:
+      time_created:       ""
+      computer:           ""
+      event_type:         "LOGOFF"
+      event_id:           "ASA-716002"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "ASA WebVPN session terminated | user=${user} group=${group} from=${ip}"

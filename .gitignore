@@ -1,2 +1,9 @@
 /target
 *.bak
+
+# Local dev / debug dumps — never commit
+bad_chunk_*.bin
+bad_chunk_*.zip
+desktop-carved.csv
+masstin_rejected_evtx/
+test_all_carve.sh

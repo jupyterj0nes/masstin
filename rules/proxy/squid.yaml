@@ -1,0 +1,108 @@
+# =============================================================================
+# Masstin custom parser rule — Squid proxy
+# =============================================================================
+#
+# Format covered:
+#   Squid access.log native format (logformat squid). Each line is
+#   space-separated (with multiple spaces as padding, so a regex is cleaner
+#   than csv splitting).
+#
+# Default "squid" format field order:
+#   0: time         (unix timestamp with .ms)
+#   1: elapsed      (ms)
+#   2: client       (remotehost IP)
+#   3: action/code  (e.g. TCP_MISS/200, TCP_TUNNEL/200, TCP_DENIED/403)
+#   4: bytes        (response size)
+#   5: method       (GET, POST, CONNECT, ...)
+#   6: url          (full URL or host:port for CONNECT)
+#   7: user         (rfc931 / authenticated user, "-" if none)
+#   8: peer/status  (e.g. HIER_DIRECT/1.2.3.4, DEFAULT_PARENT/proxy)
+#   9: mime_type    (content-type or "-")
+#
+# For lateral movement tracking we care about:
+#   - Authenticated users (user != "-") going to internal resources
+#   - CONNECT method (HTTPS tunnelling) with a user — indicates proxy-routed
+#     lateral movement
+#   - TCP_DENIED with a user — failed access attempts
+#
+# References:
+#   https://wiki.squid-cache.org/Features/LogFormat
+#   https://wiki.squid-cache.org/SquidFaq/SquidLogs
+# =============================================================================
+
+meta:
+  vendor: "Squid"
+  product: "Squid proxy"
+  format: "access.log native (logformat squid)"
+  versions_tested: ["Squid 4.x", "Squid 5.x", "Squid 6.x"]
+  description: "Authenticated proxy requests and CONNECT tunnels — lateral movement signal"
+  author: "masstin community"
+  reference_url: "https://wiki.squid-cache.org/Features/LogFormat"
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Authenticated CONNECT tunnel (HTTPS proxy, high lateral-movement value)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "squid-connect-authenticated"
+    match:
+      regex: '^\d+\.\d+\s+\d+\s+\S+\s+\S+\s+\d+\s+CONNECT\s+\S+\s+[A-Za-z0-9][^\s]*\s'
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\d+\.\d+)\s+(?P<elapsed>\d+)\s+(?P<client>\S+)\s+(?P<code>\S+)\s+(?P<bytes>\d+)\s+CONNECT\s+(?P<target>\S+)\s+(?P<user>\S+)\s+(?P<peer>\S+)\s+(?P<mime>\S+)'
+    map:
+      time_created:       "${ts}"
+      computer:           "${target}"
+      event_type:         "CONNECT"
+      event_id:           "SQUID-CONNECT"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${client}"
+      ip_address:         "${client}"
+      logon_type:         "PROXY"
+      filename:           "${__source_file}"
+      detail:             "Squid CONNECT tunnel | user=${user} client=${client} target=${target} code=${code} bytes=${bytes}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Authenticated HTTP request (non-CONNECT)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "squid-http-authenticated"
+    match:
+      regex: '^\d+\.\d+\s+\d+\s+\S+\s+(?:TCP_MISS|TCP_HIT|TCP_REFRESH_HIT|TCP_IMS_HIT)\S*\s+\d+\s+(?:GET|POST|HEAD|PUT|DELETE|PATCH)\s+\S+\s+[A-Za-z0-9][^\s]*\s'
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\d+\.\d+)\s+(?P<elapsed>\d+)\s+(?P<client>\S+)\s+(?P<code>\S+)\s+(?P<bytes>\d+)\s+(?P<method>\S+)\s+(?P<url>\S+)\s+(?P<user>\S+)\s+(?P<peer>\S+)\s+(?P<mime>\S+)'
+    map:
+      time_created:       "${ts}"
+      computer:           "${url}"
+      event_type:         "CONNECT"
+      event_id:           "SQUID-HTTP"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${client}"
+      ip_address:         "${client}"
+      logon_type:         "PROXY"
+      filename:           "${__source_file}"
+      detail:             "Squid HTTP | user=${user} client=${client} ${method} ${url} code=${code} bytes=${bytes}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Denied request (access control failure)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "squid-denied"
+    match:
+      regex: '^\d+\.\d+\s+\d+\s+\S+\s+TCP_DENIED\S*\s'
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\d+\.\d+)\s+(?P<elapsed>\d+)\s+(?P<client>\S+)\s+(?P<code>\S+)\s+(?P<bytes>\d+)\s+(?P<method>\S+)\s+(?P<url>\S+)\s+(?P<user>\S+)\s+(?P<peer>\S+)\s+(?P<mime>\S+)'
+    map:
+      time_created:       "${ts}"
+      computer:           "${url}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "SQUID-DENIED"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${client}"
+      ip_address:         "${client}"
+      logon_type:         "PROXY"
+      filename:           "${__source_file}"
+      detail:             "Squid denied | user=${user} client=${client} ${method} ${url} code=${code}"

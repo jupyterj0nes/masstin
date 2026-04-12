@@ -1,0 +1,112 @@
+# =============================================================================
+# Masstin custom parser rule — Fortinet FortiGate SSL VPN
+# =============================================================================
+#
+# Format covered:
+#   FortiGate syslog — native key=value pairs separated by spaces. Values
+#   containing spaces are double-quoted. The event log uses type=event with
+#   subtype=vpn, and each SSL VPN event is identified by the `action=` field.
+#
+# Actions covered in v1 (relevant to lateral movement):
+#   action=tunnel-up        → SUCCESSFUL_LOGON (SSL tunnel established)
+#   action=ssl-login-fail   → FAILED_LOGON    (authentication failure)
+#   action=tunnel-down      → LOGOFF          (SSL tunnel closed)
+#   action=ssl-new-con      → informational, typically ignored
+#
+# Common fields for SSL VPN events:
+#   date, time, devname, devid, logid, type=event, subtype=vpn, level,
+#   vd, eventtime, logdesc, action, tunneltype, tunnelid, remip, user,
+#   group, dst_host, reason, msg
+#
+# References:
+#   https://docs.fortinet.com/document/fortigate/latest/fortios-log-message-reference
+#   https://docs.fortinet.com/document/fortigate/6.2.0/cookbook/834425/understanding-vpn-related-logs
+# =============================================================================
+
+meta:
+  vendor: "Fortinet"
+  product: "FortiGate SSL VPN"
+  format: "Fortinet syslog key=value (type=event subtype=vpn)"
+  versions_tested: ["FortiOS 6.2", "FortiOS 6.4", "FortiOS 7.0", "FortiOS 7.2", "FortiOS 7.4"]
+  description: "SSL VPN tunnel lifecycle events: login success, login failure, tunnel down"
+  author: "masstin community"
+  reference_url: "https://docs.fortinet.com/document/fortigate/latest/fortios-log-message-reference"
+
+prefilter:
+  contains_all:
+    - "type=\"event\""
+    - "subtype=\"vpn\""
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. SSL tunnel up (successful VPN logon)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortinet-sslvpn-tunnel-up"
+    match:
+      contains: ['action="tunnel-up"']
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "FORTI-VPN-TUNNEL-UP"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${remip}"
+      ip_address:         "${remip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "FortiGate SSL VPN tunnel UP | user=${user} from=${remip} tunneltype=${tunneltype} group=${group} assignip=${assignip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. SSL login failed
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortinet-sslvpn-login-fail"
+    match:
+      contains: ['action="ssl-login-fail"']
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "FORTI-VPN-LOGIN-FAIL"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${remip}"
+      ip_address:         "${remip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "FortiGate SSL VPN login FAIL | user=${user} from=${remip} reason=${reason} msg=${msg}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. SSL tunnel down (VPN logoff)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "fortinet-sslvpn-tunnel-down"
+    match:
+      contains: ['action="tunnel-down"']
+    extract:
+      type: keyvalue
+      pair_separator: " "
+      kv_separator: "="
+      trim: true
+    map:
+      time_created:       "${date} ${time}"
+      computer:           "${devname}"
+      event_type:         "LOGOFF"
+      event_id:           "FORTI-VPN-TUNNEL-DOWN"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${remip}"
+      ip_address:         "${remip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "FortiGate SSL VPN tunnel DOWN | user=${user} from=${remip} duration=${duration} sent=${sentbyte} rcvd=${rcvdbyte}"

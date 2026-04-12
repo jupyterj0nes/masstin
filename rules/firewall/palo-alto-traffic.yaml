@@ -1,0 +1,145 @@
+# =============================================================================
+# Masstin custom parser rule — Palo Alto PAN-OS TRAFFIC log
+# =============================================================================
+#
+# Format covered:
+#   PAN-OS syslog TRAFFIC log (type=TRAFFIC, subtype=start|end|drop|deny).
+#   CSV-delimited. For lateral movement tracking we only care about sessions
+#   where `srcuser` is set — that means the firewall could correlate the
+#   connection to a domain user (User-ID). Unauthenticated internet traffic
+#   is not interesting for our use case.
+#
+# Field order (PAN-OS 10.x+, 0-indexed as the CSV parser sees them):
+#    0  FUTURE_USE
+#    1  Receive Time
+#    2  Serial Number
+#    3  Type                 ("TRAFFIC")
+#    4  Threat/Content Type  ("start" | "end" | "drop" | "deny")
+#    5  FUTURE_USE
+#    6  Generated Time
+#    7  Source Address       (src IP)
+#    8  Destination Address  (dst IP)
+#    9  NAT Source IP
+#   10  NAT Destination IP
+#   11  Rule Name
+#   12  Source User          (srcuser)
+#   13  Destination User     (dstuser)
+#   14  Application
+#   15  Virtual System
+#   16  Source Zone
+#   17  Destination Zone
+#   18  Inbound Interface
+#   19  Outbound Interface
+#   20  Log Action
+#   21  FUTURE_USE
+#   22  Session ID
+#   23  Repeat Count
+#   24  Source Port          (sport)
+#   25  Destination Port     (dport)
+#   26  NAT Source Port
+#   27  NAT Destination Port
+#   28  Flags
+#   29  Protocol
+#   30  Action               ("allow" | "deny" | "drop" | "reset-...")
+#   31  Bytes
+#   ...
+#
+# References:
+#   https://docs.paloaltonetworks.com/pan-os/11-0/pan-os-admin/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields
+#
+# NOTE on volume: TRAFFIC logs can easily be millions of lines per hour on a
+# busy firewall. The prefilter keeps only lines with "TRAFFIC" and an
+# authenticated srcuser containing a backslash (DOMAIN\user) or @ (UPN).
+# Tune the prefilter to your environment's naming scheme if needed.
+# =============================================================================
+
+meta:
+  vendor: "Palo Alto Networks"
+  product: "PAN-OS TRAFFIC log"
+  format: "syslog CSV (type=TRAFFIC)"
+  versions_tested: ["PAN-OS 10.x", "PAN-OS 11.x"]
+  description: "Authenticated TRAFFIC sessions (User-ID resolved src user) — lateral movement signal"
+  author: "masstin community"
+  reference_url: "https://docs.paloaltonetworks.com/pan-os/11-0/pan-os-admin/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields"
+
+prefilter:
+  contains: [",TRAFFIC,"]
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Session end with authenticated srcuser (the lateral movement signal)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "pan-traffic-authenticated-session-end"
+    match:
+      contains: [",TRAFFIC,end,"]
+      # Position 12 (srcuser) must be non-empty — authenticated traffic only
+      regex: '^[^,]*,[^,]*,[^,]*,TRAFFIC,end,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]+,'
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        1: receive_time
+        6: generated_time
+        7: src_ip
+        8: dst_ip
+        11: rule_name
+        12: srcuser
+        14: application
+        16: src_zone
+        17: dst_zone
+        24: sport
+        25: dport
+        29: protocol
+        30: action
+        31: bytes
+    map:
+      time_created:       "${generated_time}"
+      computer:           "${dst_ip}"
+      event_type:         "CONNECT"
+      event_id:           "PAN-TRAFFIC-END"
+      subject_user_name:  "${srcuser}"
+      target_user_name:   "${srcuser}"
+      workstation_name:   "${src_ip}"
+      ip_address:         "${src_ip}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "PAN TRAFFIC end | user=${srcuser} ${src_ip}:${sport} -> ${dst_ip}:${dport} app=${application} proto=${protocol} action=${action} rule=${rule_name} bytes=${bytes}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Session start with authenticated srcuser
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "pan-traffic-authenticated-session-start"
+    match:
+      contains: [",TRAFFIC,start,"]
+      regex: '^[^,]*,[^,]*,[^,]*,TRAFFIC,start,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]+,'
+    extract:
+      type: csv
+      delimiter: ","
+      quote: '"'
+      fields_by_index:
+        6: generated_time
+        7: src_ip
+        8: dst_ip
+        11: rule_name
+        12: srcuser
+        14: application
+        16: src_zone
+        17: dst_zone
+        24: sport
+        25: dport
+        29: protocol
+        30: action
+    map:
+      time_created:       "${generated_time}"
+      computer:           "${dst_ip}"
+      event_type:         "CONNECT"
+      event_id:           "PAN-TRAFFIC-START"
+      subject_user_name:  "${srcuser}"
+      target_user_name:   "${srcuser}"
+      workstation_name:   "${src_ip}"
+      ip_address:         "${src_ip}"
+      logon_type:         "FW"
+      filename:           "${__source_file}"
+      detail:             "PAN TRAFFIC start | user=${srcuser} ${src_ip}:${sport} -> ${dst_ip}:${dport} app=${application} proto=${protocol} rule=${rule_name}"

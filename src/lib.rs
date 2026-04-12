@@ -1,3 +1,5 @@
+#![feature(alloc_error_hook)]
+
 use clap::{Parser, ValueEnum};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
@@ -37,6 +39,7 @@ pub use crate::parse_tasks::*;
 mod parse_mountpoints;
 pub use crate::parse_mountpoints::*;
 pub mod parse_carve;
+pub mod parse_custom;
 pub mod vmdk;
 pub use crate::vmdk::*;
 
@@ -112,6 +115,21 @@ pub struct Cli {
     /// Carve only unallocated space (faster). Default: carve entire disk.
     #[arg(long)]
     carve_unalloc: bool,
+
+    /// Comma-separated list of hex offsets to skip during carving (for corrupted E01 chunks that hang).
+    /// Example: --skip-offsets 0x6478b6000,0x7a0000000
+    /// Each offset skips a 32 MB window starting at that offset.
+    #[arg(long)]
+    skip_offsets: Option<String>,
+
+    /// Path to a YAML rule file or directory for `parse-custom`.
+    /// See rules/ and docs/custom-parsers.md for the schema and contributed rules.
+    #[arg(long)]
+    rules: Option<String>,
+
+    /// Dry-run mode for `parse-custom`: parse and show first matches + rejects, do not write CSV.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -144,6 +162,8 @@ enum ActionType {
     ParseMassive,
     /// Carve EVTX records from disk images — recovers events from unallocated space after log deletion. Use --carve-unalloc for faster unallocated-only scan.
     CarveImage,
+    /// Parse arbitrary text logs (VPN/firewall/proxy) using YAML rule files from the rules/ library. See docs/custom-parsers.md.
+    ParseCustom,
 }
 
 // -----------------------------------------------------------------------------
@@ -245,8 +265,42 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             crate::banner::print_massive_warning();
             parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), true);
         }
+        ActionType::ParseCustom => {
+            let rules_path = match config.rules.as_ref() {
+                Some(r) => r.clone(),
+                None => {
+                    eprintln!("Error: parse-custom requires --rules <path> (file or directory of YAML rule files)");
+                    return Ok(());
+                }
+            };
+            if config.file.is_empty() {
+                eprintln!("Error: parse-custom requires at least one -f <logfile>");
+                return Ok(());
+            }
+            crate::parse_custom::parse_custom(
+                &config.file,
+                &rules_path,
+                config.output.as_ref(),
+                config.dry_run,
+            );
+        }
         ActionType::CarveImage => {
-            crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc);
+            let skip_offsets: Vec<u64> = config.skip_offsets.as_deref()
+                .map(|s| s.split(',')
+                    .filter_map(|tok| {
+                        let t = tok.trim();
+                        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+                        u64::from_str_radix(t, 16).ok()
+                    })
+                    .collect())
+                .unwrap_or_default();
+            if !skip_offsets.is_empty() {
+                eprintln!("  Skip offsets configured: {} offset(s)", skip_offsets.len());
+                for o in &skip_offsets {
+                    eprintln!("    → {:#x} ({:.2} GB)", o, *o as f64 / 1_073_741_824.0);
+                }
+            }
+            crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc, &skip_offsets);
         }
     }
 
@@ -351,6 +405,18 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if config.file.is_empty() {
                 return Err(String::from(
                     "For carve-image, specify forensic image files with -f (E01/VMDK/dd).",
+                ));
+            }
+        }
+        ActionType::ParseCustom => {
+            if config.file.is_empty() {
+                return Err(String::from(
+                    "For parse-custom, specify log files with -f and a rule file or directory with --rules.",
+                ));
+            }
+            if config.rules.is_none() {
+                return Err(String::from(
+                    "For parse-custom, --rules <path> is required (YAML rule file or directory).",
                 ));
             }
         }

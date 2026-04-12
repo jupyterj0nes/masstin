@@ -1,0 +1,130 @@
+# =============================================================================
+# Masstin custom parser rule — OpenVPN Community / Access Server
+# =============================================================================
+#
+# Format covered:
+#   OpenVPN server log when running via syslog or log-append. Each line has
+#   the syslog prefix followed by `openvpn[PID]:` and then a free-form
+#   message. The client IP:port and, when available, the username appear
+#   embedded in the message text.
+#
+# Messages covered in v1 (relevant to lateral movement):
+#   "user 'NAME' authenticated"         → SUCCESSFUL_LOGON (plugin/script auth OK)
+#   "AUTH_FAILED"                        → FAILED_LOGON
+#   "[NAME] Peer Connection Initiated"   → SUCCESSFUL_LOGON (cert-based auth)
+#   "SIGTERM[soft,...] received, client-instance exiting"  → LOGOFF
+#
+# OpenVPN has many message variants depending on client/server/auth mode
+# (cert-only, cert+user/pass, auth-user-pass-verify, plugin). The v1 rules
+# cover the four most common patterns seen in real deployments.
+#
+# References:
+#   https://openvpn.net/community-resources/reference-manual-for-openvpn-2-6/
+#   https://openvpn.net/as-docs/logging.html
+# =============================================================================
+
+meta:
+  vendor: "OpenVPN"
+  product: "OpenVPN Community / Access Server"
+  format: "free-form syslog (openvpn[PID]: ...)"
+  versions_tested: ["OpenVPN 2.4", "OpenVPN 2.5", "OpenVPN 2.6"]
+  description: "OpenVPN client connection lifecycle and authentication events"
+  author: "masstin community"
+  reference_url: "https://openvpn.net/community-resources/reference-manual-for-openvpn-2-6/"
+
+prefilter:
+  contains_any:
+    - "openvpn"
+    - "OpenVPN"
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Plugin / script authentication success
+  #    Format: "<ts> <host> openvpn[PID]: user 'NAME' authenticated"
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "openvpn-user-authenticated"
+    match:
+      regex: "openvpn.*?user ['\"]?[^'\" ]+['\"]? authenticated"
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\S+\s+\S+\s+\S+)\s+(?P<host>\S+)\s+openvpn(?:\[\d+\])?:\s+user\s+[''"]?(?P<user>[^''"\s]+)[''"]?\s+authenticated'
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "OPENVPN-AUTH-SUCC"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "OpenVPN user authenticated | user=${user} host=${host}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Authentication failed
+  #    Format: "<ts> <host> openvpn[PID]: <ip>:<port> [user NAME] AUTH_FAILED"
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "openvpn-auth-failed"
+    match:
+      contains: ["AUTH_FAILED"]
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\S+\s+\S+\s+\S+)\s+(?P<host>\S+)\s+openvpn(?:\[\d+\])?:\s+(?P<ip>[\d\.:a-fA-F]+):(?P<port>\d+)(?:\s+\[(?P<user>[^\]]+)\])?.*?AUTH_FAILED'
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "OPENVPN-AUTH-FAIL"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "OpenVPN AUTH_FAILED | user=${user} from=${ip}:${port}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Peer Connection Initiated (cert-based authentication, session start)
+  #    Format: "<ts> <host> openvpn[PID]: <name>/<ip>:<port> Peer Connection Initiated with [AF_INET]<ip>:<port>"
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "openvpn-peer-connection-initiated"
+    match:
+      contains: ["Peer Connection Initiated"]
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\S+\s+\S+\s+\S+)\s+(?P<host>\S+)\s+openvpn(?:\[\d+\])?:\s+(?P<user>[^/\s]+)/(?P<ip>[\d\.:a-fA-F]+):(?P<port>\d+)\s+Peer Connection Initiated'
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "OPENVPN-PEER-INIT"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "OpenVPN peer connection initiated | user=${user} from=${ip}:${port}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Client instance exiting (session end)
+  #    Format: "<ts> <host> openvpn[PID]: <name>/<ip>:<port> SIGTERM[soft,...] received, client-instance exiting"
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "openvpn-client-exiting"
+    match:
+      contains: ["client-instance exiting"]
+    extract:
+      type: regex
+      pattern: '^(?P<ts>\S+\s+\S+\s+\S+)\s+(?P<host>\S+)\s+openvpn(?:\[\d+\])?:\s+(?P<user>[^/\s]+)/(?P<ip>[\d\.:a-fA-F]+):(?P<port>\d+)\s+SIGTERM\[(?P<signal>[^\]]+)\].*?client-instance exiting'
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "LOGOFF"
+      event_id:           "OPENVPN-CLIENT-EXIT"
+      subject_user_name:  "${user}"
+      target_user_name:   "${user}"
+      workstation_name:   "${ip}"
+      ip_address:         "${ip}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "OpenVPN client instance exiting | user=${user} from=${ip}:${port} signal=${signal}"
