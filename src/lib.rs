@@ -34,6 +34,8 @@ mod parse_ual;
 pub use crate::parse_ual::*;
 mod parse_tasks;
 pub use crate::parse_tasks::*;
+mod parse_mountpoints;
+pub use crate::parse_mountpoints::*;
 pub mod vmdk;
 pub use crate::vmdk::*;
 

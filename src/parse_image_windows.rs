@@ -26,6 +26,8 @@ struct ExtractedArtifacts {
     linux_logs_dir: Option<PathBuf>,
     /// Directory containing extracted Scheduled Task XML files, if any were found
     tasks_dir: Option<PathBuf>,
+    /// Directory containing extracted NTUSER.DAT files for MountPoints2 parsing
+    ntuser_dir: Option<PathBuf>,
 }
 
 /// Main entry point: parse forensic disk images (Windows + Linux).
@@ -171,6 +173,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // Extract from image files — use image name as temp subdirectory
     let mut linux_log_dirs: Vec<String> = Vec::new();
     let mut task_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
+    let mut ntuser_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
 
     let mut images_processed = 0;
     let mut images_skipped = 0;
@@ -223,9 +226,12 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 if let Some(linux_dir) = artifacts.linux_logs_dir {
                     linux_log_dirs.push(linux_dir.to_string_lossy().to_string());
                 }
+                let hostname = extract_hostname_from_evtx_dir(&artifacts.evtx_dir);
                 if let Some(tdir) = artifacts.tasks_dir {
-                    let hostname = extract_hostname_from_evtx_dir(&artifacts.evtx_dir);
-                    task_dirs.push((tdir.to_string_lossy().to_string(), hostname));
+                    task_dirs.push((tdir.to_string_lossy().to_string(), hostname.clone()));
+                }
+                if let Some(ndir) = artifacts.ntuser_dir {
+                    ntuser_dirs.push((ndir.to_string_lossy().to_string(), hostname));
                 }
             }
             Err(e) => {
@@ -271,6 +277,21 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             all_task_events.extend(events);
         }
     }
+
+    // Parse MountPoints2 from NTUSER.DAT files
+    let mut all_mountpoint_events = Vec::new();
+    if !ntuser_dirs.is_empty() {
+        for (ndir, hostname) in &ntuser_dirs {
+            let events = crate::parse_mountpoints::parse_mountpoints(Path::new(ndir), hostname);
+            all_mountpoint_events.extend(events);
+        }
+        if !all_mountpoint_events.is_empty() {
+            crate::banner::print_search_result_line(all_mountpoint_events.len(), "MountPoints2 remote share events");
+        }
+    }
+
+    // Combine task events + mountpoint events as extra events for the pipeline
+    all_task_events.extend(all_mountpoint_events);
 
     if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
@@ -998,6 +1019,8 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     let mut total_tasks = 0;
     let mut total_ual = 0;
     let mut total_vss = 0;
+    let ntuser_dir = temp_dir.join("ntuser_extracted");
+    let mut total_ntuser = 0;
 
     for (i, partition_offset) in partitions.iter().enumerate() {
         // Skip BitLocker-encrypted partitions — content is not readable without recovery key
@@ -1035,6 +1058,12 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         let tasks_part_dir = tasks_dir.join(format!("partition_{}", i));
         if let Ok(count) = extract_all_files_from_ntfs_path(reader, *partition_offset, SCHTASKS_PATH, &tasks_part_dir) {
             total_tasks += count;
+        }
+
+        // Extract NTUSER.DAT from each user profile for MountPoints2 analysis
+        let ntuser_part_dir = ntuser_dir.join(format!("partition_{}", i));
+        if let Ok(count) = extract_ntuser_dat_files(reader, *partition_offset, &ntuser_part_dir) {
+            total_ntuser += count;
         }
 
         // Check for Volume Shadow Copies (VSS) and extract EVTX from each
@@ -1094,6 +1123,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     if total_evtx > 0 { artifact_parts.push(format!("{} EVTX", total_evtx)); }
     if total_ual > 0 { artifact_parts.push(format!("{} UAL", total_ual)); }
     if total_tasks > 0 { artifact_parts.push(format!("{} Tasks", total_tasks)); }
+    if total_ntuser > 0 { artifact_parts.push(format!("{} NTUSER.DAT", total_ntuser)); }
     if !artifact_parts.is_empty() {
         crate::banner::print_info(&format!("  Extracted: {}", artifact_parts.join(" + ")));
     }
@@ -1126,7 +1156,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         crate::banner::print_phase_result(&format!("{} Linux log files extracted total", total_linux_logs));
     }
 
-    if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 {
+    if total_evtx == 0 && total_linux_logs == 0 && total_tasks == 0 && total_ntuser == 0 {
         let mut found = Vec::new();
         if bitlocker_count > 0 { found.push(format!("{} BitLocker-encrypted", bitlocker_count)); }
         let readable_ntfs = ntfs_partitions.len() - bitlocker_count;
@@ -1145,6 +1175,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         evtx_dir: evtx_output_dir,
         linux_logs_dir: if total_linux_logs > 0 { Some(linux_logs_dir) } else { None },
         tasks_dir: if total_tasks > 0 { Some(tasks_dir) } else { None },
+        ntuser_dir: if total_ntuser > 0 { Some(ntuser_dir) } else { None },
     })
 }
 
@@ -1818,4 +1849,128 @@ impl<'a, R: Read + Seek> Seek for OffsetReader<'a, R> {
             }
         }
     }
+}
+
+/// Extract NTUSER.DAT from each user profile in the Users directory.
+/// Files are saved as username_NTUSER.DAT in the output directory.
+fn extract_ntuser_dat_files<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    output_dir: &Path,
+) -> Result<usize, String> {
+    let mut partition_reader = OffsetReader::new(reader, partition_offset);
+
+    let mut ntfs = ntfs::Ntfs::new(&mut partition_reader)
+        .map_err(|e| format!("Cannot parse NTFS: {}", e))?;
+    ntfs.read_upcase_table(&mut partition_reader)
+        .map_err(|e| format!("Cannot read upcase table: {}", e))?;
+
+    let root_dir = ntfs.root_directory(&mut partition_reader)
+        .map_err(|e| format!("Cannot read root directory: {}", e))?;
+
+    // Navigate to Users directory
+    let users_dir = {
+        let index = root_dir.directory_index(&mut partition_reader)
+            .map_err(|e| format!("Cannot read root index: {}", e))?;
+        let mut found_dir = None;
+        let mut entries = index.entries();
+        while let Some(entry) = entries.next(&mut partition_reader) {
+            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            if let Some(key) = entry.key() {
+                let file_name = match key { Ok(f) => f, Err(_) => continue };
+                let name = file_name.name().to_string_lossy();
+                if name.eq_ignore_ascii_case("Users") {
+                    found_dir = Some(
+                        entry.file_reference().to_file(&ntfs, &mut partition_reader)
+                            .map_err(|e| format!("Cannot open Users: {}", e))?
+                    );
+                    break;
+                }
+            }
+        }
+        match found_dir {
+            Some(d) => d,
+            None => return Err("Users directory not found".to_string()),
+        }
+    };
+
+    // Iterate user profile directories
+    let users_index = users_dir.directory_index(&mut partition_reader)
+        .map_err(|e| format!("Cannot read Users directory: {}", e))?;
+
+    let _ = fs::create_dir_all(output_dir);
+    let mut count = 0;
+
+    // Skip system profiles
+    let skip_profiles = ["Default", "Default User", "Public", "All Users", "desktop.ini"];
+
+    let mut user_entries = users_index.entries();
+    while let Some(entry) = user_entries.next(&mut partition_reader) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if let Some(key) = entry.key() {
+            let file_name = match key { Ok(f) => f, Err(_) => continue };
+            let username = file_name.name().to_string_lossy().to_string();
+
+            // Skip system profiles and special entries
+            if username.starts_with('.') || username.starts_with('$') { continue; }
+            if skip_profiles.iter().any(|s| s.eq_ignore_ascii_case(&username)) { continue; }
+
+            // Open user profile directory
+            let user_dir = match entry.file_reference().to_file(&ntfs, &mut partition_reader) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Check if this is actually a directory
+            let user_index = match user_dir.directory_index(&mut partition_reader) {
+                Ok(idx) => idx,
+                Err(_) => continue, // Not a directory
+            };
+
+            // Look for NTUSER.DAT in this user's profile
+            let mut dir_entries = user_index.entries();
+            while let Some(file_entry) = dir_entries.next(&mut partition_reader) {
+                let file_entry = match file_entry { Ok(e) => e, Err(_) => continue };
+                if let Some(fkey) = file_entry.key() {
+                    let fname = match fkey { Ok(f) => f, Err(_) => continue };
+                    let name = fname.name().to_string_lossy().to_string();
+
+                    if !name.eq_ignore_ascii_case("NTUSER.DAT") { continue; }
+
+                    // Extract this NTUSER.DAT
+                    let ntfs_file = match file_entry.file_reference().to_file(&ntfs, &mut partition_reader) {
+                        Ok(f) => f, Err(_) => continue
+                    };
+                    let data_item = match ntfs_file.data(&mut partition_reader, "") {
+                        Some(Ok(d)) => d, _ => continue
+                    };
+                    let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };
+                    let data_value = match data_attr.value(&mut partition_reader) { Ok(v) => v, Err(_) => continue };
+                    let mut attached = data_value.attach(&mut partition_reader);
+
+                    // Save as username_NTUSER.DAT
+                    let output_path = output_dir.join(format!("{}_NTUSER.DAT", username));
+                    let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        match attached.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                            Err(_) => break,
+                        }
+                    }
+
+                    if is_debug_mode() {
+                        let size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                        eprintln!("[DEBUG] Extracted {}'s NTUSER.DAT ({} bytes)", username, size);
+                    }
+                    count += 1;
+                    break; // Found NTUSER.DAT for this user, move to next user
+                }
+            }
+        }
+    }
+
+    Ok(count)
 }
