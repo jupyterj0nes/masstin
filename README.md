@@ -47,6 +47,8 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Unified 14-column timeline** | All sources merged into a single chronological CSV with a canonical 14-column schema. Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons. `logon_id` carried through for session correlation. | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy logs via YAML rule files with three extractor types (csv, regex, keyvalue) and nested sub-extract with `strip_before` preprocessing. Ships with **8 researched rules / 31 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
 | **Noise filtering** | Four opt-in flags to cut output down to signal only: `--ignore-local` drops records with no usable source (loopback IPs, LOCAL markers, service/interactive logons without src, MSTSC/default_value placeholders); `--exclude-users`, `--exclude-hosts`, `--exclude-ips` accept comma-separated lists, glob wildcards (`svc_*`, `*$`) and `@file.txt` imports; `--exclude-ips` also accepts CIDR ranges (`10.0.0.0/8`). Combine with `--dry-run` for a pre-flight stats report showing exactly what would be filtered. | [Noise filtering](https://weinvestigateanything.com/en/tools/masstin-noise-filtering/) |
+| **Triage-aware discovery** | When the directory walker hits a ZIP, masstin lists its top-level entries and matches against three known triage tool layouts: **KAPE** (`_kape.cli` / `Console/KAPE.log` / `<host>/C/Windows/System32/winevt/Logs/`), **Velociraptor Offline Collector** (`client_info.json` + `collection_context.json` / `uploads.json`), and **Cortex XDR Offline Collector** (`output/cortex-xdr-payload.log`). Detected packages surface as `=> Triage found: <type> [host: ...]` lines in phase 1 with hostname extracted from the ZIP filename when possible. | [Triage detection](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
+| **Per-source breakdown** | The phase-2 summary groups every parsed artifact by its source — forensic image, triage zip, plain archive, or loose folder — instead of by its leaf directory name. Each group shows the total event count plus the per-EVTX list underneath. Lets the analyst tell at a glance how many events came from `HRServer.e01` vs from a Cortex XDR triage of `WIN-DC01` vs from a folder of loose EVTX dropped in `D:\evidence\`. | [Per-source breakdown](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
 | **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution. Ships with a Cypher query for **temporal path reconstruction** — find the chronologically coherent attacker route between any two nodes. | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
 | **Automation-ready** | `--silent` for Velociraptor / SOAR pipelines, single cross-platform binary for Windows / Linux / macOS, no runtime dependencies. | |
 
@@ -355,6 +357,64 @@ After every run with any filter flag active, masstin prints a breakdown:
 The stats always attribute each filtered record to exactly one cause (the first filter layer that matched), so the numbers add up. Use `--dry-run` to see this report without writing the CSV.
 
 **Safety guarantee:** records with a valid routable public `src_ip` are never filtered by `--ignore-local`, regardless of what `src_computer` contains. This preserves brute force and external attack signal even when Windows couldn't resolve a workstation name — the most common missing-metadata case in real forensics.
+
+### Triage detection and per-source breakdown
+
+When the directory walker encounters a ZIP archive, masstin reads its top-level entry list and runs pattern matching against three known triage tool layouts. Detected packages surface as `=> Triage found:` lines in phase 1 and drive the per-source grouping in phase 2 — so the analyst can tell at a glance which events came from which source.
+
+**Detection signatures**
+
+| Triage tool | Marker (any of) | Hostname extracted from |
+|---|---|---|
+| **KAPE** | `_kape.cli` at any level, `Console/KAPE.log`, or 5+ entries matching `<host>/C/Windows/System32/winevt/Logs/*.evtx` | Filename pattern `<host>_<digits>...zip` (only when the shape is unambiguous; KAPE has no enforced filename) |
+| **Velociraptor Offline Collector** | Top-level `client_info.json` + (`collection_context.json` OR `uploads.json`); encrypted variant uses `metadata.json` + `data.zip` | Filename pattern `Collection-<host>-<YYYY-MM-DD>T...Z.zip` |
+| **Cortex XDR Offline Collector** | Any entry ending in `cortex-xdr-payload.log` (this filename is unique to the XDR collector) | Filename pattern `offline_collector_output_<host>_<YYYY-MM-DD>_<HH-MM-SS>.zip` |
+
+**Phase 1 output** (folder containing 2 triages):
+
+```
+[1/3] Searching for artifacts...
+        => Triage found: Velociraptor Offline Collector [host: WIN-DC01]
+           source: Collection-WIN-DC01-2026-04-13T15_30_00Z.zip
+           entries inside: 247 (EVTX or other matched files)
+        => Triage found: Cortex XDR Offline Collector [host: TESTHOST01]
+           source: offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip
+           entries inside: 173 (EVTX or other matched files)
+        420 EVTX artifacts found inside 2 of 2 compressed archives
+        => 432 EVTX artifacts found total
+```
+
+**Phase 2 output** — every artifact is grouped by SOURCE (image, triage, archive, or loose folder), each group showing the total event count plus the per-EVTX list:
+
+```
+[+] Lateral movement events grouped by source (4 sources):
+
+        => [IMAGE]  HRServer_Disk0.e01  (45 events total)
+           - Security.evtx (32)
+           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (13)
+
+        => [TRIAGE: Cortex XDR]  offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip  [host: TESTHOST01]  (834 events total)
+           - Security.evtx (612)
+           - Microsoft-Windows-WinRM%4Operational.evtx (89)
+           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (133)
+
+        => [TRIAGE: Velociraptor]  Collection-WIN-DC01-2026-04-13T15_30_00Z.zip  [host: WIN-DC01]  (4521 events total)
+           - Security.evtx (4380)
+           - Microsoft-Windows-WinRM%4Operational.evtx (141)
+
+        => [FOLDER]  D:/evidence/loose/extracted_evtx  (131 events total)
+           - Security.evtx (120)
+           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (11)
+```
+
+**Source tags** are ASCII only — no emoji — so they render correctly in conhost legacy on Windows Server 2016/2019, RDP sessions, mosh/tmux, and any analyst environment regardless of fonts or terminal capabilities. Each tag is colour-coded for visual distinction:
+
+- `[IMAGE]` — cyan — forensic image extract (works for E01, VMDK, dd, all formats)
+- `[TRIAGE: <type>]` — yellow — detected triage package, with hostname when the filename pattern allows extraction
+- `[ARCHIVE]` — white — ZIP that doesn't match any known triage layout
+- `[FOLDER]` — dim — loose artifacts in a regular directory, identified by their full parent path (not just the leaf name)
+
+This applies to **every parser action** that walks directories: `parse-windows`, `parse-image`, `parse-massive`, `parse-linux`. The same source labels show up regardless of which action you ran, so the breakdown format is consistent across the whole tool.
 
 ### EVTX carving: last-resort recovery from unallocated space
 
