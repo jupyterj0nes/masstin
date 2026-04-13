@@ -177,6 +177,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     let mut images_processed = 0;
     let mut images_skipped = 0;
+    // Track skip reason per image so the analyst can see at a glance *why*
+    // N-M images were skipped when processing 100+ images. Keys are short
+    // category labels, values are counts.
+    let mut skip_breakdown: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
 
     for (img_idx, image_path) in all_image_files.iter().enumerate() {
         let ext = Path::new(image_path)
@@ -191,13 +196,23 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             .unwrap_or(image_path)
             .to_string();
 
-        let file_size_str = fs::metadata(image_path)
-            .map(|m| {
-                let gb = m.len() as f64 / 1_073_741_824.0;
+        // For VMDK, the descriptor file is tiny (~1 KB) but the real virtual
+        // disk lives in -flat / -s### extent files. Probe the descriptor for
+        // the declared capacity so the header shows the real disk size.
+        let size_bytes: Option<u64> = if ext == "vmdk" {
+            crate::vmdk::VmdkReader::probe_size(image_path)
+                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+        } else {
+            fs::metadata(image_path).ok().map(|m| m.len())
+        };
+        let file_size_str = match size_bytes {
+            Some(n) => {
+                let gb = n as f64 / 1_073_741_824.0;
                 if gb >= 1.0 { format!("{:.1} GB", gb) }
-                else { format!("{:.0} MB", m.len() as f64 / 1_048_576.0) }
-            })
-            .unwrap_or_else(|_| "? size".to_string());
+                else { format!("{:.0} MB", n as f64 / 1_048_576.0) }
+            }
+            None => "? size".to_string(),
+        };
 
         crate::banner::print_info("");
         crate::banner::print_phase_result(&format!(
@@ -237,6 +252,26 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             Err(e) => {
                 images_skipped += 1;
                 let msg = e.to_string();
+                let category: &'static str = if msg.contains("Incomplete VMDK") || msg.contains("VMDK descriptor") {
+                    "descriptor-only (missing -flat.vmdk)"
+                } else if msg.contains("streamOptimized VMDK truncated") {
+                    "streamOptimized truncated"
+                } else if msg.contains("streamOptimized VMDK") {
+                    "streamOptimized broken"
+                } else if msg.contains("BitLocker") {
+                    "BitLocker encrypted"
+                } else if msg.contains("No partitions found") {
+                    "no MBR/GPT partitions"
+                } else if msg.contains("No NTFS or ext4") {
+                    "unsupported filesystem"
+                } else if msg.contains("but no forensic artifacts") {
+                    "no forensic artifacts inside"
+                } else if msg.contains("Empty image") || msg.contains("empty image") {
+                    "empty (0 bytes)"
+                } else {
+                    "other error"
+                };
+                *skip_breakdown.entry(category).or_insert(0) += 1;
                 if msg.contains("Incomplete VMDK") {
                     let detail = if let Some(pos) = msg.find("flat extent '") {
                         let after = &msg[pos + 13..];
@@ -291,6 +326,22 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    // Emit per-image skip breakdown before the parse phases so the analyst
+    // can see *why* N-M of the N listed images produced no artifacts.
+    // Only worth printing when there was a non-trivial number of images.
+    if total_images > 1 && (images_processed + images_skipped) > 0 {
+        crate::banner::print_info("");
+        crate::banner::print_info(&format!(
+            "  Image summary: {} processed, {} skipped (of {} total)",
+            images_processed, images_skipped, total_images
+        ));
+        if !skip_breakdown.is_empty() {
+            for (reason, n) in &skip_breakdown {
+                crate::banner::print_info(&format!("    - {}: {}", reason, n));
+            }
+        }
+    }
+
     if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() && all_mountpoint_events.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
@@ -329,7 +380,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         // Merge both CSVs into the final output (deduplicated, sorted by time_created)
         crate::banner::print_info("Merging Windows + Linux timelines...");
         let merge_files_list = vec![win_tmp_str.clone(), linux_tmp_str.clone()];
-        match crate::merge::merge_files(&merge_files_list, output) {
+        match crate::merge::merge_files(&merge_files_list, output, None, None) {
             Ok(()) => {
                 crate::banner::print_phase_result("Merged Windows + Linux timeline generated");
             }

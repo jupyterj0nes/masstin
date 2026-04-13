@@ -113,6 +113,15 @@ pub struct Cli {
     #[arg(long)]
     filter_cortex_ip: Option<String>,
 
+    /// For load-neo4j / load-memgraph: emit one edge per CSV row instead of
+    /// collapsing duplicate (src, user, dst) triples into a single edge with
+    /// a `count` property. Useful when you want to see every individual
+    /// lateral movement event, typically combined with --start-time /
+    /// --end-time to restrict the view to a narrow time window. Also usable
+    /// with `merge` to produce an ungrouped intermediate CSV.
+    #[arg(long)]
+    ungrouped: bool,
+
     /// Scan all NTFS volumes on the system for VSS (parse-image-windows only, requires admin)
     #[arg(long)]
     all_volumes: bool,
@@ -277,6 +286,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 &config.file,
                 &config.database.as_ref().unwrap(),
                 &config.user.as_ref().unwrap(),
+                config.ungrouped,
+                config.start_time.as_ref(),
+                config.end_time.as_ref(),
             )
             .await;
         }
@@ -286,11 +298,19 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 &config.file,
                 &config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap_or(&default_user),
+                config.ungrouped,
+                config.start_time.as_ref(),
+                config.end_time.as_ref(),
             )
             .await;
         }
         ActionType::Merge => {
-            merge_files(&config.file, config.output.as_ref())?;
+            merge_files(
+                &config.file,
+                config.output.as_ref(),
+                config.start_time.as_ref(),
+                config.end_time.as_ref(),
+            )?;
         }
         ActionType::ParserElastic => {
             parse_events_elastic(&config.file, &config.directory, config.output.as_ref());

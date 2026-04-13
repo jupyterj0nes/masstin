@@ -4,12 +4,27 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use chrono::NaiveDateTime;
 
+/// Parse a user-supplied start/end time from the CLI flags.
+/// Accepts `YYYY-MM-DD HH:MM:SS [-0000]` (same format as Cortex flags).
+fn parse_window(raw: &str) -> Option<NaiveDateTime> {
+    let trimmed = raw.trim();
+    let base = if trimmed.len() >= 19 { &trimmed[..19] } else { trimmed };
+    NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S").ok()
+}
+
 const MASSTIN_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
 const MASSTIN_HEADER_OLD: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 
-pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), Box<dyn Error>> {
+pub fn merge_files(
+    files: &Vec<String>,
+    output: Option<&String>,
+    start_time: Option<&String>,
+    end_time: Option<&String>,
+) -> Result<(), Box<dyn Error>> {
     let mut merged_lines: Vec<(NaiveDateTime, String)> = Vec::new();
     let mut seen_lines: HashSet<String> = HashSet::new();
+    let start_dt = start_time.and_then(|s| parse_window(s));
+    let end_dt = end_time.and_then(|s| parse_window(s));
     
     // Step 1: Verify that all files have the correct header
     for file_path in files {
@@ -41,6 +56,12 @@ pub fn merge_files(files: &Vec<String>, output: Option<&String>) -> Result<(), B
                     .or_else(|_| NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S%.f+00:00"))
                     .or_else(|_| NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%dT%H:%M:%S+00:00"));
                 if let Ok(time_created) = time_created_result {
+                    if let Some(start) = start_dt {
+                        if time_created < start { continue; }
+                    }
+                    if let Some(end) = end_dt {
+                        if time_created > end { continue; }
+                    }
                     // Apply noise filter. For the 14-column format:
                     //   0=time 1=dst 2=event_type 3=event_id 4=logon_type
                     //   5=target_user 6=target_domain 7=src_computer 8=src_ip
