@@ -38,31 +38,40 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 ## Key Features
 
+### Core capabilities
+
 | Feature | Description | Details |
 |---------|-------------|---------|
-| **Unified cross-OS image parsing** | **NEW:** Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS), ext4 partitions get Linux parsing (auth.log, wtmp, etc.) — all merged into one timeline. Point `-d` at a folder with mixed Windows and Linux images and get a single chronological CSV. Zero manual steps, zero mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively finds all E01/VMDK/dd images, auto-detects OS, extracts all forensic artifacts from live + VSS, and generates a single unified timeline. Per-image artifact grouping in the summary shows exactly which image produced which events. One command, entire incident. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **BitLocker detection** | Automatically detects BitLocker-encrypted partitions by reading the `-FVE-FS-` signature at VBR offset 3. Warns the analyst with the exact partition offset and skips encrypted volumes — no wasted time on unreadable data. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **streamOptimized VMDK** | Full support for streamOptimized VMDKs (compressed grains with zlib) commonly found in OVA exports, cloud templates and vSphere backups. Also handles incomplete SFTP uploads via `.filepart` fallback for flat VMDKs. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs deleted by attackers. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs) | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Mounted volume support** | Point `-d D:` at a mounted volume or use `--all-volumes` to scan every NTFS disk — live EVTX + VSS recovery without imaging first | |
-| **UAL parsing** | Auto-detect and parse User Access Logging (SUM/UAL) ESE databases — 3-year server logon history surviving event log clearing | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-| **MountPoints2 registry** | Extract NTUSER.DAT from each user profile and parse MountPoints2 registry keys — reveals which user connected to which remote share (\\\\SERVER\\SHARE), with timestamps. Survives event log clearing. Supports dirty hives with transaction log recovery (.LOG1/.LOG2). | [MountPoints2](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
-| **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Implements **Tier 1** (full 64 KB chunks) and **Tier 2** (orphan record detection); **Tier 3** (template matching for partially overwritten records) is planned. Builds synthetic EVTX files grouped by provider and parses them through the full pipeline. Hardened against upstream `evtx` crate bugs (infinite loops, multi-GB OOMs) via thread isolation + `alloc_error_hook`. Corrupted chunks can be skipped with `--skip-offsets`. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
-| **Multi-artifact parsing** | 32+ Windows Event IDs from 11 EVTX sources + Scheduled Tasks XML + MountPoints2 registry + Linux logs + Winlogbeat JSON + Cortex XDR | [Artifacts](#supported-artifacts) |
-| **Custom parsers (YAML)** | `parse-custom` action parses arbitrary VPN / firewall / proxy logs via YAML rule files with 3 extractor types (csv, regex, keyvalue) and nested sub-extract. Ships with 8 researched rules and 31 sub-parsers out of the box: Palo Alto GlobalProtect (5), Palo Alto TRAFFIC with User-ID filter (2), Cisco AnyConnect (4), Cisco ASA (6), Fortinet SSL VPN (3), Fortinet FortiGate (4), OpenVPN (4), Squid proxy (3). Every rule is backed by vendor official documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema spec in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
+| **Unified cross-OS image parsing** | Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS + registry), ext4 partitions get Linux parsing (auth.log, wtmp, secure, audit) — all merged into one chronological timeline. Zero manual mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively walks it, finds every E01/VMDK/dd image, auto-detects OS, extracts all artifacts from live + VSS, and produces a single unified timeline. Per-image artifact grouping in the summary tells you exactly which image produced which events. One command, entire incident. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Unified 14-column timeline** | All sources merged into a single chronological CSV with a canonical 14-column schema. Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons. `logon_id` carried through for session correlation. | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
+| **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy logs via YAML rule files with three extractor types (csv, regex, keyvalue) and nested sub-extract with `strip_before` preprocessing. Ships with **8 researched rules / 31 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
+| **Noise filtering** | Four opt-in flags to cut output down to signal only: `--ignore-local` drops records with no usable source (loopback IPs, LOCAL markers, service/interactive logons without src, MSTSC/default_value placeholders); `--exclude-users`, `--exclude-hosts`, `--exclude-ips` accept comma-separated lists, glob wildcards (`svc_*`, `*$`) and `@file.txt` imports; `--exclude-ips` also accepts CIDR ranges (`10.0.0.0/8`). Combine with `--dry-run` for a pre-flight stats report showing exactly what would be filtered. | [Noise filtering](https://weinvestigateanything.com/en/tools/masstin-noise-filtering/) |
+| **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution. Ships with a Cypher query for **temporal path reconstruction** — find the chronologically coherent attacker route between any two nodes. | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
+| **Automation-ready** | `--silent` for Velociraptor / SOAR pipelines, single cross-platform binary for Windows / Linux / macOS, no runtime dependencies. | |
 
-> **Build note.** Core masstin builds on **stable Rust** with a plain `cargo build --release` — the default configuration does not require nightly. The EVTX carving path ships with an optional OOM-recovery hook (`nightly-oom-hook` Cargo feature) that uses `std::alloc::set_alloc_error_hook`, which is currently nightly-only. The official **pre-built release binaries** on the [Releases page](https://github.com/jupyterj0nes/masstin/releases) are compiled on nightly with this feature enabled, so end users downloading those binaries get the full OOM protection automatically — no Rust toolchain required at runtime. Contributors building from source on stable get a fully functional masstin; the OOM hook becomes a no-op stub, which only affects the 1% of forensic images with pathological BinXML corruption in carved chunks.
-| **Event classification** | Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Unified timeline** | All sources merged into a single chronological CSV with 14 standardized columns | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Cross-platform timeline** | Windows EVTX + Linux SSH + EDR data in one timeline — `parse-image` auto-merges across OS boundaries, or use `merge` for manual combination | |
-| **Compressed triage support** | Recursive ZIP extraction with auto-detection of forensic passwords | |
-| **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution | |
-| **Temporal path reconstruction** | Cypher query to find the chronologically coherent attacker route between two nodes | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
-| **Session correlation** | `logon_id` field for matching logon/logoff to determine session duration | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Linux smart inference** | Auto-detects hostname, infers year from `dpkg.log`, supports Debian and RHEL, RFC3164 and RFC5424 | [Linux artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| **Silent mode** | `--silent` flag for Velociraptor, SOAR and automation integration | |
-| **Cross-platform** | Windows, Linux & macOS — single binary | |
+### Input format support
+
+| Feature | Description | Details |
+|---------|-------------|---------|
+| **Forensic images** | E01 (ewf), VMDK (flat + sparse + streamOptimized with zlib-compressed grains), raw dd, multi-part images. Handles OVA exports, cloud templates, vSphere backups, and incomplete SFTP uploads via `.filepart` fallback. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Mounted volumes** | Point `-d D:` at a mounted drive or pass `--all-volumes` to scan every NTFS disk on the host — live EVTX + VSS recovery without imaging first. | |
+| **BitLocker detection** | Automatically detects BitLocker-encrypted partitions via the `-FVE-FS-` VBR signature, warns with the exact offset, and skips encrypted volumes instead of crashing on unreadable data. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **Compressed triage** | Recursive ZIP extraction with auto-detection of standard forensic passwords (`infected`, `kape`, etc.). | |
+
+### Artifact coverage
+
+| Feature | Description | Details |
+|---------|-------------|---------|
+| **Multi-source Windows EVTX** | 32+ Windows Event IDs across 11 EVTX providers: Security, TerminalServices-LocalSessionManager + RemoteConnectionManager, RDPClient, RDPCoreTS, SMBServer, SMBClient + Connectivity, WinRM, WMI-Activity, plus Scheduled Tasks XML. | [Artifacts](#supported-artifacts) |
+| **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs an attacker deleted from the live volume. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
+| **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Implements **Tier 1** (full 64 KB chunks) and **Tier 2** (orphan record detection); Tier 3 (template matching) is planned. Hardened against upstream `evtx` crate bugs (infinite loops, multi-GB OOMs) via thread isolation + `alloc_error_hook`. Corrupted chunks can be skipped with `--skip-offsets`. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
+| **UAL (User Access Logging)** | Auto-detect and parse SUM/UAL ESE databases — 3-year server logon history that survives Security event log clearing. Essential for Windows Server forensics where attackers wipe EVTX but forget UAL. | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
+| **MountPoints2 registry** | Extract NTUSER.DAT from every user profile and parse MountPoints2 registry keys — reveals which user connected to which remote share (`\\SERVER\SHARE`) with timestamps. Survives event log clearing. Supports dirty hives with transaction log recovery (`.LOG1` / `.LOG2`). | [MountPoints2](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
+| **Linux logs** | `auth.log`, `secure`, `wtmp`, `audit.log` with smart inference: auto-detects hostname, infers year from `dpkg.log`, supports Debian and RHEL, RFC3164 and RFC5424 formats. | [Linux artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+| **EDR & SIEM feeds** | Winlogbeat JSON export (`parser-elastic`), Cortex XDR legacy export (`parse-cortex`), Cortex XDR forensics EVTX export (`parse-cortex-evtx-forensics`). All feeds normalized to the same 14-column schema so they merge cleanly with host-side artifacts. | |
+
+> **Build note.** Core masstin builds on **stable Rust** with a plain `cargo build --release` — the default configuration does not require nightly. The EVTX carving path ships with an optional OOM-recovery hook (`nightly-oom-hook` Cargo feature) that uses `std::alloc::set_alloc_error_hook`, currently nightly-only. The **pre-built release binaries** on the [Releases page](https://github.com/jupyterj0nes/masstin/releases) are compiled on nightly with this feature enabled, so end users downloading those binaries get full OOM protection automatically — no Rust toolchain required at runtime. Contributors building from source on stable get a fully functional masstin; the OOM hook becomes a no-op stub, which only affects the 1% of forensic images with pathological BinXML corruption in carved chunks.
 
 ## Install
 
@@ -273,6 +282,79 @@ The library currently covers:
 | `proxy/squid.yaml` | 3 | Squid access.log CONNECT tunnel, HTTP, TCP_DENIED |
 
 Every rule is researched against vendor official documentation and validated against realistic sample log lines committed under each category's `samples/` directory. See [`rules/README.md`](rules/README.md) for the full references table and [`docs/custom-parsers.md`](docs/custom-parsers.md) for the schema specification.
+
+### Noise filtering: `--ignore-local` and `--exclude-*`
+
+Real forensic cases often generate CSVs with 50%+ of rows that carry no useful lateral movement signal — service logons from LOCAL SYSTEM, RDP failures where the source IP was never captured, brute force attempts from noisy internal jumpboxes, and so on. Masstin ships with four opt-in flags that let you cut the output down to just the records that matter. All four are off by default, so existing workflows are not affected.
+
+```bash
+# Drop records with no usable source (loopback, service/interactive logons
+# without src, LOCAL markers, MSTSC/default_value placeholders)
+masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local
+
+# Exclude known noisy service accounts and machine accounts
+masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
+    --exclude-users 'svc_*,*$,@corpsvc.txt'
+
+# Exclude known jumpbox hostnames
+masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
+    --exclude-hosts 'JUMP01,JUMP02,*-MON,@jumpboxes.txt'
+
+# Exclude internal subnets via CIDR
+masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
+    --exclude-ips '10.0.0.0/8,172.16.0.0/12,fe80::/10'
+
+# Pre-flight: --dry-run with any filter shows a stats breakdown without
+# writing the CSV — validate the filter composition before committing
+masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local --dry-run
+
+# Re-filter an existing CSV via merge (no re-parsing of images)
+masstin -a merge -f old-timeline.csv --ignore-local --exclude-users @svc.txt \
+    -o filtered.csv
+```
+
+**Filter rules**
+
+| Flag | Drops records where... | Applies to |
+|---|---|---|
+| `--ignore-local` | Neither src_ip nor src_computer carries a useful value. IP useful = valid, non-loopback, non-link-local. Computer useful = non-empty, non-`-`, non-`LOCAL`, non-`MSTSC`, non-`default_value`, non-self-reference. | All parser actions |
+| `--exclude-users LIST` | `subject_user_name` OR `target_user_name` matches any glob in the list (case-insensitive). | All parser actions + `merge` |
+| `--exclude-hosts LIST` | `dst_computer` OR `src_computer` matches any glob. | All parser actions + `merge` |
+| `--exclude-ips LIST` | `src_ip` matches any individual IP or CIDR range in the list. | All parser actions + `merge` |
+
+**List syntax** (same for all three `--exclude-*` flags):
+
+- **Inline CSV:** `svc_backup,svc_monitor,svc_sql`
+- **File import:** `@users.txt` — one entry per line, `#` for comments
+- **Mix:** `svc_foo,@bigfile.txt,admin*`
+- **Glob wildcards:** `svc_*` (prefix), `*$` (suffix, matches machine accounts), `*admin*` (contains), `exact_match` (exact)
+- **CIDR (ips only):** `10.0.0.0/24`, `fe80::/10`, individual IPs
+
+**Filter summary**
+
+After every run with any filter flag active, masstin prints a breakdown:
+
+```
+  🧹 Filter summary:
+     Total records seen: 178,274
+     Total kept:         110,070 (61.7%)
+     Total filtered:     68,204 (38.3%)
+
+     --ignore-local:     68,204 (38.3%)
+        both_noise             67,703
+        self_reference            134
+        service_logon             306
+        interactive_logon          21
+        literal_LOCAL              39
+        loopback_ip                 1
+     --exclude-users:       523 (0.3%)   [3 patterns]
+     --exclude-hosts:       245 (0.1%)   [2 patterns]
+     --exclude-ips:          12 (0.0%)   [1 ranges]
+```
+
+The stats always attribute each filtered record to exactly one cause (the first filter layer that matched), so the numbers add up. Use `--dry-run` to see this report without writing the CSV.
+
+**Safety guarantee:** records with a valid routable public `src_ip` are never filtered by `--ignore-local`, regardless of what `src_computer` contains. This preserves brute force and external attack signal even when Windows couldn't resolve a workstation name — the most common missing-metadata case in real forensics.
 
 ### EVTX carving: last-resort recovery from unallocated space
 
