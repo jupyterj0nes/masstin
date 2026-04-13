@@ -611,21 +611,29 @@ fn substitute(template: &str, ctx: &HashMap<String, String>) -> String {
 // ─── CSV output ─────────────────────────────────────────────────────────────
 
 fn write_csv(path: &str, records: &[LogData]) -> Result<(), String> {
+    // Canonical masstin CSV schema — must match MASSTIN_HEADER in merge.rs
+    // so that parse-custom output is compatible with merge / load-neo4j /
+    // load-memgraph. Field order:
+    //   time_created, dst_computer, event_type, event_id, logon_type,
+    //   target_user_name, target_domain_name, src_computer, src_ip,
+    //   subject_user_name, subject_domain_name, logon_id, detail, log_filename
+    //
+    // LogData struct uses historical field names internally; the mapping is:
+    //   LogData.computer          → dst_computer
+    //   LogData.workstation_name  → src_computer
+    //   LogData.ip_address        → src_ip
+    //   LogData.filename          → log_filename
     let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
     wtr.write_record(&[
-        "time_created", "computer", "event_type", "event_id",
-        "subject_user_name", "subject_domain_name",
-        "target_user_name", "target_domain_name",
-        "logon_type", "workstation_name", "ip_address", "logon_id",
-        "filename", "detail",
+        "time_created", "dst_computer", "event_type", "event_id", "logon_type",
+        "target_user_name", "target_domain_name", "src_computer", "src_ip",
+        "subject_user_name", "subject_domain_name", "logon_id", "detail", "log_filename",
     ]).map_err(|e| e.to_string())?;
     for r in records {
         wtr.write_record(&[
-            &r.time_created, &r.computer, &r.event_type, &r.event_id,
-            &r.subject_user_name, &r.subject_domain_name,
-            &r.target_user_name, &r.target_domain_name,
-            &r.logon_type, &r.workstation_name, &r.ip_address, &r.logon_id,
-            &r.filename, &r.detail,
+            &r.time_created, &r.computer, &r.event_type, &r.event_id, &r.logon_type,
+            &r.target_user_name, &r.target_domain_name, &r.workstation_name, &r.ip_address,
+            &r.subject_user_name, &r.subject_domain_name, &r.logon_id, &r.detail, &r.filename,
         ]).map_err(|e| e.to_string())?;
     }
     wtr.flush().map_err(|e| e.to_string())?;

@@ -140,7 +140,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             for data in event_data.Datas {
                                 if let Some(name) = data.Name {
                                     if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                        *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
                                     }
                                 }
                             }
@@ -291,7 +291,7 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             for data in event_data.Datas {
                                 if let Some(name) = data.Name {
                                     if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                        *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
                                     }
                                 }
                             }
@@ -353,7 +353,7 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                         for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
                                 }
                             }
                         }
@@ -413,7 +413,7 @@ pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
                                 }
                             }
                         }
@@ -638,7 +638,7 @@ pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
                         for data in event_data.Datas {
                             if let Some(name) = data.Name {
                                 if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"default_value".to_string()).clone();
+                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
                                 }
                             }
                         }
