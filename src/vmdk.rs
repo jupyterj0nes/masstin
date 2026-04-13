@@ -116,6 +116,46 @@ impl VmdkReader {
         self.total_size
     }
 
+    /// Cheap size probe: returns the declared virtual disk size without
+    /// opening extent files or validating sparse headers. Used for the
+    /// header display so descriptor-based VMDKs don't report ~1 KB.
+    /// Falls back to None on parse errors — caller should fall back to
+    /// fs::metadata().len().
+    pub fn probe_size(path: &str) -> Option<u64> {
+        let mut file = File::open(path).ok()?;
+        let mut magic_buf = [0u8; 4];
+        file.read_exact(&mut magic_buf).ok()?;
+        let magic = u32::from_le_bytes(magic_buf);
+
+        if magic == SPARSE_MAGIC {
+            // Monolithic sparse — size is in the header capacity field
+            file.seek(SeekFrom::Start(0)).ok()?;
+            let h = Self::read_sparse_header_at_current(&mut file).ok()?;
+            return Some(h.capacity * SECTOR_SIZE);
+        }
+
+        // Descriptor: read first 64 KB as text and sum extent sector counts
+        drop(file);
+        let mut file = File::open(path).ok()?;
+        let mut buf = vec![0u8; 65536];
+        let n = file.read(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf[..n]);
+        if !text.contains("# Disk DescriptorFile") && !text.contains("createType") {
+            return None;
+        }
+        let mut total_sectors: u64 = 0;
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("RW ") && !line.starts_with("RDONLY ") && !line.starts_with("NOACCESS ") {
+                continue;
+            }
+            if let Ok(parts) = Self::parse_extent_line(line) {
+                total_sectors = total_sectors.saturating_add(parts.sectors);
+            }
+        }
+        if total_sectors == 0 { None } else { Some(total_sectors * SECTOR_SIZE) }
+    }
+
     // -------------------------------------------------------------------------
     //  Descriptor parsing
     // -------------------------------------------------------------------------
@@ -295,6 +335,10 @@ impl VmdkReader {
             let file_size = file.seek(SeekFrom::End(0))
                 .map_err(|e| format!("Cannot seek to end: {}", e))?;
 
+            // Declared capacity from the first header — lets us spot
+            // truncated files (declared > on-disk) and report it cleanly.
+            let declared_bytes = header.capacity.saturating_mul(SECTOR_SIZE);
+
             let mut footer_header = None;
             let mut debug_info = format!("file_size={}", file_size);
             for offset_from_end in &[1024u64, 1536, 2048, 512] {
@@ -311,8 +355,20 @@ impl VmdkReader {
                 }
             }
 
-            let footer_header = footer_header
-                .ok_or(format!("streamOptimized VMDK: no valid footer found ({}). File may be truncated", debug_info))?;
+            let footer_header = footer_header.ok_or_else(|| {
+                let gb = |b: u64| b as f64 / 1_073_741_824.0;
+                if declared_bytes > 0 && file_size < declared_bytes {
+                    format!(
+                        "streamOptimized VMDK truncated: declared {:.1} GB, only {:.1} GB on disk — footer missing ({})",
+                        gb(declared_bytes), gb(file_size), debug_info
+                    )
+                } else {
+                    format!(
+                        "streamOptimized VMDK: no valid footer found (declared {:.1} GB, file {:.1} GB, {})",
+                        gb(declared_bytes), gb(file_size), debug_info
+                    )
+                }
+            })?;
             if footer_header.gd_offset != GD_AT_END && footer_header.gd_offset != 0 {
                 header.gd_offset = footer_header.gd_offset;
             } else {
