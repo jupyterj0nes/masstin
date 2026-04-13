@@ -135,30 +135,64 @@ pub(crate) struct TriageInfo {
 /// Detect what kind of triage package a ZIP is, based on its top-level entry list.
 /// Returns None if the ZIP doesn't match any known triage layout.
 pub(crate) fn detect_triage_type(entries: &[String]) -> Option<TriageType> {
-    // 1. Cortex XDR — strongest unique marker is "cortex-xdr-payload.log".
-    //    No other tool uses this filename, so any match is conclusive.
-    let has_cortex_payload = entries.iter().any(|n| {
+    // 1. Cortex XDR Offline Collector — REQUIRE BOTH `output/manifest.json`
+    //    AND `output/cortex-xdr-payload.log` together at the OUTER zip root.
+    //
+    //    The single-file marker (`cortex-xdr-payload.log` anywhere) is too
+    //    loose: each Cortex XDR collection contains ~80 inner script_output.zip
+    //    archives (one per artifact module), and EVERY one of them has
+    //    `cortex-xdr-payload.log` at ITS root. If a user has an extracted
+    //    Cortex XDR triage on disk, the directory walker hits each of those
+    //    inner zips and would fire ~80 false-positive "Triage found" lines.
+    //
+    //    The combination `output/manifest.json` + `output/cortex-xdr-payload.log`
+    //    only occurs at the outer offline_collector_output_*.zip top level.
+    //    Inner script_output.zip files have neither (they have a
+    //    different `manifest.json` at their own root, not under `output/`,
+    //    and their cortex-xdr-payload.log is not under `output/` either).
+    let has_outer_manifest = entries.iter().any(|n| {
+        let lower = n.to_lowercase();
+        lower == "output/manifest.json"
+    });
+    let has_outer_payload = entries.iter().any(|n| {
         let lower = n.to_lowercase();
         lower == "output/cortex-xdr-payload.log"
-            || lower.ends_with("/cortex-xdr-payload.log")
-            || lower == "cortex-xdr-payload.log"
     });
-    if has_cortex_payload {
+    if has_outer_manifest && has_outer_payload {
         return Some(TriageType::CortexXdr);
     }
 
-    // 2. Velociraptor Offline Collector — root files combine
-    //      client_info.json + (collection_context.json OR uploads.json)
-    //    Encrypted variant uses metadata.json + data.zip instead.
-    let has_client_info = entries.iter().any(|n| n == "client_info.json");
-    let has_collection_context = entries.iter().any(|n| n == "collection_context.json");
-    let has_uploads_json = entries.iter().any(|n| n == "uploads.json");
+    // 2. Velociraptor Offline Collector — three matching paths.
+    //    a) Root files combine
+    //         client_info.json + (collection_context.json OR uploads.json)
+    //    b) Encrypted variant: metadata.json + data.zip at root
+    //    c) Re-zipped extract heuristic: any path containing `uploads/auto/`
+    //       or `uploads/ntfs/`. These subdirectories are unique to
+    //       Velociraptor (the offline collector stores files via the
+    //       ntfs / auto accessors at those paths) and survive re-zipping
+    //       even when the original root JSON metadata files end up under
+    //       a subdirectory after extraction + re-zip.
+    //
+    //    The match patterns accept the marker at any level (root or under
+    //    a subdirectory) so a user who extracted a Velociraptor zip and
+    //    then re-zipped the resulting folder still gets correctly detected
+    //    as Velociraptor instead of falling through to the KAPE fallback.
+    let has_client_info = entries.iter().any(|n| n == "client_info.json" || n.ends_with("/client_info.json"));
+    let has_collection_context = entries.iter().any(|n| n == "collection_context.json" || n.ends_with("/collection_context.json"));
+    let has_uploads_json = entries.iter().any(|n| n == "uploads.json" || n.ends_with("/uploads.json"));
     if has_client_info && (has_collection_context || has_uploads_json) {
         return Some(TriageType::Velociraptor);
     }
-    let has_metadata = entries.iter().any(|n| n == "metadata.json");
-    let has_data_zip = entries.iter().any(|n| n == "data.zip");
+    let has_metadata = entries.iter().any(|n| n == "metadata.json" || n.ends_with("/metadata.json"));
+    let has_data_zip = entries.iter().any(|n| n == "data.zip" || n.ends_with("/data.zip"));
     if has_metadata && has_data_zip {
+        return Some(TriageType::Velociraptor);
+    }
+    let has_vr_uploads = entries.iter().any(|n| {
+        let normalized = n.replace('\\', "/");
+        normalized.contains("uploads/auto/") || normalized.contains("uploads/ntfs/")
+    });
+    if has_vr_uploads {
         return Some(TriageType::Velociraptor);
     }
 
