@@ -236,6 +236,16 @@ pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_fullpath
             style(artifact_count).yellow(),
             style("(EVTX or other matched files)").dim(),
         );
+    } else {
+        // Always show the line — analyst needs visual confirmation that the
+        // detection happened even when nothing usable was found inside (very
+        // common with Velociraptor collections that ran a parsing artifact
+        // without uploading raw EVTX, so the zip has only JSON results).
+        eprintln!("           {} {} {}",
+            style("entries inside:").dim(),
+            style("0").dim(),
+            style("(no raw .evtx files — likely parsed JSON artifacts only)").dim(),
+        );
     }
 }
 
@@ -318,11 +328,27 @@ pub fn print_artifact_detail_grouped(artifacts: &[(String, String, Option<u32>, 
     if artifacts.is_empty() { return; }
     eprintln!();
 
-    // Group preserving first-seen order of sources.
+    // Group preserving first-seen order of sources. Within each source,
+    // dedupe items by `(name, vss_idx)` and SUM their counts. This collapses
+    // duplicate entries that happen when two physical copies of the same
+    // image file (different paths but same filename) get processed under
+    // the same `[IMAGE]` source label and produce identical (name, None)
+    // tuples. VSS entries are preserved separately because their `vss_idx`
+    // is `Some(N)` while live entries are `None`.
+    //
+    // The summed counts are PRE-deduplication totals (i.e. raw work done
+    // by the parser), matching the per-source `events total` line at the
+    // top of each group. The global dedup count printed at the end of
+    // phase 3 explains the gap between the breakdown total and the final
+    // CSV row count.
     let mut grouped: Vec<(String, Vec<(String, Option<u32>, usize)>)> = Vec::new();
     for (source, name, vss_idx, count) in artifacts {
         if let Some(g) = grouped.iter_mut().find(|(s, _)| s == source) {
-            g.1.push((name.clone(), *vss_idx, *count));
+            if let Some(existing) = g.1.iter_mut().find(|(n, v, _)| n == name && v == vss_idx) {
+                existing.2 += count;
+            } else {
+                g.1.push((name.clone(), *vss_idx, *count));
+            }
         } else {
             grouped.push((source.clone(), vec![(name.clone(), *vss_idx, *count)]));
         }
