@@ -206,8 +206,12 @@ pub fn print_search_results_v2(
 }
 
 /// Print a "Triage found" line during the discovery phase, with the type,
-/// optional hostname, the source filename and the artifact count inside.
-pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_filename: &str, artifact_count: usize) {
+/// optional hostname, the FULL path to the source zip, and the artifact
+/// count inside. Full path (not just filename) is critical because real
+/// cases often have duplicate copies of the same triage zip in different
+/// subfolders (e.g. SFTP/.../host.zip vs To-Unit42/.../host.zip) and the
+/// analyst needs to see they're physically different files.
+pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_fullpath: &str, artifact_count: usize) {
     if is_silent() { return; }
     let host_part = match hostname {
         Some(h) => format!(" {}", style(format!("[host: {}]", h)).dim()),
@@ -219,9 +223,12 @@ pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_filename
         style(type_label).white().bold(),
         host_part,
     );
+    // Normalise backslashes to forward slashes for consistency with the
+    // rest of the output and to work well on RDP / conhost.
+    let pretty_path = zip_fullpath.replace('\\', "/");
     eprintln!("           {} {}",
         style("source:").dim(),
-        style(zip_filename).white(),
+        style(pretty_path).white(),
     );
     if artifact_count > 0 {
         eprintln!("           {} {} {}",
@@ -298,22 +305,26 @@ pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
 }
 
 /// New per-source breakdown printer used by parse-windows + parse-linux.
-/// Receives `(source_label, artifact_short_name, count)` tuples already
-/// labeled by the caller (see parse::source_label_for_evtx). Source labels
-/// look like "[IMAGE]  HRServer.e01", "[TRIAGE: Cortex XDR]  ... [host: X]",
-/// "[ARCHIVE]  some.zip", "[FOLDER]  D:/evidence/loose".
-pub fn print_artifact_detail_grouped(artifacts: &[(String, String, usize)]) {
+/// Receives `(source_label, artifact_short_name, vss_index, count)` tuples.
+///
+/// `vss_index = None` means the artifact came from a live partition (or from
+/// a context without VSS semantics like a triage zip); `Some(N)` means it
+/// came from VSS snapshot N of the same image. Within each source group the
+/// items are sorted live-first then by VSS index, and VSS entries are
+/// rendered with a "[VSS]" / "[VSS-N]" suffix so the analyst can tell at a
+/// glance which events were recovered from a shadow copy.
+pub fn print_artifact_detail_grouped(artifacts: &[(String, String, Option<u32>, usize)]) {
     if is_silent() { return; }
     if artifacts.is_empty() { return; }
     eprintln!();
 
-    // Group preserving first-seen order of sources
-    let mut grouped: Vec<(String, Vec<(String, usize)>)> = Vec::new();
-    for (source, name, count) in artifacts {
+    // Group preserving first-seen order of sources.
+    let mut grouped: Vec<(String, Vec<(String, Option<u32>, usize)>)> = Vec::new();
+    for (source, name, vss_idx, count) in artifacts {
         if let Some(g) = grouped.iter_mut().find(|(s, _)| s == source) {
-            g.1.push((name.clone(), *count));
+            g.1.push((name.clone(), *vss_idx, *count));
         } else {
-            grouped.push((source.clone(), vec![(name.clone(), *count)]));
+            grouped.push((source.clone(), vec![(name.clone(), *vss_idx, *count)]));
         }
     }
 
@@ -322,31 +333,59 @@ pub fn print_artifact_detail_grouped(artifacts: &[(String, String, usize)]) {
         style(format!("Lateral movement events grouped by source ({} sources):", grouped.len())).bold(),
     );
 
-    for (source, items) in &grouped {
-        let total: usize = items.iter().map(|(_, c)| c).sum();
+    for (source, items) in &mut grouped {
+        let total: usize = items.iter().map(|(_, _, c)| c).sum();
         // Pick a color hint based on the source tag prefix so the user can
         // visually scan IMAGE / TRIAGE / ARCHIVE / FOLDER groups.
         let styled_source = if source.starts_with("[IMAGE]") {
-            style(source).cyan().bold().to_string()
+            style(source.clone()).cyan().bold().to_string()
         } else if source.starts_with("[TRIAGE:") {
-            style(source).yellow().bold().to_string()
+            style(source.clone()).yellow().bold().to_string()
         } else if source.starts_with("[ARCHIVE]") {
-            style(source).white().bold().to_string()
+            style(source.clone()).white().bold().to_string()
         } else {
             // [FOLDER] or unknown prefix
-            style(source).white().to_string()
+            style(source.clone()).white().to_string()
         };
+
+        // Sort live-first (None), then by VSS index, then by name.
+        items.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        });
+
+        // Decide whether VSS entries need an index suffix. If more than one
+        // distinct VSS snapshot appears inside this source group, we must
+        // show "[VSS-0]", "[VSS-1]"... to disambiguate. If only one VSS
+        // snapshot is present we render a cleaner "[VSS]" with no index.
+        use std::collections::HashSet;
+        let distinct_vss: HashSet<u32> = items
+            .iter()
+            .filter_map(|(_, v, _)| *v)
+            .collect();
+        let needs_vss_index = distinct_vss.len() > 1;
+
         eprintln!();
         eprintln!("        {} {}  {}",
             style("=>").green().bold(),
             styled_source,
             style(format!("({} events total)", total)).dim(),
         );
-        for (name, count) in items {
-            eprintln!("           {} {} {}",
+        for (name, vss_idx, count) in items.iter() {
+            let suffix = match vss_idx {
+                None => String::new(),
+                Some(n) => {
+                    if needs_vss_index {
+                        format!("  {}", style(format!("[VSS-{}]", n)).yellow())
+                    } else {
+                        format!("  {}", style("[VSS]").yellow())
+                    }
+                }
+            };
+            eprintln!("           {} {} {}{}",
                 style("-").dim(),
                 style(name).white(),
                 style(format!("({})", count)).dim(),
+                suffix,
             );
         }
     }

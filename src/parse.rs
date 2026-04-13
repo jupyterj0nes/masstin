@@ -328,17 +328,30 @@ pub(crate) fn source_label_for_evtx(
             // zip_path is "outer.zip" or "outer.zip -> nested.zip"; we display
             // the OUTER zip and use it as triage map key.
             let outer = zip_path.split(" -> ").next().unwrap_or(zip_path);
-            let zip_name = std::path::Path::new(outer)
+            let path = std::path::Path::new(outer);
+            let zip_name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(outer);
+            // Include the immediate parent directory in the displayed name so
+            // two physical copies of the same triage zip living in different
+            // folders (e.g. SFTP/.../host.zip vs To-Unit42/.../host.zip)
+            // appear as DIFFERENT source groups instead of collapsing into
+            // one bucket with duplicated entries inside.
+            let parent_hint = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| format!("{}/", s))
+                .unwrap_or_default();
+            let display_name = format!("{}{}", parent_hint, zip_name);
             if let Some(info) = triages.get(outer) {
                 let host_part = info.hostname.as_ref()
                     .map(|h| format!("  [host: {}]", h))
                     .unwrap_or_default();
-                return format!("[TRIAGE: {}]  {}{}", info.kind.short_label(), zip_name, host_part);
+                return format!("[TRIAGE: {}]  {}{}", info.kind.short_label(), display_name, host_part);
             }
-            format!("[ARCHIVE]  {}", zip_name)
+            format!("[ARCHIVE]  {}", display_name)
         }
     }
 }
@@ -372,6 +385,27 @@ fn extract_image_name_from_extract_path(path: &str) -> Option<String> {
         }
     }
     Some(dir_name.to_string())
+}
+
+/// Detect a VSS snapshot index in an extracted-EVTX path.
+///
+/// parse-image extracts EVTX files from forensic images into a temp directory
+/// whose path contains the marker "masstin_image_extract/". Within that, live
+/// partitions go to "partition_<N>/" and VSS snapshots go to
+/// "partition_<N>_vss_<M>/". The latter is what we look for.
+///
+///   ".../masstin_image_extract/HRServer.e01/evtx_extracted/partition_0/Security.evtx"
+///       → None (live)
+///   ".../masstin_image_extract/HRServer.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
+///       → Some(0) (VSS snapshot 0)
+///   ".../masstin_image_extract/HRServer.e01/evtx_extracted/partition_1_vss_2/Security.evtx"
+///       → Some(2) (VSS snapshot 2)
+pub(crate) fn detect_vss_index(path: &str) -> Option<u32> {
+    let normalized = path.replace('\\', "/");
+    let pos = normalized.find("_vss_")?;
+    let after = &normalized[pos + "_vss_".len()..];
+    let end = after.find('/').unwrap_or(after.len());
+    after[..end].parse::<u32>().ok()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1751,11 +1785,27 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
 // MAIN FUNCTION TO PARSE EVENTS
 // ---------------------------------------------------------------------------------------
 pub fn parse_events(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>) {
-    parse_events_ex(files, directories, output, &[]);
+    parse_events_ex(files, directories, output, &[], &[]);
 }
 
-/// Parse events with optional extra LogData entries (e.g., from Scheduled Tasks)
-pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: Option<&String>, extra_events: &[LogData]) {
+/// Parse events with optional extra LogData entries from external sources.
+///
+/// `extra_task_events`: events synthesised from remote Scheduled Tasks XML
+///   (parsed by parse_image_windows when it walks a forensic image).
+/// `extra_mountpoint_events`: events synthesised from MountPoints2 registry
+///   entries (parsed from NTUSER.DAT hives extracted by parse_image_windows).
+///
+/// Both vectors are added to the final timeline AND counted in the discovery
+/// summary inside the [1/3] phase, with their own labelled lines next to the
+/// EVTX count, so the analyst sees one coherent block instead of having
+/// counters leak out before the phase header.
+pub fn parse_events_ex(
+    files: &Vec<String>,
+    directories: &Vec<String>,
+    output: Option<&String>,
+    extra_task_events: &[LogData],
+    extra_mountpoint_events: &[LogData],
+) {
     let start_time = std::time::Instant::now();
 
     if is_debug_mode() {
@@ -1811,13 +1861,17 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         .collect();
 
     // Print "Triage found" lines BEFORE the EVTX count summary so the analyst
-    // sees the high-value detections at the top of phase 1.
+    // sees the high-value detections at the top of phase 1. We pass the FULL
+    // zip path (not just filename) because real cases often have duplicate
+    // copies of the same host's triage in different folders and the analyst
+    // needs to see they're physically different files.
     for t in &triages {
-        let zip_name = std::path::Path::new(&t.zip_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&t.zip_path);
-        crate::banner::print_triage_found(t.kind.label(), t.hostname.as_deref(), zip_name, t.artifact_count);
+        crate::banner::print_triage_found(
+            t.kind.label(),
+            t.hostname.as_deref(),
+            &t.zip_path,
+            t.artifact_count,
+        );
     }
 
     // Count ZIPs vs direct files for the summary
@@ -1852,8 +1906,14 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
     if !all_ual_files.is_empty() {
         crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
     }
-    if !extra_events.is_empty() {
-        crate::banner::print_search_result_line(extra_events.len(), "remote Scheduled Task events");
+    // Both extras (scheduled tasks + MountPoints2) get printed here inside
+    // phase 1, with their own labels, so the analyst sees the full discovery
+    // summary in one block instead of having counters leak out before [1/3].
+    if !extra_mountpoint_events.is_empty() {
+        crate::banner::print_search_result_line(extra_mountpoint_events.len(), "MountPoints2 remote share events");
+    }
+    if !extra_task_events.is_empty() {
+        crate::banner::print_search_result_line(extra_task_events.len(), "remote Scheduled Task events");
     }
 
     if is_debug_mode() {
@@ -1865,8 +1925,12 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
     let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
     let mut skipped_no_events: usize = 0;
     let mut parsed_files: usize = 0;
-    // (source_label, evtx_short_name, count) — phase 2 grouping by source.
-    let mut artifact_details: Vec<(String, String, usize)> = Vec::new();
+    // (source_label, evtx_short_name, vss_index, count)
+    //   vss_index = None for live artifacts, Some(N) for VSS snapshot N
+    // The phase-2 breakdown sorts each source's items live-first then by
+    // VSS index, and renders VSS entries with a "[VSS]" / "[VSS-N]" suffix
+    // so the analyst can see at a glance which events came from a snapshot.
+    let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
 
     for evtxfile in &vec_filenames {
         let short_name = match &evtxfile {
@@ -1894,7 +1958,14 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         } else {
             parsed_files += 1;
             let source = source_label_for_evtx(evtxfile, &triage_map);
-            artifact_details.push((source, short_name.clone(), count));
+            // Detect VSS index from the underlying path (only applies to
+            // EvtxLocation::File paths that came from parse-image's temp
+            // extract dir; EvtxLocation::ZipEntry never has VSS).
+            let vss_idx = match evtxfile {
+                EvtxLocation::File(path) => detect_vss_index(path),
+                EvtxLocation::ZipEntry { .. } => None,
+            };
+            artifact_details.push((source, short_name.clone(), vss_idx, count));
             if is_debug_mode() {
                 println!("[INFO] {} events from {}", count, short_name);
             }
@@ -1917,7 +1988,10 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
                     .and_then(|n| n.to_str())
                     .unwrap_or(mdb_name)
                     .to_string();
-                artifact_details.push((src, short, *count));
+                // UAL databases live in the same per-partition temp dir as
+                // EVTX files, so the VSS detection applies here too.
+                let vss_idx = detect_vss_index(mdb_name);
+                artifact_details.push((src, short, vss_idx, *count));
             }
             log_data.extend(ual_events);
         }
@@ -1929,11 +2003,18 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
     }
 
-    // Add extra events (e.g., Scheduled Tasks, WMI remote)
-    let extra_count = extra_events.len();
-    if extra_count > 0 {
-        log_data.extend_from_slice(extra_events);
-        parsed_files += extra_count;
+    // Add both extras streams (Scheduled Tasks + MountPoints2) to the final
+    // timeline. They come from parse_image_windows's registry / XML parsing
+    // and are counted as "parsed_files" so the summary line reflects them.
+    let extra_task_count = extra_task_events.len();
+    if extra_task_count > 0 {
+        log_data.extend_from_slice(extra_task_events);
+        parsed_files += extra_task_count;
+    }
+    let extra_mp_count = extra_mountpoint_events.len();
+    if extra_mp_count > 0 {
+        log_data.extend_from_slice(extra_mountpoint_events);
+        parsed_files += extra_mp_count;
     }
 
     // Phase 3: Generate output

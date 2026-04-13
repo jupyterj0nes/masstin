@@ -848,14 +848,17 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     }
 
     // Print triage detections right after the discovery walk, before the
-    // overall count summary. Same formatting helper as parse-windows.
+    // overall count summary. Same formatting helper as parse-windows — we
+    // pass the full zip path so the analyst can tell two physically
+    // distinct copies of the same host's triage apart.
     if !quiet {
         for t in &triages {
-            let zip_name = std::path::Path::new(&t.zip_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&t.zip_path);
-            crate::banner::print_triage_found(t.kind.label(), t.hostname.as_deref(), zip_name, 0);
+            crate::banner::print_triage_found(
+                t.kind.label(),
+                t.hostname.as_deref(),
+                &t.zip_path,
+                0,
+            );
         }
     }
     let zip_count = archives_scanned;
@@ -899,9 +902,10 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     let mut collected = Vec::<RawEvt>::new();
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
-    // (source_label, artifact_short_name, count) — same structure as
-    // parse-windows so banner::print_artifact_detail_grouped can render it.
-    let mut artifact_details: Vec<(String, String, usize)> = Vec::new();
+    // (source_label, artifact_short_name, vss_index, count) — same structure
+    // as parse-windows so banner::print_artifact_detail_grouped can render it.
+    // Linux logs never come from VSS snapshots, so vss_index is always None.
+    let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
     let mut year_cache: HashMap<PathBuf, i32> = HashMap::new();
 
     for path in &targets {
@@ -985,7 +989,8 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
                 .and_then(|n| n.to_str())
                 .unwrap_or(&path_str)
                 .to_string();
-            artifact_details.push((source, short, count));
+            // Linux logs never come from VSS; always None.
+            artifact_details.push((source, short, None, count));
         }
         collected.extend(parsed);
 
