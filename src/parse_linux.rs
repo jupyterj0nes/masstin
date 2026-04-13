@@ -819,9 +819,13 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
                 archives_scanned += 1;
                 let zip_path_str = p.to_string_lossy().to_string();
 
-                // Detect triage type from top-level entries BEFORE extraction.
+                // Detect triage type from top-level entries AND zip path
+                // BEFORE extraction. The filename + path heuristics catch
+                // re-zipped Velociraptor extracts whose JSON metadata
+                // markers are missing (happens when users extract a VR
+                // collection and re-zip only the C/ subtree).
                 let triage_kind = crate::parse::read_zip_top_entries(&p)
-                    .and_then(|entries| crate::parse::detect_triage_type(&entries));
+                    .and_then(|entries| crate::parse::detect_triage_type(&zip_path_str, &entries));
 
                 let extracted = extract_zips_recursive(&p, &temp_dir);
 

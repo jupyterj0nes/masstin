@@ -132,9 +132,47 @@ pub(crate) struct TriageInfo {
     pub artifact_count: usize,    // EVTX or Linux-log entries inside
 }
 
-/// Detect what kind of triage package a ZIP is, based on its top-level entry list.
+/// Check whether a zip filename (stem, no extension) follows the
+/// Velociraptor offline collector naming convention:
+///   `<LETTER>_<YYYYMMDD>-<HHMMSS>_<username>`           (e.g. F_20260406-182920_MANAN.SHAH)
+///   `Extracted_<LETTER>_<YYYYMMDD>-<HHMMSS>_<username>` (re-zip of an extract)
+///
+/// The drive-letter prefix, 8-digit date, dash, 6-digit time and underscore
+/// delimiters are unique enough that no other DFIR triage tool uses this
+/// pattern. Used as a last-resort Velociraptor signature when the in-zip
+/// JSON metadata markers are all missing (typical for re-zipped extracts).
+fn is_velociraptor_filename(stem: &str) -> bool {
+    let without_prefix = stem.strip_prefix("Extracted_").unwrap_or(stem);
+    let bytes = without_prefix.as_bytes();
+    // Minimum: "X_YYYYMMDD-HHMMSS_Z" → 19 chars
+    if bytes.len() < 19 { return false; }
+    if !bytes[0].is_ascii_alphabetic() { return false; }
+    if bytes[1] != b'_' { return false; }
+    // 8 digits (date)
+    if !bytes[2..10].iter().all(|b| b.is_ascii_digit()) { return false; }
+    if bytes[10] != b'-' { return false; }
+    // 6 digits (time)
+    if !bytes[11..17].iter().all(|b| b.is_ascii_digit()) { return false; }
+    if bytes[17] != b'_' { return false; }
+    // At least one more character for the username
+    bytes.len() > 18
+}
+
+/// Check whether the zip path lives under a directory literally named
+/// `Velociraptor` (case-insensitive). Velociraptor's offline collector
+/// convention is to drop the output under a `Velociraptor/` subfolder.
+/// Safe heuristic: no other DFIR tool uses this directory name.
+fn is_velociraptor_path(zip_path: &str) -> bool {
+    let normalized = zip_path.replace('\\', "/").to_lowercase();
+    normalized.contains("/velociraptor/")
+}
+
+/// Detect what kind of triage package a ZIP is, based on its top-level entry
+/// list AND its filename/path (Velociraptor re-zips can lose every JSON
+/// metadata marker but still keep the distinctive `<LETTER>_<date>_<user>.zip`
+/// filename convention under a `Velociraptor/` parent directory).
 /// Returns None if the ZIP doesn't match any known triage layout.
-pub(crate) fn detect_triage_type(entries: &[String]) -> Option<TriageType> {
+pub(crate) fn detect_triage_type(zip_path: &str, entries: &[String]) -> Option<TriageType> {
     // 1. Cortex XDR Offline Collector — REQUIRE BOTH `output/manifest.json`
     //    AND `output/cortex-xdr-payload.log` together at the OUTER zip root.
     //
@@ -193,6 +231,24 @@ pub(crate) fn detect_triage_type(entries: &[String]) -> Option<TriageType> {
         normalized.contains("uploads/auto/") || normalized.contains("uploads/ntfs/")
     });
     if has_vr_uploads {
+        return Some(TriageType::Velociraptor);
+    }
+    //    d) Filename pattern heuristic — Velociraptor's offline collector
+    //       produces archives with a very distinctive naming convention:
+    //         <LETTER>_<YYYYMMDD>-<HHMMSS>_<username>.zip
+    //         Extracted_<LETTER>_<YYYYMMDD>-<HHMMSS>_<username>.zip
+    //       No other DFIR triage tool uses this pattern. We check the zip
+    //       filename BEFORE falling through to KAPE so a re-zipped VR extract
+    //       (which loses every JSON metadata marker and flattens the uploads/
+    //       subtree, looking layout-wise like a KAPE triage to the fallback
+    //       heuristic) still gets correctly classified as Velociraptor.
+    //    e) Path heuristic — the zip lives under a directory literally named
+    //       "Velociraptor" (the offline collector convention). Also unique.
+    let zip_stem = std::path::Path::new(zip_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if is_velociraptor_filename(zip_stem) || is_velociraptor_path(zip_path) {
         return Some(TriageType::Velociraptor);
     }
 
@@ -1579,8 +1635,11 @@ fn find_evtx_files(directories: &[String]) -> DiscoveryResult {
                         let zip_path_str = path.to_string_lossy().to_string();
 
                         // Detect triage type from the top-level entry list
+                        // AND the zip path/filename (the filename + path
+                        // heuristics catch re-zipped Velociraptor extracts
+                        // that lost their JSON metadata markers).
                         let triage_kind = read_zip_top_entries(path)
-                            .and_then(|entries| detect_triage_type(&entries));
+                            .and_then(|entries| detect_triage_type(&zip_path_str, &entries));
 
                         // Walk the ZIP recursively for EVTX files
                         let found = list_evtx_in_zip(path, None).unwrap_or_default();
