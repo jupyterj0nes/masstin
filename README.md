@@ -370,35 +370,41 @@ When the directory walker encounters a ZIP archive, masstin reads its top-level 
 | **Velociraptor Offline Collector** | Top-level `client_info.json` + (`collection_context.json` OR `uploads.json`); encrypted variant uses `metadata.json` + `data.zip` | Filename pattern `Collection-<host>-<YYYY-MM-DD>T...Z.zip` |
 | **Cortex XDR Offline Collector** | Any entry ending in `cortex-xdr-payload.log` (this filename is unique to the XDR collector) | Filename pattern `offline_collector_output_<host>_<YYYY-MM-DD>_<HH-MM-SS>.zip` |
 
-**Phase 1 output** (folder containing 2 triages):
+**Phase 1 output** (folder containing 2 triages plus a forensic image with NTUSER.DAT hives). Notice that every counter — triages, EVTX inside compressed archives, MountPoints2 from registry, Scheduled Tasks from XML — appears as `=>` lines INSIDE the same `[1/3]` block, not scattered before/after the phase header:
 
 ```
 [1/3] Searching for artifacts...
         => Triage found: Velociraptor Offline Collector [host: WIN-DC01]
-           source: Collection-WIN-DC01-2026-04-13T15_30_00Z.zip
+           source: K:/CEN26-1164N-B/SFTP/triages/Collection-WIN-DC01-2026-04-13T15_30_00Z.zip
            entries inside: 247 (EVTX or other matched files)
         => Triage found: Cortex XDR Offline Collector [host: TESTHOST01]
-           source: offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip
+           source: K:/CEN26-1164N-B/SFTP/triages/offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip
            entries inside: 173 (EVTX or other matched files)
         420 EVTX artifacts found inside 2 of 2 compressed archives
         => 432 EVTX artifacts found total
+        => 12 MountPoints2 remote share events found
+        => 13 remote Scheduled Task events found
 ```
 
-**Phase 2 output** — every artifact is grouped by SOURCE (image, triage, archive, or loose folder), each group showing the total event count plus the per-EVTX list:
+The `source:` line under each triage shows the **full path** to the zip — critical because real cases often have duplicate copies of the same host's triage in different folders (e.g. one in `SFTP/...` and another in `To-Unit42/...`). Showing only the filename would make them look identical even though they're physically different files.
+
+**Phase 2 output** — every artifact is grouped by SOURCE (image, triage, archive, or loose folder), each group showing the total event count plus the per-EVTX list. **VSS-recovered events are tagged inline** so the analyst can tell at a glance which logs came from a shadow copy vs which came from the live partition:
 
 ```
 [+] Lateral movement events grouped by source (4 sources):
 
-        => [IMAGE]  HRServer_Disk0.e01  (45 events total)
-           - Security.evtx (32)
-           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (13)
+        => [IMAGE]  HRServer_Disk0.e01  (4521 events total)
+           - Security.evtx (3220)
+           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (134)
+           - Security.evtx (1095)  [VSS]
+           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (72)  [VSS]
 
-        => [TRIAGE: Cortex XDR]  offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip  [host: TESTHOST01]  (834 events total)
+        => [TRIAGE: Cortex XDR]  triages/offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip  [host: TESTHOST01]  (834 events total)
            - Security.evtx (612)
            - Microsoft-Windows-WinRM%4Operational.evtx (89)
            - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (133)
 
-        => [TRIAGE: Velociraptor]  Collection-WIN-DC01-2026-04-13T15_30_00Z.zip  [host: WIN-DC01]  (4521 events total)
+        => [TRIAGE: Velociraptor]  triages/Collection-WIN-DC01-2026-04-13T15_30_00Z.zip  [host: WIN-DC01]  (4521 events total)
            - Security.evtx (4380)
            - Microsoft-Windows-WinRM%4Operational.evtx (141)
 
@@ -407,14 +413,27 @@ When the directory walker encounters a ZIP archive, masstin reads its top-level 
            - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (11)
 ```
 
+**VSS tagging** is automatic — the helper detects `partition_<N>_vss_<M>/` paths in the temp extraction tree and labels matching entries with a `[VSS]` suffix (or `[VSS-0]`, `[VSS-1]` when multiple snapshots from the same image coexist, so each one stays visually distinct). Live entries carry no annotation. Within each source group, items are sorted **live-first then by VSS index**, so the analyst reads "what the system has now" at the top and "what masstin recovered from snapshots" underneath as a clearly demarcated bonus section. This is exactly the forensic story masstin's VSS recovery feature is supposed to tell.
+
+**Triage source labels** include the **immediate parent directory** of the zip (`triages/<filename>` above) so two physical copies of the same host's triage living in different folders (e.g. `SFTP/host.zip` vs `To-Unit42/host.zip`) appear as DIFFERENT source groups instead of collapsing into one bucket with duplicated entries inside.
+
 **Source tags** are ASCII only — no emoji — so they render correctly in conhost legacy on Windows Server 2016/2019, RDP sessions, mosh/tmux, and any analyst environment regardless of fonts or terminal capabilities. Each tag is colour-coded for visual distinction:
 
 - `[IMAGE]` — cyan — forensic image extract (works for E01, VMDK, dd, all formats)
-- `[TRIAGE: <type>]` — yellow — detected triage package, with hostname when the filename pattern allows extraction
+- `[TRIAGE: <type>]` — yellow — detected triage package, with hostname and parent-directory hint
 - `[ARCHIVE]` — white — ZIP that doesn't match any known triage layout
 - `[FOLDER]` — dim — loose artifacts in a regular directory, identified by their full parent path (not just the leaf name)
+- `[VSS]` / `[VSS-N]` suffix — yellow — appended to individual EVTX entries within an `[IMAGE]` group when they were recovered from a Volume Shadow Copy
 
 This applies to **every parser action** that walks directories: `parse-windows`, `parse-image`, `parse-massive`, `parse-linux`. The same source labels show up regardless of which action you ran, so the breakdown format is consistent across the whole tool.
+
+After the summary, the action prints a **load-into-graph hint** with both Memgraph and Neo4j commands ready to copy-paste, with the output path canonicalised to the long form (no 8.3 short names like `C00PR~1.DES` leaking into the suggestion):
+
+```
+        Load into graph (pick one):
+          Memgraph:  masstin -a load-memgraph -f C:/Users/c00pr/.../timeline.csv --database localhost:7687
+          Neo4j:     masstin -a load-neo4j   -f C:/Users/c00pr/.../timeline.csv --database bolt://localhost:7687 --user neo4j
+```
 
 ### EVTX carving: last-resort recovery from unallocated space
 
