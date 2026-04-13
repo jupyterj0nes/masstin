@@ -278,22 +278,20 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Parse MountPoints2 from NTUSER.DAT files
+    // Parse MountPoints2 from NTUSER.DAT files. NOTE: we no longer print
+    // the count here — it is now passed to parse_events_ex as a separate
+    // parameter and printed inside the [1/3] phase alongside the EVTX and
+    // Scheduled Task counters, so the analyst sees one coherent discovery
+    // summary instead of counters leaking out before the phase header.
     let mut all_mountpoint_events = Vec::new();
     if !ntuser_dirs.is_empty() {
         for (ndir, hostname) in &ntuser_dirs {
             let events = crate::parse_mountpoints::parse_mountpoints(Path::new(ndir), hostname);
             all_mountpoint_events.extend(events);
         }
-        if !all_mountpoint_events.is_empty() {
-            crate::banner::print_search_result_line(all_mountpoint_events.len(), "MountPoints2 remote share events");
-        }
     }
 
-    // Combine task events + mountpoint events as extra events for the pipeline
-    all_task_events.extend(all_mountpoint_events);
-
-    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() {
+    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() && all_mountpoint_events.is_empty() {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
     }
@@ -311,8 +309,15 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let linux_tmp_str = linux_tmp.to_string_lossy().to_string();
 
         crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
-        crate::parse::parse_events_ex(&empty_files, &extracted_dirs, Some(&win_tmp_str), &all_task_events);
+        crate::parse::parse_events_ex(
+            &empty_files,
+            &extracted_dirs,
+            Some(&win_tmp_str),
+            &all_task_events,
+            &all_mountpoint_events,
+        );
         all_task_events.clear();
+        all_mountpoint_events.clear();
 
         crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
         crate::parse_linux::parse_linux_quiet(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
@@ -333,9 +338,16 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             }
         }
     } else if has_windows {
-        // Windows only — include task events in the same pipeline
-        crate::parse::parse_events_ex(&empty_files, &extracted_dirs, output, &all_task_events);
-        all_task_events.clear(); // consumed by parse_events_ex
+        // Windows only — include task + mountpoint events in the same pipeline
+        crate::parse::parse_events_ex(
+            &empty_files,
+            &extracted_dirs,
+            output,
+            &all_task_events,
+            &all_mountpoint_events,
+        );
+        all_task_events.clear();
+        all_mountpoint_events.clear();
         if let Some(out_path) = output {
             rewrite_log_filenames(out_path);
         }
@@ -347,17 +359,27 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    // Append remaining task events (only if not consumed by parse_events_ex)
+    // Append remaining task + mountpoint events (only if they weren't
+    // consumed by parse_events_ex because the pipeline went down the
+    // Linux-only branch).
     if !all_task_events.is_empty() {
         if let Some(out_path) = output {
             append_logdata_to_csv(out_path, &all_task_events);
+        }
+    }
+    if !all_mountpoint_events.is_empty() {
+        if let Some(out_path) = output {
+            append_logdata_to_csv(out_path, &all_mountpoint_events);
         }
     }
 
     // Suggest graph database loading
     if let Some(out_path) = output {
         crate::banner::print_info("");
-        crate::banner::print_info(&format!("Load into graph: masstin -a load-memgraph -f {} --database localhost:7687", out_path));
+        let pretty = crate::banner::normalize_display_path(out_path);
+        crate::banner::print_info("Load into graph (pick one):");
+        crate::banner::print_info(&format!("  Memgraph:  masstin -a load-memgraph -f {} --database localhost:7687", pretty));
+        crate::banner::print_info(&format!("  Neo4j:     masstin -a load-neo4j   -f {} --database bolt://localhost:7687 --user neo4j", pretty));
     }
 
     // Cleanup temp directories
