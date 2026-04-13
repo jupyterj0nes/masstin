@@ -791,7 +791,7 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     if !quiet { crate::banner::print_search_start(); }
 
     let mut targets: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
-    let mut zip_count: usize = 0;
+    let mut archives_scanned: usize = 0;
 
     // Create temp dir for ZIP extraction
     let temp_dir = std::env::temp_dir().join("masstin_linux_extract");
@@ -800,7 +800,13 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     // Collect additional dirs from ZIP extraction
     let mut all_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
 
-    // First pass: find ZIPs and extract them
+    // Triage tracking: maps each extraction directory to the TriageInfo of
+    // the source ZIP, so the per-source breakdown can label artifacts as
+    // "[TRIAGE: <type>]" instead of "[FOLDER]" pointing to a temp path.
+    let mut triage_dirs: Vec<(PathBuf, crate::parse::TriageInfo)> = Vec::new();
+    let mut triages: Vec<crate::parse::TriageInfo> = Vec::new();
+
+    // First pass: find ZIPs, detect triage, extract them
     for root in dirs {
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let p = entry.into_path();
@@ -810,12 +816,49 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
                 if is_debug_mode() {
                     println!("[DEBUG] ZIP detected: {}", p.display());
                 }
-                zip_count += 1;
+                archives_scanned += 1;
+                let zip_path_str = p.to_string_lossy().to_string();
+
+                // Detect triage type from top-level entries BEFORE extraction.
+                let triage_kind = crate::parse::read_zip_top_entries(&p)
+                    .and_then(|entries| crate::parse::detect_triage_type(&entries));
+
                 let extracted = extract_zips_recursive(&p, &temp_dir);
+
+                if let Some(kind) = triage_kind {
+                    let hostname = crate::parse::extract_triage_hostname(&zip_path_str, kind);
+                    let info = crate::parse::TriageInfo {
+                        kind,
+                        zip_path: zip_path_str.clone(),
+                        hostname,
+                        artifact_count: 0,
+                    };
+                    // The first extracted path is the root of THIS zip's
+                    // extraction; record it so the source-label helper can
+                    // attribute extracted file paths back to this triage.
+                    if let Some(first_dir) = extracted.first() {
+                        triage_dirs.push((first_dir.clone(), info.clone()));
+                    }
+                    triages.push(info);
+                }
+
                 all_dirs.extend(extracted);
             }
         }
     }
+
+    // Print triage detections right after the discovery walk, before the
+    // overall count summary. Same formatting helper as parse-windows.
+    if !quiet {
+        for t in &triages {
+            let zip_name = std::path::Path::new(&t.zip_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&t.zip_path);
+            crate::banner::print_triage_found(t.kind.label(), t.hostname.as_deref(), zip_name, 0);
+        }
+    }
+    let zip_count = archives_scanned;
 
     // Second pass: find Linux artifacts in all dirs (original + extracted)
     for root in &all_dirs {
@@ -856,7 +899,9 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     let mut collected = Vec::<RawEvt>::new();
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
-    let mut artifact_details: Vec<(String, usize)> = Vec::new();
+    // (source_label, artifact_short_name, count) — same structure as
+    // parse-windows so banner::print_artifact_detail_grouped can render it.
+    let mut artifact_details: Vec<(String, String, usize)> = Vec::new();
     let mut year_cache: HashMap<PathBuf, i32> = HashMap::new();
 
     for path in &targets {
@@ -934,7 +979,13 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
             skipped += 1;
         } else {
             parsed_count += 1;
-            artifact_details.push((path_str, count));
+            let source = crate::parse::source_label_for_linux_path(&path_str, &triage_dirs);
+            let short = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&path_str)
+                .to_string();
+            artifact_details.push((source, short, count));
         }
         collected.extend(parsed);
 
@@ -950,7 +1001,7 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
     }
 
     pb.finish_and_clear();
-    crate::banner::print_artifact_detail(&artifact_details);
+    crate::banner::print_artifact_detail_grouped(&artifact_details);
 
     if is_debug_mode() {
         println!(
