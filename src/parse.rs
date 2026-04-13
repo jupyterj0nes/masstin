@@ -91,6 +91,289 @@ enum EvtxLocation {
     },
 }
 
+// =============================================================================
+//   Triage package detection (KAPE / Velociraptor / Cortex XDR)
+// =============================================================================
+//
+// When the directory walker encounters a ZIP archive, we read its top-level
+// entries and run pattern matching against three known triage tool layouts.
+// Detected packages surface as `=> Triage found: ...` lines in phase 1 and
+// drive the per-source grouping in the phase 2 breakdown.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TriageType {
+    Kape,
+    Velociraptor,
+    CortexXdr,
+}
+
+impl TriageType {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            TriageType::Kape => "KAPE",
+            TriageType::Velociraptor => "Velociraptor Offline Collector",
+            TriageType::CortexXdr => "Cortex XDR Offline Collector",
+        }
+    }
+    pub(crate) fn short_label(&self) -> &'static str {
+        match self {
+            TriageType::Kape => "KAPE",
+            TriageType::Velociraptor => "Velociraptor",
+            TriageType::CortexXdr => "Cortex XDR",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TriageInfo {
+    pub kind: TriageType,
+    pub zip_path: String,         // outer zip absolute path
+    pub hostname: Option<String>, // extracted from filename when possible
+    pub artifact_count: usize,    // EVTX or Linux-log entries inside
+}
+
+/// Detect what kind of triage package a ZIP is, based on its top-level entry list.
+/// Returns None if the ZIP doesn't match any known triage layout.
+pub(crate) fn detect_triage_type(entries: &[String]) -> Option<TriageType> {
+    // 1. Cortex XDR — strongest unique marker is "cortex-xdr-payload.log".
+    //    No other tool uses this filename, so any match is conclusive.
+    let has_cortex_payload = entries.iter().any(|n| {
+        let lower = n.to_lowercase();
+        lower == "output/cortex-xdr-payload.log"
+            || lower.ends_with("/cortex-xdr-payload.log")
+            || lower == "cortex-xdr-payload.log"
+    });
+    if has_cortex_payload {
+        return Some(TriageType::CortexXdr);
+    }
+
+    // 2. Velociraptor Offline Collector — root files combine
+    //      client_info.json + (collection_context.json OR uploads.json)
+    //    Encrypted variant uses metadata.json + data.zip instead.
+    let has_client_info = entries.iter().any(|n| n == "client_info.json");
+    let has_collection_context = entries.iter().any(|n| n == "collection_context.json");
+    let has_uploads_json = entries.iter().any(|n| n == "uploads.json");
+    if has_client_info && (has_collection_context || has_uploads_json) {
+        return Some(TriageType::Velociraptor);
+    }
+    let has_metadata = entries.iter().any(|n| n == "metadata.json");
+    let has_data_zip = entries.iter().any(|n| n == "data.zip");
+    if has_metadata && has_data_zip {
+        return Some(TriageType::Velociraptor);
+    }
+
+    // 3. KAPE — direct markers first (the kape command-line file or run log)
+    let has_kape_marker = entries.iter().any(|n| {
+        let lower = n.to_lowercase();
+        lower == "_kape.cli"
+            || lower.ends_with("/_kape.cli")
+            || (lower.ends_with("/kape.log") && lower.contains("/console/"))
+    });
+    if has_kape_marker {
+        return Some(TriageType::Kape);
+    }
+    // KAPE fallback heuristic: many entries matching the typical layout
+    //   <hostname>/C/Windows/System32/winevt/Logs/*.evtx
+    let kape_layout_count = entries.iter().filter(|n| {
+        let normalized = n.replace('\\', "/").to_lowercase();
+        normalized.contains("/c/windows/system32/winevt/logs/")
+            || normalized.starts_with("c/windows/system32/winevt/logs/")
+    }).count();
+    if kape_layout_count >= 5 {
+        return Some(TriageType::Kape);
+    }
+
+    None
+}
+
+/// Best-effort hostname extraction from a triage zip filename.
+pub(crate) fn extract_triage_hostname(zip_path: &str, kind: TriageType) -> Option<String> {
+    let stem = std::path::Path::new(zip_path)
+        .file_stem()
+        .and_then(|s| s.to_str())?;
+    match kind {
+        TriageType::CortexXdr => {
+            // offline_collector_output_<HOST>_<YYYY-MM-DD>_<HH-MM-SS>
+            let prefix = "offline_collector_output_";
+            if !stem.starts_with(prefix) { return None; }
+            let rest = &stem[prefix.len()..];
+            // Find the first '_' followed by a 4-digit year + '-' (date pattern)
+            let bytes = rest.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'_' && i + 5 < bytes.len() {
+                    let next4 = &bytes[i+1..i+5];
+                    if next4.iter().all(|c| c.is_ascii_digit()) && bytes[i+5] == b'-' {
+                        return Some(rest[..i].to_string());
+                    }
+                }
+            }
+            None
+        }
+        TriageType::Velociraptor => {
+            // Collection-<HOST>-<TIMESTAMP> (timestamp starts with 4-digit year)
+            let prefix = "Collection-";
+            if !stem.starts_with(prefix) { return None; }
+            let rest = &stem[prefix.len()..];
+            let bytes = rest.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'-' && i + 1 < bytes.len() && bytes[i+1].is_ascii_digit() {
+                    return Some(rest[..i].to_string());
+                }
+            }
+            None
+        }
+        TriageType::Kape => {
+            // KAPE has no enforced filename pattern. Common operator conventions:
+            //   <hostname>_<YYYYMMDD>_<HHMMSS>.zip
+            //   <hostname>_<timestamp>.zip
+            // Only return a hostname when the stem clearly has a "<word>_<digits>"
+            // shape so we don't misreport the zip basename as a hostname for
+            // arbitrary names like "kape-output.zip".
+            let mut parts = stem.splitn(2, '_');
+            let head = parts.next()?;
+            let tail = parts.next()?;
+            // Tail must start with at least 4 digits to look like a date/time stamp
+            let tail_starts_with_digits = tail.chars().take(4).all(|c| c.is_ascii_digit());
+            if tail_starts_with_digits && !head.is_empty() {
+                Some(head.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Read the top-level entry names of a ZIP without recursion. Used by the
+/// triage detector so it can scan the file listing once and decide the type.
+pub(crate) fn read_zip_top_entries(zip_path: &Path) -> Option<Vec<String>> {
+    let file = File::open(zip_path).ok()?;
+    let mut archive = ZipArchive::new(file).ok()?;
+    let mut names = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            names.push(entry.name().to_string());
+        }
+    }
+    Some(names)
+}
+
+/// Source label helper for parse-linux. Linux artifacts come from one of:
+///   - A forensic image extract dir (path contains "masstin_image_extract/")
+///   - A triage extraction temp dir (mapped via `triage_dirs`)
+///   - A regular folder on disk (loose auth.log, wtmp, etc.)
+pub(crate) fn source_label_for_linux_path(
+    path: &str,
+    triage_dirs: &[(std::path::PathBuf, TriageInfo)],
+) -> String {
+    let normalized = path.replace('\\', "/");
+    // 1. Triage extraction match
+    for (dir, info) in triage_dirs {
+        let dir_str = dir.to_string_lossy().replace('\\', "/");
+        if !dir_str.is_empty() && normalized.starts_with(&dir_str) {
+            let zip_name = std::path::Path::new(&info.zip_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&info.zip_path);
+            let host_part = info.hostname.as_ref()
+                .map(|h| format!("  [host: {}]", h))
+                .unwrap_or_default();
+            return format!("[TRIAGE: {}]  {}{}", info.kind.short_label(), zip_name, host_part);
+        }
+    }
+    // 2. Forensic image extract
+    if let Some(image) = extract_image_name_from_extract_path(path) {
+        return format!("[IMAGE]  {}", image);
+    }
+    // 3. Loose folder
+    let parent = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| s.replace('\\', "/"))
+        .unwrap_or_else(|| path.replace('\\', "/"));
+    format!("[FOLDER]  {}", parent)
+}
+
+/// Result of the discovery walk: EVTX locations + any triage packages
+/// detected at top-level zips along the way.
+pub(crate) struct DiscoveryResult {
+    pub evtx_files: Vec<EvtxLocation>,
+    pub triages: Vec<TriageInfo>,
+    pub archives_scanned: usize,        // total zips opened (bug #4)
+    pub archives_with_evtx: usize,      // zips that contributed at least one evtx
+}
+
+/// Categories used to group artifacts in the phase-2 breakdown. The string
+/// inside is the source label printed to the user (e.g. "[IMAGE]  HRServer.e01"
+/// or "[TRIAGE: Cortex XDR]  offline_collector_...zip  [host: STFVEEAMPRXY01]").
+pub(crate) fn source_label_for_evtx(
+    loc: &EvtxLocation,
+    triages: &std::collections::HashMap<String, TriageInfo>,
+) -> String {
+    match loc {
+        EvtxLocation::File(path) => {
+            // parse-image extracts EVTX into a temp dir whose path contains
+            // the marker "masstin_image_extract/" — group by the image name.
+            if let Some(image) = extract_image_name_from_extract_path(path) {
+                return format!("[IMAGE]  {}", image);
+            }
+            // Loose EVTX: group by full parent-directory path.
+            let parent = std::path::Path::new(path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .map(|s| s.replace('\\', "/"))
+                .unwrap_or_else(|| path.replace('\\', "/"));
+            format!("[FOLDER]  {}", parent)
+        }
+        EvtxLocation::ZipEntry { zip_path, .. } => {
+            // zip_path is "outer.zip" or "outer.zip -> nested.zip"; we display
+            // the OUTER zip and use it as triage map key.
+            let outer = zip_path.split(" -> ").next().unwrap_or(zip_path);
+            let zip_name = std::path::Path::new(outer)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(outer);
+            if let Some(info) = triages.get(outer) {
+                let host_part = info.hostname.as_ref()
+                    .map(|h| format!("  [host: {}]", h))
+                    .unwrap_or_default();
+                return format!("[TRIAGE: {}]  {}{}", info.kind.short_label(), zip_name, host_part);
+            }
+            format!("[ARCHIVE]  {}", zip_name)
+        }
+    }
+}
+
+/// Source label for non-EVTX artifacts whose origin is a regular filesystem
+/// path (e.g. UAL .mdb files, MountPoints2 NTUSER.DAT hives). They never come
+/// from inside a ZIP in the current code paths, so no triage handling is needed.
+pub(crate) fn source_label_for_path(path: &str) -> String {
+    if let Some(image) = extract_image_name_from_extract_path(path) {
+        return format!("[IMAGE]  {}", image);
+    }
+    let parent = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| s.replace('\\', "/"))
+        .unwrap_or_else(|| path.replace('\\', "/"));
+    format!("[FOLDER]  {}", parent)
+}
+
+fn extract_image_name_from_extract_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let marker = "masstin_image_extract/";
+    let pos = normalized.find(marker)?;
+    let after = &normalized[pos + marker.len()..];
+    let dir_name = after.split('/').next()?;
+    // Strip numeric prefix added for uniqueness ("0_HRServer.e01" -> "HRServer.e01")
+    if let Some(underscore) = dir_name.find('_') {
+        let prefix = &dir_name[..underscore];
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            return Some(dir_name[underscore + 1..].to_string());
+        }
+    }
+    Some(dir_name.to_string())
+}
+
 // ---------------------------------------------------------------------------------------
 // SECURITY LOG PARSER
 // ---------------------------------------------------------------------------------------
@@ -1193,8 +1476,13 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
 // ---------------------------------------------------------------------------------------
 // SEARCH FOR EVTX FILES IN DIRECTORIES (AND ZIP)
 // ---------------------------------------------------------------------------------------
-fn find_evtx_files(directories: &[String]) -> Vec<EvtxLocation> {
-    let mut evtx_files = Vec::new();
+fn find_evtx_files(directories: &[String]) -> DiscoveryResult {
+    let mut result = DiscoveryResult {
+        evtx_files: Vec::new(),
+        triages: Vec::new(),
+        archives_scanned: 0,
+        archives_with_evtx: 0,
+    };
 
     for directory in directories {
         let path = Path::new(directory);
@@ -1212,16 +1500,39 @@ fn find_evtx_files(directories: &[String]) -> Vec<EvtxLocation> {
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("evtx") => {
                         if let Some(path_str) = path.to_str() {
-                            evtx_files.push(EvtxLocation::File(path_str.to_string()));
+                            result.evtx_files.push(EvtxLocation::File(path_str.to_string()));
                         }
                     }
                     Some("zip") => {
                         if is_debug_mode() {
                             println!("[DEBUG] ZIP detected: {}", path.display());
                         }
-                        if let Some(found) = list_evtx_in_zip(path, None) {
-                            evtx_files.extend(found);
+                        result.archives_scanned += 1;
+                        let zip_path_str = path.to_string_lossy().to_string();
+
+                        // Detect triage type from the top-level entry list
+                        let triage_kind = read_zip_top_entries(path)
+                            .and_then(|entries| detect_triage_type(&entries));
+
+                        // Walk the ZIP recursively for EVTX files
+                        let found = list_evtx_in_zip(path, None).unwrap_or_default();
+                        let count_in_this_zip = found.len();
+                        if count_in_this_zip > 0 {
+                            result.archives_with_evtx += 1;
                         }
+
+                        // If we detected a triage layout, record it
+                        if let Some(kind) = triage_kind {
+                            let hostname = extract_triage_hostname(&zip_path_str, kind);
+                            result.triages.push(TriageInfo {
+                                kind,
+                                zip_path: zip_path_str,
+                                hostname,
+                                artifact_count: count_in_this_zip,
+                            });
+                        }
+
+                        result.evtx_files.extend(found);
                     }
                     _ => {}
                 }
@@ -1230,10 +1541,11 @@ fn find_evtx_files(directories: &[String]) -> Vec<EvtxLocation> {
     }
 
     if is_debug_mode() {
-        println!("[DEBUG] Total EVTX files found: {}", evtx_files.len());
+        println!("[DEBUG] Total EVTX files found: {}", result.evtx_files.len());
+        println!("[DEBUG] Triages detected: {}", result.triages.len());
     }
 
-    evtx_files
+    result
 }
 
 // -----------------------------------------------------------------------------
@@ -1485,10 +1797,34 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
     }
     let dir_count = directories.len();
     let file_count = files.len();
-    vec_filenames.extend(find_evtx_files(directories)); // includes EVTX in ZIP
+    let discovery = find_evtx_files(directories);
+    let archives_scanned = discovery.archives_scanned;
+    let archives_with_evtx = discovery.archives_with_evtx;
+    let triages = discovery.triages;
+    vec_filenames.extend(discovery.evtx_files);
+
+    // Build the triage lookup map keyed by outer-zip path. Phase 2 grouping
+    // uses this to label EVTX rows with [TRIAGE: <type>] instead of [ARCHIVE].
+    let triage_map: std::collections::HashMap<String, TriageInfo> = triages
+        .iter()
+        .map(|t| (t.zip_path.clone(), t.clone()))
+        .collect();
+
+    // Print "Triage found" lines BEFORE the EVTX count summary so the analyst
+    // sees the high-value detections at the top of phase 1.
+    for t in &triages {
+        let zip_name = std::path::Path::new(&t.zip_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&t.zip_path);
+        crate::banner::print_triage_found(t.kind.label(), t.hostname.as_deref(), zip_name, t.artifact_count);
+    }
 
     // Count ZIPs vs direct files for the summary
-    let zip_count = vec_filenames.iter().filter(|f| matches!(f, EvtxLocation::ZipEntry { .. })).count();
+    let zip_entries_inside_archives = vec_filenames
+        .iter()
+        .filter(|f| matches!(f, EvtxLocation::ZipEntry { .. }))
+        .count();
     let total_evtx = vec_filenames.len();
 
     // Detect UAL databases early so we can include them in the artifact count
@@ -1504,7 +1840,15 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
     all_ual_files.sort();
     all_ual_files.dedup();
 
-    crate::banner::print_search_results_labeled(total_evtx, zip_count, dir_count, file_count, "EVTX artifacts");
+    crate::banner::print_search_results_v2(
+        total_evtx,
+        zip_entries_inside_archives,
+        archives_scanned,
+        archives_with_evtx,
+        dir_count,
+        file_count,
+        "EVTX artifacts",
+    );
     if !all_ual_files.is_empty() {
         crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
     }
@@ -1519,26 +1863,40 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
     // Phase 2: Process artifacts
     crate::banner::print_processing_start();
     let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
-    let mut skipped: usize = 0;
+    let mut skipped_no_events: usize = 0;
     let mut parsed_files: usize = 0;
-    let mut artifact_details: Vec<(String, usize)> = Vec::new();
+    // (source_label, evtx_short_name, count) — phase 2 grouping by source.
+    let mut artifact_details: Vec<(String, String, usize)> = Vec::new();
 
     for evtxfile in &vec_filenames {
-        let name = match &evtxfile {
+        let short_name = match &evtxfile {
+            EvtxLocation::File(path) => std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            EvtxLocation::ZipEntry { evtx_name, .. } => std::path::Path::new(evtx_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(evtx_name)
+                .to_string(),
+        };
+        let progress_name = match &evtxfile {
             EvtxLocation::File(path) => path.clone(),
             EvtxLocation::ZipEntry { evtx_name, .. } => evtx_name.clone(),
         };
-        crate::banner::progress_set_message(&pb, &name);
+        crate::banner::progress_set_message(&pb, &progress_name);
 
         let parsed_logs = parselog(evtxfile.clone());
         let count = parsed_logs.len();
         if count == 0 {
-            skipped += 1;
+            skipped_no_events += 1;
         } else {
             parsed_files += 1;
-            artifact_details.push((name.clone(), count));
+            let source = source_label_for_evtx(evtxfile, &triage_map);
+            artifact_details.push((source, short_name.clone(), count));
             if is_debug_mode() {
-                println!("[INFO] {} events from {}", count, name);
+                println!("[INFO] {} events from {}", count, short_name);
             }
         }
         log_data.extend(parsed_logs);
@@ -1549,17 +1907,23 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
 
     // Parse UAL databases (detected earlier during artifact search)
     if !all_ual_files.is_empty() {
-        let source = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
-        let (ual_events, mdb_details) = crate::parse_ual::parse_ual_databases(&all_ual_files, source);
+        let source_dir = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
+        let (ual_events, mdb_details) = crate::parse_ual::parse_ual_databases(&all_ual_files, source_dir);
         if !ual_events.is_empty() {
             for (mdb_name, count) in &mdb_details {
-                artifact_details.push((mdb_name.clone(), *count));
+                let src = source_label_for_path(mdb_name);
+                let short = std::path::Path::new(mdb_name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(mdb_name)
+                    .to_string();
+                artifact_details.push((src, short, *count));
             }
             log_data.extend(ual_events);
         }
     }
 
-    crate::banner::print_artifact_detail_ex(&artifact_details, dir_count);
+    crate::banner::print_artifact_detail_grouped(&artifact_details);
 
     if is_debug_mode() {
         println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
@@ -1581,7 +1945,7 @@ pub fn parse_events_ex(files: &Vec<String>, directories: &Vec<String>, output: O
         crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
     }
 
-    crate::banner::print_summary(total_after_dedup, parsed_files, skipped, output.map(|s| s.as_str()), start_time);
+    crate::banner::print_summary(total_after_dedup, parsed_files, skipped_no_events, output.map(|s| s.as_str()), start_time);
 }
 
 // ---------------------------------------------------------------------------------------

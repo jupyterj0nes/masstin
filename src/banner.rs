@@ -150,16 +150,86 @@ pub fn print_search_results(artifact_count: usize, zip_count: usize, dir_count: 
     print_search_results_labeled(artifact_count, zip_count, dir_count, file_count, "artifacts");
 }
 
+/// Legacy wrapper kept for parse_linux callers that haven't been migrated yet.
+/// Prefer print_search_results_v2 in new code — it distinguishes archive count
+/// from entries-inside-archives and reports archives_with_evtx separately.
 pub fn print_search_results_labeled(artifact_count: usize, zip_count: usize, dir_count: usize, file_count: usize, label: &str) {
     if is_silent() { return; }
     if zip_count > 0 {
-        eprintln!("        {} compressed packages found", style(zip_count).yellow());
+        eprintln!("        {} {} found inside compressed archives",
+            style(zip_count).yellow(),
+            label,
+        );
     }
-    eprintln!("        {} {} {} found",
+    eprintln!("        {} {} {} found total",
         style("=>").green().bold(),
         style(artifact_count).green().bold(),
         label,
     );
+    let _ = (dir_count, file_count); // silence unused warning
+}
+
+/// New search-results printer used by parse-windows. Always shows how many
+/// archives were scanned vs how many actually contributed entries (bug #4),
+/// and reports the entries-inside-archives count instead of the misleading
+/// "{N} compressed packages found" wording (bug #1).
+pub fn print_search_results_v2(
+    total_artifacts: usize,
+    entries_inside_archives: usize,
+    archives_scanned: usize,
+    archives_with_artifacts: usize,
+    _dir_count: usize,
+    _file_count: usize,
+    label: &str,
+) {
+    if is_silent() { return; }
+    if archives_scanned > 0 {
+        if entries_inside_archives > 0 {
+            eprintln!("        {} {} found inside {} of {} compressed archives",
+                style(entries_inside_archives).yellow(),
+                label,
+                style(archives_with_artifacts).yellow(),
+                style(archives_scanned).yellow(),
+            );
+        } else {
+            eprintln!("        {} compressed archives scanned, none contained {}",
+                style(archives_scanned).dim(),
+                label,
+            );
+        }
+    }
+    eprintln!("        {} {} {} found total",
+        style("=>").green().bold(),
+        style(total_artifacts).green().bold(),
+        label,
+    );
+}
+
+/// Print a "Triage found" line during the discovery phase, with the type,
+/// optional hostname, the source filename and the artifact count inside.
+pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_filename: &str, artifact_count: usize) {
+    if is_silent() { return; }
+    let host_part = match hostname {
+        Some(h) => format!(" {}", style(format!("[host: {}]", h)).dim()),
+        None => String::new(),
+    };
+    eprintln!("        {} {} {}{}",
+        style("=>").green().bold(),
+        style("Triage found:").yellow().bold(),
+        style(type_label).white().bold(),
+        host_part,
+    );
+    eprintln!("           {} {}",
+        style("source:").dim(),
+        style(zip_filename).white(),
+    );
+    if artifact_count > 0 {
+        eprintln!("           {} {} {}",
+            style("entries inside:").dim(),
+            style(artifact_count).yellow(),
+            style("(EVTX or other matched files)").dim(),
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +295,61 @@ pub fn print_output_start() {
 
 pub fn print_artifact_detail(artifacts: &[(String, usize)]) {
     print_artifact_detail_ex(artifacts, 0);
+}
+
+/// New per-source breakdown printer used by parse-windows + parse-linux.
+/// Receives `(source_label, artifact_short_name, count)` tuples already
+/// labeled by the caller (see parse::source_label_for_evtx). Source labels
+/// look like "[IMAGE]  HRServer.e01", "[TRIAGE: Cortex XDR]  ... [host: X]",
+/// "[ARCHIVE]  some.zip", "[FOLDER]  D:/evidence/loose".
+pub fn print_artifact_detail_grouped(artifacts: &[(String, String, usize)]) {
+    if is_silent() { return; }
+    if artifacts.is_empty() { return; }
+    eprintln!();
+
+    // Group preserving first-seen order of sources
+    let mut grouped: Vec<(String, Vec<(String, usize)>)> = Vec::new();
+    for (source, name, count) in artifacts {
+        if let Some(g) = grouped.iter_mut().find(|(s, _)| s == source) {
+            g.1.push((name.clone(), *count));
+        } else {
+            grouped.push((source.clone(), vec![(name.clone(), *count)]));
+        }
+    }
+
+    eprintln!("  {} {}",
+        style("[+]").green().bold(),
+        style(format!("Lateral movement events grouped by source ({} sources):", grouped.len())).bold(),
+    );
+
+    for (source, items) in &grouped {
+        let total: usize = items.iter().map(|(_, c)| c).sum();
+        // Pick a color hint based on the source tag prefix so the user can
+        // visually scan IMAGE / TRIAGE / ARCHIVE / FOLDER groups.
+        let styled_source = if source.starts_with("[IMAGE]") {
+            style(source).cyan().bold().to_string()
+        } else if source.starts_with("[TRIAGE:") {
+            style(source).yellow().bold().to_string()
+        } else if source.starts_with("[ARCHIVE]") {
+            style(source).white().bold().to_string()
+        } else {
+            // [FOLDER] or unknown prefix
+            style(source).white().to_string()
+        };
+        eprintln!();
+        eprintln!("        {} {}  {}",
+            style("=>").green().bold(),
+            styled_source,
+            style(format!("({} events total)", total)).dim(),
+        );
+        for (name, count) in items {
+            eprintln!("           {} {} {}",
+                style("-").dim(),
+                style(name).white(),
+                style(format!("({})", count)).dim(),
+            );
+        }
+    }
 }
 
 pub fn print_artifact_detail_ex(artifacts: &[(String, usize)], total_images: usize) {
@@ -468,7 +593,7 @@ pub fn print_summary(total_events: usize, parsed_files: usize, skipped: usize, o
         eprintln!("  {} {} {}",
             style("Skipped:").bold(),
             style(skipped).yellow(),
-            style("(no relevant events or access denied)").dim(),
+            style("(no relevant events found in file)").dim(),
         );
     }
     eprintln!("  {} {}",
@@ -476,7 +601,8 @@ pub fn print_summary(total_events: usize, parsed_files: usize, skipped: usize, o
         style(total_events).green().bold(),
     );
     if let Some(path) = output_path {
-        eprintln!("  {} {}", style("Output:").bold(), style(path).green());
+        let pretty = normalize_display_path(path);
+        eprintln!("  {} {}", style("Output:").bold(), style(pretty).green());
     } else {
         eprintln!("  {} {}", style("Output:").bold(), style("stdout").green());
     }
@@ -485,4 +611,20 @@ pub fn print_summary(total_events: usize, parsed_files: usize, skipped: usize, o
         style(secs).cyan(),
     );
     eprintln!();
+}
+
+/// Normalise a Windows path for human display: resolve 8.3 short names like
+/// "C:/Users/C00PR~1.DES/..." into their long-form equivalent, and strip the
+/// "\\?\" prefix that std::fs::canonicalize leaves on Windows. Falls back to
+/// the input unchanged on any error or on non-Windows platforms.
+pub(crate) fn normalize_display_path(p: &str) -> String {
+    match std::fs::canonicalize(p) {
+        Ok(buf) => {
+            let s = buf.to_string_lossy().to_string();
+            // Strip Windows verbatim prefix
+            let trimmed = s.strip_prefix(r"\\?\").unwrap_or(&s);
+            trimmed.replace('\\', "/")
+        }
+        Err(_) => p.replace('\\', "/"),
+    }
 }
