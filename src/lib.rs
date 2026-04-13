@@ -44,6 +44,7 @@ mod parse_mountpoints;
 pub use crate::parse_mountpoints::*;
 pub mod parse_carve;
 pub mod parse_custom;
+pub mod filter;
 pub mod vmdk;
 pub use crate::vmdk::*;
 
@@ -131,9 +132,51 @@ pub struct Cli {
     #[arg(long)]
     rules: Option<String>,
 
-    /// Dry-run mode for `parse-custom`: parse and show first matches + rejects, do not write CSV.
+    /// Dry-run mode. For `parse-custom`: parse and show first matches + rejects, do not write CSV.
+    /// When combined with any `--ignore-local` / `--exclude-*` flag on any parser action:
+    /// run the parser, count what would be filtered, print the stats summary, and write
+    /// only the CSV header (no rows). Useful as a pre-flight check before committing to
+    /// a big filter run.
     #[arg(long)]
     dry_run: bool,
+
+    // ─── Noise filtering flags ──────────────────────────────────────────────
+    //
+    // Applied sequentially to every LogData record before writing. The filter
+    // is a global singleton initialized at startup from these flags; see
+    // src/filter.rs for the full rule table and src/filter.rs::classify_local()
+    // for the --ignore-local decision logic.
+
+    /// Drop records that carry no usable source information: loopback IPs
+    /// (127.0.0.1, ::1, 0.0.0.0, link-local), literal "LOCAL" markers,
+    /// service/interactive logons with empty source, and noise placeholders
+    /// observed in real forensic data (MSTSC, default_value, "-"). A record
+    /// is kept whenever either src_ip or src_computer carries meaningful
+    /// lateral-movement signal — the IP always wins, so `MSTSC|<real-IP>`
+    /// stays and `MSTSC|-` is filtered.
+    #[arg(long)]
+    ignore_local: bool,
+
+    /// Comma-separated list of usernames to filter out. Matches against both
+    /// subject_user_name and target_user_name (case-insensitive). Supports
+    /// glob wildcards (`svc_*`, `*$` for machine accounts, `*admin*`) and
+    /// the `@file.txt` prefix to load one entry per line.
+    /// Example: --exclude-users svc_backup,svc_monitor,*$,@corpsvc.txt
+    #[arg(long)]
+    exclude_users: Option<String>,
+
+    /// Comma-separated list of hostnames to filter out. Matches against
+    /// dst_computer and src_computer. Same syntax as --exclude-users.
+    /// Example: --exclude-hosts JUMP01,JUMP02,*-MON,@jumpboxes.txt
+    #[arg(long)]
+    exclude_hosts: Option<String>,
+
+    /// Comma-separated list of IPs or CIDR ranges to filter out. Matches
+    /// src_ip. Accepts individual IPs (`10.0.0.5`), CIDR ranges
+    /// (`10.0.0.0/24`, `fe80::/10`), and the `@file.txt` prefix.
+    /// Example: --exclude-ips 10.0.0.0/8,172.16.0.0/12,@bluenet.txt
+    #[arg(long)]
+    exclude_ips: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -203,6 +246,22 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     crate::parse::set_debug_mode(config.debug);
     crate::parse_elastic::set_debug_mode(config.debug);
     crate::banner::set_silent_mode(config.silent);
+
+    // Build the global noise filter from CLI flags and install it before any
+    // parser action runs. If all four filter flags are off, the filter is a
+    // no-op (should_keep_record always returns true) so there is zero cost.
+    match crate::filter::build_config(
+        config.ignore_local,
+        config.exclude_users.as_deref(),
+        config.exclude_hosts.as_deref(),
+        config.exclude_ips.as_deref(),
+    ) {
+        Ok(cfg) => crate::filter::init_filter(cfg, config.dry_run),
+        Err(e) => {
+            eprintln!("Error: invalid filter argument: {}", e);
+            return Ok(());
+        }
+    }
 
     // Print banner
     let action_name = format!("{:?}", config.action);
@@ -307,6 +366,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc, &skip_offsets);
         }
     }
+
+    // Print noise filter summary (no-op if no filter flags were set)
+    crate::filter::print_filter_summary();
 
     Ok(())
 }

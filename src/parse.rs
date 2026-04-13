@@ -1090,6 +1090,9 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
         let mut sorted = log_data;
         sorted.sort_by(|a, b| a.filename.len().cmp(&b.filename.len()));
         for item in sorted {
+            if !crate::filter::should_keep_record(&item) {
+                continue;
+            }
             let key = format!("{}|{}|{}|{}|{}|{}",
                 item.time_created, item.computer, item.event_id,
                 item.event_type, item.target_user_name, item.ip_address);

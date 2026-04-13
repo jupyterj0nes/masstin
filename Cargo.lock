@@ -1708,6 +1708,7 @@ dependencies = [
  "flate2",
  "futures",
  "indicatif",
+ "ipnet",
  "libesedb",
  "lvm2",
  "mbrman",

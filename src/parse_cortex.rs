@@ -607,9 +607,33 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     // Write header row
     wtr.write_record(FINAL_COLUMNS)?;
 
-    // Process each record and write the resulting row.
+    // Process each record and write the resulting row. Applies the global
+    // noise filter (--ignore-local / --exclude-*) by reconstructing a
+    // minimal LogData view of the processed row — FINAL_COLUMNS order
+    // matches the canonical masstin CSV header, so indices are fixed.
     for record in records {
         let processed = process_record(record, debug);
+        if processed.len() >= 14 {
+            let ld = crate::parse::LogData {
+                time_created: processed[0].clone(),
+                computer: processed[1].clone(),
+                event_type: processed[2].clone(),
+                event_id: processed[3].clone(),
+                logon_type: processed[4].clone(),
+                target_user_name: processed[5].clone(),
+                target_domain_name: processed[6].clone(),
+                workstation_name: processed[7].clone(),
+                ip_address: processed[8].clone(),
+                subject_user_name: processed[9].clone(),
+                subject_domain_name: processed[10].clone(),
+                logon_id: processed[11].clone(),
+                detail: processed[12].clone(),
+                filename: processed[13].clone(),
+            };
+            if !crate::filter::should_keep_record(&ld) {
+                continue;
+            }
+        }
         wtr.write_record(&processed)?;
     }
 

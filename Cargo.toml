@@ -51,4 +51,5 @@ ext4-view = { version = "0.9", features = ["std"] }
 lvm2 = "0.0.3"
 notatin = "1.0"
 serde_yaml = "0.9"
+ipnet = "2"
 

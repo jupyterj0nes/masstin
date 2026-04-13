@@ -531,6 +531,45 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
         eprintln!("[WARN] nothing matched lateral-movement filter");
         return;
     }
+
+    // Apply noise filter (--ignore-local / --exclude-*). We build a minimal
+    // LogData view of each RawEvt just for the filter check — RawEvt's
+    // `remote` field can be either an IP or a hostname, so we route it to
+    // both src_ip and workstation_name for the classifier.
+    let filtered: Vec<RawEvt> = rows
+        .iter()
+        .filter(|r| {
+            let (src_ip, src_computer) = if r.remote.parse::<std::net::IpAddr>().is_ok() {
+                (r.remote.clone(), String::new())
+            } else {
+                (String::new(), r.remote.clone())
+            };
+            let ld = crate::parse::LogData {
+                time_created: r.ts_rfc3339.clone(),
+                computer: r.dst_host.clone(),
+                event_type: String::new(),
+                event_id: String::new(),
+                subject_user_name: String::new(),
+                subject_domain_name: String::new(),
+                target_user_name: r.user.clone(),
+                target_domain_name: String::new(),
+                logon_type: String::new(),
+                workstation_name: src_computer,
+                ip_address: src_ip,
+                logon_id: String::new(),
+                filename: r.filename.clone(),
+                detail: String::new(),
+            };
+            crate::filter::should_keep_record(&ld)
+        })
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
+        return;
+    }
+    let rows = &filtered[..];
+
     let col = |f: fn(&RawEvt) -> String| rows.iter().map(f).collect::<Vec<_>>();
 
     let df = DataFrame::new(vec![

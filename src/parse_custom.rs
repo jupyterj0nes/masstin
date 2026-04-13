@@ -403,6 +403,12 @@ pub fn parse_custom(
         return;
     }
 
+    // Apply noise filter (--ignore-local / --exclude-*) if configured.
+    let all_records: Vec<LogData> = all_records
+        .into_iter()
+        .filter(|r| crate::filter::should_keep_record(r))
+        .collect();
+
     // Write output CSV
     crate::banner::print_phase("3", "3", &format!(
         "Writing {} records to output...", all_records.len()

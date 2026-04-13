@@ -26,23 +26,9 @@ const RDPCONNMANAGER_EVENT_IDS: &[&str] = &["1149"];
 const RDPLOCALSESSION_EVENT_IDS: &[&str] = &["21","22","24","25"];
 const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 
-#[derive(Debug, serde::Serialize)]
-struct LogData {
-    time_created: String,
-    computer: String,
-    event_type: String,
-    event_id: String,
-    subject_user_name: String,
-    subject_domain_name: String,
-    target_user_name: String,
-    target_domain_name: String,
-    logon_type: String,
-    workstation_name: String,
-    ip_address: String,
-    logon_id: String,
-    detail: String,
-    filename: String,
-}
+// LogData schema is shared with the rest of masstin. We re-export here so
+// local functions that construct records can use the short name.
+use crate::parse::LogData;
 
 /// **Processes a Winlogbeat JSON file and extracts relevant events**
 fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
@@ -298,6 +284,11 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
 
 /// **Converts extracted events into a Polars DataFrame and saves CSV**
 fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
+    // Apply noise filter (--ignore-local / --exclude-*).
+    let log_data: Vec<LogData> = log_data
+        .into_iter()
+        .filter(|r| crate::filter::should_keep_record(r))
+        .collect();
     if log_data.is_empty() {
         println!("[WARNING] No relevant events found.");
         return;
