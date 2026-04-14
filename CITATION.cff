@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+message: "If you use masstin in your research, incident response work, or DFIR publications, please cite it as below."
+title: "masstin — Lateral movement tracker for anything!"
+abstract: >-
+  Masstin is a high-speed DFIR tool written in Rust that parses forensic
+  artifacts (Windows EVTX, Linux logs, User Access Logging databases,
+  Winlogbeat JSON, Cortex XDR exports, KAPE/Velociraptor triage packages,
+  E01/dd/VMDK forensic images including streamOptimized) and unifies lateral
+  movement evidence into a single chronological timeline, with direct upload
+  to Neo4j and Memgraph graph databases for visualization and temporal path
+  reconstruction.
+authors:
+  - family-names: "Díaz"
+    given-names: "Antonio"
+    alias: "jupyterj0nes"
+    orcid: ""
+    website: "https://weinvestigateanything.com"
+type: software
+license: AGPL-3.0-or-later
+repository-code: "https://github.com/jupyterj0nes/masstin"
+url: "https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/"
+version: "0.13.0"
+date-released: "2026-04-14"
+keywords:
+  - DFIR
+  - digital forensics
+  - incident response
+  - lateral movement
+  - EVTX
+  - UAL
+  - VSS
+  - Neo4j
+  - Memgraph
+  - Rust
+  - forensic imaging
+  - EVTX carving
+  - Velociraptor
+  - KAPE
+  - Cortex XDR
+  - Windows security events
+preferred-citation:
+  type: software
+  title: "masstin — Lateral movement tracker for anything!"
+  authors:
+    - family-names: "Díaz"
+      given-names: "Antonio"
+      alias: "jupyterj0nes"
+  version: "0.13.0"
+  year: 2026
+  url: "https://github.com/jupyterj0nes/masstin"
