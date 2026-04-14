@@ -395,15 +395,21 @@ pub async fn load_neo4j(
             };
 
             // Relationship type must be a valid Cypher identifier:
-            // replace dots, hyphens, spaces with underscores; uppercase; strip @domain
+            // [A-Za-z_][A-Za-z0-9_]*. Anything else (`$`, `!`, `(`, `)`, dots,
+            // hyphens, spaces, accents...) becomes `_`. The `$` case is the
+            // important one — machine accounts like `SPACHE$` would otherwise
+            // generate `r:SPACHE$` which Cypher parses as a parameter ref and
+            // kills the Bolt session for every query after it.
             let rel_type_normalized = {
-                let r = if relation_type.chars().next().unwrap_or(' ').is_ascii_digit() {
-                    format!("u{}", relation_type)
-                } else {
-                    relation_type.to_string()
-                };
-                r.replace(".", "_").replace("-", "_").replace(" ", "_")
-                    .split("@").next().unwrap_or(&r).to_uppercase()
+                let stripped = relation_type.split('@').next().unwrap_or(relation_type);
+                let mut s: String = stripped.chars().map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }
+                }).collect();
+                if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    s = format!("u{}", s);
+                }
+                if s.is_empty() { s = "NO_USER".to_string(); }
+                s.to_uppercase()
             };
 
             // Node names and properties: keep original values (no normalization)

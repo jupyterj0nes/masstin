@@ -484,6 +484,42 @@ masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
 masstin -a load-memgraph -f timeline.csv --database localhost:7687
 ```
 
+#### Load options
+
+| Flag | Effect |
+|------|--------|
+| `--ungrouped` | Emit one edge per CSV row (`CREATE`) instead of collapsing identical `(src, user, dst, logon_type)` tuples into a single edge with a `count` property. Use it when investigating a narrow time window where individual events matter. Pair with `--start-time` / `--end-time`. |
+| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this. Reuses the same parser as the Cortex flags. |
+| `--end-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is later than this. |
+
+```bash
+# Investigate every individual lateral movement event during a 30-minute window
+masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j \
+        --ungrouped --start-time "2026-03-15 14:00:00" --end-time "2026-03-15 14:30:00"
+```
+
+#### IP ↔ hostname unification
+
+The same physical host often appears as both an IP and a hostname depending on which event populated each row. Both loaders build an internal `ip → hostname` map and resolve them to a single graph node automatically. Events `4778` (Session Reconnected) and `4779` (Session Disconnected) get an **x1000 weight** in the frequency map because Windows always populates both fields reliably for those events, so a single 4778/4779 outweighs hundreds of conflicting normal events.
+
+When the loader can't tie an IP to a hostname (for example an external attacker IP with no matching session), the IP stays as its own node.
+
+### Merge graph nodes after loading
+
+If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
+
+```bash
+# Neo4j
+masstin -a merge-neo4j-nodes \
+        --database bolt://localhost:7687 --user neo4j \
+        --old-node "10.0.0.10" --new-node "WORKSTATION-A"
+
+# Memgraph
+masstin -a merge-memgraph-nodes \
+        --database localhost:7687 \
+        --old-node "10.0.0.10" --new-node "WORKSTATION-A"
+```
+
 ## Output Format
 
 All actions produce a unified CSV with 14 columns:
@@ -616,15 +652,18 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `merge` \| `load-neo4j` \| `load-memgraph` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
 | `-o, --output` | Output file path |
 | `--database` | Graph database URL (e.g., `localhost:7687`) |
 | `-u, --user` | Database user (Neo4j) |
 | `--cortex-url` | Cortex XDR API base URL |
-| `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` |
-| `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` |
+| `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` (Cortex actions, `merge`, `load-neo4j` / `load-memgraph`) |
+| `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` (same scope as `--start-time`) |
+| `--ungrouped` | For `load-neo4j` / `load-memgraph`: emit one edge per CSV row instead of grouping |
+| `--old-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node to remove (its edges are transferred to `--new-node`) |
+| `--new-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node that survives the merge |
 | `--filter-cortex-ip` | Filter by IP in Cortex queries |
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
