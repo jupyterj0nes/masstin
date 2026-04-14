@@ -22,6 +22,12 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 > **[We Investigate Anything](https://weinvestigateanything.com)** — Masstin is part of the WIA project, a DFIR knowledge base where you'll find detailed documentation for every artifact masstin parses, investigation guides, and real-world case studies — all in English and Spanish.
 
+<div align="center">
+  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction — attacker's chronologically-valid route through the network, rendered in Memgraph"/>
+  <br>
+  <em>Temporal path reconstruction — the attacker's chronologically-valid route between two hosts, rendered from a masstin timeline in Memgraph. Each hop is validated as happening strictly after the previous one.</em>
+</div>
+
 ## Table of Contents
 
 - [Key Features](#key-features)
