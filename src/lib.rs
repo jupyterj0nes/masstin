@@ -17,6 +17,10 @@ mod load_neo4j;
 pub use crate::load_neo4j::*;
 mod load_memgraph;
 pub use crate::load_memgraph::*;
+mod merge_neo4j_nodes;
+pub use crate::merge_neo4j_nodes::*;
+mod merge_memgraph_nodes;
+pub use crate::merge_memgraph_nodes::*;
 mod merge;
 pub use crate::merge::*;
 use serde_json::Value;
@@ -186,6 +190,18 @@ pub struct Cli {
     /// Example: --exclude-ips 10.0.0.0/8,172.16.0.0/12,@bluenet.txt
     #[arg(long)]
     exclude_ips: Option<String>,
+
+    /// For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the node to
+    /// remove (its edges are transferred to `--new-node`, then it is deleted).
+    /// Typically the duplicate IP-shaped node that the loader could not unify.
+    #[arg(long)]
+    old_node: Option<String>,
+
+    /// For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the node to
+    /// keep. All edges from `--old-node` are transferred here, with their
+    /// properties preserved.
+    #[arg(long)]
+    new_node: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -220,6 +236,10 @@ enum ActionType {
     CarveImage,
     /// Parse arbitrary text logs (VPN/firewall/proxy) using YAML rule files from the rules/ library. See docs/custom-parsers.md.
     ParseCustom,
+    /// Merge two :host nodes in a Neo4j graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Used to unify a host that appears as both an IP and a hostname after loading. No APOC required.
+    MergeNeo4jNodes,
+    /// Merge two :host nodes in a Memgraph graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Same as `merge-neo4j-nodes` but for Memgraph.
+    MergeMemgraphNodes,
 }
 
 // -----------------------------------------------------------------------------
@@ -385,6 +405,25 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             }
             crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc, &skip_offsets);
         }
+        ActionType::MergeNeo4jNodes => {
+            merge_neo4j_nodes(
+                config.database.as_ref().unwrap(),
+                config.user.as_ref().unwrap(),
+                config.old_node.as_ref().unwrap(),
+                config.new_node.as_ref().unwrap(),
+            )
+            .await;
+        }
+        ActionType::MergeMemgraphNodes => {
+            let default_user = String::from("");
+            merge_memgraph_nodes(
+                config.database.as_ref().unwrap(),
+                config.user.as_ref().unwrap_or(&default_user),
+                config.old_node.as_ref().unwrap(),
+                config.new_node.as_ref().unwrap(),
+            )
+            .await;
+        }
     }
 
     // Print noise filter summary (no-op if no filter flags were set)
@@ -524,6 +563,22 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             // Merge requires at least two files
             if config.file.len() < 2 {
                 return Err(String::from("You must specify at least two files to merge."));
+            }
+        }
+        ActionType::MergeNeo4jNodes => {
+            if config.database.is_none() || config.user.is_none()
+                || config.old_node.is_none() || config.new_node.is_none() {
+                return Err(String::from(
+                    "For merge-neo4j-nodes you must specify --database, --user, --old-node and --new-node.",
+                ));
+            }
+        }
+        ActionType::MergeMemgraphNodes => {
+            if config.database.is_none()
+                || config.old_node.is_none() || config.new_node.is_none() {
+                return Err(String::from(
+                    "For merge-memgraph-nodes you must specify --database, --old-node and --new-node.",
+                ));
             }
         }
         ActionType::ParseCortex => {

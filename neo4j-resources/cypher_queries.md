@@ -166,6 +166,41 @@ Replace the start and end host names with your own. The result shows the attacke
   <img src="neo4j-resources/temporal_path.png" alt="Temporal path showing attack chain"/>
 </div>
 
+## Post-load: unify IP and hostname nodes
+
+Sometimes the same physical host shows up as two separate nodes — one by IP, one by hostname — because different events populated different fields and the loader did not have enough evidence (typically a `4778` or `4779` Security event) to tie them together. masstin's `merge-neo4j-nodes` action transfers every relationship from a duplicate node onto the canonical one and deletes the orphan, **without requiring APOC**.
+
+```bash
+masstin -a merge-neo4j-nodes \
+        --database bolt://localhost:7687 --user neo4j \
+        --old-node "10.0.0.10" --new-node "WORKSTATION-A"
+```
+
+The action introspects the relationship types touching `--old-node`, then runs one transfer query per type. Each transfer query is plain Cypher of this shape (shown here for a single type `:RELTYPE` so you can run it manually if you prefer):
+
+```cypher
+// Transfer outgoing edges of one specific type from the old node to the new node
+MATCH (new:host {name:'WORKSTATION-A'})
+WITH new
+MATCH (old:host {name:'10.0.0.10'})-[r:RELTYPE]->(target)
+CREATE (new)-[nr:RELTYPE]->(target)
+SET nr = properties(r)
+DELETE r;
+
+// Same thing for incoming edges
+MATCH (new:host {name:'WORKSTATION-A'})
+WITH new
+MATCH (source)-[r:RELTYPE]->(old:host {name:'10.0.0.10'})
+CREATE (source)-[nr:RELTYPE]->(new)
+SET nr = properties(r)
+DELETE r;
+
+// Finally, delete the orphaned old node
+MATCH (old:host {name:'10.0.0.10'}) DELETE old;
+```
+
+Why one query per relationship type: vanilla Cypher does **not** allow dynamic relationship types in `CREATE`, and masstin generates one type per `target_user_name`, so a single query cannot cover them all. If you have APOC installed, the equivalent one-liner is `CALL apoc.refactor.mergeNodes([new, old], {properties:'combine', mergeRels:false})`. The masstin action works for everyone regardless of plugins.
+
 For more Cypher queries and detailed documentation, visit the [Neo4j and Cypher guide](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) at We Investigate Anything.
 
 For more information on the Cypher language, refer to the [official Cypher documentation](https://neo4j.com/docs/cypher-manual/current/).
