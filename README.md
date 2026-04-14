@@ -755,6 +755,10 @@ Full documentation at **[We Investigate Anything](https://weinvestigateanything.
 - [ ] Unallocated-only carving scan (`--carve-unalloc`) — currently scans the whole image
 - [ ] Custom parsers v2: JSON extractor, conditional map, per-rule `--validate` command
 - [ ] More community parser rules: Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall
+- [ ] **EVTX header tampering detection** — flag chunks whose record numbers, timestamps or CRCs have been edited (Event Log Edit / similar tooling)
+- [ ] **Linux event recovery / carving** — recover deleted entries from `auth.log`, `wtmp`, `btmp`, `journald` after rotation or attacker cleanup
+- [ ] **macOS support** — `parse-mac` (live `/var/log` and unified logs) and `parse-image-mac` (HFS+/APFS forensic images), bringing Mac to feature parity with Windows and Linux
+- [ ] **Official Velociraptor plugin** — package masstin so analysts can run it from a Velociraptor artifact and get a unified timeline back without leaving the platform
 
 ## License
 
