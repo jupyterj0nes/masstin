@@ -17,7 +17,9 @@ pub fn is_debug_mode() -> bool {
 }
 
 /// **Event IDs sorted by log type**
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
+/// 5145 intentionally excluded — see parse.rs::SECURITY_EVENT_IDS for rationale
+/// (file-access audit noise that adds no lateral-movement signal beyond 5140).
+const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
 const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
 const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
@@ -91,21 +93,16 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
         "4771" => "FAILED_LOGON".to_string(),
         "4778" => "SUCCESSFUL_LOGON".to_string(),
         "4779" => "LOGOFF".to_string(),
-        "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
+        "5140" => "SUCCESSFUL_LOGON".to_string(),
         _ => "CONNECT".to_string(),
     };
 
     let share_name = ed.and_then(|d| d.get("ShareName")).and_then(|s| s.as_str()).unwrap_or("");
-    let relative_target = ed.and_then(|d| d.get("RelativeTargetName")).and_then(|s| s.as_str()).unwrap_or("");
 
     let detail = match event_id_str.as_str() {
         "4624" | "4648" => process_name.to_string(),
         "4625" => sub_status.to_string(),
         "5140" => share_name.to_string(),
-        "5145" => {
-            if relative_target.is_empty() { share_name.to_string() }
-            else { format!("{}\\{}", share_name, relative_target) }
-        },
         _ => String::new(),
     };
 

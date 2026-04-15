@@ -25,7 +25,7 @@ pub fn is_debug_mode() -> bool {
 }
 
 /// Translate Windows SubStatus hex codes to human-readable failure reasons
-fn translate_substatus(code: &str) -> String {
+pub fn translate_substatus(code: &str) -> String {
     let desc = match code.to_lowercase().as_str() {
         "0xc000006a" => "Wrong password",
         "0xc0000064" => "User does not exist",
@@ -50,7 +50,12 @@ fn translate_substatus(code: &str) -> String {
 }
 
 // Event IDs for various logs
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
+// 5145 intentionally excluded: it fires on every file access inside an
+// already-established SMB session (50+ events per connection) and adds no
+// lateral-movement information beyond what 5140 already captures — the pivot
+// (src→dst, user, share) is the same. Including it burns volume without
+// adding edges to the graph.
+const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
 const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
 const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
@@ -568,24 +573,16 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             "4771" => "FAILED_LOGON".to_string(),
                             "4778" => "SUCCESSFUL_LOGON".to_string(),
                             "4779" => "LOGOFF".to_string(),
-                            "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
+                            "5140" => "SUCCESSFUL_LOGON".to_string(),
                             _ => "CONNECT".to_string(),
                         };
 
                         // Determine detail column
                         let share_name = data_values.get("ShareName").unwrap_or(&String::new()).to_string();
-                        let relative_target = data_values.get("RelativeTargetName").unwrap_or(&String::new()).to_string();
                         let detail = match event_id.as_str() {
                             "4624" | "4648" => data_values.get("ProcessName").unwrap_or(&String::new()).to_string(),
                             "4625" => translate_substatus(data_values.get("SubStatus").unwrap_or(&String::new())),
                             "5140" => share_name,
-                            "5145" => {
-                                if relative_target.is_empty() {
-                                    share_name
-                                } else {
-                                    format!("{}\\{}", share_name, relative_target)
-                                }
-                            },
                             _ => String::from(""),
                         };
 

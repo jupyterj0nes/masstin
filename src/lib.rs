@@ -118,6 +118,38 @@ pub struct Cli {
     #[arg(long)]
     filter_cortex_ip: Option<String>,
 
+    /// For `parse-cortex`: restrict the XQL network query to admin/lateral-movement
+    /// ports only (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986).
+    /// Without this flag the query still defaults to (22, 445, 3389). Use it when
+    /// you want WinRM/RPC/VNC/SQL pivoting visible as well, or when the default
+    /// three-port query returns too much noise/hits the 1M API cap.
+    #[arg(long)]
+    admin_ports: bool,
+
+    /// For `parse-cortex`: minimum time window (in seconds) the auto-pagination
+    /// splitter is allowed to produce. When a query saturates the API 1M cap,
+    /// the window is bisected until either the count drops below the cap or
+    /// the window reaches this floor. Lower = more passes, higher fidelity on
+    /// bursty tenants but more API calls. Higher = fewer passes, cheaper but
+    /// may truncate during traffic spikes. Default: 300 (5 min).
+    #[arg(long, default_value_t = 300)]
+    cortex_min_window_secs: i64,
+
+    /// For `parse-cortex`: hard cap on the total number of auto-pagination
+    /// passes. Prevents a pathological tenant (e.g. sustained saturation at
+    /// minute granularity) from blowing up memory or API quota. When reached,
+    /// remaining windows in the queue are processed without further splitting
+    /// and a warning is emitted. Default: 200.
+    #[arg(long, default_value_t = 200)]
+    cortex_max_passes: usize,
+
+    /// For `parse-cortex-evtx-forensics`: comma-separated list of Windows Event IDs
+    /// to include in the forensics XQL query. Overrides the default set
+    /// (4624,4625,4648,21,22,24,25,1009,551,31001,30803-30808,1024,1102,1149).
+    /// Example: --cortex-event-ids 4624,4625,4648
+    #[arg(long)]
+    cortex_event_ids: Option<String>,
+
     /// For load-neo4j / load-memgraph: emit one edge per CSV row instead of
     /// collapsing duplicate (src, user, dst) triples into a single edge with
     /// a `count` property. Useful when you want to see every individual
@@ -343,7 +375,11 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.debug,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
-                config.filter_cortex_ip.as_ref(), // 👈 nuevo parámetro
+                config.filter_cortex_ip.as_ref(),
+                config.ignore_local,
+                config.admin_ports,
+                config.cortex_min_window_secs,
+                config.cortex_max_passes,
             )
             .await?;
         }
@@ -355,6 +391,10 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.debug,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.ignore_local,
+                config.cortex_event_ids.as_ref(),
+                config.cortex_min_window_secs,
+                config.cortex_max_passes,
             )
             .await?;
         }

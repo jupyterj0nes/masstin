@@ -22,6 +22,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | 4776 | NTLM authentication (domain controller) | — |
 | 4778 | RDP session reconnected | 10 |
 | 4779 | RDP session disconnected | 10 |
+| 5140 | Network share accessed | 3 |
 
 ### Terminal Services
 
@@ -54,6 +55,15 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | SMBClient/Connectivity | 30807 | SMB connectivity event |
 | SMBClient/Connectivity | 30808 | SMB share access |
 
+### PowerShell Remoting & WMI
+
+[Full article →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/)
+
+| Log Source | Event ID | Description |
+|------------|----------|-------------|
+| WinRM/Operational | 6 | WSMan session initiation on the source host (destination in `connection` field) |
+| WMI-Activity/Operational | 5858 | WMI client failure with `ClientMachine` field identifying remote origin |
+
 ## Linux Artifacts
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/)
@@ -76,7 +86,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
 
-Parses all 28 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
+Parses all 32 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
 
 ## Cortex XDR
 
@@ -84,16 +94,22 @@ Parses all 28 Windows Event IDs listed above from Winlogbeat JSON format (`@time
 
 ### Network Events (via API)
 
+Default admin port list queried by `parse-cortex`:
+
 | Port | Protocol | Logon Type |
 |------|----------|------------|
-| 3389 | RDP | 10 |
-| 445 | SMB | 3 |
-| 22 | SSH | SSH |
+| 22   | SSH  | SSH |
+| 445  | SMB  | 3   |
+| 3389 | RDP  | 10  |
+| 5985 | WinRM (HTTP)  | 3 |
+| 5986 | WinRM (HTTPS) | 3 |
+
+`--admin-ports` widens the set further to 135, 139, 1433, 3306, 5900 for RPC, NetBIOS, SQL and VNC pivoting visibility.
 
 ### EVTX Forensics (via XQL)
 
-Queries Cortex XDR for forensic event logs from: Security, TerminalServices-LocalSessionManager, SMBServer/Security, SMBClient/Security, RDPClient, RemoteConnectionManager.
+Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR forensic collection agent and the offline collector (triage packages uploaded to the tenant land in the same dataset). The query mirrors the event ID and source set of `parse-windows` exactly, including Security, TerminalServices-LocalSessionManager, SMBServer/Security, SmbClient/Security, RDPClient, RemoteConnectionManager, RdpCoreTS, WinRM/Operational and WMI-Activity/Operational. Regex extraction currently ships with EN / ES / DE / FR / IT keyword variants and auto-paginates via time bisection if a window saturates the 1M API cap.
 
 ---
 
-**Total:** 28 Windows Event IDs across 9 EVTX sources + 7 Linux artifact types + Winlogbeat JSON + Cortex XDR
+**Total:** 32 Windows Event IDs across 10 EVTX sources + 7 Linux artifact types + Winlogbeat JSON + Cortex XDR

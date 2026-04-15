@@ -258,6 +258,15 @@ masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetw
   -o cortex-evtx.csv
 ```
 
+`parse-cortex-evtx-forensics` queries the Cortex XDR `forensics_event_log` dataset —
+the backing store for Cortex's forensic triage feature, where the XDR forensic
+agent collects Windows Event Logs from endpoints on demand. The same dataset also
+receives logs uploaded by the Cortex XDR offline collector, so triage packages
+gathered from air-gapped or unreachable hosts and pushed into the tenant are
+queried through the exact same path. masstin mirrors the event IDs and extraction
+logic of `parse-windows`, so output from this action merges cleanly with host-side
+artifacts.
+
 ### Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
 
 For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 8 researched rules in [`rules/`](rules/) that you can use out of the box.
@@ -685,7 +694,7 @@ Masstin parses **32+ Windows Event IDs** across **11 EVTX sources**, plus Linux 
 
 | Source | Event IDs | What it tracks | Article |
 |--------|-----------|---------------|---------|
-| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140, 5145 | Logons, logoffs, Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140 | Logons, logoffs, Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
 | **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
 | **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
 | **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
