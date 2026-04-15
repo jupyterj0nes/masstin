@@ -32,6 +32,7 @@ mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;
 mod parse_linux;
 pub use crate::parse_linux::*;
+mod parse_journal;
 mod parse_image_windows;
 pub use crate::parse_image_windows::*;
 mod parse_image_linux;

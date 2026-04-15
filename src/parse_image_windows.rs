@@ -386,6 +386,20 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to merge timelines: {}", e);
+                // Fallback: don't throw away the Windows CSV just because the
+                // Linux side produced nothing (or the merge failed for any
+                // other reason). Copy the Windows output to the user's final
+                // path so the 100k+ Windows events already parsed survive.
+                if let Some(out_path) = output {
+                    if std::path::Path::new(&win_tmp_str).exists() {
+                        match fs::copy(&win_tmp_str, out_path) {
+                            Ok(_) => crate::banner::print_info(
+                                "Fallback: Windows-only timeline written (Linux side unavailable)"
+                            ),
+                            Err(ce) => eprintln!("[ERROR] Fallback copy failed: {}", ce),
+                        }
+                    }
+                }
             }
         }
     } else if has_windows {

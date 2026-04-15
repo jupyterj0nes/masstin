@@ -62,21 +62,40 @@ static IPV4_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d{1,3}(\.\d{1,3}){3}$").unwrap());
 static IPV6_COLON: Lazy<Regex> = Lazy::new(|| Regex::new(r":").unwrap());
 
-static SSH_OK_RE: Lazy<Regex> = Lazy::new(|| {
+pub(crate) static SSH_OK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"Accepted (?:password|publickey) for (\S+) from (\S+)"#).unwrap()
 });
-static SSH_FAIL_RE: Lazy<Regex> =
+pub(crate) static SSH_FAIL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"Failed password for (\S+) from (\S+)"#).unwrap());
 static PAM_FAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"pam_unix\(sshd:[^\)]*\).*rhost=(\S+)\s+user=(\S+)"#).unwrap()
 });
 static XINETD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"START: ssh .* from=::ffff:(\S+)"#).unwrap());
+// Matches auditd SSH/PAM auth events on Debian/Ubuntu/RHEL:
+//   - USER_AUTH  : pam_unix / pam_sss authentication attempt
+//   - USER_LOGIN : sshd login (Ubuntu 22 + SSSD primary signal — no acct= field)
+//   - USER_ACCT  : account validation
+//   - USER_START : session_open (hostname=? for sudo, but carries addr= on SSH)
+// We anchor on `addr=<ip>` (more reliable than hostname=, which is often `?`)
+// and pick up res=success/failed. Username is extracted separately from the
+// several possible fields: acct="...", id=<uid>, AUID="...", UID="...".
 static AUDIT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"type=(USER_AUTH|USER_START).*acct="([^"]+)".*hostname=([\d\.]+).*res=(\w+)"#,
+        r#"type=(USER_AUTH|USER_LOGIN|USER_ACCT|USER_START).*?addr=([\d\.:a-fA-F]+).*?res=(\w+)"#,
     )
     .unwrap()
+});
+
+// Username extractors — tried in order. First match wins.
+static AUDIT_USER_ACCT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"acct="([^"]+)""#).unwrap()
+});
+static AUDIT_USER_AUID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"AUID="([^"?]+)""#).unwrap()
+});
+static AUDIT_USER_UID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bUID="([^"?]+)""#).unwrap()
 });
 
 // Regex for RFC3164 syslog header: "Mar 16 08:25:22 hostname"
@@ -176,14 +195,14 @@ fn get_file_year(path: &Path) -> i32 {
 
 // ────────────────────────── raw event holder ─────────────────────────────────
 #[derive(Clone)]
-struct RawEvt {
-    ts_rfc3339: String,
-    user: String,
-    remote: String, // ip OR host (we’ll split later)
-    tty_or_proc: String,
-    evt: String,
-    filename: String,
-    dst_host: String,
+pub(crate) struct RawEvt {
+    pub(crate) ts_rfc3339: String,
+    pub(crate) user: String,
+    pub(crate) remote: String, // ip OR host (we’ll split later)
+    pub(crate) tty_or_proc: String,
+    pub(crate) evt: String,
+    pub(crate) filename: String,
+    pub(crate) dst_host: String,
 }
 
 // ────────────────────────── hostname discovery ───────────────────────────────
@@ -487,48 +506,96 @@ fn parse_secure_or_messages(path: &Path, dst_host: &str, filter_ip: bool, year_h
 fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
     let mut out = Vec::new();
     for line in open_plain_or_gzip(path).lines().flatten() {
-        if let Some(cap) = AUDIT_RE.captures(&line) {
-            // extract epoch.seconds.micro -> first field inside msg=audit(...)
-            if let Some(idx_start) = line.find("msg=audit(") {
-                if let Some(idx_colon) = line[idx_start + 10..].find(':') {
-                    let ts_str = &line[idx_start + 10..idx_start + 10 + idx_colon];
-                    if let Ok(frac) = ts_str.parse::<f64>() {
-                        let secs = frac.trunc() as i64;
-                        let ts =
-                            DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(secs, 0), Utc)
-                                .to_rfc3339();
-                        let user = cap[2].to_string();
-                        let ip = cap[3].to_string();
-                        let res = &cap[4];
-                        let evt = if res == "success" {
-                            "SSH_SUCCESS"
-                        } else {
-                            "SSH_FAILED"
-                        };
-                        if filter_ip && !looks_like_ip(&ip) {
-                            continue;
+        let cap = match AUDIT_RE.captures(&line) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Reject sudo/cron session_open lines where addr is literally "?".
+        // The outer regex already requires an addr digit/hex, but USER_START
+        // with hostname=? addr=? would otherwise be caught by nothing; our
+        // [\d\.:a-fA-F]+ class excludes `?` so that's fine.
+        let evt_type = &cap[1];
+        let ip = cap[2].to_string();
+        let res = &cap[3];
+
+        if filter_ip && !looks_like_ip(&ip) {
+            continue;
+        }
+
+        // Extract timestamp from msg=audit(<epoch>.<ms>:<serial>)
+        let ts = match line.find("msg=audit(") {
+            Some(idx_start) => {
+                let rest = &line[idx_start + 10..];
+                match rest.find(':') {
+                    Some(idx_colon) => {
+                        match rest[..idx_colon].parse::<f64>() {
+                            Ok(frac) => {
+                                let secs = frac.trunc() as i64;
+                                DateTime::<Utc>::from_utc(
+                                    NaiveDateTime::from_timestamp(secs, 0), Utc,
+                                ).to_rfc3339()
+                            }
+                            Err(_) => continue,
                         }
-                        out.push(RawEvt {
-                            ts_rfc3339: ts,
-                            user,
-                            remote: ip,
-                            tty_or_proc: "audit".into(),
-                            evt: evt.into(),
-                            filename: path.display().to_string(),
-                            dst_host: dst_host.into(),
-                        });
                     }
+                    None => continue,
                 }
             }
+            None => continue,
+        };
+
+        // Username: try acct="..." first (USER_AUTH/USER_START), then AUID="..."
+        // (USER_LOGIN on Ubuntu 22 + SSSD), then UID="..." as last resort.
+        let user = AUDIT_USER_ACCT_RE
+            .captures(&line)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .or_else(|| AUDIT_USER_AUID_RE
+                .captures(&line)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string())))
+            .or_else(|| AUDIT_USER_UID_RE
+                .captures(&line)
+                .and_then(|c| c.get(1).map(|m| m.as_str().to_string())))
+            .unwrap_or_default();
+
+        // USER_LOGIN = SSH login itself; USER_AUTH/USER_ACCT/USER_START = PAM
+        // stages. Only USER_LOGIN and USER_AUTH are the lateral-movement
+        // signal; USER_START is session_open which fires once per session and
+        // would double-count. Keep USER_LOGIN + USER_AUTH, drop the rest.
+        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" {
+            continue;
         }
+
+        let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
+
+        out.push(RawEvt {
+            ts_rfc3339: ts,
+            user,
+            remote: ip,
+            tty_or_proc: "audit".into(),
+            evt: evt.into(),
+            filename: path.display().to_string(),
+            dst_host: dst_host.into(),
+        });
     }
     out
 }
 
 // ────────────────────────── DataFrame builder ────────────────────────────────
+/// Write a masstin CSV containing only the canonical header.
+/// Used when no Linux events match, so downstream merge steps in parse-image /
+/// parse-massive find a valid (empty) file instead of erroring with ENOENT.
+fn write_empty_csv(output: Option<&String>) {
+    let header = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename\n";
+    if let Some(path) = output {
+        let _ = std::fs::write(path, header);
+    }
+}
+
 fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     if rows.is_empty() {
         eprintln!("[WARN] nothing matched lateral-movement filter");
+        write_empty_csv(output);
         return;
     }
 
@@ -566,6 +633,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
         .collect();
     if filtered.is_empty() {
         eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
+        write_empty_csv(output);
         return;
     }
     let rows = &filtered[..];
@@ -632,6 +700,8 @@ fn is_linux_artifact(fname: &str) -> bool {
         || lower.starts_with("messages")
         || lower.starts_with("audit.log")
         || lower.starts_with("auth.log")
+        || lower.ends_with(".journal")
+        || lower.ends_with(".journal~")
 }
 
 /// Recursively extract ZIPs (including password-protected with common forensic passwords)
@@ -980,6 +1050,8 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
             parsed = parse_secure_or_messages(path, &dst_host, true, cached_year);
         } else if fname.starts_with("audit.log") {
             parsed = parse_audit(path, &dst_host, true);
+        } else if fname.ends_with(".journal") || fname.ends_with(".journal~") {
+            parsed = crate::parse_journal::parse_journal_file(path, &dst_host);
         }
 
         let count = parsed.len();

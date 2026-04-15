@@ -1,6 +1,6 @@
 [package]
 name = "masstin"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "Lateral movement tracker for anything! A DFIR tool that parses forensic artifacts and visualizes lateral movement in graph databases. Written by Toño Díaz (@jupyterjones)"
 authors = ["Tono Diaz (@jupyterj0nes)"]
@@ -52,4 +52,5 @@ lvm2 = "0.0.3"
 notatin = "1.0"
 serde_yaml = "0.9"
 ipnet = "2"
+systemd-journal-reader = "0.1.1"
 
