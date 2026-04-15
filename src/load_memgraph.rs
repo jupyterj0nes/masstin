@@ -141,7 +141,7 @@ pub async fn load_memgraph(
         };
 
         let local_values: HashSet<&str> =
-                ["LOCAL", "127.0.0.1", "::1", "DEFAULT_VALUE", "\"\"", "-", ""," ",]
+                ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "\"\"", "-", ""," ",]
                 .iter().cloned().collect();
 
         let mut filtered_by_time: usize = 0;
@@ -185,16 +185,18 @@ pub async fn load_memgraph(
                 row[idx_src_ip] = row[idx_src_ip].split('.').next().unwrap_or(row[idx_src_ip]);
             }
 
-            if row[idx_dst].contains(':') {
+            // Strip `hostname:port` / `hostname:instance` suffixes, but preserve
+            // IPv6 literals (they are all hex + colons and must never be split).
+            if row[idx_dst].contains(':') && !looks_like_ip(row[idx_dst]) {
                 row[idx_dst] = row[idx_dst].split(':').next().unwrap_or(row[idx_dst]);
             }
 
-            if row[idx_src_computer].contains(':') {
-                row[idx_src_computer] = row[idx_src_computer].split(':').next().unwrap_or(row[idx_dst]);
+            if row[idx_src_computer].contains(':') && !looks_like_ip(row[idx_src_computer]) {
+                row[idx_src_computer] = row[idx_src_computer].split(':').next().unwrap_or(row[idx_src_computer]);
             }
 
-            if row[idx_src_ip].contains(':') {
-                row[idx_src_ip] = row[idx_src_ip].split(':').next().unwrap_or(row[idx_dst]);
+            if row[idx_src_ip].contains(':') && !looks_like_ip(row[idx_src_ip]) {
+                row[idx_src_ip] = row[idx_src_ip].split(':').next().unwrap_or(row[idx_src_ip]);
             }
 
             if local_values.contains(&row[idx_src_computer]) && local_values.contains(&row[idx_src_ip]) {
@@ -222,6 +224,7 @@ pub async fn load_memgraph(
         for line in &processed_lines {
             let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
 
+            // ── Direct evidence: (src_ip, src_computer) pair ──
             if !local_values.contains(parts[idx_src_computer].as_str())
                 && !local_values.contains(parts[idx_src_ip].as_str())
                 && parts[idx_src_computer] != parts[idx_src_ip]
@@ -234,6 +237,27 @@ pub async fn load_memgraph(
                 *counts
                     .entry((parts[idx_src_ip].clone(), parts[idx_src_computer].clone()))
                     .or_insert(0) += weight;
+            }
+
+            // ── Machine-account hint: target_user ends in $ → computer name ──
+            // On Kerberos AD networks every machine has a computer account
+            // MACHINE$. When a 4624 arrives from an IP with src_computer
+            // empty and target_user=MACHINE$, that's strong evidence the IP
+            // belongs to MACHINE. Weight x100 sits between normal events
+            // (x1) and the authoritative 4778/4779 pair (x1000).
+            if local_values.contains(parts[idx_src_computer].as_str())
+                && !local_values.contains(parts[idx_src_ip].as_str())
+            {
+                let target_user = parts[idx_target_user].as_str();
+                if target_user.ends_with('$') && target_user.len() > 1 {
+                    let machine = &target_user[..target_user.len() - 1];
+                    // Reject if it still looks like an IP or has invalid chars
+                    if !looks_like_ip(machine) && !machine.contains('.') && !machine.is_empty() {
+                        *counts
+                            .entry((parts[idx_src_ip].clone(), machine.to_string()))
+                            .or_insert(0) += 100;
+                    }
+                }
             }
         }
 
@@ -336,9 +360,18 @@ pub async fn load_memgraph(
             let relation_type = if row[5].trim().is_empty() || row[5] == "\"\"" { "NO_USER" } else { row[5] };
 
             // ── Source-side resolution ──
+            // When the parser leaves `src_computer` empty, equal to a local
+            // value, OR filled in with the literal IP (which happens on 4624
+            // events where WorkstationName was blank and masstin fell back
+            // to the address), we try to resolve the real hostname from the
+            // global ip_to_host map. That way the same physical host does
+            // not end up as two separate nodes (one by hostname, one by IP).
             let src_ip_raw = row[9];
             let src_computer_raw = row[8];
-            let origin_name: String = if local_values.contains(src_computer_raw) {
+            let src_computer_is_ip = looks_like_ip(src_computer_raw)
+                && src_computer_raw == src_ip_raw;
+            let needs_resolution = local_values.contains(src_computer_raw) || src_computer_is_ip;
+            let origin_name: String = if needs_resolution {
                 if let Some(resolved_host) = ip_to_host.get(src_ip_raw) {
                     resolved += 1;
                     resolved_host.clone()
@@ -363,6 +396,18 @@ pub async fn load_memgraph(
             } else {
                 dst_raw.to_string()
             };
+
+            // Self-loop filter: after resolution, drop any edge whose origin
+            // and destination point at the same host. Self-loops are pure
+            // noise in a lateral-movement graph — they collapse into ugly
+            // circular arrows in the viewer and obscure real cross-host
+            // movement. We check here (post-resolution) rather than on the
+            // raw fields, because resolution itself creates new matches
+            // (e.g. 192.168.10.11 → WINTERFELL against dst=WINTERFELL).
+            if origin_name.eq_ignore_ascii_case(&destination_name) {
+                pb.inc(1);
+                continue;
+            }
 
             // Relationship type must be a valid Cypher identifier:
             // [A-Za-z_][A-Za-z0-9_]*. Anything else (`$`, `!`, `(`, `)`, dots,

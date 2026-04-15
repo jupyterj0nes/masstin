@@ -60,13 +60,17 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 | Source | Type | What it captures |
 |--------|------|-----------------|
-| `/var/log/secure` | Text | SSH success, failure, connection attempts |
+| `/var/log/auth.log` | Text | SSH success, failure, PAM (Debian/Ubuntu) |
+| `/var/log/secure` | Text | SSH success, failure, PAM (RHEL/CentOS/Rocky) |
 | `/var/log/messages` | Text | SSH events (alternative to secure) |
-| `/var/log/audit/audit.log` | Text | Authentication events via audit subsystem |
+| `/var/log/audit/audit.log` | Text | `USER_LOGIN` / `USER_AUTH` from auditd — primary signal on Ubuntu with SSSD + AD |
+| `/var/log/journal/<machine-id>/*.journal[~]` | Binary (zstd) | systemd-journald — SSH `sshd` events on modern distros where `auth.log` is empty (Ubuntu 18+, RHEL 8+, Debian 11+). Pure-Rust reader, handles compact mode + zstd, **works on Windows analyst hosts without libsystemd**. |
 | `utmp` | Binary | Active user sessions |
 | `wtmp` | Binary | Historical login/logout/boot records |
 | `btmp` | Binary | Failed login attempts |
 | `lastlog` | Binary | Last login per user |
+
+> **Domain-joined Linux (SSSD / Active Directory):** on Ubuntu 22 + SSSD hosts, `/var/log/auth.log` is often nearly empty because PAM routes auth through the systemd journal. Masstin reads `.journal` / `.journal~` files directly and applies the same `Accepted (password|publickey)` / `Failed password` regexes as on text logs, so SSH logins from AD users surface in the timeline with no extra configuration. Combined with the audit.log `USER_LOGIN` path, this recovers the full lateral-movement picture on modern enterprise Linux.
 
 ## Winlogbeat JSON
 

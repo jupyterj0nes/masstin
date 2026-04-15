@@ -742,8 +742,63 @@ fn extract_logs_from_ext4_partition<R: Read + Seek + 'static>(
         }
     }
 
-    // 3. Also try /etc/hostname if not already extracted via EXACT_FILES
-    // (it may have been caught above, but let's be explicit)
+    // 3. Walk /var/log/journal/<machine-id>/*.journal{,~} — systemd-journald
+    //    binary logs. On modern distros (Ubuntu 18+, RHEL 8+) this is where
+    //    SSH auth actually lives; /var/log/auth.log is nearly empty when
+    //    pam_sss / SSSD is in use.
+    if let Ok(machines) = fs.read_dir("/var/log/journal") {
+        for machine_entry in machines.flatten() {
+            let machine_name = match machine_entry.file_name().as_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+            if machine_name == "." || machine_name == ".." { continue; }
+            match machine_entry.file_type() {
+                Ok(ft) if ft.is_dir() => {}
+                _ => continue,
+            }
+            let machine_dir = format!("/var/log/journal/{}", machine_name);
+            let journal_entries = match fs.read_dir(machine_dir.as_str()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for j in journal_entries.flatten() {
+                let jname = match j.file_name().as_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                let jlow = jname.to_lowercase();
+                if !(jlow.ends_with(".journal") || jlow.ends_with(".journal~")) {
+                    continue;
+                }
+                match j.file_type() {
+                    Ok(ft) if ft.is_regular_file() => {}
+                    _ => continue,
+                }
+                let full_path = format!("{}/{}", machine_dir, jname);
+                match fs.read(full_path.as_str()) {
+                    Ok(data) => {
+                        let dest = map_linux_path_to_local(&full_path, output_dir);
+                        if let Some(parent) = dest.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        if let Ok(mut f) = File::create(&dest) {
+                            let _ = f.write_all(&data);
+                            count += 1;
+                            if is_debug_mode() {
+                                eprintln!("[DEBUG] Extracted journal: {} ({} bytes)", full_path, data.len());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if is_debug_mode() {
+                            eprintln!("[DEBUG] Could not read journal {}: {}", full_path, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(count)
 }
