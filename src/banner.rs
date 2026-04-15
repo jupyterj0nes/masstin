@@ -624,18 +624,19 @@ pub fn print_cortex_network_summary(total: usize, rdp: usize, smb: usize, ssh: u
     );
 }
 
-pub fn print_cortex_forensics_summary(machines: usize, artifacts: usize, events: usize) {
+pub fn print_cortex_forensics_summary(machines: usize, distinct_event_ids: usize, events: usize) {
     if is_silent() { return; }
     eprintln!();
     eprintln!("  {} {}",
         style("[+]").green().bold(),
         style("Forensic artifacts retrieved:").bold(),
     );
-    eprintln!("        {} {} from {} {}",
+    eprintln!("        {} {} across {} {} {}",
         style("=>").green().bold(),
         style(format!("{} events", events)).green().bold(),
-        style(artifacts).yellow(),
-        style(format!("artifacts across {} machines", machines)).dim(),
+        style(machines).yellow(),
+        style("hosts,").dim(),
+        style(format!("{} distinct event IDs", distinct_event_ids)).dim(),
     );
 }
 

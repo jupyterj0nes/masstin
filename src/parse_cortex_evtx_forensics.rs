@@ -53,6 +53,10 @@ pub async fn parse_cortex_evtx_forensics_data(
     debug: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
+    ignore_local: bool,
+    event_ids: Option<&String>,
+    min_window_secs: i64,
+    max_passes: usize,
 ) -> Result<(), Box<dyn Error>> {
     let start_clock = std::time::Instant::now();
 
@@ -70,18 +74,21 @@ pub async fn parse_cortex_evtx_forensics_data(
         _ => None,
     };
 
-    // 2) build an additional XQL filter only if both limits exist
-    let time_filter = if let (Some(start), Some(end)) = (epoch_start, epoch_end) {
-        // Timestamp ≤ end  AND  Timestamp ≥ start
-        format!(
-            r#"| filter (timestamp_diff(to_timestamp({end}), Timestamp, "SECOND") > 0) and
-                     (timestamp_diff(Timestamp,      to_timestamp({start}), "SECOND") > 0 )"#
-        )
-    } else {
-        String::new()  // no extra limit
+    // Build the time_filter XQL clause as a function of window bounds. When
+    // auto-pagination bisects, each pass uses its own (start, end) to rebuild
+    // the clause. If no bounds are provided, the clause is empty and the query
+    // uses the default `timeframe=365d` at the top.
+    let build_time_filter = |start: Option<i64>, end: Option<i64>| -> String {
+        match (start, end) {
+            (Some(s), Some(e)) => format!(
+                r#"| filter (timestamp_diff(to_timestamp({e}), Timestamp, "SECOND") > 0) and
+                     (timestamp_diff(Timestamp,      to_timestamp({s}), "SECOND") > 0 )"#
+            ),
+            _ => String::new(),
+        }
     };
 
-    
+
 
     let client = Client::new();
 
@@ -93,137 +100,275 @@ pub async fn parse_cortex_evtx_forensics_data(
     // Headers
     let headers = build_headers(&token, &x_xdr_auth_id)?;
 
-    // NUEVA QUERY basada en tu especificación
-    let query_string = format!(
+    // Event IDs pushed into XQL. Default set now matches the canonical list from
+    // parse-windows (src/parse.rs constants) so that `parse-cortex-evtx-forensics`
+    // covers exactly the same lateral-movement surface as `parse-windows`:
+    //   Security:       4624,4625,4634,4647,4648,4768,4769,4770,4771,4776,4778,4779,5140
+    //                   (5145 intentionally excluded — see SECURITY_EVENT_IDS in parse.rs)
+    //   SMB Client:     31001
+    //   SMB Client Conn:30803-30808
+    //   SMB Server:     1009,551
+    //   RDP Client:     1024,1102
+    //   RDP ConnMgr:    1149
+    //   RDP LSM:        21,22,24,25
+    //   RDP Core TS:    131
+    //   WinRM:          6
+    //   WMI-Activity:   5858
+    // --cortex-event-ids overrides to narrow (e.g. "4624,4625,4648").
+    let default_ids = "4624,4625,4634,4647,4648,4768,4769,4770,4771,4776,4778,4779,5140,31001,30803,30804,30805,30806,30807,30808,1009,551,1024,1102,1149,21,22,24,25,131,6,5858";
+    let event_ids_clause: String = match event_ids {
+        Some(raw) => raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","),
+        None => default_ids.to_string(),
+    };
+
+    // --ignore-local pushed server-side: drop events where srcip/source_host map
+    // to the same host as dst_host or are loopback/link-local markers. The final
+    // `dst_host != source_host` check already exists below; here we add IP-shape
+    // exclusions up front so less data has to traverse the stream.
+    let ignore_local_post_clause = if ignore_local {
+        r#"| filter (srcip not in ("127.0.0.1","::1","0.0.0.0","localhost","-") or srcip = null)
+           | filter (source_host not in ("127.0.0.1","::1","0.0.0.0","localhost","-") or source_host = null)"#
+    } else {
+        ""
+    };
+
+    // XQL query. Sources and event_id set mirror parse-windows exactly.
+    //
+    // Locale coverage for the `regextract` branches:
+    //   EN, ES: validated against the Unit42 academy tenant.
+    //   DE, FR, IT: derived from Microsoft Learn localized KB3097467,
+    //               wallix/pylogsparser French normalizer, and ManageEngine
+    //               ADAudit Plus localized event reference pages.
+    //   Niche events (131 RdpCoreTS, 6 WinRM, 5858 WMI-Activity) carry
+    //               English-only templates on every locale — confirmed from the
+    //               ETW manifests and Microsoft WMI KB — so no localization
+    //               layer is needed for their branches.
+    //
+    // Extending to new locales is forward-compatible: each field is a
+    // `(?:EN|ES|DE|FR|IT|...)` alternation, so wrong or missing additions
+    // silently fail to match without affecting other languages.
+    // Community contributions welcome — see CONTRIBUTING and the README
+    // section "Help us localize the Cortex XDR EVTX query".
+    //
+    // Field semantics (mirror parse.rs parse_security_log / parse_smb_server /
+    // parse_rdp_localsession / parse_winrm / parse_wmi):
+    //   dst_host     = host where the auth/event landed
+    //   source_host  = workstation name reported by the source system
+    //   srcip        = source IP reported by the source system
+    //   subject_*    = initiator (Subject: block)
+    //   target_*     = account whose credentials were used / for whom the logon was created
+    //   lt           = logon type (string), or "runas"/"10"/"3" derived by event_id
+    //   process      = process name (4624/4648), or overloaded carrier for
+    //                  detail content of 5140/5858/6/4625
+    let build_query = |w_start: Option<i64>, w_end: Option<i64>| -> String {
+        let time_filter = build_time_filter(w_start, w_end);
+        format!(
         r#"config case_sensitive = false timeframe=365d |
-       dataset = forensics_event_log 
-                    | filter event_id in (4624,4625,4648,21,22,24,25,1009,551,31001,30803,30804,30805,30806,30807,30808,1024,1102,1149) and source in ("Security","Microsoft-Windows-TerminalServices-LocalSessionManager/Operational","Microsoft-Windows-SMBServer/Security","Microsoft-Windows-SmbClient/Security","Microsoft-Windows-TerminalServices-RDPClient/Operational","Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational") 
+       dataset = forensics_event_log
+                    | filter event_id in ({event_ids_clause}) and source in (
+                        "Security",
+                        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+                        "Microsoft-Windows-SMBServer/Security",
+                        "Microsoft-Windows-SmbClient/Security",
+                        "Microsoft-Windows-TerminalServices-RDPClient/Operational",
+                        "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+                        "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational",
+                        "Microsoft-Windows-WinRM/Operational",
+                        "Microsoft-Windows-WMI-Activity/Operational")
                     | filter message not in ("""::""", null, """""","-")
-                    | alter lt = if(event_id in (4624,4625), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión):\s*(\d+)"), 0),event_id=4648,"runas",event_id in (21,22,24,25,1024,1102,1149),"10","3")
-                    | alter srcip = if(event_id in (4624,4625,21,22,24,25,1149,1009,551),arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Client Name|Nombre de.? cliente):\s*\\*([\w.-]+)"), 0))
-                    | alter process = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso):\s*([^\r\n]+)"), 0))
-                    | alter source_host = if(event_id in (4624,4625),arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo):\s*\\*([\w.-]+)"), 0),event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102),host_name)
-                    | alter subject_name = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Name|Firmante:.*?Nombre de cuenta):\s*([\w.\-$]+)"), 0))
-                    | alter subject_domain = if(event_id in (4624,4625,4648),arrayindex(regextract(message , "(?si)(?:Subject:.*?Account Domain|Firmante:.*?Dominio de cuenta):\s*([\w.\-$ ]+)"), 0))
-                    | alter target_user = if(event_id in (4624,4625,4648),arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Name|Nuevo inicio de sesión:.*?Nombre de cuenta|Account For Which Logon Failed:.*?Account Name|Cuenta con error de inicio de sesión:.*?Nombre de cuenta|Account Whose Credentials Were Used:.*?Account Name|Cuenta cuyas credenciales se usaron:.*?Nombre de cuenta):\s*([\w.\-$]+)"), 0),event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|User|Usuario):\s(?:[^\s\\]+)\\([^\s]+)"), 0))
-                    | alter target_domain = if(event_id in (4624,4625,4648),arrayindex(regextract(message , "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta):\s*([\w.\-$]+)"), 0),event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
-                    | alter dst_host = if(event_id in (4624,4625,21,22,24,25,1149),host_name,event_id=4648,arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino):\s*\\*([\w.-]+)"), 0),event_id in (31001,30803,30804,30805,30806,30807),arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor):\s\\*(.+)"), 0),event_id=30808,arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido):\s\\*(.+)"), 0),event_id in (1102),arrayindex(regextract(message, "(?i)(?:server|servidor)\s+([\w.-]+)\b"), 0))
+                    | alter lt = if(
+                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión|Anmeldetyp|Type d.ouverture de session|Tipo di accesso):\s*(\d+)"), 0),
+                        event_id = 4648, "runas",
+                        event_id in (21,22,24,25,1024,1102,1149,131), "10",
+                        event_id in (6,5858), "",
+                        "3")
+                    | alter srcip = if(
+                        event_id in (4624,4625,21,22,24,25,1149,1009,551), arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Quellnetzwerkadresse|Adresse du réseau source|Indirizzo di rete di origine|Client Name|Nombre de.? cliente|Clientname|Nom du client|Nome client):\s*\\*([\w.-]+)"), 0),
+                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Source Address|Dirección de origen|Quelladresse|Adresse source|Indirizzo di origine):\s*([\w.:-]+)"), 0),
+                        event_id = 131, arrayindex(regextract(message, "(?i)from client\s+([^:\s]+)"), 0),
+                        event_id = 5858, arrayindex(regextract(message, "ClientMachine\s*=\s*([\w.\-$]+)"), 0))
+                    | alter process = if(
+                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso|Prozessname|Nom du processus|Nome processo|Nome del processo):\s*([^\r\n]+)"), 0),
+                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):\s*(\S+)"), 0),
+                        event_id = 5858, arrayindex(regextract(message, "Operation\s*=\s*([^;]{{1,120}})"), 0),
+                        event_id = 6,    arrayindex(regextract(message, "(?i)connection\s*[:=]?\s*(\S+)"), 0),
+                        event_id = 4625, arrayindex(regextract(message, "(?i)(?:Sub Status|Subestado|Unterstatus|Sous-état|Sottostato):\s*(0x[0-9a-f]+)"), 0))
+                    | alter source_host = if(
+                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo|Arbeitsstationsname|Nom de la station de travail|Nome workstation|Nome stazione di lavoro):\s*\\*([\w.-]+)"), 0),
+                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Source Workstation|Estación de trabajo de origen|Quellarbeitsstation|Station de travail source|Workstation di origine):\s*([\w.-]+)"), 0),
+                        event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102), host_name)
+                    | alter subject_name = if(
+                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Name|Firmante:.*?Nombre de cuenta|Antragsteller:.*?Kontoname|Sujet:.*?Nom du compte|Soggetto:.*?Nome account|Oggetto:.*?Nome account):\s*([\w.\-$]+)"), 0))
+                    | alter subject_domain = if(
+                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Domain|Firmante:.*?Dominio de cuenta|Antragsteller:.*?Kontodomäne|Sujet:.*?Domaine du compte|Soggetto:.*?Dominio account|Oggetto:.*?Dominio account):\s*([\w.\-$ ]+)"), 0))
+                    | alter target_user = if(
+                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Name|Nuevo inicio de sesión:.*?Nombre de cuenta|Neue Anmeldung:.*?Kontoname|Nouvelle ouverture de session:.*?Nom du compte|Nuovo accesso:.*?Nome account|Account For Which Logon Failed:.*?Account Name|Cuenta con error de inicio de sesión:.*?Nombre de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontoname|Compte pour lequel l.ouverture de session a échoué:.*?Nom du compte|Account per cui l.accesso non è riuscito:.*?Nome account|Account Whose Credentials Were Used:.*?Account Name|Cuenta cuyas credenciales se usaron:.*?Nombre de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontoname|Compte dont les informations d.identification ont été utilisées:.*?Nom du compte|Account le cui credenziali sono state usate:.*?Nome account):\s*([\w.\-$]+)"), 0),
+                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Logon Account|Cuenta de inicio de sesión|Anmeldekonto|Compte d.ouverture de session|Account di accesso):\s*([\w.\-$]+)"), 0),
+                        event_id = 5858, arrayindex(regextract(message, "User\s*=\s*(?:[^\s\\]+\\)?([\w.\-$]+)"), 0),
+                        event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s(?:[^\s\\]+)\\([^\s]+)"), 0))
+                    | alter target_domain = if(
+                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Neue Anmeldung:.*?Kontodomäne|Nouvelle ouverture de session:.*?Domaine du compte|Nuovo accesso:.*?Dominio account|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontodomäne|Compte pour lequel l.ouverture de session a échoué:.*?Domaine du compte|Account per cui l.accesso non è riuscito:.*?Dominio account|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontodomäne|Compte dont les informations d.identification ont été utilisées:.*?Domaine du compte|Account le cui credenziali sono state usate:.*?Dominio account):\s*([\w.\-$]+)"), 0),
+                        event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
+                    | alter dst_host = if(
+                        event_id in (4624,4625,4634,4647,4776,4778,4779,5140,21,22,24,25,1149,131,5858), host_name,
+                        event_id = 4648, arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino|Zielservername|Nom du serveur cible|Nome del server di destinazione):\s*\\*([\w.-]+)"), 0),
+                        event_id in (31001,30803,30804,30805,30806,30807), arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor|Servername|Nom du serveur|Nome del server):\s\\*(.+)"), 0),
+                        event_id = 30808, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):\s\\*(.+)"), 0),
+                        event_id = 1102, arrayindex(regextract(message, "(?i)(?:server|servidor|serveur)\s+([\w.-]+)\b"), 0),
+                        event_id = 6,    arrayindex(regextract(message, "(?i)connection\s*[:=]?\s*(?:https?://)?([\w.-]+)"), 0))
                     | alter Timestamp  = to_timestamp(event_generated, "millis")
                     {time_filter}
                     | filter ((`source_host` not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost") or srcip not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost")) and dst_host not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost"))
                     | filter (dst_host != source_host) and (dst_host != srcip )
-                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process"#);
+                    {ignore_local_post_clause}
+                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process"#)
+    };
 
-    let query_payload = json!({
-        "request_data": {
-            "query":   query_string,
-            "tenants": []
-        }
-    });
-    
     // Phase 2: Query API
     crate::banner::print_phase("2", "3", "Querying Cortex XDR Forensics API...");
     if start_time.is_some() {
         crate::banner::print_phase_detail("Time range:", &format!("{} to {}", start_time.unwrap_or(&String::new()), end_time.unwrap_or(&String::new())));
     }
 
-    if debug {
-        eprintln!("[DEBUG] POSTing query to: {}", start_query_url);
-        eprintln!("[DEBUG] Payload: {}", query_payload);
-    }
+    // Auto-pagination by time splitting. Same pattern as parse_cortex: when a
+    // query hits the API cap near 1M records, bisect the time window and retry
+    // each half. Only active when both bounds are provided; otherwise a single
+    // query runs with the default 365d timeframe.
+    const API_CAP: usize = 1_000_000;
+    const SATURATION_THRESHOLD: usize = 999_000;
 
-    // Start the query
-    let resp = client.post(&start_query_url)
-        .headers(headers.clone())
-        .json(&query_payload)
-        .send().await?;
-
-    if resp.status() != 200 {
-        return Err(format!("start_xql_query failed with status: {}", resp.status()).into());
-    }
-
-    let resp_json: Value = resp.json().await?;
-    if debug {
-        eprintln!("[DEBUG] start_xql_query response: {}", resp_json);
-    }
-
-    let query_id = resp_json
-        .get("reply")
-        .and_then(|r| r.as_str())
-        .ok_or("Could not retrieve 'query_id' from start query response")?
-        .to_string();
-
-    if debug {
-        eprintln!("[DEBUG] Query ID: {}", query_id);
-    }
-
-    // Poll for results
-    let spinner = crate::banner::create_spinner("Waiting for forensic query results...");
-    let poll_payload = json!({
-        "request_data": {
-            "query_id": query_id,
-            "offset": 0
-        }
-    });
-
+    let has_bounds = epoch_start.is_some() && epoch_end.is_some();
     let mut all_data: Vec<Value> = Vec::new();
-    let max_retries = 10;
-    for attempt in 0..max_retries {
-        if debug {
-            eprintln!("[DEBUG] Attempt {} to get results", attempt + 1);
-        }
-        let poll_resp = client.post(&get_results_url)
-            .headers(headers.clone())
-            .json(&poll_payload)
-            .send().await?;
+    let mut work: Vec<(Option<i64>, Option<i64>)> = vec![(epoch_start, epoch_end)];
+    let mut pass = 0usize;
+    let mut truncated_passes = 0usize;
+    let mut max_cap_hit = false;
 
-        if poll_resp.status() != 200 {
-            eprintln!("[DEBUG] get_query_results status: {}", poll_resp.status());
-            break;
-        }
-        let poll_json: Value = poll_resp.json().await?;
-        if debug {
-            eprintln!("[DEBUG] poll_json: {}", poll_json);
+    if has_bounds {
+        crate::banner::print_phase_detail(
+            "Auto-pagination:",
+            &format!(
+                "min window {}s, max {} passes, saturation threshold {}",
+                min_window_secs, max_passes, SATURATION_THRESHOLD
+            ),
+        );
+    }
+
+    while let Some((w_start, w_end)) = work.pop() {
+        pass += 1;
+
+        if has_bounds {
+            let span_secs = match (w_start, w_end) { (Some(s), Some(e)) => e - s, _ => -1 };
+            let span_label = if span_secs < 0 {
+                "?".to_string()
+            } else if span_secs < 3600 {
+                format!("{}m", span_secs / 60)
+            } else if span_secs < 86400 {
+                format!("{}h {}m", span_secs / 3600, (span_secs % 3600) / 60)
+            } else {
+                format!("{}d {}h", span_secs / 86400, (span_secs % 86400) / 3600)
+            };
+            crate::banner::print_phase_detail(
+                &format!("Pass {}/{}", pass, max_passes),
+                &format!(
+                    "window {} → {}  (span {})  queue={}  collected={}",
+                    w_start.map(epoch_to_str).unwrap_or_else(|| "-".into()),
+                    w_end.map(epoch_to_str).unwrap_or_else(|| "-".into()),
+                    span_label,
+                    work.len(),
+                    all_data.len()
+                ),
+            );
         }
 
-        let status = poll_json.pointer("/reply/status").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-        if status == "SUCCESS" {
-            // Check results in poll_json["reply"]["results"]["data"] (optional)
-            if let Some(results_data) = poll_json.pointer("/reply/results/data") {
-                if results_data.is_array() {
-                    if let Some(arr) = results_data.as_array() {
-                        all_data.extend_from_slice(arr);
-                    }
+        let pass_start = std::time::Instant::now();
+        let batch = run_forensics_query(
+            &client,
+            &start_query_url,
+            &get_results_url,
+            &get_stream_url,
+            &headers,
+            &build_query(w_start, w_end),
+            debug,
+        )
+        .await?;
+        let batch_len = batch.len();
+        let elapsed = pass_start.elapsed().as_secs();
+
+        if has_bounds {
+            crate::banner::print_phase_detail(
+                "  ↳",
+                &format!("retrieved {} events in {}s", batch_len, elapsed),
+            );
+        }
+
+        if has_bounds && batch_len >= SATURATION_THRESHOLD {
+            if pass >= max_passes {
+                max_cap_hit = true;
+                crate::banner::print_warning(&format!(
+                    "Pass cap {} reached — accepting saturated window as-is. Raise --cortex-max-passes if you need deeper recovery.",
+                    max_passes
+                ));
+                all_data.extend(batch);
+                truncated_passes += 1;
+                continue;
+            }
+            match bisect_epoch_window(w_start, w_end, min_window_secs) {
+                Some(mid) => {
+                    crate::banner::print_warning(&format!(
+                        "Saturated at {}/{} — bisecting at {}. Queue will grow by 1.",
+                        batch_len, API_CAP, epoch_to_str(mid)
+                    ));
+                    // Push later half first so we pop the earlier half next.
+                    work.push((Some(mid), w_end));
+                    work.push((w_start, Some(mid)));
+                    continue;
+                }
+                None => {
+                    truncated_passes += 1;
+                    crate::banner::print_warning(&format!(
+                        "Saturated at {} but window is already at the {}s floor — accepting truncation. Lower --cortex-min-window-secs to go finer.",
+                        batch_len, min_window_secs
+                    ));
+                    all_data.extend(batch);
                 }
             }
-            // If there's a "stream_id"
-            if let Some(stream_id) = poll_json.pointer("/reply/results/stream_id").and_then(|v| v.as_str()) {
-                if debug {
-                    eprintln!("[DEBUG] Large dataset. Using stream_id: {}", stream_id);
-                }
-                let more_data = fetch_stream_data(&client, &get_stream_url, &headers, stream_id, debug).await?;
-                all_data.extend(more_data);
-            }
-            break;
-        } else if status == "PENDING" || status == "RUNNING" {
-            if debug { eprintln!("[DEBUG] Query still {}, sleeping 5s...", status); }
-            sleep(Duration::from_secs(5)).await;
         } else {
-            if debug { eprintln!("[DEBUG] Unexpected status: {}", status); }
-            break;
+            all_data.extend(batch);
         }
     }
 
-    spinner.finish_and_clear();
+    if has_bounds {
+        crate::banner::print_phase_detail(
+            "Auto-pagination complete:",
+            &format!(
+                "{} passes, {} events collected, {} windows truncated",
+                pass, all_data.len(), truncated_passes
+            ),
+        );
+        if max_cap_hit {
+            crate::banner::print_warning(
+                "One or more windows hit --cortex-max-passes. Consider raising it or narrowing --start-time/--end-time."
+            );
+        }
+    }
 
-    // Count unique machines and artifacts for summary
+    // Count unique destination hosts and unique event sources for the summary.
+    // The query returns `dst_host` (renamed from host_name) so we count that.
     let mut machines: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut event_ids_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for record in &all_data {
-        if let Some(host) = record.get("host_name").and_then(|v| v.as_str()) {
-            if !host.is_empty() { machines.insert(host.to_string()); }
+        for key in &["dst_host", "source_host"] {
+            if let Some(host) = record.get(*key).and_then(|v| v.as_str()) {
+                if !host.is_empty() && host != "-" { machines.insert(host.to_string()); }
+            }
+        }
+        if let Some(eid) = record.get("event_id") {
+            let s = eid.as_str().map(|v| v.to_string()).or_else(|| eid.as_i64().map(|v| v.to_string()));
+            if let Some(v) = s { event_ids_seen.insert(v); }
         }
     }
-    crate::banner::print_cortex_forensics_summary(machines.len(), machines.len(), all_data.len());
+    crate::banner::print_cortex_forensics_summary(machines.len(), event_ids_seen.len(), all_data.len());
 
     // Sort by _time
     all_data.sort_by(|a, b| {
@@ -250,6 +395,102 @@ pub async fn parse_cortex_evtx_forensics_data(
 
     crate::banner::print_summary(all_data.len(), all_data.len(), 0, Some(out_path), start_clock);
     Ok(())
+}
+
+// ----------------------------------------------
+// Single-query runner (used by the auto-pagination loop)
+// Posts one XQL query, polls for completion, fetches streamed results.
+// ----------------------------------------------
+async fn run_forensics_query(
+    client: &Client,
+    start_query_url: &str,
+    get_results_url: &str,
+    get_stream_url: &str,
+    headers: &HeaderMap,
+    query_string: &str,
+    debug: bool,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let payload = json!({
+        "request_data": { "query": query_string, "tenants": [] }
+    });
+
+    if debug {
+        eprintln!("[DEBUG] POST to: {}", start_query_url);
+        eprintln!("[DEBUG] Query: {}", query_string);
+    }
+
+    let resp = client.post(start_query_url)
+        .headers(headers.clone())
+        .json(&payload)
+        .send().await?;
+    if resp.status() != 200 {
+        return Err(format!("start_xql_query failed with status: {}", resp.status()).into());
+    }
+    let resp_json: Value = resp.json().await?;
+    let query_id = resp_json
+        .get("reply")
+        .and_then(|r| r.as_str())
+        .ok_or("Could not retrieve 'query_id' from start query response")?
+        .to_string();
+
+    let spinner = crate::banner::create_spinner("Waiting for forensic query results...");
+    let mut out: Vec<Value> = Vec::new();
+    let poll_payload = json!({
+        "request_data": { "query_id": query_id, "offset": 0 }
+    });
+
+    // Poll up to 10 minutes (120 * 5s) — large saturated windows can take a while.
+    let max_retries = 120;
+    for attempt in 0..max_retries {
+        if debug {
+            eprintln!("[DEBUG] Poll attempt {}", attempt + 1);
+        }
+        let poll_resp = client.post(get_results_url)
+            .headers(headers.clone())
+            .json(&poll_payload)
+            .send().await?;
+        if poll_resp.status() != 200 { break; }
+        let poll_json: Value = poll_resp.json().await?;
+        let status = poll_json.pointer("/reply/status").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+
+        if status == "SUCCESS" {
+            if let Some(results_data) = poll_json.pointer("/reply/results/data") {
+                if let Some(arr) = results_data.as_array() {
+                    out.extend_from_slice(arr);
+                }
+            }
+            if let Some(stream_id) = poll_json.pointer("/reply/results/stream_id").and_then(|v| v.as_str()) {
+                let more = fetch_stream_data(client, get_stream_url, headers, stream_id, debug).await?;
+                out.extend(more);
+            }
+            break;
+        } else if status == "PENDING" || status == "RUNNING" {
+            sleep(Duration::from_secs(5)).await;
+        } else {
+            break;
+        }
+    }
+    spinner.finish_and_clear();
+    Ok(out)
+}
+
+/// Bisect a (start_epoch, end_epoch) window. Returns the midpoint epoch
+/// (seconds) or None if the window is smaller than 2× the min_window_secs
+/// floor (which would produce a half below the floor).
+fn bisect_epoch_window(start: Option<i64>, end: Option<i64>, min_window_secs: i64) -> Option<i64> {
+    let (s, e) = (start?, end?);
+    let span = e - s;
+    if span < min_window_secs * 2 {
+        return None;
+    }
+    Some(s + span / 2)
+}
+
+/// Format an epoch-seconds timestamp as "YYYY-MM-DD HH:MM:SS UTC" for logs.
+fn epoch_to_str(epoch: i64) -> String {
+    Utc.timestamp(epoch, 0)
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string()
 }
 
 // ----------------------------------------------
@@ -412,25 +653,65 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
 
     let process = record.get("process").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Classify event_type based on event_id (same mapping as Security.evtx)
+    // Classify event_type — must match parse.rs (parse_security_log / parse_smb_server
+    // / parse_rdp_localsession / parse_winrm / parse_wmi) exactly. Any divergence
+    // would produce different CSV output for the same underlying event depending
+    // on whether it came from parse-windows or parse-cortex-evtx-forensics.
+    //
+    // For 4768/4769/4776 parse-windows branches on Status=="0x0" to classify
+    // success/failure. We don't have the Status field in the Cortex query — it
+    // would need yet another alter branch. As a best-effort we classify as
+    // SUCCESSFUL_LOGON and rely on 4771 (pre-auth fail) for the FAILED signal.
+    // TODO: add Status extraction to the XQL query if the false-positive rate
+    // on 4768/4769/4776 proves to be a problem in practice.
     let event_type = match event_id.as_str() {
         "4624" => "SUCCESSFUL_LOGON".to_string(),
         "4625" => "FAILED_LOGON".to_string(),
+        "4634" | "4647" | "4779" => "LOGOFF".to_string(),
         "4648" => "SUCCESSFUL_LOGON".to_string(),
+        "4768" | "4769" | "4776" => "SUCCESSFUL_LOGON".to_string(),
+        "4770" => "SUCCESSFUL_LOGON".to_string(),
+        "4771" => "FAILED_LOGON".to_string(),
+        "4778" => "SUCCESSFUL_LOGON".to_string(),
+        "5140" => "SUCCESSFUL_LOGON".to_string(),
         "21" | "22" | "25" | "1149" => "SUCCESSFUL_LOGON".to_string(),
         "24" => "LOGOFF".to_string(),
         "1024" | "1102" | "131" => "CONNECT".to_string(),
         "1009" | "31001" => "SUCCESSFUL_LOGON".to_string(),
-        "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
         "30803" | "30804" | "30805" | "30806" | "30807" | "30808" => "CONNECT".to_string(),
         "551" => "FAILED_LOGON".to_string(),
+        "6" | "5858" => "CONNECT".to_string(),
         _ => "CONNECT".to_string(),
     };
 
-    // detail: for 4624/4648 use process, for 4625 use SubStatus (not available in Cortex query, use process as fallback)
+    // detail — replicate parse.rs semantics. The XQL `process` column is
+    // overloaded to carry whichever raw string the event's detail field needs
+    // (ProcessName for 4624/4648, SubStatus for 4625, ShareName for 5140,
+    // Operation for 5858, connection for 6). Final wrapping happens here.
     let detail = match event_id.as_str() {
         "4624" | "4648" => process.clone(),
-        "4625" => process.clone(),
+        "4625" => {
+            if process.is_empty() {
+                String::new()
+            } else {
+                crate::parse::translate_substatus(&process)
+            }
+        }
+        "5140" => process.clone(),
+        "5858" => {
+            if process.is_empty() {
+                String::new()
+            } else {
+                format!("WMI: {}", process)
+            }
+        }
+        "6" => {
+            if process.is_empty() {
+                String::new()
+            } else {
+                format!("WinRM: {}", process)
+            }
+        }
         _ => String::new(),
     };
 

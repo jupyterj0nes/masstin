@@ -39,7 +39,11 @@ pub async fn parse_cortex_data(
     debug: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
-    filter_ip: Option<&String>
+    filter_ip: Option<&String>,
+    ignore_local: bool,
+    admin_ports: bool,
+    min_window_secs: i64,
+    max_passes: usize,
 ) -> Result<(), Box<dyn Error>> {
     let start_clock = std::time::Instant::now();
 
@@ -87,24 +91,45 @@ pub async fn parse_cortex_data(
         None => "".to_string(),
     };
 
-    let query_string = format!(
-        r#"config case_sensitive = false timeframe between "{cortex_start_str}" and "{cortex_end_str}" | dataset = xdr_data |
-        filter event_type = NETWORK and (action_local_port in (3389,445,22) or action_remote_port in (3389,445,22)) |
+    // Port list pushed into the XQL. Default covers the core lateral-movement
+    // ports (SSH, SMB, RDP, WinRM) — WinRM 5985/5986 was added to the default
+    // after live validation showed PSRemoting flows missed by the narrower set.
+    // --admin-ports widens further to the full admin set (RPC 135, NetBIOS 139,
+    // VNC 5900, SQL 1433/3306) for wider pivot visibility at the cost of volume.
+    let port_list = if admin_ports {
+        "22,135,139,445,1433,3306,3389,5900,5985,5986"
+    } else {
+        "22,445,3389,5985,5986"
+    };
+
+    // --ignore-local pushed server-side: exclude loopback, link-local and
+    // self-connections (same src/dst IP) so we don't drag that noise across
+    // the 1M API cap. Post-filter `filter::should_keep_record` still runs.
+    let ignore_local_clause = if ignore_local {
+        r#"filter ((`action_local_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost")) and (`action_remote_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost"))) |
+        filter (action_local_ip != action_remote_ip) |"#.to_string()
+    } else {
+        String::new()
+    };
+
+    let build_query = |s: &str, e: &str| -> String {
+        format!(
+            r#"config case_sensitive = false timeframe between "{s}" and "{e}" | dataset = xdr_data |
+        filter event_type = NETWORK and (action_local_port in ({port_list}) or action_remote_port in ({port_list})) |
         filter ((`action_local_ip` not in ("""::""", null, """""")) and (`action_remote_ip` not in ("""::""", null, """"""))) |
+        {ignore_local_clause}
         {filter_ip_clause}
         fields agent_hostname, action_local_ip, action_local_port, actor_primary_username, action_remote_ip, action_remote_port, actor_process_image_name, actor_process_command_line, action_download, action_upload, action_total_download, action_total_upload"#
-    );
-
-    let query_payload = json!({
-        "request_data": {
-            "query": query_string,
-            "tenants": []
-        }
-    });
+        )
+    };
 
 
     // Phase 2: Query API
     crate::banner::print_phase("2", "3", "Querying Cortex XDR Network API...");
+    crate::banner::print_phase_detail("Ports:", port_list);
+    if ignore_local {
+        crate::banner::print_phase_detail("Ignore local:", "loopback, link-local, self-connections filtered server-side");
+    }
     if filter_ip.is_some() {
         crate::banner::print_phase_detail("Filter IP:", filter_ip.unwrap());
     }
@@ -112,141 +137,154 @@ pub async fn parse_cortex_data(
         crate::banner::print_phase_detail("Time range:", &format!("{} to {}", cortex_start_str, cortex_end_str));
     }
 
-    if debug {
-        eprintln!("[DEBUG] Starting query with payload: {}", query_payload);
-        eprintln!("[DEBUG] POST to: {}", start_query_url);
-    }
+    // Auto-pagination by time splitting. If the API returns at/near the 1M cap,
+    // the window is bisected and each half re-queried. Only kicks in when both
+    // time bounds are present; otherwise a single query runs as before.
+    //
+    // The two knobs exposed to the user:
+    //   --cortex-min-window-secs : floor for bisection (don't split below this)
+    //   --cortex-max-passes      : hard cap on queue iterations
+    //
+    // We never block on user input; every decision is printed verbosely so a
+    // watching analyst can Ctrl-C at will if they see something they dislike.
+    const API_CAP: usize = 1_000_000;
+    const SATURATION_THRESHOLD: usize = 999_000;
 
-    let resp = client
-        .post(&start_query_url)
-        .headers(headers.clone())
-        .json(&query_payload)
-        .send()
-        .await?;
-
-    if debug {
-        eprintln!("[DEBUG] Start query response status: {}", resp.status());
-    }
-    if resp.status() != 200 {
-        return Err(format!(
-            "Unexpected status from start_xql_query: {}",
-            resp.status()
-        )
-        .into());
-    }
-
-    let resp_json: Value = resp.json().await?;
-    if debug {
-        eprintln!("[DEBUG] Start query response JSON: {}", resp_json);
-    }
-
-    // 3) Extract query_id from the response
-    let query_id = match resp_json.get("reply") {
-        Some(v) if !v.is_null() => v.as_str().unwrap_or("").to_string(),
-        _ => {
-            return Err("Could not retrieve 'query_id' from the start query response.".into());
-        }
-    };
-
-    if debug {
-        eprintln!("[DEBUG] Query ID: {}", query_id);
-    }
-
-    // 4) Poll for results (up to 10 times with 5s interval)
-    let spinner = crate::banner::create_spinner("Waiting for query results...");
     let mut all_data: Vec<Value> = Vec::new();
-    let mut attempt = 0;
-    let max_retries = 10;
-    let poll_payload = json!({
-        "request_data": {
-            "query_id": query_id,
-            "offset": 0
+    let has_bounds = !cortex_start_str.is_empty() && !cortex_end_str.is_empty();
+    let mut work: Vec<(String, String)> =
+        vec![(cortex_start_str.to_string(), cortex_end_str.to_string())];
+    let mut pass = 0usize;
+    let mut truncated_passes = 0usize;
+    let mut max_cap_hit = false;
+
+    if has_bounds {
+        crate::banner::print_phase_detail(
+            "Auto-pagination:",
+            &format!(
+                "min window {}s, max {} passes, saturation threshold {}",
+                min_window_secs, max_passes, SATURATION_THRESHOLD
+            ),
+        );
+    }
+
+    while let Some((w_start, w_end)) = work.pop() {
+        pass += 1;
+
+        // Pre-pass status line: which window, queue depth, running totals.
+        if has_bounds {
+            let span_secs = bisect_time_window(&w_start, &w_end, 0)
+                .map(|(_, half)| half * 2)
+                .unwrap_or(-1);
+            let span_label = if span_secs < 0 {
+                "?".to_string()
+            } else if span_secs < 3600 {
+                format!("{}m", span_secs / 60)
+            } else if span_secs < 86400 {
+                format!("{}h {}m", span_secs / 3600, (span_secs % 3600) / 60)
+            } else {
+                format!("{}d {}h", span_secs / 86400, (span_secs % 86400) / 3600)
+            };
+            crate::banner::print_phase_detail(
+                &format!("Pass {}/{}", pass, max_passes),
+                &format!(
+                    "window {} → {}  (span {})  queue={}  collected={}",
+                    w_start,
+                    w_end,
+                    span_label,
+                    work.len(),
+                    all_data.len()
+                ),
+            );
         }
-    });
 
-    while attempt < max_retries {
-        if debug {
-            eprintln!("[DEBUG] Attempt {} to retrieve query results", attempt + 1);
+        let pass_start = std::time::Instant::now();
+        let batch = run_network_query(
+            &client,
+            &start_query_url,
+            &get_results_url,
+            &get_stream_url,
+            &headers,
+            &build_query(&w_start, &w_end),
+            debug,
+        )
+        .await?;
+        let batch_len = batch.len();
+        let elapsed = pass_start.elapsed().as_secs();
+
+        // Post-pass status: how many records, saturation, decision.
+        if has_bounds {
+            crate::banner::print_phase_detail(
+                "  ↳",
+                &format!("retrieved {} events in {}s", batch_len, elapsed),
+            );
         }
 
-        let poll_resp = client
-            .post(&get_results_url)
-            .headers(headers.clone())
-            .json(&poll_payload)
-            .send()
-            .await?;
-
-        if poll_resp.status() != 200 {
-            if debug {
-                eprintln!(
-                    "[DEBUG] Non-200 status from get_query_results: {}",
-                    poll_resp.status()
-                );
+        if has_bounds && batch_len >= SATURATION_THRESHOLD {
+            // Saturated. Decide: hit the pass cap? hit the window floor? or split?
+            if pass >= max_passes {
+                max_cap_hit = true;
+                crate::banner::print_warning(&format!(
+                    "Pass cap {} reached — accepting saturated window as-is. Raise --cortex-max-passes if you need deeper recovery.",
+                    max_passes
+                ));
+                all_data.extend(batch);
+                truncated_passes += 1;
+                continue;
             }
-            break;
-        }
-
-        let poll_json: Value = poll_resp.json().await?;
-        if debug {
-            eprintln!("[DEBUG] Poll response JSON: {}", poll_json);
-        }
-
-        // Check query status
-        let status = poll_json
-            .pointer("/reply/status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UNKNOWN");
-
-        if status == "SUCCESS" {
-            // We have results or possibly a stream
-            let reply_obj = poll_json.get("reply").unwrap_or(&Value::Null);
-
-            // If there's a "results" object with "data", append them
-            if let Some(results_data) = reply_obj.pointer("/results/data") {
-                if results_data.is_array() {
-                    if let Some(arr) = results_data.as_array() {
-                        all_data.extend_from_slice(arr);
-                    }
+            match bisect_time_window(&w_start, &w_end, min_window_secs) {
+                Some((mid_str, half)) => {
+                    crate::banner::print_warning(&format!(
+                        "Saturated at {}/{} — bisecting at {} (half-span {}s). Queue will grow by 1.",
+                        batch_len, API_CAP, mid_str, half
+                    ));
+                    // Push later half first so we pop the earlier half next
+                    // (gives a chronologically coherent running total in logs).
+                    work.push((mid_str.clone(), w_end));
+                    work.push((w_start, mid_str));
+                    continue;
+                }
+                None => {
+                    truncated_passes += 1;
+                    crate::banner::print_warning(&format!(
+                        "Saturated at {} but window is already at the {}s floor — accepting truncation. Lower --cortex-min-window-secs to go finer (CAUTION: may explode pass count).",
+                        batch_len, min_window_secs
+                    ));
+                    all_data.extend(batch);
                 }
             }
-
-            // Check for a "stream_id" if the dataset is large
-            if let Some(stream_id_val) = reply_obj.pointer("/results/stream_id") {
-                if let Some(s_id) = stream_id_val.as_str() {
-                    if debug {
-                        eprintln!("[DEBUG] Large dataset. Fetching stream results...");
-                    }
-                    let more_data = fetch_stream_data(&client, &get_stream_url, &headers, s_id, debug).await?;
-                    all_data.extend(more_data);
-                }
-            }
-            break;
-        } else if status == "PENDING" || status == "RUNNING" {
-            if debug {
-                eprintln!("[DEBUG] Query still pending or running. Sleeping 5 seconds...");
-            }
-            attempt += 1;
-            sleep(Duration::from_secs(5)).await;
         } else {
-            if debug {
-                eprintln!("[DEBUG] Unexpected status: {}", status);
-            }
-            break;
+            all_data.extend(batch);
         }
     }
 
-    spinner.finish_and_clear();
+    if has_bounds {
+        crate::banner::print_phase_detail(
+            "Auto-pagination complete:",
+            &format!(
+                "{} passes, {} events collected, {} windows truncated",
+                pass, all_data.len(), truncated_passes
+            ),
+        );
+        if max_cap_hit {
+            crate::banner::print_warning(
+                "One or more windows hit --cortex-max-passes. Consider raising it or narrowing --start-time/--end-time."
+            );
+        }
+    }
 
-    // Count by port type for summary
+    // Count by port type for summary. SMB bucket aggregates SMB+RPC+NetBIOS+WinRM+SQL
+    // so the existing 3-bucket banner stays meaningful when --admin-ports is set.
     let mut rdp_count = 0usize;
     let mut smb_count = 0usize;
     let mut ssh_count = 0usize;
     for record in &all_data {
-        let local_port = record.get("action_local_port").and_then(|v| v.as_u64()).unwrap_or(0);
-        let remote_port = record.get("action_remote_port").and_then(|v| v.as_u64()).unwrap_or(0);
-        if local_port == 3389 || remote_port == 3389 { rdp_count += 1; }
-        else if local_port == 445 || remote_port == 445 { smb_count += 1; }
-        else if local_port == 22 || remote_port == 22 { ssh_count += 1; }
+        let lp = get_port(record, "action_local_port").unwrap_or(0);
+        let rp = get_port(record, "action_remote_port").unwrap_or(0);
+        let is = |p: i64| lp == p || rp == p;
+        if is(3389) || is(5900) { rdp_count += 1; }
+        else if is(445) || is(135) || is(139) || is(5985) || is(5986) || is(1433) || is(3306) { smb_count += 1; }
+        else if is(22) { ssh_count += 1; }
     }
     crate::banner::print_cortex_network_summary(all_data.len(), rdp_count, smb_count, ssh_count);
 
@@ -342,6 +380,125 @@ fn get_port(record: &Value, key: &str) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// Runs a single XQL query against the Cortex network endpoint and returns
+/// all records (inline + streamed). Extracted from `parse_cortex_data` so
+/// the outer function can auto-paginate by time splitting when the API 1M
+/// cap is hit.
+async fn run_network_query(
+    client: &Client,
+    start_query_url: &str,
+    get_results_url: &str,
+    get_stream_url: &str,
+    headers: &HeaderMap,
+    query_string: &str,
+    debug: bool,
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let query_payload = json!({
+        "request_data": { "query": query_string, "tenants": [] }
+    });
+
+    if debug {
+        eprintln!("[DEBUG] POST to: {}", start_query_url);
+        eprintln!("[DEBUG] Query: {}", query_string);
+    }
+
+    let resp = client
+        .post(start_query_url)
+        .headers(headers.clone())
+        .json(&query_payload)
+        .send()
+        .await?;
+    if resp.status() != 200 {
+        return Err(format!("Unexpected status from start_xql_query: {}", resp.status()).into());
+    }
+    let resp_json: Value = resp.json().await?;
+    let query_id = match resp_json.get("reply") {
+        Some(v) if !v.is_null() => v.as_str().unwrap_or("").to_string(),
+        _ => return Err("Could not retrieve 'query_id' from the start query response.".into()),
+    };
+
+    let spinner = crate::banner::create_spinner("Waiting for query results...");
+    let mut out: Vec<Value> = Vec::new();
+    let poll_payload = json!({
+        "request_data": { "query_id": query_id, "offset": 0 }
+    });
+
+    // Poll up to 10 minutes (120 * 5s) — large saturated windows can take a while.
+    let max_retries = 120;
+    for attempt in 0..max_retries {
+        if debug {
+            eprintln!("[DEBUG] Poll attempt {}", attempt + 1);
+        }
+        let poll_resp = client
+            .post(get_results_url)
+            .headers(headers.clone())
+            .json(&poll_payload)
+            .send()
+            .await?;
+        if poll_resp.status() != 200 {
+            break;
+        }
+        let poll_json: Value = poll_resp.json().await?;
+        let status = poll_json
+            .pointer("/reply/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+
+        if status == "SUCCESS" {
+            let reply_obj = poll_json.get("reply").unwrap_or(&Value::Null);
+            if let Some(results_data) = reply_obj.pointer("/results/data") {
+                if let Some(arr) = results_data.as_array() {
+                    out.extend_from_slice(arr);
+                }
+            }
+            if let Some(stream_id_val) = reply_obj.pointer("/results/stream_id") {
+                if let Some(s_id) = stream_id_val.as_str() {
+                    let more = fetch_stream_data(client, get_stream_url, headers, s_id, debug).await?;
+                    out.extend(more);
+                }
+            }
+            break;
+        } else if status == "PENDING" || status == "RUNNING" {
+            sleep(Duration::from_secs(5)).await;
+        } else {
+            break;
+        }
+    }
+    spinner.finish_and_clear();
+    Ok(out)
+}
+
+/// Bisects a time window expressed as "YYYY-MM-DD HH:MM:SS[ TZ]" strings.
+/// Returns the midpoint formatted identically plus the half-duration in seconds.
+/// Returns `None` if parsing fails or the window is smaller than `min_window_secs`.
+fn bisect_time_window(
+    start: &str,
+    end: &str,
+    min_window_secs: i64,
+) -> Option<(String, i64)> {
+    let parse = |s: &str| -> Option<DateTime<Utc>> {
+        let t = s.trim();
+        if let Ok(dt) = DateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S %z") {
+            return Some(dt.with_timezone(&Utc));
+        }
+        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S") {
+            return Some(DateTime::<Utc>::from_utc(nd, Utc));
+        }
+        None
+    };
+    let s_dt = parse(start)?;
+    let e_dt = parse(end)?;
+    let span = (e_dt - s_dt).num_seconds();
+    if span < min_window_secs * 2 {
+        return None;
+    }
+    let half = span / 2;
+    let mid = s_dt + chrono::Duration::seconds(half);
+    // Keep the same format the CLI accepts so it round-trips.
+    let mid_str = mid.format("%Y-%m-%d %H:%M:%S -0000").to_string();
+    Some((mid_str, half))
 }
 
 /// Fetches large datasets from the "stream" endpoint and returns a `Vec<Value>`.
@@ -494,7 +651,7 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         .to_string();
 
     // Determine if the local port is one of the destination ports.
-    let dst_ports = [3389, 445, 22];
+    let dst_ports = [22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986];
     let is_dst_port = if let Some(port) = local_port {
         dst_ports.contains(&(port as i32))
     } else {
@@ -528,34 +685,19 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     };
 
     // Determine logon_type using local_port first, then remote_port.
-    let logon_type = if let Some(port) = local_port {
-        match port {
-            3389 => "10".to_string(),
-            445 => "3".to_string(),
-            22 => "SSH".to_string(),
-            _ => {
-                if let Some(rport) = remote_port {
-                    match rport {
-                        3389 => "10".to_string(),
-                        445 => "3".to_string(),
-                        22 => "SSH".to_string(),
-                        _ => "".to_string(),
-                    }
-                } else {
-                    "".to_string()
-                }
-            }
+    fn lt_for(p: i64) -> Option<&'static str> {
+        match p {
+            3389 | 5900 => Some("10"),
+            445 | 135 | 139 | 5985 | 5986 | 1433 | 3306 => Some("3"),
+            22 => Some("SSH"),
+            _ => None,
         }
-    } else if let Some(rport) = remote_port {
-        match rport {
-            3389 => "10".to_string(),
-            445 => "3".to_string(),
-            22 => "SSH".to_string(),
-            _ => "".to_string(),
-        }
-    } else {
-        "".to_string()
-    };
+    }
+    let logon_type = local_port
+        .and_then(lt_for)
+        .or_else(|| remote_port.and_then(lt_for))
+        .unwrap_or("")
+        .to_string();
 
     // If logon_type is empty and debug is enabled, print a verbose message.
     if debug && logon_type.is_empty() {
