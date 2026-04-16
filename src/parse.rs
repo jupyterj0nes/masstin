@@ -24,6 +24,35 @@ pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(Ordering::SeqCst)
 }
 
+/// Normalise IPv6 noise in the IpAddress field from Windows EVTX:
+///   - `::ffff:192.168.10.32` → `192.168.10.32` (IPv4-mapped IPv6)
+///   - `fe80::...` → `""` (link-local, useless for lateral movement)
+/// Without this, each variant creates a separate node in the graph.
+/// Infer logon_type for events that lack one natively.
+/// Kerberos (4768/4769/4770/4771), NTLM (4776), share access (5140),
+/// explicit creds (4648), and WinRM (6) are all network-based in a
+/// lateral movement context → type 3.
+fn infer_logon_type(event_id: &str, raw: &str) -> String {
+    if !raw.is_empty() {
+        return raw.to_string();
+    }
+    match event_id {
+        "4768" | "4769" | "4770" | "4771" | "4776" | "5140" | "4648" | "6" => "3".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn strip_ipv4_mapped(ip: &str) -> String {
+    if let Some(v4) = ip.strip_prefix("::ffff:") {
+        return v4.to_string();
+    }
+    let lower = ip.to_lowercase();
+    if lower.starts_with("fe80:") {
+        return String::new();
+    }
+    ip.to_string()
+}
+
 /// Translate Windows SubStatus hex codes to human-readable failure reasons
 pub fn translate_substatus(code: &str) -> String {
     let desc = match code.to_lowercase().as_str() {
@@ -586,6 +615,7 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             _ => String::from(""),
                         };
 
+                        let logon_type = infer_logon_type(&event_id, data_values.get("LogonType").unwrap_or(&String::new()));
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
                             computer: event.System.Computer.unwrap_or_default(),
@@ -595,9 +625,9 @@ pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogDa
                             subject_domain_name: data_values.get("SubjectDomainName").unwrap_or(&String::new()).to_string(),
                             target_user_name: data_values.get("TargetUserName").unwrap_or(&String::new()).to_string(),
                             target_domain_name: data_values.get("TargetDomainName").unwrap_or(&String::new()).to_string(),
-                            logon_type: data_values.get("LogonType").unwrap_or(&String::new()).to_string(),
+                            logon_type,
                             workstation_name: data_values.get("WorkstationName").unwrap_or(&String::new()).to_string(),
-                            ip_address: data_values.get("IpAddress").unwrap_or(&String::new()).to_string(),
+                            ip_address: strip_ipv4_mapped(data_values.get("IpAddress").unwrap_or(&String::new())),
                             logon_id: data_values.get("TargetLogonId").unwrap_or(&String::new()).to_string(),
                             filename: file.to_string(),
                             detail,

@@ -50,6 +50,12 @@ pub mod load {
 struct GroupedData {
     earliest_date: String,
     count: usize,
+    // Non-key fields: stored from the first row seen for this group
+    subject_user: String,
+    subject_domain: String,
+    target_domain: String,
+    src_computer: String,
+    src_ip: String,
 }
 
 /// Strip timezone suffix for Memgraph localDateTime().
@@ -297,8 +303,12 @@ pub async fn load_memgraph(
                 ));
             }
         } else {
+            // Grouping key: (dst, target_user, logon_type)
+            // The resolved origin node is determined downstream by ip_to_host;
+            // src_ip is a detail for the CSV, not the graph. Keeping only
+            // these 3 fields produces one edge per (origin, user, type, dest).
             let mut grouped_map: HashMap<
-                (String, String, String, String, String, String, String, String),
+                (String, String, String),
                 GroupedData,
             > = HashMap::new();
 
@@ -306,18 +316,18 @@ pub async fn load_memgraph(
                 let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
                 let key = (
                     parts[idx_dst].clone(),
-                    parts[idx_subject_user].clone(),
-                    parts[idx_subject_domain].clone(),
                     parts[idx_target_user].clone(),
-                    parts[idx_target_domain].clone(),
                     parts[idx_logon_type].clone(),
-                    parts[idx_src_computer].clone(),
-                    parts[idx_src_ip].clone(),
                 );
                 let date = parts[0].clone();
                 let entry = grouped_map.entry(key).or_insert(GroupedData {
                     earliest_date: date.clone(),
                     count: 0,
+                    subject_user: parts[idx_subject_user].clone(),
+                    subject_domain: parts[idx_subject_domain].clone(),
+                    target_domain: parts[idx_target_domain].clone(),
+                    src_computer: parts[idx_src_computer].clone(),
+                    src_ip: parts[idx_src_ip].clone(),
                 });
                 if date < entry.earliest_date {
                     entry.earliest_date = date;
@@ -325,19 +335,19 @@ pub async fn load_memgraph(
                 entry.count += 1;
             }
 
-            for ((dst_computer, subject_user_name, subject_domain_name, target_user_name, target_domain_name, logon_type, src_computer, src_ip), data) in grouped_map {
+            for ((dst_computer, target_user_name, logon_type), data) in grouped_map {
                 edges_to_emit.push(format!(
                     "{},{},{},{},{},{},{},{},{},{}",
                     data.earliest_date,
                     dst_computer,
                     data.count,
-                    subject_user_name,
-                    subject_domain_name,
+                    data.subject_user,
+                    data.subject_domain,
                     target_user_name,
-                    target_domain_name,
+                    data.target_domain,
                     logon_type,
-                    src_computer,
-                    src_ip,
+                    data.src_computer,
+                    data.src_ip,
                 ));
             }
         }
