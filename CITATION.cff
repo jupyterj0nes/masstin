@@ -19,8 +19,8 @@ type: software
 license: AGPL-3.0-or-later
 repository-code: "https://github.com/jupyterj0nes/masstin"
 url: "https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/"
-version: "0.13.0"
-date-released: "2026-04-14"
+version: "0.14.0"
+date-released: "2026-04-16"
 keywords:
   - DFIR
   - digital forensics
@@ -45,6 +45,6 @@ preferred-citation:
     - family-names: "Díaz"
       given-names: "Antonio"
       alias: "jupyterj0nes"
-  version: "0.13.0"
+  version: "0.14.0"
   year: 2026
   url: "https://github.com/jupyterj0nes/masstin"
