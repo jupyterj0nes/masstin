@@ -25,32 +25,18 @@ const EVTX_CHUNK_SIZE: usize = 65536; // 64KB
 const RECORD_MAGIC: &[u8; 4] = b"\x2a\x2a\x00\x00";
 const SCAN_BLOCK_SIZE: usize = 4 * 1024 * 1024; // 4MB read blocks
 
-/// Install a global allocation error hook that converts OOM aborts into panics,
-/// so the isolated-thread validator below can recover when the evtx crate tries
-/// to allocate multi-GB buffers on corrupt BinXML.
+/// Main entry point for carve-image action.
 ///
-/// On nightly with `--features nightly-oom-hook`, this is the real hook. On
-/// stable (or nightly without the feature) it's a no-op stub: allocation
-/// failures will abort the process as they would without masstin's protection.
-/// The official release binaries are built on nightly with the feature enabled.
-#[cfg(feature = "nightly-oom-hook")]
-fn install_oom_hook() {
-    std::alloc::set_alloc_error_hook(|layout| {
-        panic!("allocation of {} bytes failed (caught by masstin hook)", layout.size());
-    });
-}
-
-#[cfg(not(feature = "nightly-oom-hook"))]
-fn install_oom_hook() {
-    // No-op on stable. carve-image still works; the catch_unwind isolation
-    // thread recovers from panics (including OOM re-raised via other paths),
-    // but a bare `abort()` from the allocator propagates out as before.
-}
-
-/// Main entry point for carve-image action
+/// Historical note: prior to the evtx 0.11.2 upgrade, carve-image required a
+/// nightly-only `set_alloc_error_hook` to survive pathological chunks where
+/// the upstream parser would attempt multi-GB allocations on corrupt BinXML
+/// template size fields (issues omerbenamram/evtx#290, #291, #292). evtx
+/// 0.11.2 bounds those operations upstream, so the hook is no longer needed
+/// and masstin builds cleanly on stable Rust. The remaining defenses
+/// (thread isolation, `catch_unwind`, 60-second per-file timeout,
+/// `--skip-offsets` escape hatch) still run and continue to protect against
+/// any future upstream regression or non-allocation panic path.
 pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool, skip_offsets: &[u64]) {
-    install_oom_hook();
-
     let start_time = std::time::Instant::now();
 
     crate::banner::print_phase("1", "3", "Scanning forensic images for EVTX remnants...");
@@ -151,16 +137,17 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
         let (vtx, vrx) = std::sync::mpsc::channel();
         let vhandle = std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Try to iterate all records — if any corrupt template triggers OOM
-                // via set_alloc_error_hook, it panics and is caught here.
+                // Try to iterate all records — any panic from corrupt BinXML is
+                // caught here and the file is rejected before it can reach the
+                // main parse pipeline.
                 let parser = match evtx::EvtxParser::from_path(&path_clone) {
                     Ok(p) => p,
                     Err(_) => return false,
                 };
                 let mut p = parser;
-                // Walk EVERY record — any OOM-triggering corrupt template must fire inside
-                // the isolated thread (where catch_unwind + alloc_error_hook protect us),
-                // not later in the main pipeline. No early break.
+                // Walk EVERY record — any panic must fire inside the isolated
+                // thread (where catch_unwind protects us), not later in the
+                // main pipeline. No early break.
                 for rec in p.records() {
                     let _ = rec; // individual record errors are OK, file is still usable
                 }
@@ -739,7 +726,12 @@ fn carve_from_seekable<R: Read + Seek>(
     Ok((chunks_found, orphan_records, carved_evtx_files))
 }
 
-/// Peek into a chunk to validate it and extract the provider name from the first record
+/// Peek into a chunk to validate it and extract the provider name from the first record.
+///
+/// Migrated to evtx 0.11.2: the old `XmlOutput::with_writer` + `record.into_output()`
+/// pattern was removed upstream. The new API exposes `record.into_xml()` which
+/// consumes an `EvtxRecord` and returns `SerializedEvtxRecord<String>` with the
+/// rendered XML in the public `.data` field.
 fn peek_chunk_provider(chunk_data: &[u8]) -> Option<String> {
     // Validate chunk by trying to parse it
     let mut chunk_obj = evtx::EvtxChunkData::new(chunk_data.to_vec(), false).ok()?;
@@ -750,10 +742,8 @@ fn peek_chunk_provider(chunk_data: &[u8]) -> Option<String> {
     // Get provider from first record by rendering to XML
     for record_result in parsed.iter() {
         if let Ok(record) = record_result {
-            let mut xml_buf: Vec<u8> = Vec::new();
-            let mut xml_out = evtx::XmlOutput::with_writer(&mut xml_buf, &evtx::ParserSettings::default());
-            if record.into_output(&mut xml_out).is_ok() {
-                let xml = String::from_utf8_lossy(&xml_out.into_writer()).to_string();
+            if let Ok(serialized) = record.into_xml() {
+                let xml = &serialized.data;
                 // Extract provider from <Provider Name="..."/>
                 if let Some(start) = xml.find("Provider Name=\"") {
                     let after = &xml[start + 15..];
