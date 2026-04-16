@@ -680,6 +680,10 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 | `--old-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node to remove (its edges are transferred to `--new-node`) |
 | `--new-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node that survives the merge |
 | `--filter-cortex-ip` | Filter by IP in Cortex queries |
+| `--admin-ports` | `parse-cortex`: widen network port list to full admin set (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986). Default is RDP/SMB/SSH + WinRM. |
+| `--cortex-event-ids` | `parse-cortex-evtx-forensics`: comma-separated override of the default Windows Event ID set |
+| `--cortex-min-window-secs` | Auto-pagination floor for both Cortex actions when a time window saturates the API 1M cap (default 300) |
+| `--cortex-max-passes` | Hard cap on auto-pagination passes for both Cortex actions (default 200) |
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
 | `--stdout` | Print output to stdout only |
