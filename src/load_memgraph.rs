@@ -314,9 +314,14 @@ pub async fn load_memgraph(
 
             for line in &processed_lines {
                 let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
+                // Strip @DOMAIN from target_user before grouping — Kerberos
+                // TGS events (4769) append @REALM to the username while 4624
+                // events don't, causing duplicate edges for the same user.
+                let user_clean = parts[idx_target_user].split('@').next()
+                    .unwrap_or(&parts[idx_target_user]).to_string();
                 let key = (
                     parts[idx_dst].clone(),
-                    parts[idx_target_user].clone(),
+                    user_clean,
                     parts[idx_logon_type].clone(),
                 );
                 let date = parts[0].clone();
