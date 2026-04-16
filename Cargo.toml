@@ -7,23 +7,11 @@ authors = ["Tono Diaz (@jupyterj0nes)"]
 repository = "https://github.com/jupyterjones/masstin"
 license = "AGPL-3.0-only"
 
-# Optional features
-#
-# `nightly-oom-hook` installs std::alloc::set_alloc_error_hook during EVTX
-# carving so allocation failures from malformed BinXML can be caught and
-# the offending chunk rejected, instead of aborting the whole process.
-# The hook is nightly-only today, so the feature is opt-in. The official
-# release binaries are built with this feature enabled on nightly Rust.
-# Plain `cargo build` on stable compiles cleanly with a no-op stub.
-[features]
-default = []
-nightly-oom-hook = []
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 clap = { version = "4.0.32", features = ["derive"] }
-evtx = "0.8.0"
+evtx = "0.11.2"
 chrono = "0.4.23"
 quick-xml = { version = "0.20", features = ["serialize"] }
 serde = { version = "1.0", features = [ "derive" ] }
