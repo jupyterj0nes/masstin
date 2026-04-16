@@ -499,16 +499,32 @@ masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
 masstin -a load-memgraph -f timeline.csv --database localhost:7687
 ```
 
+#### Grouped vs ungrouped: two modes for two questions
+
+The loader supports two modes depending on what you are investigating:
+
+**Grouped (default)** — one edge per unique `(destination, user, logon_type)` combination. The edge carries a `count` property (how many events collapsed into it) and a `time` property (earliest event). This produces a clean, readable graph that answers **"who talks to whom and how"** — the global picture. Ideal for understanding network topology, mapping trust boundaries, and presenting findings.
+
+**Ungrouped (`--ungrouped`)** — one edge per CSV row with its real timestamp. This preserves full temporal granularity so you can query for **chronologically coherent paths**: "the attacker logged in from A to B at 10:00, then from B to C at 10:05". This is the mode for active hunting. Always pair it with `--start-time` / `--end-time` to scope the window — loading an ungrouped 250k-row timeline without a time filter will create an unusable graph.
+
+| Mode | Edges | Best for |
+|------|-------|----------|
+| Grouped (default) | ~100-200 | Global overview, topology, presentations |
+| `--ungrouped` | 1 per CSV row | Temporal path hunting, incident timeline |
+
 #### Load options
 
 | Flag | Effect |
 |------|--------|
-| `--ungrouped` | Emit one edge per CSV row (`CREATE`) instead of collapsing identical `(src, user, dst, logon_type)` tuples into a single edge with a `count` property. Use it when investigating a narrow time window where individual events matter. Pair with `--start-time` / `--end-time`. |
-| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this. Reuses the same parser as the Cortex flags. |
+| `--ungrouped` | One edge per CSV row (`CREATE`) instead of grouping. Preserves real timestamps for temporal path queries. Pair with `--start-time` / `--end-time`. |
+| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this. |
 | `--end-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is later than this. |
 
 ```bash
-# Investigate every individual lateral movement event during a 30-minute window
+# Global overview — who talks to whom (default, grouped)
+masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
+
+# Temporal hunting — every individual event in a 30-minute window
 masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j \
         --ungrouped --start-time "2026-03-15 14:00:00" --end-time "2026-03-15 14:30:00"
 ```
