@@ -77,8 +77,16 @@ jobs:
       - name: List files
         run: ls -la
 
+      - name: Fetch CHANGELOG from repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: CHANGELOG.md
           generate_release_notes: true
           files: masstin-*
