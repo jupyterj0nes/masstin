@@ -123,6 +123,8 @@ cargo build --release
 
 Parses Windows EVTX files and UAL databases from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
 
+EVTX dispatch happens by `Provider.Name` read from the XML, not by filename, so files that do not follow the canonical Windows naming scheme — `Security-<YYYY-MM-DD-HH-MM-SS>.evtx` produced by the "Archive the log when full" retention policy, operator-renamed files, extracts from third-party tooling — are still routed to the right parser. If you want strict canonical-only matching for speed on a huge noisy tree, point `-d` directly at the `winevt/Logs` folder and the walker only opens `.evtx` and `.zip` anyway.
+
 > **Note:** The legacy command `parse` is still supported as an alias for backwards compatibility.
 
 ```bash
@@ -480,11 +482,14 @@ masstin -a carve-image -f image.e01 -o carved.csv --debug
 - **Tier 2 — orphan record detection**: individual records outside recoverable chunks are counted and reported (header metadata only; full XML reconstruction is Tier 3).
 - **Tier 3 — template matching**: planned. Will reconstruct XML from orphan records using templates harvested from Tier 1 chunks plus a common Windows template library.
 
-**Hardened against a hostile ecosystem**: the upstream `evtx` crate was designed to parse well-formed live logs, not arbitrary corrupted 64 KB buffers from unallocated space. We found three classes of bugs during development (infinite loop on malformed BinXML and two unbounded multi-GB allocations that aborted the whole process), [reported them upstream](https://github.com/omerbenamram/evtx/issues/290), and they were fixed in evtx 0.11.2. Masstin pins that version and keeps the following in-process defenses as belt-and-suspenders for future regressions:
+**Hardened against a hostile ecosystem**: the upstream `evtx` crate was designed to parse well-formed live logs, not arbitrary corrupted 64 KB buffers from unallocated space. We found three classes of bugs during development (infinite loop on malformed BinXML and two unbounded multi-GB allocations that aborted the whole process), [reported them upstream](https://github.com/omerbenamram/evtx/issues/290), and they were fixed in evtx 0.11.2. A fourth path — a `Vec::with_capacity(~16 GiB)` inside `read_template_values_cursor` driven by a corrupt BinXML template-values count — still aborts the process on evtx 0.11.2 because the Rust allocator resolves OOM with `abort()` (not a panic), so `catch_unwind` and thread isolation cannot contain it.
 
-- Every synthetic EVTX parse runs in an isolated worker thread with a 60-second timeout
-- `std::panic::catch_unwind` captures any remaining panic path and rejects the offending file
-- A validation phase walks each synthetic EVTX end-to-end before it reaches the main pipeline; files that hang or panic are rejected, the rest of the timeline proceeds unaffected
+To survive that without blocking on an upstream fix, the phase-2 validator spawns a **child process per synthetic EVTX** via `MASSTIN_VALIDATE_EVTX=<path>`, which runs `masstin::validate_evtx_file` and exits 0 on success. If the child aborts by OOM the parent sees a non-zero exit code (Windows `0xC0000409`, Linux signal), rejects the offending file, and keeps carving. Verified end-to-end on a 50 GB `ws01-wipe-novss.raw`: one pathological chunk used to kill the entire run; now it gets quarantined as `masstin_rejected_evtx/panic_oom__Security.evtx` while the remaining 107 synthetic files parse cleanly.
+
+Defenses kept on top of the subprocess boundary:
+
+- `std::panic::catch_unwind` inside the child for any ordinary panic path in malformed BinXML
+- 60-second wall-clock poll deadline on the child; hangs are killed and the file is rejected
 - `--skip-offsets` lets you tell masstin to jump over a 32 MB window around a problematic E01 offset on re-runs
 - `--debug` preserves rejected synthetic EVTX files to `<output_dir>/masstin_rejected_evtx/` for post-mortem
 
