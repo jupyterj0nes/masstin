@@ -42,6 +42,7 @@ pub use crate::parse_tasks::*;
 mod parse_mountpoints;
 pub use crate::parse_mountpoints::*;
 pub mod parse_carve;
+pub use crate::parse_carve::validate_evtx_file;
 pub mod parse_custom;
 pub mod filter;
 pub mod vmdk;
