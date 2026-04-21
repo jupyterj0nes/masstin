@@ -402,7 +402,6 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         }
         ActionType::ParseMassive => {
             crate::banner::print_massive_warning();
-            crate::parse::set_massive_mode(true);
             parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), true);
         }
         ActionType::ParseCustom => {
