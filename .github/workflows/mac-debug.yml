@@ -22,7 +22,7 @@ on:
 jobs:
   shell:
     name: Debug shell on macOS ${{ inputs.arch }}
-    runs-on: ${{ inputs.arch == 'arm64' && 'macos-latest' || 'macos-13' }}
+    runs-on: ${{ inputs.arch == 'arm64' && 'macos-latest' || 'macos-13-large' }}
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
