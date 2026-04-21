@@ -22,8 +22,13 @@ jobs:
             os: ubuntu-latest
             artifact: masstin
           - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: masstin
+            mac_arch: x86_64
+          - target: aarch64-apple-darwin
             os: macos-latest
             artifact: masstin
+            mac_arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -48,15 +53,15 @@ jobs:
           chmod +x masstin-${{ github.ref_name }}-linux
 
       - name: Rename binary (macOS)
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos')
         run: |
-          cp target/${{ matrix.target }}/release/masstin masstin-${{ github.ref_name }}-macos
-          chmod +x masstin-${{ github.ref_name }}-macos
+          cp target/${{ matrix.target }}/release/masstin masstin-${{ github.ref_name }}-macos-${{ matrix.mac_arch }}
+          chmod +x masstin-${{ github.ref_name }}-macos-${{ matrix.mac_arch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: masstin-${{ matrix.os }}
+          name: masstin-${{ matrix.target }}
           path: masstin-${{ github.ref_name }}*
 
   release:
