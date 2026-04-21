@@ -16,9 +16,32 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::parse::{is_debug_mode, LogData};
+
+/// Child-process entry: open a single EVTX and iterate every record.
+/// Returns true iff the file parses cleanly end-to-end. Called only via
+/// the `MASSTIN_VALIDATE_EVTX` env var from `main.rs`; parse-carve spawns
+/// a child per synthetic EVTX so that any `alloc_error`-driven abort from
+/// a corrupt BinXML template only kills the child — the parent sees a
+/// non-zero exit code and rejects the file. `catch_unwind` still covers
+/// ordinary panics inside the child.
+pub fn validate_evtx_file(path: &str) -> bool {
+    let result = std::panic::catch_unwind(|| {
+        let parser = match evtx::EvtxParser::from_path(path) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let mut p = parser;
+        for rec in p.records() {
+            let _ = rec;
+        }
+        true
+    });
+    matches!(result, Ok(true))
+}
 
 const ELFCHNK_MAGIC: &[u8; 8] = b"ElfChnk\x00";
 const EVTX_CHUNK_SIZE: usize = 65536; // 64KB
@@ -27,15 +50,25 @@ const SCAN_BLOCK_SIZE: usize = 4 * 1024 * 1024; // 4MB read blocks
 
 /// Main entry point for carve-image action.
 ///
-/// Historical note: prior to the evtx 0.11.2 upgrade, carve-image required a
-/// nightly-only `set_alloc_error_hook` to survive pathological chunks where
-/// the upstream parser would attempt multi-GB allocations on corrupt BinXML
-/// template size fields (issues omerbenamram/evtx#290, #291, #292). evtx
-/// 0.11.2 bounds those operations upstream, so the hook is no longer needed
-/// and masstin builds cleanly on stable Rust. The remaining defenses
-/// (thread isolation, `catch_unwind`, 60-second per-file timeout,
-/// `--skip-offsets` escape hatch) still run and continue to protect against
-/// any future upstream regression or non-allocation panic path.
+/// Historical note on OOM isolation: prior to the evtx 0.11.2 upgrade,
+/// carve-image relied on a nightly-only `set_alloc_error_hook` to survive
+/// pathological chunks where the upstream parser attempted multi-GB
+/// allocations on corrupt BinXML template size fields (issues
+/// omerbenamram/evtx#290, #291, #292). evtx 0.11.2 bounds *some* of those
+/// operations, but NOT the template-values count read by
+/// `read_template_values_cursor`: a corrupt u32 there still drives a
+/// `Vec::with_capacity(N)` of several GiB, which the global allocator
+/// resolves by calling `abort()`. That abort is not a Rust panic and is
+/// therefore invisible to `catch_unwind` / thread isolation, and it is
+/// amplified by rayon (the crate parallelises chunk decoding, so the
+/// abort can fire in a worker pool the parent never sees).
+///
+/// Defence today is subprocess isolation: phase 2 spawns this same binary
+/// per synthetic EVTX via `MASSTIN_VALIDATE_EVTX=<path>` (see main.rs).
+/// If the child aborts by OOM, the parent observes a non-zero exit code
+/// and rejects the file. The 60-second per-file timeout,
+/// `--skip-offsets` escape hatch, and in-child `catch_unwind` still cover
+/// the non-allocation panic paths.
 pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool, skip_offsets: &[u64]) {
     let start_time = std::time::Instant::now();
 
@@ -132,72 +165,105 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
 
     let mut validated: Vec<String> = Vec::new();
     let mut rejected = 0usize;
+
+    // Each synthetic EVTX is validated in a dedicated child process invoking
+    // the same binary with MASSTIN_VALIDATE_EVTX=<path>. Subprocess isolation
+    // is the only way to survive `alloc_error` aborts from corrupt BinXML
+    // templates (the `evtx` crate reserves Vec capacity from template-value
+    // counts without bounds, and rayon workers amplify the blast radius — a
+    // single bad chunk can try to allocate ~16 GiB and crash the whole
+    // process). catch_unwind + thread isolation cannot catch that.
+    let exe = std::env::current_exe().ok();
     for path in &all_carved_evtx {
-        let path_clone = path.clone();
-        let (vtx, vrx) = std::sync::mpsc::channel();
-        let vhandle = std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Try to iterate all records — any panic from corrupt BinXML is
-                // caught here and the file is rejected before it can reach the
-                // main parse pipeline.
-                let parser = match evtx::EvtxParser::from_path(&path_clone) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                };
-                let mut p = parser;
-                // Walk EVERY record — any panic must fire inside the isolated
-                // thread (where catch_unwind protects us), not later in the
-                // main pipeline. No early break.
-                for rec in p.records() {
-                    let _ = rec; // individual record errors are OK, file is still usable
+        let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?");
+
+        let Some(exe) = exe.as_ref() else {
+            rejected += 1;
+            crate::banner::print_warning(&format!(
+                "  [reject] {} — cannot locate current executable to spawn validator", fname
+            ));
+            continue;
+        };
+
+        let mut child = match Command::new(exe)
+            .env("MASSTIN_VALIDATE_EVTX", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                rejected += 1;
+                crate::banner::print_warning(&format!(
+                    "  [reject] {} — could not spawn validator: {}", fname, e
+                ));
+                continue;
+            }
+        };
+
+        // Poll every 50 ms up to a 60 s deadline.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        timed_out = true;
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                true
-            }));
-            let _ = vtx.send(result);
-        });
-        match vrx.recv_timeout(Duration::from_secs(60)) {
-            Ok(Ok(true)) => {
+                Err(_) => break None,
+            }
+        };
+
+        match (status, timed_out) {
+            (Some(s), _) if s.success() => {
                 validated.push(path.clone());
-                let _ = vhandle.join();
             }
-            Ok(Ok(false)) => {
+            (Some(s), _) => {
                 rejected += 1;
-                let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?");
-                if save_rejected {
-                    if !rejected_dir_created { let _ = fs::create_dir_all(&rejected_dir); rejected_dir_created = true; }
-                    let dest = rejected_dir.join(format!("open_fail__{}", fname));
-                    let _ = fs::copy(path, &dest);
-                    crate::banner::print_warning(&format!("  [reject] {} — parser failed to open (saved to {})", fname, dest.display()));
-                } else {
-                    crate::banner::print_warning(&format!("  [reject] {} — parser failed to open", fname));
-                }
-                let _ = vhandle.join();
-            }
-            Ok(Err(_)) => {
-                rejected += 1;
-                let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?");
+                let code_str = s
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string());
                 if save_rejected {
                     if !rejected_dir_created { let _ = fs::create_dir_all(&rejected_dir); rejected_dir_created = true; }
                     let dest = rejected_dir.join(format!("panic_oom__{}", fname));
                     let _ = fs::copy(path, &dest);
-                    crate::banner::print_warning(&format!("  [reject] {} — panic/OOM in evtx crate (saved to {})", fname, dest.display()));
+                    crate::banner::print_warning(&format!(
+                        "  [reject] {} — validator exit={} (OOM/panic, saved to {})",
+                        fname, code_str, dest.display()
+                    ));
                 } else {
-                    crate::banner::print_warning(&format!("  [reject] {} — panic/OOM in evtx crate", fname));
+                    crate::banner::print_warning(&format!(
+                        "  [reject] {} — validator exit={} (OOM/panic)", fname, code_str
+                    ));
                 }
-                let _ = vhandle.join();
             }
-            Err(_) => {
+            (None, true) => {
                 rejected += 1;
-                let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?");
                 if save_rejected {
                     if !rejected_dir_created { let _ = fs::create_dir_all(&rejected_dir); rejected_dir_created = true; }
                     let dest = rejected_dir.join(format!("hang__{}", fname));
                     let _ = fs::copy(path, &dest);
-                    crate::banner::print_warning(&format!("  [reject] {} — hung >60s in evtx crate (saved to {})", fname, dest.display()));
+                    crate::banner::print_warning(&format!(
+                        "  [reject] {} — hung >60s (killed, saved to {})", fname, dest.display()
+                    ));
                 } else {
-                    crate::banner::print_warning(&format!("  [reject] {} — hung >60s in evtx crate", fname));
+                    crate::banner::print_warning(&format!(
+                        "  [reject] {} — hung >60s (killed)", fname
+                    ));
                 }
-                std::mem::forget(vhandle);
+            }
+            (None, false) => {
+                rejected += 1;
+                crate::banner::print_warning(&format!(
+                    "  [reject] {} — validator wait failed", fname
+                ));
             }
         }
     }
