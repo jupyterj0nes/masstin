@@ -24,22 +24,6 @@ pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(Ordering::SeqCst)
 }
 
-/// "Massive mode" — set by the parse-massive action. Gates aggressive
-/// fallbacks that can add noise or hit quirky EVTX files: currently
-/// enables `parse_unknown` (dispatch by Provider.Name in the XML) for
-/// EVTX whose filename does not match any known channel, so archived
-/// or renamed logs like `Security-YYYY-MM-DD-HH-MM-SS.evtx` still get
-/// parsed. Kept off in parse-windows / parse-image for predictability.
-static MASSIVE_MODE: AtomicBool = AtomicBool::new(false);
-
-pub fn set_massive_mode(val: bool) {
-    MASSIVE_MODE.store(val, Ordering::SeqCst);
-}
-
-pub fn is_massive_mode() -> bool {
-    MASSIVE_MODE.load(Ordering::SeqCst)
-}
-
 /// Normalise IPv6 noise in the IpAddress field from Windows EVTX:
 ///   - `::ffff:192.168.10.32` → `192.168.10.32` (IPv4-mapped IPv6)
 ///   - `fe80::...` → `""` (link-local, useless for lateral movement)
@@ -1903,15 +1887,13 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
             parse_wmi(&file_origin, WMI_EVENT_IDS.to_vec())
         },
         _ => {
-            // Unknown filename (e.g. archived EVTX like Security-YYYY-MM-DD-HH-MM-SS.evtx
+            // Unknown filename (archived EVTX such as Security-YYYY-MM-DD-HH-MM-SS.evtx
             // that Windows drops into winevt\Logs\Archive\ when "Archive the log when
-            // full" is enabled, or operator-renamed files). Only fall back to Provider.Name
-            // dispatch in parse-massive — the cautious action stays predictable.
-            if is_massive_mode() {
-                parse_unknown(&file_origin)
-            } else {
-                Vec::new()
-            }
+            // full" is enabled, operator-renamed files, or EVTX extracted from
+            // third-party tooling). Fall back to Provider.Name dispatch so these
+            // still get parsed. Users who want strict canonical-only matching can
+            // simply point -d at the canonical Logs directory.
+            parse_unknown(&file_origin)
         }
     };
 
