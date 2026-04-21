@@ -91,9 +91,16 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 |----------|----------|
 | Windows | [`masstin-windows.exe`](https://github.com/jupyterj0nes/masstin/releases/latest) |
 | Linux | [`masstin-linux`](https://github.com/jupyterj0nes/masstin/releases/latest) |
-| macOS | [`masstin-macos`](https://github.com/jupyterj0nes/masstin/releases/latest) |
+| macOS (Apple Silicon, M1+) | [`masstin-macos-arm64`](https://github.com/jupyterj0nes/masstin/releases/latest) |
+| macOS (Intel) | [`masstin-macos-x86_64`](https://github.com/jupyterj0nes/masstin/releases/latest) |
 
 Go to [**Releases**](https://github.com/jupyterj0nes/masstin/releases) and download the binary for your platform. That's it.
+
+> **macOS first run:** if Gatekeeper blocks the binary ("Apple cannot check it for malicious software"), clear the quarantine attribute once and run normally:
+> ```bash
+> chmod +x masstin-*-macos-*
+> xattr -d com.apple.quarantine masstin-*-macos-*
+> ```
 
 ### Install from crates.io
 
