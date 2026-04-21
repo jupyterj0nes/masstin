@@ -119,6 +119,31 @@ cargo build --release
 
 ## Usage
 
+### Choosing the right action — what each one actually processes
+
+Quick reference. The three Windows actions differ by **what you feed them**, not by the parser underneath — EVTX dispatch is the same in all of them (Provider.Name routing, unknown providers silently skipped).
+
+| Source | `parse-windows` | `parse-image` | `parse-massive` |
+|---|:---:|:---:|:---:|
+| Loose EVTX files and directories | ✅ | ❌ | ✅ |
+| Recursive ZIP walk (unlimited nesting) | ✅ | ❌ | ✅ |
+| `Provider.Name` fallback for archived / renamed EVTX | ✅ | ✅ | ✅ |
+| Forensic disk images (E01, VMDK, raw, dd, img) | ❌ | ✅ | ✅ |
+| NTFS walker → `winevt/Logs` + VSS recovery | ❌ | ✅ | ✅ |
+| UAL databases (`LogFiles/Sum/*.mdb`) | ❌ | ✅ | ✅ |
+| Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
+| MountPoints2 (NTUSER.DAT registry hive) | ❌ | ✅ | ✅ |
+| Triage detection (KAPE / Velociraptor / Cortex XDR) with per-source labels | ❌ | ❌ | ✅ |
+| Loose-artifact promotion of `-d` directories into the pipeline | ❌ | ❌ | ✅ |
+
+Rule of thumb:
+
+- **Folder / ZIP / single EVTX** → `parse-windows`
+- **Forensic image** (`.e01`, `.vmdk`, `.raw`) → `parse-image`
+- **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
+
+In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
+
 ### Parse Windows: Generate a lateral movement timeline
 
 Parses Windows EVTX files and UAL databases from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
