@@ -1,0 +1,50 @@
+name: macOS debug shell (tmate)
+
+# Manual-only workflow: spawns a macOS runner (arm64 or x86_64), builds
+# masstin in release mode, then opens an SSH session you can connect to
+# for interactive debugging. Free while the repo is public.
+#
+# Hard ceiling is ~6 hours per run (GitHub runner limit). Disconnecting
+# with `exit` inside the session ends the job immediately so you don't
+# keep the runner alive for nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'macOS architecture'
+        type: choice
+        options:
+          - arm64
+          - x86_64
+        default: arm64
+
+jobs:
+  shell:
+    name: Debug shell on macOS ${{ inputs.arch }}
+    runs-on: ${{ inputs.arch == 'arm64' && 'macos-latest' || 'macos-13' }}
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Environment info
+        run: |
+          echo "=== macOS runner ==="
+          uname -a
+          sw_vers
+          rustc --version
+          df -h .
+          echo "Repo checkout at: $GITHUB_WORKSPACE"
+
+      - name: Build masstin (release)
+        run: cargo build --release
+
+      - name: Open tmate SSH session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          # Only SSH keys registered on the GitHub account that launched
+          # the workflow can connect. No public tmate URL is exposed.
+          limit-access-to-actor: true
