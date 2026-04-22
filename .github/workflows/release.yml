@@ -75,6 +75,17 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Checkout FIRST so we have CHANGELOG.md in the working dir.
+      # Doing checkout after download-artifact would wipe the downloaded
+      # binaries because actions/checkout@v4 runs `git clean -ffdx` on
+      # the workspace by default before cloning.
+      - name: Fetch CHANGELOG from repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -82,13 +93,6 @@ jobs:
 
       - name: List files
         run: ls -la
-
-      - name: Fetch CHANGELOG from repo
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            CHANGELOG.md
-          sparse-checkout-cone-mode: false
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
