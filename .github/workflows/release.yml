@@ -22,7 +22,13 @@ jobs:
             os: ubuntu-latest
             artifact: masstin
           - target: x86_64-apple-darwin
-            os: macos-13
+            # macos-latest is arm64 Apple Silicon; the Rust toolchain
+            # cross-compiles cleanly to x86_64-apple-darwin and the
+            # libesedb-sys vendored C source respects the target triple
+            # via cc::Build. Avoids the macos-13 Intel runner pool which
+            # is effectively unavailable on free tier (24h queue waits
+            # observed in practice).
+            os: macos-latest
             artifact: masstin
             mac_arch: x86_64
           - target: aarch64-apple-darwin
