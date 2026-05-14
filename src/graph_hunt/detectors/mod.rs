@@ -11,6 +11,10 @@ use std::collections::HashSet;
 mod novel_edge;
 mod chain_motif;
 mod pagerank_spike;
+mod betweenness_spike;
+mod community_bridge;
+mod cred_rotation;
+mod rare_logon_type;
 
 pub struct Finding {
     pub detector: &'static str,
@@ -71,6 +75,10 @@ pub async fn run_all(
             "novel-edge" => novel_edge::run(graph, bl).await,
             "chain-motif" => chain_motif::run(graph, bl).await,
             "pagerank-spike" => pagerank_spike::run(graph, bl).await,
+            "betweenness-spike" => betweenness_spike::run(graph, bl).await,
+            "community-bridge" => community_bridge::run(graph, bl).await,
+            "cred-rotation" => cred_rotation::run(graph, bl).await,
+            "rare-logon-type" => rare_logon_type::run(graph, bl).await,
             _ => Vec::new(),
         };
 
