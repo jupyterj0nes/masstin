@@ -47,6 +47,7 @@ pub mod parse_custom;
 pub mod filter;
 pub mod vmdk;
 pub use crate::vmdk::*;
+mod graph_hunt;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -230,6 +231,26 @@ pub struct Cli {
     /// properties preserved.
     #[arg(long)]
     new_node: Option<String>,
+
+    /// For `graph-hunt`: cutoff datetime separating baseline from investigation
+    /// window. Events strictly before this timestamp form the baseline; events
+    /// at or after it are the window scanned for anomalies. Format:
+    /// "YYYY-MM-DD HH:MM:SS" (UTC assumed).
+    #[arg(long)]
+    investigation_from: Option<String>,
+
+    /// For `graph-hunt`: comma-separated list of detector names to skip.
+    /// Available: novel-edge, chain-motif, pagerank-spike, betweenness-spike,
+    /// community-bridge, cred-rotation, rare-logon-type.
+    /// Example: --skip-detectors pagerank-spike,betweenness-spike
+    #[arg(long)]
+    skip_detectors: Option<String>,
+
+    /// For `graph-hunt`: comma-separated list of detector names to run
+    /// exclusively (all others disabled). Same names as --skip-detectors.
+    /// Mutually exclusive with --skip-detectors.
+    #[arg(long)]
+    only_detectors: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -268,6 +289,9 @@ enum ActionType {
     MergeNeo4jNodes,
     /// Merge two :host nodes in a Memgraph graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Same as `merge-neo4j-nodes` but for Memgraph.
     MergeMemgraphNodes,
+    /// Hunt lateral movement anomalies on a graph already loaded into Memgraph. Uses native graph algorithms (PageRank, Louvain, betweenness) plus structural detectors (novel edges, chain motifs, credential rotation) to surface pivots. Requires --database and --investigation-from. Best results with --ungrouped loads.
+    #[value(alias = "graph-hunt")]
+    GraphHunt,
 }
 
 // -----------------------------------------------------------------------------
@@ -460,6 +484,18 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             )
             .await;
         }
+        ActionType::GraphHunt => {
+            let default_user = String::from("");
+            crate::graph_hunt::graph_hunt(
+                config.database.as_ref().unwrap(),
+                config.user.as_ref().unwrap_or(&default_user),
+                config.investigation_from.as_ref().unwrap(),
+                config.skip_detectors.as_deref(),
+                config.only_detectors.as_deref(),
+                config.output.as_deref(),
+            )
+            .await;
+        }
     }
 
     // Print noise filter summary (no-op if no filter flags were set)
@@ -614,6 +650,23 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 || config.old_node.is_none() || config.new_node.is_none() {
                 return Err(String::from(
                     "For merge-memgraph-nodes you must specify --database, --old-node and --new-node.",
+                ));
+            }
+        }
+        ActionType::GraphHunt => {
+            if config.database.is_none() {
+                return Err(String::from(
+                    "For graph-hunt you must specify --database (Memgraph bolt URI).",
+                ));
+            }
+            if config.investigation_from.is_none() {
+                return Err(String::from(
+                    "For graph-hunt you must specify --investigation-from \"YYYY-MM-DD HH:MM:SS\".",
+                ));
+            }
+            if config.skip_detectors.is_some() && config.only_detectors.is_some() {
+                return Err(String::from(
+                    "--skip-detectors and --only-detectors are mutually exclusive.",
                 ));
             }
         }
