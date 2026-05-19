@@ -155,6 +155,15 @@ pub struct Cli {
     #[arg(long)]
     ungrouped: bool,
 
+    /// For load-neo4j / load-memgraph: how many edge batches to send to the
+    /// database concurrently. The default of 1 loads serially (one Bolt
+    /// round-trip in flight at a time) — the only mode proven safe against
+    /// Memgraph 3.9.x, which can SIGSEGV under concurrent writes. Raise it
+    /// (e.g. 8) for a ~3x speedup on Neo4j, or on a Memgraph build where
+    /// concurrent writes are stable.
+    #[arg(long, default_value_t = 1)]
+    load_concurrency: usize,
+
     /// Scan all NTFS volumes on the system for VSS (parse-image-windows only, requires admin)
     #[arg(long)]
     all_volumes: bool,
@@ -361,6 +370,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.load_concurrency,
             )
             .await;
         }
@@ -373,6 +383,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.load_concurrency,
             )
             .await;
         }
