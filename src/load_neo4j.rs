@@ -65,6 +65,31 @@ struct GroupedData {
     src_ip: String,
 }
 
+/// A fully-resolved edge ready for batched insertion. All IP→hostname
+/// resolution, self-loop filtering and rel-type sanitization has already
+/// happened in the pre-pass, so the database phase is a pure batched write:
+/// edges are bucketed by `rel_type` and streamed through UNWIND queries.
+struct ResolvedEdge {
+    origin: String,
+    destination: String,
+    rel_type: String,
+    time: String,
+    logon_type: String,
+    src_computer: String,
+    src_ip: String,
+    target_user_name: String,
+    target_domain_name: String,
+    subject_user_name: String,
+    subject_domain_name: String,
+    count: String,
+}
+
+/// Edges per UNWIND batch. Each batch is a single Bolt round-trip carrying
+/// this many edges, replacing what used to be one round-trip per edge — the
+/// dominant residual cost once the :host(name) index removed the O(V*E)
+/// MERGE-scan term.
+const EDGE_BATCH: usize = 5_000;
+
 // ───────── helper (inline or place it above) ─────────────────────────
 fn looks_like_ip(s: &str) -> bool {
     // IPv4 → only digits + dots; IPv6 → hex digits + colons
@@ -96,8 +121,11 @@ pub async fn load_neo4j(
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
+    concurrency: usize,
 ) {
     let start_clock = std::time::Instant::now();
+    // 0 would make buffer_unordered yield nothing; 1 is plain serial loading.
+    let concurrency = concurrency.max(1);
 
     // Phase 1: Connect
     crate::banner::print_phase("1", "2", "Connecting to Neo4j...");
@@ -112,8 +140,23 @@ pub async fn load_neo4j(
         crate::banner::print_phase_detail("End time:", e);
     }
     let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
-    let graph = Graph::new(database, user, &pass).await.unwrap();
+    // Arc so the concurrent edge-loading phase can hand a shared handle to
+    // each in-flight batch (`Graph` is not Clone; the Bolt pool inside is).
+    let graph = std::sync::Arc::new(Graph::new(database, user, &pass).await.unwrap());
     crate::banner::print_phase_result("Connected");
+
+    // Ensure an index on :host(name). Every edge insert runs
+    // MERGE (origin:host {name:...}) / MERGE (destination:host {name:...});
+    // without this index each MERGE is a full label scan, making the whole
+    // load O(V*E) — super-linear and effectively unusable past a few hundred
+    // thousand edges. `IF NOT EXISTS` makes it idempotent on Neo4j 4.x/5.x;
+    // any error is swallowed so an older server or a pre-existing index does
+    // not abort the load.
+    match graph.execute(query("CREATE INDEX host_name IF NOT EXISTS FOR (h:host) ON (h.name)")).await {
+        Ok(mut r) => { let _ = r.next().await; }
+        Err(_) => {}
+    }
+    crate::banner::print_phase_result("Index :host(name) ready");
 
     // Parse the optional time window once — reused for every CSV row.
     // Returns (start_utc, end_utc) as Option<DateTime<Utc>>.
@@ -376,20 +419,16 @@ pub async fn load_neo4j(
             }
         }
 
-        // Phase 2: Load to database
-        let grouped_lines_count = edges_to_emit.len();
-        let phase_label = if ungrouped {
-            format!("Loading {} individual edges to Neo4j (ungrouped mode)...", grouped_lines_count)
-        } else {
-            format!("Loading {} grouped connections to Neo4j...", grouped_lines_count)
-        };
-        crate::banner::print_phase("2", "2", &phase_label);
-        let pb = crate::banner::create_progress_bar(grouped_lines_count as u64);
-        let grouped_lines = edges_to_emit;
-        let mut errors: usize = 0;
+        // ── Pre-pass: resolve every edge in Rust (no DB round-trips) ──
+        // Source/destination IP→hostname resolution, self-loop filtering and
+        // rel-type sanitization all happen here, so the database phase below
+        // is a pure batched write.
         let mut resolved: usize = 0;
-
-        for line in grouped_lines {
+        let mut resolved_edges: Vec<ResolvedEdge> = Vec::new();
+        let clean_user = |s: &str| -> String {
+            s.split('@').next().unwrap_or(s).to_string()
+        };
+        for line in &edges_to_emit {
             let row: Vec<&str> = line.split(',').collect();
             let relation_type = if row[5].trim().is_empty() || row[5] == "\"\"" { "NO_USER" } else { row[5] };
 
@@ -399,8 +438,7 @@ pub async fn load_neo4j(
             // filled in with the literal IP (happens on 4624 events where
             // WorkstationName was blank and masstin fell back to the address),
             // so the same physical host does not end up as two nodes (one by
-            // hostname, one by IP). Falls back to the row's src_computer if
-            // no mapping exists, and to the IP itself as last resort.
+            // hostname, one by IP).
             let src_ip_raw = row[9];
             let src_computer_raw = row[8];
             let src_computer_is_ip = looks_like_ip(src_computer_raw)
@@ -414,7 +452,6 @@ pub async fn load_neo4j(
                     src_ip_raw.to_string()
                 } else {
                     // Both src_computer and src_ip are noise; skip.
-                    pb.inc(1);
                     continue;
                 }
             } else {
@@ -424,26 +461,18 @@ pub async fn load_neo4j(
             // ── Destination-side resolution ──
             // If dst_computer looks like an IP and the global map has a
             // hostname for it, swap it in. This fixes the "same physical
-            // host appears as two nodes" bug where one node was created by
-            // IP (from some rows) and another by hostname (from other rows).
+            // host appears as two nodes" bug.
             let dst_raw = row[1];
             let destination_name: String = if looks_like_ip(dst_raw) {
-                if let Some(resolved_host) = ip_to_host.get(dst_raw) {
-                    resolved_host.clone()
-                } else {
-                    dst_raw.to_string()
-                }
+                ip_to_host.get(dst_raw).cloned().unwrap_or_else(|| dst_raw.to_string())
             } else {
                 dst_raw.to_string()
             };
 
             // Self-loop filter: after resolution, drop edges where origin
-            // and destination point at the same host. Self-loops are pure
-            // noise in a lateral-movement graph. Checked here post-resolution
-            // because resolution itself creates new matches (e.g.
-            // 192.168.10.11 → WINTERFELL against dst=WINTERFELL).
+            // and destination point at the same host. Checked post-resolution
+            // because resolution itself creates new matches.
             if origin_name.eq_ignore_ascii_case(&destination_name) {
-                pb.inc(1);
                 continue;
             }
 
@@ -451,8 +480,7 @@ pub async fn load_neo4j(
             // [A-Za-z_][A-Za-z0-9_]*. Anything else (`$`, `!`, `(`, `)`, dots,
             // hyphens, spaces, accents...) becomes `_`. The `$` case is the
             // important one — machine accounts like `SPACHE$` would otherwise
-            // generate `r:SPACHE$` which Cypher parses as a parameter ref and
-            // kills the Bolt session for every query after it.
+            // generate `r:SPACHE$` which Cypher parses as a parameter ref.
             let rel_type_normalized = {
                 let stripped = relation_type.split('@').next().unwrap_or(relation_type);
                 let mut s: String = stripped.chars().map(|c| {
@@ -465,58 +493,148 @@ pub async fn load_neo4j(
                 s.to_uppercase()
             };
 
-            // Node names and properties: keep original values (no normalization)
-            // Only strip @domain from usernames
-            let clean_user = |s: &str| -> String {
-                s.split("@").next().unwrap_or(s).to_string()
-            };
-
-            // In ungrouped mode we CREATE (not MERGE) the edge so every CSV
-            // row becomes a distinct edge even when (src, user, dst, logon_type)
-            // repeats — otherwise MERGE would collapse events that differ
-            // only in secondary properties. Nodes still MERGE.
-            let edge_op = if ungrouped { "CREATE" } else { "MERGE" };
-
-            let formatted_query = format!(
-                "MERGE (origin:host{{name:'{}'}})
-                MERGE (destination:host{{name:'{}'}})
-                {} (origin)-[r:{}{{time:datetime('{}'), logon_type:'{}', src_computer:'{}', src_ip:'{}', target_user_name:'{}', target_domain_name:'{}', subject_user_name:'{}', subject_domain_name:'{}', count:'{}'}}]->(destination)",
-                origin_name,
-                destination_name,
-                edge_op,
-                rel_type_normalized,
-                row[0].replace(" utc", "").replace(" ", "T"),
-                row[7],                                                      // property: original
-                src_computer_raw,                                            // property: original
-                src_ip_raw,                                                  // property: original
-                clean_user(relation_type),                                   // property: strip @domain only
-                row[6],                                                      // property: original
-                clean_user(row[3]),                                          // property: strip @domain only
-                row[4],                                                      // property: original
-                row[2],                                                      // property: original
-            );
-            
-            // Execute the query and handle possible errors
-            match graph.execute(query(&formatted_query)).await {
-                Ok(mut result) => {
-                    let row = result.next().await.unwrap();  // Process the result
-                    // You can add more logic here if you need to process the result
-                },
-                Err(e) => {
-                    errors += 1;
-                    if crate::parse::is_debug_mode() {
-                        eprintln!("[ERROR] Cypher query failed: {:?}", e);
-                    }
-                    continue;
-                }
-            }
-
-            // Increment the progress bar
-            pb.inc(1);
+            resolved_edges.push(ResolvedEdge {
+                origin: origin_name,
+                destination: destination_name,
+                rel_type: rel_type_normalized,
+                time: row[0].replace(" utc", "").replace(" ", "T"),
+                logon_type: row[7].to_string(),
+                src_computer: src_computer_raw.to_string(),
+                src_ip: src_ip_raw.to_string(),
+                target_user_name: clean_user(relation_type),
+                target_domain_name: row[6].to_string(),
+                subject_user_name: clean_user(row[3]),
+                subject_domain_name: row[4].to_string(),
+                count: row[2].to_string(),
+            });
         }
 
+        // Phase 2: Load to database (batched + concurrent)
+        let edge_total = resolved_edges.len();
+        let mode = if concurrency > 1 {
+            format!("concurrent x{}", concurrency)
+        } else {
+            "serial".to_string()
+        };
+        let phase_label = if ungrouped {
+            format!("Loading {} individual edges to Neo4j (ungrouped, {})...", edge_total, mode)
+        } else {
+            format!("Loading {} grouped connections to Neo4j ({})...", edge_total, mode)
+        };
+        crate::banner::print_phase("2", "2", &phase_label);
+
+        // Pre-create every host node in a single serial pass. The concurrent
+        // edge batches below then only ever MATCH their endpoints — never
+        // MERGE them. MERGE-ing the same node from two parallel transactions
+        // contends for a lock and can deadlock in Neo4j; MATCH is read-only
+        // on the node identity and never does. One UNWIND covers every name.
+        let mut host_names: Vec<String> = Vec::new();
+        {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for e in &resolved_edges {
+                if seen.insert(e.origin.as_str()) { host_names.push(e.origin.clone()); }
+                if seen.insert(e.destination.as_str()) { host_names.push(e.destination.clone()); }
+            }
+        }
+        crate::banner::print_phase_detail(
+            "Nodes:",
+            &format!("pre-creating {} host nodes", host_names.len()),
+        );
+        match graph
+            .execute(query("UNWIND $names AS n MERGE (:host {name: n})").param("names", host_names.clone()))
+            .await
+        {
+            Ok(mut r) => { let _ = r.next().await; }
+            Err(e) => {
+                if crate::parse::is_debug_mode() {
+                    eprintln!("[ERROR] host node pre-create failed: {:?}", e);
+                }
+            }
+        }
+
+        let pb = crate::banner::create_progress_bar(edge_total as u64);
+
+        // Cypher cannot parametrize a relationship type, and masstin's schema
+        // uses the (sanitized) username as the type. So edges are bucketed by
+        // rel_type and each bucket gets its own UNWIND query with the type
+        // baked in as a literal; the per-edge payload travels as parallel
+        // list parameters indexed by `i`.
+        let edge_op = if ungrouped { "CREATE" } else { "MERGE" };
+        let mut by_type: HashMap<&str, Vec<&ResolvedEdge>> = HashMap::new();
+        for e in &resolved_edges {
+            by_type.entry(e.rel_type.as_str()).or_default().push(e);
+        }
+
+        // Flatten every (rel_type, chunk) pair into one job list and run
+        // `concurrency` of them at a time. `Graph` itself is not Clone, but
+        // it owns a Bolt connection pool, so an Arc handle shared across jobs
+        // lets each in-flight job borrow its own connection and the server
+        // process them in parallel. A batch that hits a deadlock (two batches
+        // writing edges onto a shared hub host) is retried a few times before
+        // its edges are counted lost. Neo4j tolerates concurrency well; the
+        // CLI still defaults it to 1 for parity with the Memgraph loader.
+        let jobs: Vec<(&str, &[&ResolvedEdge])> = by_type
+            .iter()
+            .flat_map(|(rt, edges)| edges.chunks(EDGE_BATCH).map(move |c| (*rt, c)))
+            .collect();
+
+        let errors: usize = futures::stream::iter(jobs)
+            .map(|(rel_type, chunk)| {
+                let graph = graph.clone();
+                let pb = pb.clone();
+                async move {
+                    let q_str = format!(
+                        "UNWIND range(0, size($origin) - 1) AS i \
+                         MATCH (o:host {{name: $origin[i]}}) \
+                         MATCH (d:host {{name: $destination[i]}}) \
+                         {} (o)-[r:{} {{time: datetime($time[i]), logon_type: $logon_type[i], \
+                         src_computer: $src_computer[i], src_ip: $src_ip[i], \
+                         target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
+                         subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
+                         count: $count[i]}}]->(d)",
+                        edge_op, rel_type,
+                    );
+                    let build = || query(&q_str)
+                        .param("origin", chunk.iter().map(|e| e.origin.clone()).collect::<Vec<String>>())
+                        .param("destination", chunk.iter().map(|e| e.destination.clone()).collect::<Vec<String>>())
+                        .param("time", chunk.iter().map(|e| e.time.clone()).collect::<Vec<String>>())
+                        .param("logon_type", chunk.iter().map(|e| e.logon_type.clone()).collect::<Vec<String>>())
+                        .param("src_computer", chunk.iter().map(|e| e.src_computer.clone()).collect::<Vec<String>>())
+                        .param("src_ip", chunk.iter().map(|e| e.src_ip.clone()).collect::<Vec<String>>())
+                        .param("target_user_name", chunk.iter().map(|e| e.target_user_name.clone()).collect::<Vec<String>>())
+                        .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
+                        .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
+                        .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
+                        .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
+                    // Up to 4 attempts: a deadlock aborts only the losing
+                    // batch, and the Bolt round-trip itself spaces the retry.
+                    let mut last_err = None;
+                    for _ in 0..4 {
+                        match graph.execute(build()).await {
+                            Ok(mut result) => {
+                                let _ = result.next().await;
+                                pb.inc(chunk.len() as u64);
+                                return 0usize;
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    if crate::parse::is_debug_mode() {
+                        eprintln!(
+                            "[ERROR] edge batch ({} edges, r:{}) failed after retries: {:?}",
+                            chunk.len(), rel_type, last_err,
+                        );
+                    }
+                    pb.inc(chunk.len() as u64);
+                    chunk.len()
+                }
+            })
+            .buffer_unordered(concurrency)
+            .fold(0usize, |acc, n| async move { acc + n })
+            .await;
+
         pb.finish_and_clear();
-        let loaded = grouped_lines_count - errors;
+        let loaded = edge_total - errors;
         crate::banner::print_load_summary("Neo4j", loaded, resolved, errors, start_clock);
     }
 }
