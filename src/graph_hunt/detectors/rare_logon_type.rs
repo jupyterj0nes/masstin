@@ -1,33 +1,56 @@
 // rare-logon-type detector. Surfaces window edges whose logon_type is
-// globally rare in the baseline — independent of which destination
-// received them. This complements novel-edge, which only checks whether
-// a type was new for one specific destination. rare-logon-type catches
-// types that are exotic on the WHOLE network: NetworkCleartext (8),
-// NewCredentials/runas-netonly (9), CachedInteractive (11), or anything
-// custom the corpus rarely sees.
+// rare in the baseline FOR THE DESTINATION'S HOST CLASS — not globally.
 //
-// Implementation: compute per-type frequency in the baseline, then for
-// every window edge check whether its type sits below the rarity
-// threshold. Emit one finding per matching edge. The score scales with
-// rarity — a type that never appeared at all lands at 1.0, a type just
-// under the threshold lands near 0.
+// Why class-stratified: logon_type semantics are Windows-specific. A
+// Linux destination's edges (carried by wtmp/auth.log/SSH) frequently
+// report logon_type=0 (the loader's "absent" sentinel for non-Windows
+// sources), which is a legitimate value on Linux but globally rare in a
+// mixed enterprise corpus. A naive global rarity test fires a flood of
+// false positives on every Linux SSH event. Stratifying the rarity
+// distribution by destination class (Linux vs Windows) keeps the
+// detector sharp on the real targets: types like 9 (NewCredentials),
+// 8 (NetworkCleartext), 11 (CachedInteractive), exotic types appearing
+// suddenly on Windows hosts.
+//
+// Findings are deduplicated per (origin, destination, user, logon_type)
+// tuple — one row instead of N when the attacker fires the same odd
+// type repeatedly between the same hosts. The earliest event_time of
+// the tuple is reported as the finding's time_window.
 
 use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;
 use futures::stream::*;
 use neo4rs::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// Types whose share of baseline events is below this fraction count as
-/// "rare". 0.005 = 0.5%. Type 10 (RDP) in a normal enterprise corpus
-/// sits well above this; types 8/9/11 sit well below. Tuned to fire on
-/// the latter without lighting up legitimate RDP traffic.
+/// Per-class threshold below which a type counts as "rare". 0.5% works
+/// for the canonical suspicious types (8/9/11 on Windows) without
+/// lighting up routine RDP/SMB. Stratification removes the type=0 Linux
+/// noise the old global threshold suffered from.
 const RARITY_THRESHOLD: f64 = 0.005;
+
+/// Cheap heuristic for Windows vs Linux destination, used to look up the
+/// right baseline rarity distribution. The masstin loader uppercases all
+/// hostnames so we only need to test the uppercase form.
+fn host_class(name: &str) -> &'static str {
+    let n = name; // already uppercase from loader
+    if n.starts_with("LX-")
+        || n.contains("LINUX")
+        || n.contains("UBUNTU")
+        || n.contains("DEBIAN")
+        || n.contains("CENTOS")
+        || n.contains("RHEL")
+    {
+        "linux"
+    } else {
+        "windows"
+    }
+}
 
 pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    let baseline_freq = match fetch_baseline_distribution(graph, &cutoff_str).await {
+    let by_class = match fetch_baseline_by_class(graph, &cutoff_str).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("  [rare-logon-type] baseline distribution query failed: {}", e);
@@ -35,14 +58,14 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
         }
     };
 
-    if baseline_freq.is_empty() {
+    if by_class.is_empty() {
         return Vec::new();
     }
 
-    let total: u64 = baseline_freq.values().sum();
-    if total == 0 {
-        return Vec::new();
-    }
+    let class_total: HashMap<&str, u64> = by_class
+        .iter()
+        .map(|(cls, counts)| (cls.as_str(), counts.values().sum()))
+        .collect();
 
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
@@ -56,6 +79,7 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     );
 
     let mut findings: Vec<Finding> = Vec::new();
+    let mut seen: HashSet<(String, String, String, String)> = HashSet::new();
     let mut stream = match graph.execute(query(&q)).await {
         Ok(s) => s,
         Err(e) => {
@@ -77,7 +101,27 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     continue;
                 }
 
-                let baseline_count = baseline_freq.get(&logon_type).copied().unwrap_or(0);
+                let key = (
+                    origin.clone(),
+                    destination.clone(),
+                    user.clone(),
+                    logon_type.clone(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                let cls = host_class(&destination);
+                let class_freqs = match by_class.get(cls) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let total = match class_total.get(cls).copied() {
+                    Some(t) if t > 0 => t,
+                    _ => continue,
+                };
+
+                let baseline_count = class_freqs.get(&logon_type).copied().unwrap_or(0);
                 let freq = baseline_count as f64 / total as f64;
                 if freq >= RARITY_THRESHOLD {
                     continue;
@@ -87,21 +131,22 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 let pct = freq * 100.0;
 
                 let rarity_descr = if baseline_count == 0 {
-                    "never appeared in baseline".to_string()
+                    format!("never appeared in baseline among {} destinations", cls)
                 } else {
                     format!(
-                        "appeared in {} of {} baseline events ({:.3}% — below {:.1}% threshold)",
-                        baseline_count, total, pct, RARITY_THRESHOLD * 100.0
+                        "{} of {} baseline events to {} destinations ({:.3}% — below {:.1}% threshold)",
+                        baseline_count, total, cls, pct, RARITY_THRESHOLD * 100.0
                     )
                 };
 
                 let summary = format!(
-                    "{origin} -> {destination} as user='{user}' logon_type='{lt}'. \
-                     Type {lt} is globally rare: {descr}",
+                    "{origin} -> {destination} ({cls}) as user='{user}' logon_type='{lt}'. \
+                     Type {lt} is rare for {cls} hosts: {descr}",
                     origin = origin,
                     destination = destination,
                     user = user,
                     lt = logon_type,
+                    cls = cls,
                     descr = rarity_descr,
                 );
 
@@ -132,22 +177,31 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     findings
 }
 
-async fn fetch_baseline_distribution(
+/// Fetch per-host-class baseline frequency: class -> logon_type -> count.
+/// We classify in Rust (Cypher can't easily host the rule set) so the
+/// query stays simple and portable.
+async fn fetch_baseline_by_class(
     graph: &Graph,
     cutoff_str: &str,
-) -> neo4rs::Result<HashMap<String, u64>> {
+) -> neo4rs::Result<HashMap<String, HashMap<String, u64>>> {
     let q = format!(
-        "MATCH ()-[r]->()
+        "MATCH ()-[r]->(b:host)
          WHERE r.time < localDateTime('{}')
-         RETURN toString(r.logon_type) AS lt, count(r) AS c",
+         RETURN toString(r.logon_type) AS lt, b.name AS dst, count(r) AS c",
         cutoff_str
     );
     let mut stream = graph.execute(query(&q)).await?;
-    let mut out: HashMap<String, u64> = HashMap::new();
+    let mut by_class: HashMap<String, HashMap<String, u64>> = HashMap::new();
     while let Some(row) = stream.next().await? {
         let lt: String = row.get("lt").unwrap_or_default();
+        let dst: String = row.get("dst").unwrap_or_default();
         let c: i64 = row.get("c").unwrap_or(0);
-        out.insert(lt, c.max(0) as u64);
+        let cls = host_class(&dst).to_string();
+        *by_class
+            .entry(cls)
+            .or_insert_with(HashMap::new)
+            .entry(lt)
+            .or_insert(0) += c.max(0) as u64;
     }
-    Ok(out)
+    Ok(by_class)
 }
