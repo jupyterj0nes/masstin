@@ -121,11 +121,8 @@ pub async fn load_neo4j(
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
-    concurrency: usize,
 ) {
     let start_clock = std::time::Instant::now();
-    // 0 would make buffer_unordered yield nothing; 1 is plain serial loading.
-    let concurrency = concurrency.max(1);
 
     // Phase 1: Connect
     crate::banner::print_phase("1", "2", "Connecting to Neo4j...");
@@ -139,10 +136,19 @@ pub async fn load_neo4j(
     if let Some(e) = end_time {
         crate::banner::print_phase_detail("End time:", e);
     }
-    let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
-    // Arc so the concurrent edge-loading phase can hand a shared handle to
-    // each in-flight batch (`Graph` is not Clone; the Bolt pool inside is).
-    let graph = std::sync::Arc::new(Graph::new(database, user, &pass).await.unwrap());
+    // Read the password from $NEO4J_PASSWORD first so scripts (the scaling
+    // spike, CI) can drive load-neo4j without a tty. Fall back to the
+    // interactive prompt when the env var is missing or empty. Note this
+    // means the password lives in the process env; do not export it from a
+    // shared shell or a logged dotfile.
+    let pass = match std::env::var("NEO4J_PASSWORD") {
+        Ok(p) if !p.is_empty() => {
+            crate::banner::print_phase_detail("Auth:", "password from $NEO4J_PASSWORD");
+            p
+        }
+        _ => rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap(),
+    };
+    let graph = Graph::new(database, user, &pass).await.unwrap();
     crate::banner::print_phase_result("Connected");
 
     // Ensure an index on :host(name). Every edge insert runs
@@ -511,23 +517,18 @@ pub async fn load_neo4j(
 
         // Phase 2: Load to database (batched + concurrent)
         let edge_total = resolved_edges.len();
-        let mode = if concurrency > 1 {
-            format!("concurrent x{}", concurrency)
-        } else {
-            "serial".to_string()
-        };
         let phase_label = if ungrouped {
-            format!("Loading {} individual edges to Neo4j (ungrouped, {})...", edge_total, mode)
+            format!("Loading {} individual edges to Neo4j (ungrouped, batched)...", edge_total)
         } else {
-            format!("Loading {} grouped connections to Neo4j ({})...", edge_total, mode)
+            format!("Loading {} grouped connections to Neo4j (batched)...", edge_total)
         };
         crate::banner::print_phase("2", "2", &phase_label);
 
-        // Pre-create every host node in a single serial pass. The concurrent
-        // edge batches below then only ever MATCH their endpoints — never
-        // MERGE them. MERGE-ing the same node from two parallel transactions
-        // contends for a lock and can deadlock in Neo4j; MATCH is read-only
-        // on the node identity and never does. One UNWIND covers every name.
+        // Pre-create every host node in one UNWIND pass. The edge batches
+        // below then only ever MATCH their endpoints (cheaper than MERGE on
+        // every batch now that the index already exists from connect-time)
+        // and any host that ends up unreferenced — unusual but legal — is
+        // still created so the graph keeps a stable node inventory.
         let mut host_names: Vec<String> = Vec::new();
         {
             let mut seen: HashSet<&str> = HashSet::new();
@@ -558,80 +559,57 @@ pub async fn load_neo4j(
         // uses the (sanitized) username as the type. So edges are bucketed by
         // rel_type and each bucket gets its own UNWIND query with the type
         // baked in as a literal; the per-edge payload travels as parallel
-        // list parameters indexed by `i`.
+        // list parameters indexed by `i`. Batches are executed one at a time:
+        // a previous opt-in concurrent path was removed because it tripped a
+        // Memgraph 3.9.x SIGSEGV race and didn't pay off on Neo4j 4.2 either
+        // (the deadlock-retry overhead ate the parallelism gain), while
+        // guaranteeing zero edge loss required additional fallback logic. A
+        // strictly serial loader has no contention, so no edge can ever be
+        // silently dropped.
         let edge_op = if ungrouped { "CREATE" } else { "MERGE" };
         let mut by_type: HashMap<&str, Vec<&ResolvedEdge>> = HashMap::new();
         for e in &resolved_edges {
             by_type.entry(e.rel_type.as_str()).or_default().push(e);
         }
 
-        // Flatten every (rel_type, chunk) pair into one job list and run
-        // `concurrency` of them at a time. `Graph` itself is not Clone, but
-        // it owns a Bolt connection pool, so an Arc handle shared across jobs
-        // lets each in-flight job borrow its own connection and the server
-        // process them in parallel. A batch that hits a deadlock (two batches
-        // writing edges onto a shared hub host) is retried a few times before
-        // its edges are counted lost. Neo4j tolerates concurrency well; the
-        // CLI still defaults it to 1 for parity with the Memgraph loader.
-        let jobs: Vec<(&str, &[&ResolvedEdge])> = by_type
-            .iter()
-            .flat_map(|(rt, edges)| edges.chunks(EDGE_BATCH).map(move |c| (*rt, c)))
-            .collect();
-
-        let errors: usize = futures::stream::iter(jobs)
-            .map(|(rel_type, chunk)| {
-                let graph = graph.clone();
-                let pb = pb.clone();
-                async move {
-                    let q_str = format!(
-                        "UNWIND range(0, size($origin) - 1) AS i \
-                         MATCH (o:host {{name: $origin[i]}}) \
-                         MATCH (d:host {{name: $destination[i]}}) \
-                         {} (o)-[r:{} {{time: datetime($time[i]), logon_type: $logon_type[i], \
-                         src_computer: $src_computer[i], src_ip: $src_ip[i], \
-                         target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
-                         subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
-                         count: $count[i]}}]->(d)",
-                        edge_op, rel_type,
-                    );
-                    let build = || query(&q_str)
-                        .param("origin", chunk.iter().map(|e| e.origin.clone()).collect::<Vec<String>>())
-                        .param("destination", chunk.iter().map(|e| e.destination.clone()).collect::<Vec<String>>())
-                        .param("time", chunk.iter().map(|e| e.time.clone()).collect::<Vec<String>>())
-                        .param("logon_type", chunk.iter().map(|e| e.logon_type.clone()).collect::<Vec<String>>())
-                        .param("src_computer", chunk.iter().map(|e| e.src_computer.clone()).collect::<Vec<String>>())
-                        .param("src_ip", chunk.iter().map(|e| e.src_ip.clone()).collect::<Vec<String>>())
-                        .param("target_user_name", chunk.iter().map(|e| e.target_user_name.clone()).collect::<Vec<String>>())
-                        .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
-                        .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
-                        .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
-                        .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
-                    // Up to 4 attempts: a deadlock aborts only the losing
-                    // batch, and the Bolt round-trip itself spaces the retry.
-                    let mut last_err = None;
-                    for _ in 0..4 {
-                        match graph.execute(build()).await {
-                            Ok(mut result) => {
-                                let _ = result.next().await;
-                                pb.inc(chunk.len() as u64);
-                                return 0usize;
-                            }
-                            Err(e) => last_err = Some(e),
+        let mut errors: usize = 0;
+        for (rel_type, edges) in &by_type {
+            for chunk in edges.chunks(EDGE_BATCH) {
+                let q_str = format!(
+                    "UNWIND range(0, size($origin) - 1) AS i \
+                     MATCH (o:host {{name: $origin[i]}}) \
+                     MATCH (d:host {{name: $destination[i]}}) \
+                     {} (o)-[r:{} {{time: datetime($time[i]), logon_type: $logon_type[i], \
+                     src_computer: $src_computer[i], src_ip: $src_ip[i], \
+                     target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
+                     subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
+                     count: $count[i]}}]->(d)",
+                    edge_op, rel_type,
+                );
+                let q = query(&q_str)
+                    .param("origin", chunk.iter().map(|e| e.origin.clone()).collect::<Vec<String>>())
+                    .param("destination", chunk.iter().map(|e| e.destination.clone()).collect::<Vec<String>>())
+                    .param("time", chunk.iter().map(|e| e.time.clone()).collect::<Vec<String>>())
+                    .param("logon_type", chunk.iter().map(|e| e.logon_type.clone()).collect::<Vec<String>>())
+                    .param("src_computer", chunk.iter().map(|e| e.src_computer.clone()).collect::<Vec<String>>())
+                    .param("src_ip", chunk.iter().map(|e| e.src_ip.clone()).collect::<Vec<String>>())
+                    .param("target_user_name", chunk.iter().map(|e| e.target_user_name.clone()).collect::<Vec<String>>())
+                    .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
+                    .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
+                    .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
+                    .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
+                match graph.execute(q).await {
+                    Ok(mut result) => { let _ = result.next().await; }
+                    Err(e) => {
+                        errors += chunk.len();
+                        if crate::parse::is_debug_mode() {
+                            eprintln!("[ERROR] edge batch ({} edges, r:{}) failed: {:?}", chunk.len(), rel_type, e);
                         }
                     }
-                    if crate::parse::is_debug_mode() {
-                        eprintln!(
-                            "[ERROR] edge batch ({} edges, r:{}) failed after retries: {:?}",
-                            chunk.len(), rel_type, last_err,
-                        );
-                    }
-                    pb.inc(chunk.len() as u64);
-                    chunk.len()
                 }
-            })
-            .buffer_unordered(concurrency)
-            .fold(0usize, |acc, n| async move { acc + n })
-            .await;
+                pb.inc(chunk.len() as u64);
+            }
+        }
 
         pb.finish_and_clear();
         let loaded = edge_total - errors;
