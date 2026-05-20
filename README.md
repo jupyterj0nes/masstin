@@ -572,6 +572,42 @@ The same physical host often appears as both an IP and a hostname depending on w
 
 When the loader can't tie an IP to a hostname (for example an external attacker IP with no matching session), the IP stays as its own node.
 
+#### Loader internals: why it is fast and never loses an edge
+
+The loader is built so that **every CSV row that makes it past the filters lands as exactly one edge in the graph** — no silent drops, no retries hiding failures. Five design choices add up to that guarantee while keeping the load near-linear in edge count:
+
+1. **`CREATE INDEX :host(name)` at connect time** (idempotent). Without it, every per-edge `MERGE (h:host {name: ...})` does a full label scan, turning the load into O(V·E) — super-linear and effectively unusable past a few hundred thousand edges. With it, each MERGE is an indexed lookup.
+2. **One-pass resolution in Rust.** IP→hostname unification, self-loop filtering and relationship-type sanitization all happen client-side once, before anything touches Bolt. The database phase is a pure write — no logic to retry.
+3. **`UNWIND` batches of 5000 edges per round-trip**, bucketed by relationship type (Cypher cannot parametrize a relationship type, and masstin's schema uses the sanitized username as the rel type). One Bolt round-trip per 5000 edges instead of one per edge.
+4. **One-shot host-node pre-create**, then `MATCH` (not `MERGE`) for the endpoints inside each edge batch. With the index already in place, MATCH is the cheapest possible lookup, and the edge batches no longer reason about node existence.
+5. **Strictly serial execution.** An opt-in concurrent path was tried and reverted: Memgraph 3.9.x SIGSEGVs under concurrent writes (timing-dependent race), Neo4j tolerated concurrency but the deadlock-retry-backoff overhead actually made it slower than serial on the test corpus, and any retry policy admitted the theoretical risk of silently dropping edges. Serial = no contention = zero retries needed = zero loss by construction.
+
+**Measured impact** (cumulative load of a 1 M-edge test corpus on the same Memgraph 3.9 host):
+
+| | Time | Throughput | Load curve |
+|--|-----:|----------:|-----------|
+| Before this optimization | 50.9 min | 327 edges/s | super-linear (exp ≈ 1.20) |
+| After (current default) | 23.0 min | 726 edges/s | near-linear (exp ≈ 1.09) |
+
+On Neo4j 4.2 the same loader hits ~12 000 edges/s on the same corpus — Neo4j is about an order of magnitude faster per write than Memgraph for this workload, so a 4 GB / ~27 M-edge CSV that takes ~13 h on Memgraph extrapolates to ~37 min on Neo4j.
+
+#### Driving load-neo4j without a password prompt
+
+By default `load-neo4j` prompts for the password interactively (`rpassword`), which is fine on the desk but breaks scripts and CI. Set the **`NEO4J_PASSWORD` environment variable** before invoking masstin to skip the prompt:
+
+```bash
+# Linux / macOS
+NEO4J_PASSWORD='your-pass' masstin -a load-neo4j -f timeline.csv \
+    --database bolt://localhost:7687 --user neo4j
+
+# PowerShell
+$env:NEO4J_PASSWORD = 'your-pass'
+masstin.exe -a load-neo4j -f timeline.csv `
+    --database bolt://localhost:7687 --user neo4j
+```
+
+When the variable is unset or empty the loader falls back to the interactive prompt. The password lives in the process environment — do not export it from a shared shell or a logged dotfile.
+
 ### Merge graph nodes after loading
 
 If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
