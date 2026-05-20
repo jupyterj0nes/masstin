@@ -48,6 +48,7 @@ pub mod filter;
 pub mod vmdk;
 pub use crate::vmdk::*;
 mod graph_hunt;
+mod graph_hunt_neo4j;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -292,6 +293,9 @@ enum ActionType {
     /// Hunt lateral movement anomalies on a graph already loaded into Memgraph. Uses native graph algorithms (PageRank, Louvain, betweenness) plus structural detectors (novel edges, chain motifs, credential rotation) to surface pivots. Requires --database and --investigation-from. Best results with --ungrouped loads.
     #[value(alias = "graph-hunt")]
     GraphHunt,
+    /// Hunt lateral movement anomalies on a graph already loaded into Neo4j. Sister action to `graph-hunt` (which targets Memgraph MAGE); runs the same 7 detectors but calls the Neo4j Graph Data Science (GDS) library instead of MAGE for PageRank, Louvain, and betweenness. Requires the GDS plugin installed in Neo4j and `--user`. Password is read from $NEO4J_PASSWORD or prompted interactively.
+    #[value(alias = "graph-hunt-neo4j")]
+    GraphHuntNeo4j,
 }
 
 // -----------------------------------------------------------------------------
@@ -496,6 +500,18 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             )
             .await;
         }
+        ActionType::GraphHuntNeo4j => {
+            let default_user = String::from("neo4j");
+            crate::graph_hunt_neo4j::graph_hunt_neo4j(
+                config.database.as_ref().unwrap(),
+                config.user.as_ref().unwrap_or(&default_user),
+                config.investigation_from.as_ref().unwrap(),
+                config.skip_detectors.as_deref(),
+                config.only_detectors.as_deref(),
+                config.output.as_deref(),
+            )
+            .await;
+        }
     }
 
     // Print noise filter summary (no-op if no filter flags were set)
@@ -662,6 +678,23 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if config.investigation_from.is_none() {
                 return Err(String::from(
                     "For graph-hunt you must specify --investigation-from \"YYYY-MM-DD HH:MM:SS\".",
+                ));
+            }
+            if config.skip_detectors.is_some() && config.only_detectors.is_some() {
+                return Err(String::from(
+                    "--skip-detectors and --only-detectors are mutually exclusive.",
+                ));
+            }
+        }
+        ActionType::GraphHuntNeo4j => {
+            if config.database.is_none() {
+                return Err(String::from(
+                    "For graph-hunt-neo4j you must specify --database (Neo4j bolt URI).",
+                ));
+            }
+            if config.investigation_from.is_none() {
+                return Err(String::from(
+                    "For graph-hunt-neo4j you must specify --investigation-from \"YYYY-MM-DD HH:MM:SS\".",
                 ));
             }
             if config.skip_detectors.is_some() && config.only_detectors.is_some() {
