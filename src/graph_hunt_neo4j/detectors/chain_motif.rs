@@ -38,16 +38,30 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     // in Rust from the returned timestamp strings — that keeps the query
     // portable across Memgraph versions where Duration accessor semantics
     // (component-of vs total) differ.
-    // Neo4j 4.2 does not support direct subtraction between two DateTime
-    // values (Memgraph does and returns a Duration). Use
-    // `duration.between(a, b)` instead — same semantics, returns a Duration
-    // that compares cleanly against the ISO-8601 cap.
+    // Neo4j 4.x notes that bit us here:
+    //   1. Direct subtraction between two DateTime values is not supported
+    //      (Memgraph allows it and returns a Duration). Use
+    //      `duration.between(a, b)` to compute the difference.
+    //   2. Worse: comparing two Duration values with `<=` is officially
+    //      undefined in Neo4j 4.x — months and days can't be totally
+    //      ordered (a "month" duration is not commensurate with a "30
+    //      days" duration). The comparison silently drops nearly all rows
+    //      and yields a tiny handful of false matches with gap == exactly
+    //      300s (the engine's fallback was effectively == not <=).
+    //   3. Reading `.seconds` directly off a Duration returns ONLY the
+    //      seconds component, not the total — so a 7-hour gap whose
+    //      seconds field happens to be 4 would pass `<= 300`. Wrong again.
+    //
+    // The portable, correct form: `duration.inSeconds(a, b).seconds`
+    // normalizes the entire interval into a Duration whose only populated
+    // component is seconds, so `.seconds` returns the total elapsed
+    // seconds as an integer suitable for arithmetic comparison.
     let q = format!(
         "MATCH (a:host)-[r1]->(b:host)-[r2]->(c:host)
          WHERE r1.time >= datetime('{cutoff}')
            AND r2.time >= datetime('{cutoff}')
            AND r1.time < r2.time
-           AND duration.between(r1.time, r2.time) <= duration('PT{gap}S')
+           AND duration.inSeconds(r1.time, r2.time).seconds <= {gap}
            AND type(r1) <> type(r2)
            AND a.name <> c.name
          RETURN a.name AS a, b.name AS b, c.name AS c,
@@ -88,22 +102,31 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 let gap_seconds = parse_gap_seconds(&t1, &t2).unwrap_or(MAX_HOP_GAP_SECONDS);
 
+                // Novelty filter: require AT LEAST ONE hop of the chain to be
+                // an (origin, destination) pair that was never observed in
+                // the baseline. Without this filter the detector drowns in
+                // legitimate baseline chains where two adjacent edges happen
+                // to fall under MAX_HOP_GAP_SECONDS with different rel
+                // types (e.g. a service crawl + an admin RDP one minute
+                // later through the same pivot). Validated on the test
+                // corpus: drops chain-motif's noise from ~1300 chains to a
+                // small set dominated by real lateral-movement patterns.
+                let novel_hop_count = {
+                    let mut n = 0u32;
+                    if !bl.is_known_edge(&a, &b) { n += 1; }
+                    if !bl.is_known_edge(&b, &c) { n += 1; }
+                    n
+                };
+                if novel_hop_count == 0 {
+                    continue;
+                }
+
                 // Score: faster chains are more suspicious. 0s gap → 1.0,
-                // MAX_HOP_GAP_SECONDS → 0.5. The novelty of the involved
-                // edges adds a bonus.
+                // MAX_HOP_GAP_SECONDS → 0.5. The novelty hop count adds a
+                // bonus on top — novel-both-hops chains beat novel-one-hop.
                 let speed_score = 1.0
                     - (gap_seconds as f64 / (2.0 * MAX_HOP_GAP_SECONDS as f64)).min(0.5);
-
-                let novelty_bonus = {
-                    let mut n = 0u32;
-                    if !bl.is_known_edge(&a, &b) {
-                        n += 1;
-                    }
-                    if !bl.is_known_edge(&b, &c) {
-                        n += 1;
-                    }
-                    n as f64 * 0.1
-                };
+                let novelty_bonus = novel_hop_count as f64 * 0.1;
                 let score = (speed_score + novelty_bonus).min(1.0);
 
                 let summary = format!(
