@@ -50,6 +50,7 @@ fn parse_detector_list(raw: &str) -> HashSet<String> {
 pub async fn graph_hunt_neo4j(
     database: &str,
     user: &str,
+    db: &str,
     investigation_from: &str,
     skip_detectors: Option<&str>,
     only_detectors: Option<&str>,
@@ -87,7 +88,21 @@ pub async fn graph_hunt_neo4j(
             .unwrap_or_default(),
     };
 
-    let graph = match Graph::new(database, user, &pass).await {
+    let config = match ConfigBuilder::default()
+        .uri(database)
+        .user(user)
+        .password(&pass)
+        .db(db)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Masstin - Error: failed to build Neo4j config: {}", e);
+            return;
+        }
+    };
+    crate::banner::print_phase_detail("Database (Neo4j):", db);
+    let graph = match Graph::connect(config).await {
         Ok(g) => g,
         Err(e) => {
             eprintln!("Masstin - Error: cannot connect to Neo4j: {}", e);
@@ -174,13 +189,13 @@ pub async fn graph_hunt_neo4j(
 
 /// Create the GDS graph projection over (:host) nodes and every relationship
 /// type (the loader uses the sanitized username as the rel type, so there's
-/// no canonical small set to enumerate). GDS 1.x uses `gds.graph.create`,
-/// which is the API present in the user's 1.4.1 install. GDS 2.x renamed
-/// this to `gds.graph.project` — if/when we move to a 2.x server, this is
-/// the single point that needs updating.
+/// no canonical small set to enumerate). Uses `gds.graph.project()` which
+/// is the GDS 2.x procedure name (Neo4j 5.x / 2026.x). GDS 1.x used
+/// `gds.graph.create()` and is EOL — masstin requires GDS 2.x on the
+/// server side from this version on.
 async fn create_projection(graph: &Graph) -> neo4rs::Result<()> {
     let q = format!(
-        "CALL gds.graph.create('{}', 'host', '*') YIELD graphName, nodeCount, relationshipCount",
+        "CALL gds.graph.project('{}', 'host', '*') YIELD graphName, nodeCount, relationshipCount",
         PROJECTION_NAME
     );
     let mut stream = graph.execute(query(&q)).await?;

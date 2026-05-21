@@ -445,6 +445,7 @@ pub async fn load_neo4j(
     files: &Vec<String>,
     database: &String,
     user: &String,
+    db: &str,
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
@@ -470,7 +471,24 @@ pub async fn load_neo4j(
         }
         _ => rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap(),
     };
-    let graph = Graph::new(database, user, &pass).await.unwrap();
+    // Use ConfigBuilder so we can target a non-default database. Neo4j 5.x
+    // / 2026.x deployments commonly have multiple DBs (one per case, one
+    // per environment); `--db` lets the user pick. Defaults to `neo4j`.
+    let config = match ConfigBuilder::default()
+        .uri(database)
+        .user(user)
+        .password(&pass)
+        .db(db)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("MASSTIN - Error: failed to build Neo4j config: {}", e);
+            return;
+        }
+    };
+    let graph = Graph::connect(config).await.unwrap();
+    crate::banner::print_phase_detail("Database (Neo4j):", db);
     crate::banner::print_phase_result("Connected");
 
     match graph.execute(query("CREATE INDEX host_name IF NOT EXISTS FOR (h:host) ON (h.name)")).await {
