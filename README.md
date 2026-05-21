@@ -608,6 +608,80 @@ masstin.exe -a load-neo4j -f timeline.csv `
 
 When the variable is unset or empty the loader falls back to the interactive prompt. The password lives in the process environment — do not export it from a shared shell or a logged dotfile.
 
+### Detect lateral movement: graph-hunt
+
+Once the graph is loaded, masstin can run 7 detectors against it that surface lateral-movement anomalies — novel edges, chain motifs, credential rotation, community bridges, PageRank/betweenness spikes, rare logon types. Two flavors:
+
+- **`-a graph-hunt`** — targets **Memgraph**. Uses MAGE algorithms (`pagerank.get`, `community_detection.get`, `betweenness_centrality.get`) that ship with the default Memgraph install. No extra plugin needed.
+- **`-a graph-hunt-neo4j`** — targets **Neo4j**. Uses the Neo4j Graph Data Science (GDS) library. **Requires GDS to be installed in the target Neo4j instance** (see prerequisites below).
+
+#### Prerequisites for `graph-hunt-neo4j`
+
+The detector calls procedures from the Graph Data Science plugin. masstin uses the GDS 2.x API (`gds.graph.project`, `gds.pageRank.stream`, `gds.louvain.stream`, `gds.betweenness.stream`), which means **Neo4j 5.x or later with GDS 2.x** is required. The cleanest install path is via Neo4j Desktop's UI:
+
+1. Open **Neo4j Desktop** → select your instance.
+2. Click the **`...`** menu (top-right of the instance card) → **Plugins**.
+3. Find **Graph Data Science** in the list → click **Install**.
+4. **Restart the instance** so the plugin loads into the JVM. Desktop shows the badge "Installed" once the JAR is in place; restarting is what makes the procedures actually callable.
+
+To verify GDS is live after restart:
+
+```cypher
+CALL gds.version()              // returns the installed GDS version
+CALL gds.list() YIELD name      // lists every gds.* procedure available
+```
+
+If those return `Neo.ClientError.Procedure.ProcedureNotFound`, the plugin JAR is in `plugins/` but the JVM didn't load it — restart the DBMS.
+
+#### Running graph-hunt
+
+Both actions take a `--investigation-from` cutoff (any datetime in the corpus). Events strictly before the cutoff form the **baseline**; events at-or-after form the **investigation window**. The detectors compare the two.
+
+```bash
+# Memgraph
+masstin -a graph-hunt \
+        --database bolt://localhost:7687 \
+        --investigation-from "2026-03-15 00:00:00" \
+        -o findings.csv
+
+# Neo4j (default database = neo4j; password from $NEO4J_PASSWORD or prompt)
+NEO4J_PASSWORD='your-pass' masstin -a graph-hunt-neo4j \
+        --database bolt://localhost:7687 --user neo4j \
+        --investigation-from "2026-03-15 00:00:00" \
+        -o findings.csv
+
+# Neo4j with a named database (useful when one server holds multiple cases)
+masstin -a graph-hunt-neo4j \
+        --database bolt://localhost:7687 --user neo4j \
+        --db detection-test \
+        --investigation-from "2026-03-15 00:00:00" \
+        -o findings.csv
+```
+
+The output CSV is ranked by score and includes the Cypher snippet to inspect each finding in Neo4j Browser / Memgraph Lab.
+
+#### Heap sizing for large corpora
+
+The seven detectors run quickly on graphs up to a few hundred thousand edges with the default Neo4j heap (1 GB). For DFIR-scale corpora (millions of edges), the GDS in-memory projection needs more headroom — bump the heap via Neo4j Desktop:
+
+1. Stop the instance.
+2. **`...`** menu → **Settings** (or open `conf/neo4j.conf` in the instance folder).
+3. Raise `server.memory.heap.max_size` (e.g. `6G`) and `server.memory.pagecache.size` (e.g. `2G`).
+4. Start the instance again.
+
+As a rule of thumb: 6 GB heap comfortably handles ~15 M edges + projection on a modern desktop; 2 GB heap is enough up to ~2-3 M edges.
+
+#### Filtering detectors
+
+If the analyst only wants specific signals, `--only-detectors` / `--skip-detectors` accept a comma-separated list of detector names: `novel-edge`, `chain-motif`, `pagerank-spike`, `betweenness-spike`, `community-bridge`, `cred-rotation`, `rare-logon-type`. The two options are mutually exclusive.
+
+```bash
+# Run only novelty + chain detectors
+masstin -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j \
+        --investigation-from "2026-03-15 00:00:00" \
+        --only-detectors novel-edge,chain-motif -o findings.csv
+```
+
 ### Merge graph nodes after loading
 
 If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
@@ -762,6 +836,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 | `-o, --output` | Output file path |
 | `--database` | Graph database URL (e.g., `localhost:7687`) |
 | `-u, --user` | Database user (Neo4j) |
+| `--db` | Target database name on the graph server (default `neo4j` for Neo4j actions, `memgraph` for Memgraph). Useful in multi-database Neo4j 5.x/2026.x setups. |
 | `--cortex-url` | Cortex XDR API base URL |
 | `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` (Cortex actions, `merge`, `load-neo4j` / `load-memgraph`) |
 | `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` (same scope as `--start-time`) |

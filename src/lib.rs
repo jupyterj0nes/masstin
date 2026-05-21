@@ -80,6 +80,14 @@ pub struct Cli {
     #[arg(short, long)]
     user: Option<String>,
 
+    /// Target database name on the graph server. Defaults to `neo4j` for
+    /// load-neo4j / graph-hunt-neo4j and to `memgraph` for load-memgraph /
+    /// graph-hunt. Useful when a single Neo4j 5.x / 2026.x server holds
+    /// multiple databases (e.g. one per case) and you want to keep them
+    /// separate. Ignored when the server doesn't support multi-database.
+    #[arg(long)]
+    db: Option<String>,
+
     /// If specified, overwrite the output file if it exists
     #[arg(long)]
     overwrite: bool,
@@ -362,6 +370,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 &config.file,
                 &config.database.as_ref().unwrap(),
                 &config.user.as_ref().unwrap(),
+                config.db.as_deref().unwrap_or("neo4j"),
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
@@ -505,6 +514,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             crate::graph_hunt_neo4j::graph_hunt_neo4j(
                 config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap_or(&default_user),
+                config.db.as_deref().unwrap_or("neo4j"),
                 config.investigation_from.as_ref().unwrap(),
                 config.skip_detectors.as_deref(),
                 config.only_detectors.as_deref(),
