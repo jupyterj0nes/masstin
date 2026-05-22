@@ -627,11 +627,22 @@ The detector calls procedures from the Graph Data Science plugin. masstin uses t
 To verify GDS is live after restart:
 
 ```cypher
-CALL gds.version()              // returns the installed GDS version
-CALL gds.list() YIELD name      // lists every gds.* procedure available
+SHOW PROCEDURES YIELD name
+WHERE name STARTS WITH 'gds.graph.project'
+   OR name STARTS WITH 'gds.pageRank.stream'
+   OR name STARTS WITH 'gds.louvain.stream'
+   OR name STARTS WITH 'gds.betweenness.stream'
+RETURN name
 ```
 
-If those return `Neo.ClientError.Procedure.ProcedureNotFound`, the plugin JAR is in `plugins/` but the JVM didn't load it — restart the DBMS.
+All four families should appear. If `SHOW PROCEDURES` returns no `gds.*` rows even though the JAR is in `plugins/` and the startup log shows `Graph Data Science extension built`, the plugin loaded but its procedures were **denied by the allowlist**. Neo4j 2026.x ships with `dbms.security.procedures.allowlist` set to `apoc.*,genai.*,ai.*` and Desktop's plugin manager does **not** update that list when GDS is installed via the UI — a known plugin-manager gap. Fix: open `conf/neo4j.conf` in the instance folder (Desktop's `Open folder` button gets you there) and edit both lines:
+
+```
+dbms.security.procedures.unrestricted=apoc.*,gds.*
+dbms.security.procedures.allowlist=apoc.*,genai.*,ai.*,gds.*
+```
+
+Then restart the instance. The procedures should now be visible to `SHOW PROCEDURES` and callable from masstin.
 
 #### Running graph-hunt
 
@@ -681,6 +692,18 @@ masstin -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j \
         --investigation-from "2026-03-15 00:00:00" \
         --only-detectors novel-edge,chain-motif -o findings.csv
 ```
+
+#### Detection quality
+
+`graph-hunt-neo4j` is validated on a dual-corpus harness — a small control corpus (50 hosts, 14 users, 5M events) plus a stress corpus modeling a 200-host / 85-account enterprise (3.87M events). Headline numbers on the stress corpus:
+
+| | Findings | TPs | Hit rate | Recall (events) | Recall (scenarios) | P@10 | P@20 | P@50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Stress (3.87M events)** | 380 | 252 | **66.3%** | **109/110 (99.1%)** | **23/23 (100%)** | **90%** | **85%** | **92%** |
+
+In triage terms: 3.87M raw events → 380 prioritized alerts (**10,190× reduction**), of which 252 are real attacks (**~23,300× enrichment** over random sampling). The control corpus reaches **100% precision / 100% recall**.
+
+Full methodology, per-detector breakdown, and algorithmic notes (two-snapshot centrality, triple-novelty, context gates) are documented in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).
 
 ### Merge graph nodes after loading
 

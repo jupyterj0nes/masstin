@@ -28,6 +28,15 @@ pub use schema::GraphMode;
 /// previous interrupted run we drop-and-recreate.
 const PROJECTION_NAME: &str = "mass-hunt";
 
+/// Companion projection containing ONLY the baseline edges (r.time <
+/// cutoff). Used by `betweenness-spike` and `pagerank-spike` to compute
+/// a centrality "before" snapshot. The two-snapshot delta = full -
+/// baseline tells us whether a host's pivot-ness is structural (was
+/// already a hub, suppress) or genuinely new in the window (fire). Without
+/// it, legitimate hubs like SCCM/jumpboxes drown out real pivots at large
+/// scale because their absolute centrality is always high.
+const PROJECTION_BASELINE_NAME: &str = "mass-hunt-baseline";
+
 /// Parse the --investigation-from CLI value into a UTC datetime.
 fn parse_cutoff(raw: &str) -> Option<DateTime<Utc>> {
     let trimmed = raw.trim();
@@ -158,19 +167,32 @@ pub async fn graph_hunt_neo4j(
     // detector failure so the projection name does not survive into the
     // next hunt (GDS rejects re-creation of an existing name).
     crate::banner::print_phase("4", "4", "Running detectors...");
-    // Best-effort cleanup of any leftover projection from a previous run.
-    let _ = drop_projection(&graph).await;
+    // Best-effort cleanup of any leftover projections from a previous run.
+    let _ = drop_projection_named(&graph, PROJECTION_NAME).await;
+    let _ = drop_projection_named(&graph, PROJECTION_BASELINE_NAME).await;
     if let Err(e) = create_projection(&graph).await {
         eprintln!("Masstin - Error: GDS projection failed: {}", e);
         eprintln!("Masstin - Hint: ensure the Graph Data Science plugin is installed and Neo4j was restarted after install.");
         return;
     }
+    // Baseline-only projection for the two-snapshot centrality detectors.
+    // Non-fatal: if it fails, betweenness/pagerank fall back to
+    // single-snapshot behaviour with a warning emitted inside the detector.
+    let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+    if let Err(e) = create_baseline_projection(&graph, &cutoff_str).await {
+        eprintln!(
+            "  [graph-hunt-neo4j] WARNING: baseline projection failed ({}); \
+             betweenness/pagerank will fall back to single-snapshot mode.",
+            e
+        );
+    }
 
     let findings = detectors::run_all(&graph, &bl, &skip_set, &only_set, PROJECTION_NAME).await;
 
-    // Always drop; ignore the result. The projection lives in JVM heap only,
-    // a failed drop leaks a few MB until the DBMS restarts.
-    let _ = drop_projection(&graph).await;
+    // Always drop both; ignore the result. Projections live in JVM heap
+    // only — a failed drop leaks a few MB until the DBMS restarts.
+    let _ = drop_projection_named(&graph, PROJECTION_NAME).await;
+    let _ = drop_projection_named(&graph, PROJECTION_BASELINE_NAME).await;
 
     crate::banner::print_phase_result(&format!("{} finding(s)", findings.len()));
 
@@ -187,13 +209,53 @@ pub async fn graph_hunt_neo4j(
     );
 }
 
+/// Check whether the GDS catalog has a projection by this name in the
+/// current database. Used by `ensure_projection` to decide whether to
+/// (re)create. In Neo4j 2026.x / GDS 2.x we have observed the projection
+/// silently disappearing between consecutive algorithm calls when the
+/// neo4rs connection pool happens to fan out across sessions — the GDS
+/// catalog is per-session in some configurations, and a connection that
+/// landed on the default `neo4j` database won't see a projection created
+/// on a named database like `detection-test`. Re-checking from each
+/// detector defensively side-steps the issue regardless of which
+/// session the call lands on.
+pub(crate) async fn projection_exists(graph: &Graph, name: &str) -> neo4rs::Result<bool> {
+    let q = format!("CALL gds.graph.exists('{}') YIELD exists RETURN exists", name);
+    let mut stream = graph.execute(query(&q)).await?;
+    if let Some(row) = stream.next().await? {
+        return Ok(row.get("exists").unwrap_or(false));
+    }
+    Ok(false)
+}
+
+/// Idempotent helper: confirm the projection exists, recreating it if
+/// missing. Algorithmic detectors should call this at the start of their
+/// `run()` to be resilient against the GDS 2.x catalog-vanishing
+/// behaviour described on `projection_exists`.
+pub(crate) async fn ensure_projection(graph: &Graph, name: &str) -> neo4rs::Result<()> {
+    match projection_exists(graph, name).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            eprintln!("  [graph-hunt-neo4j] projection '{}' missing from catalog, re-projecting", name);
+            create_projection(graph).await
+        }
+        Err(e) => {
+            // Catalog probe itself failed (auth/transient) — try to project
+            // anyway; the create call will surface a meaningful error if
+            // the server is truly unhealthy.
+            eprintln!("  [graph-hunt-neo4j] projection probe failed ({}), re-projecting anyway", e);
+            create_projection(graph).await
+        }
+    }
+}
+
 /// Create the GDS graph projection over (:host) nodes and every relationship
 /// type (the loader uses the sanitized username as the rel type, so there's
 /// no canonical small set to enumerate). Uses `gds.graph.project()` which
 /// is the GDS 2.x procedure name (Neo4j 5.x / 2026.x). GDS 1.x used
 /// `gds.graph.create()` and is EOL — masstin requires GDS 2.x on the
 /// server side from this version on.
-async fn create_projection(graph: &Graph) -> neo4rs::Result<()> {
+pub(crate) async fn create_projection(graph: &Graph) -> neo4rs::Result<()> {
     let q = format!(
         "CALL gds.graph.project('{}', 'host', '*') YIELD graphName, nodeCount, relationshipCount",
         PROJECTION_NAME
@@ -210,14 +272,65 @@ async fn create_projection(graph: &Graph) -> neo4rs::Result<()> {
     Ok(())
 }
 
-/// Drop the GDS projection. `failIfMissing=false` so the initial cleanup
-/// call doesn't error when there is nothing to drop yet.
-async fn drop_projection(graph: &Graph) -> neo4rs::Result<()> {
+/// Drop a GDS projection by name. `failIfMissing=false` so the initial
+/// cleanup call doesn't error when there is nothing to drop yet. Used for
+/// both `mass-hunt` and `mass-hunt-baseline`.
+pub(crate) async fn drop_projection_named(graph: &Graph, name: &str) -> neo4rs::Result<()> {
     let q = format!(
         "CALL gds.graph.drop('{}', false) YIELD graphName",
-        PROJECTION_NAME
+        name
     );
     let mut stream = graph.execute(query(&q)).await?;
     let _ = stream.next().await?;
     Ok(())
+}
+
+/// Create the baseline-only GDS projection: the same (:host)-[*]->(:host)
+/// shape as the main projection but restricted to edges that fall strictly
+/// before the cutoff. Uses GDS 2.x's Cypher projection function form,
+/// which lets us push the time filter into the projection itself instead
+/// of trying to compute on a filtered subgraph at algorithm-call time.
+///
+/// If the corpus has zero pre-cutoff edges (extremely short investigation,
+/// or wrong cutoff) the projection is still created with whatever node
+/// set the Cypher pattern yields and zero relationships — both
+/// betweenness and pagerank correctly produce 0.0 scores on it, so the
+/// downstream delta math degenerates to "delta = full" which is the
+/// correct behavior (no baseline, so every centrality is "new").
+pub(crate) async fn create_baseline_projection(
+    graph: &Graph,
+    cutoff_str: &str,
+) -> neo4rs::Result<()> {
+    let q = format!(
+        "MATCH (a:host)-[r]->(b:host)
+         WHERE r.time < datetime('{cutoff}')
+         WITH gds.graph.project('{name}', a, b) AS g
+         RETURN g.graphName AS graphName, g.nodeCount AS nodeCount, g.relationshipCount AS relationshipCount
+         LIMIT 1",
+        cutoff = cutoff_str,
+        name = PROJECTION_BASELINE_NAME,
+    );
+    let mut stream = graph.execute(query(&q)).await?;
+    if let Some(row) = stream.next().await? {
+        let nodes: i64 = row.get("nodeCount").unwrap_or(0);
+        let rels: i64 = row.get("relationshipCount").unwrap_or(0);
+        crate::banner::print_phase_detail(
+            "Baseline projection:",
+            &format!("'{}' ({} nodes, {} rels < cutoff)", PROJECTION_BASELINE_NAME, nodes, rels),
+        );
+    }
+    Ok(())
+}
+
+/// Check existence of the baseline projection — used by the two-snapshot
+/// detectors to decide whether to take the delta path or fall back to
+/// single-snapshot. Mirrors `projection_exists` for the main projection.
+pub(crate) async fn baseline_projection_exists(graph: &Graph) -> bool {
+    projection_exists(graph, PROJECTION_BASELINE_NAME)
+        .await
+        .unwrap_or(false)
+}
+
+pub(crate) fn baseline_projection_name() -> &'static str {
+    PROJECTION_BASELINE_NAME
 }

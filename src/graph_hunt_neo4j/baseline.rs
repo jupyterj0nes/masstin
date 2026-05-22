@@ -52,6 +52,21 @@ pub struct Baseline {
     pub edge_pairs: HashMap<(String, String), EdgePairBaseline>,
     pub hosts: HashMap<String, HostBaseline>,
     pub users: HashMap<String, UserBaseline>,
+    /// Set of distinct (origin, user, destination) triples observed in the
+    /// baseline. Used by `novel-edge` to fire on triples never seen
+    /// pre-cutoff — a strictly tighter notion than the original 3-axis
+    /// disjunctive test, and the most direct expression of "actor pattern
+    /// novelty" for lateral movement: a triple is novel exactly when the
+    /// (who, from where, to where) combination is unprecedented, regardless
+    /// of which sub-pair happens to be the new bit. The logon-type axis
+    /// the old detector carried is now owned by the dedicated
+    /// `rare-logon-type` detector — cleaner separation of responsibilities.
+    pub triples: HashSet<(String, String, String)>,
+    /// Per-destination total baseline event count, precomputed for O(1)
+    /// lookup. Powers novel-edge's destination-density gate (a
+    /// destination with too few baseline events has unreliable novelty
+    /// signal regardless of how the detector's triple test fires).
+    pub dest_event_count: HashMap<String, u64>,
 }
 
 impl Baseline {
@@ -79,6 +94,53 @@ impl Baseline {
             Some(h) => h.incoming_sources.contains(source),
             None => false,
         }
+    }
+
+    /// Triple-novelty check: did the (origin, user, destination) combo
+    /// occur even once before the cutoff? Used by the refactored
+    /// `novel-edge` detector. Strictly tighter than the 3-axis OR test it
+    /// replaces — handles the "both sub-pairs known but never together"
+    /// case (classic lateral-movement signature: attacker on compromised
+    /// host using stolen creds to reach a known target).
+    pub fn is_known_triple(&self, origin: &str, user: &str, destination: &str) -> bool {
+        self.triples.contains(&(
+            origin.to_string(),
+            user.to_string(),
+            destination.to_string(),
+        ))
+    }
+
+    /// Total baseline event count landing at a given destination —
+    /// summed across every (origin, destination) pair that targeted it
+    /// before the cutoff. Used by novel-edge's context gate: a
+    /// destination with too few baseline events is one where baseline
+    /// coverage is too sparse to make "novelty" meaningful (newly
+    /// onboarded host, host whose retention window dropped most of its
+    /// past, etc.). Returns 0 for destinations with no baseline presence.
+    /// Backed by the precomputed `dest_event_count` map — O(1).
+    pub fn baseline_event_count_for_dest(&self, destination: &str) -> u64 {
+        self.dest_event_count.get(destination).copied().unwrap_or(0)
+    }
+
+    /// Baseline out-degree of an origin host — number of distinct
+    /// destinations it touched before the cutoff. Used by novel-edge's
+    /// context gate: an origin that talked to a huge fraction of the
+    /// estate in baseline (services, monitoring agents, very-active
+    /// admins) generates new triples as a matter of operational
+    /// rotation, not anomaly.
+    pub fn outgoing_degree(&self, origin: &str) -> usize {
+        self.hosts
+            .get(origin)
+            .map(|h| h.outgoing_destinations.len())
+            .unwrap_or(0)
+    }
+
+    /// Total number of distinct hosts seen in the baseline. Used as the
+    /// denominator when comparing an origin's out-degree to "fraction
+    /// of the estate". Falls back to 1 if the baseline is empty so the
+    /// caller's division never blows up.
+    pub fn host_count(&self) -> usize {
+        self.hosts.len().max(1)
     }
 }
 
@@ -112,13 +174,22 @@ pub async fn compute(
     // 2. (origin, destination) pair stats.
     let edge_pairs = fetch_edge_pairs(graph, &cutoff_str).await?;
 
-    // 3. Per-host incoming/outgoing stats. Built from the same edge data we
-    //    pulled above, plus one query for outgoing destinations.
+    // 3. Per-host incoming/outgoing stats, the (origin, user, destination)
+    //    triple set, AND the per-destination total event count — all
+    //    derived from the edge_pairs aggregation above, no extra
+    //    round-trip needed. Each pair entry already carries the
+    //    DISTINCT users seen on that pair in baseline; cross-joining
+    //    pair with users yields the triple set; summing pair.event_count
+    //    by destination yields the density map that novel-edge's
+    //    context gate needs.
     let mut hosts: HashMap<String, HostBaseline> = HashMap::new();
+    let mut triples: HashSet<(String, String, String)> = HashSet::new();
+    let mut dest_event_count: HashMap<String, u64> = HashMap::new();
     for ((origin, destination), stats) in &edge_pairs {
         let host_in = hosts.entry(destination.clone()).or_default();
         for u in &stats.users {
             host_in.incoming_users.insert(u.clone());
+            triples.insert((origin.clone(), u.clone(), destination.clone()));
         }
         for lt in &stats.logon_types {
             host_in.incoming_logon_types.insert(lt.clone());
@@ -127,6 +198,8 @@ pub async fn compute(
 
         let host_out = hosts.entry(origin.clone()).or_default();
         host_out.outgoing_destinations.insert(destination.clone());
+
+        *dest_event_count.entry(destination.clone()).or_insert(0) += stats.event_count;
     }
 
     // 4. Per-user stats (label of the relationship is the username).
@@ -135,10 +208,11 @@ pub async fn compute(
     crate::banner::print_phase_detail(
         "Baseline shape:",
         &format!(
-            "{} edge-pairs, {} hosts, {} users",
+            "{} edge-pairs, {} hosts, {} users, {} triples",
             edge_pairs.len(),
             hosts.len(),
-            users.len()
+            users.len(),
+            triples.len(),
         ),
     );
 
@@ -150,6 +224,8 @@ pub async fn compute(
         edge_pairs,
         hosts,
         users,
+        triples,
+        dest_event_count,
     })
 }
 
