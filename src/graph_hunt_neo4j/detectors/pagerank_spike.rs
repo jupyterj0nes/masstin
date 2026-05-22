@@ -1,39 +1,31 @@
-// pagerank-spike detector. Surfaces hosts that are simultaneously (a)
-// globally important in the graph topology and (b) receiving an
-// abnormally novel share of their incoming traffic in the investigation
-// window. The intuition is the classic pivot signature: a host that
-// already mattered for legitimate reasons (high rank because many
-// systems talk to it) and that suddenly starts hearing from sources or
-// at a rate it never did before — that's what an attacker uses as a
-// stepping stone.
+// pagerank-spike detector. Two-snapshot variant: surfaces hosts that
+// gained PageRank materially during the investigation window, rather than
+// hosts that simply rank high in absolute terms. The single-snapshot
+// version (PageRank on the full graph * novelty_ratio + MAD-z gate) had
+// the same structural problem as betweenness-spike — legitimate hubs
+// always score high so the detector either drowns the analyst at scale
+// or, after over-tightening, suppresses real pivots too. The fix is
+// algorithmic, not threshold-based: compare PageRank on the full graph
+// against PageRank on a baseline-only projection and score on the delta.
 //
-// We run GDS PageRank on the projection once, then for every node we
-// split its incoming degree into pre-cutoff (baseline) and post-cutoff
-// (window) counts in the same Cypher round-trip. The per-host signal is
-// `rank * novelty_ratio` where novelty_ratio = window / (baseline +
-// window). Two guards keep precision sane against this signal's natural
-// noise floor:
+// Score: (rank_full - rank_baseline) * novelty_ratio for hosts that
+// (a) qualify via the existing MIN_BASELINE_EDGES gate, (b) have a
+// positive PageRank delta, and (c) pass the robust MAD-z outlier test
+// over the delta distribution. The MAD test stays because it's a
+// distribution-aware filter that catches anomalies even when the absolute
+// delta values are corpus-specific.
 //
-//   1. MIN_BASELINE_EDGES gate — drop hosts with too little prior
-//      activity. Without it, a host that just had 0-2 baseline edges
-//      and 1 window edge gets novelty_ratio ~ 1.0, multiplied by its
-//      non-zero PageRank, and lights up despite carrying no real
-//      anomaly signal. Captures the Security.evtx asymmetry symptom
-//      (sparse Security baseline on workstation X looks "newly
-//      active" simply because the rotation horizon cut off the prior
-//      history).
-//
-//   2. Robust MAD z-score over novelty_ratio across the qualified host
-//      set — only hosts whose novelty_ratio is a real outlier (>3 MADs
-//      above the median, the canonical Hampler threshold) get emitted.
-//      MAD is robust to heavy-tailed distributions where a handful of
-//      legitimate-but-noisy hosts would inflate stddev and mask true
-//      outliers.
+// Fallback: if the baseline projection isn't available we revert to the
+// previous behaviour (rank * novelty_ratio with MAD-z over
+// novelty_ratio), emit a warning, and continue. Keeps recall at parity
+// with the single-snapshot version when something is wrong with the
+// projection layer.
 
 use crate::graph_hunt_neo4j::baseline::Baseline;
 use crate::graph_hunt_neo4j::detectors::Finding;
 use futures::stream::*;
 use neo4rs::*;
+use std::collections::HashMap;
 
 /// Minimum number of baseline edges a host must have to be considered.
 /// Below this the novelty_ratio is statistically meaningless and the
@@ -42,20 +34,18 @@ use neo4rs::*;
 /// (DCs/fileservers have thousands of baseline edges, well above 20).
 const MIN_BASELINE_EDGES: i64 = 20;
 
-/// MAD z-score above which a novelty_ratio counts as a genuine outlier.
+/// MAD z-score above which an observation counts as a genuine outlier.
 /// 2.0 is a deliberately mild cutoff: in a homogeneous baseline (most
-/// hubs receive similar novelty fractions) MAD is tiny and even small
+/// hubs gain similar amounts of rank) MAD is tiny and even small
 /// deviations cross z=2; in a heterogeneous one it weeds out routine
 /// drift. 3.0 (the classical Hampler value) over-suppressed the detector
-/// on test corpora where hubs are all hit at similar novelty levels.
+/// on test corpora where hubs grow at similar rates.
 const MAD_Z_THRESHOLD: f64 = 2.0;
 
 /// Lower bound on the final composite score for a host to surface. Set
-/// high enough to silence pure-noise hits (composite = rank * novelty
-/// where both are < 0.1 means uninteresting); set low enough to let
-/// genuine pivots through. Tuned against the test corpus where real
-/// pivot composites sit in the 0.05-2.0 range.
-const MIN_SCORE: f64 = 0.05;
+/// high enough to silence pure-noise hits; set low enough to let genuine
+/// pivots through. Tuned against the small control corpus.
+const MIN_SCORE: f64 = 0.0001;
 
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -67,13 +57,20 @@ struct Candidate {
 }
 
 pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding> {
+    // Resilience against GDS 2.x catalog-vanishing across pool sessions.
+    if let Err(e) = crate::graph_hunt_neo4j::ensure_projection(graph, projection).await {
+        eprintln!("  [pagerank-spike] cannot ensure projection: {}", e);
+        return Vec::new();
+    }
     let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    // Single round-trip: stream PageRank from the GDS projection, join
-    // each result against the node's incoming-edge counts split by the
-    // cutoff. We DON'T apply the MAD-z filter in Cypher — it's a
-    // distribution-aware step that's cleaner in Rust where we have the
-    // full set in memory.
+    let baseline_available = crate::graph_hunt_neo4j::baseline_projection_exists(graph).await;
+    let baseline_projection = crate::graph_hunt_neo4j::baseline_projection_name();
+
+    // Pass 1: PageRank on the full graph, joined with the window/baseline
+    // incoming-degree split in a single Cypher round-trip. The MIN_BASELINE
+    // gate stays here because at zero pre-cutoff edges novelty_ratio is
+    // meaningless and the delta calculation later can't rescue that.
     let q = format!(
         "CALL gds.pageRank.stream('{proj}') YIELD nodeId, score
          WITH gds.util.asNode(nodeId) AS node, score AS rank
@@ -127,42 +124,98 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
         return Vec::new();
     }
 
-    // Robust outlier statistics over novelty_ratio.
-    let (median, mad) = median_and_mad(candidates.iter().map(|c| c.novelty_ratio));
+    // Pass 2: PageRank on the baseline-only projection. Empty fallback
+    // map = single-snapshot behaviour.
+    let baseline_rank: HashMap<String, f64> = if baseline_available {
+        match fetch_baseline_pagerank(graph, baseline_projection).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "  [pagerank-spike] baseline pagerank query failed ({}); \
+                     falling back to single-snapshot mode",
+                    e
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        eprintln!(
+            "  [pagerank-spike] baseline projection unavailable; \
+             scoring on full-graph rank alone (legacy behaviour)"
+        );
+        HashMap::new()
+    };
+    let two_snapshot = baseline_available && !baseline_rank.is_empty();
+
+    // For each candidate compute the "observation" we'll MAD-test over.
+    // Two-snapshot: the rank delta. Single-snapshot: novelty_ratio (legacy).
+    let observations: Vec<f64> = if two_snapshot {
+        candidates
+            .iter()
+            .map(|c| {
+                let prev = baseline_rank.get(&c.host).copied().unwrap_or(0.0);
+                (c.rank - prev).max(0.0)
+            })
+            .collect()
+    } else {
+        candidates.iter().map(|c| c.novelty_ratio).collect()
+    };
+    let (median, mad) = median_and_mad(observations.iter().copied());
 
     let mut findings: Vec<Finding> = Vec::new();
-    for c in &candidates {
-        // Robust z-score: scale the deviation by 1/0.6745 so that, under a
-        // Gaussian, MAD-z is comparable to a regular z-score. If MAD is 0
-        // (every candidate has identical novelty — degenerate test corpus
-        // or extremely uniform real data) fall back to MIN_SCORE on the
-        // composite alone so the detector still emits something useful.
+    for (c, &observed) in candidates.iter().zip(observations.iter()) {
+        // Robust z-score: scale the deviation by 1/0.6745 so MAD-z is
+        // comparable to a regular z-score under Gaussianity. Degenerate
+        // MAD == 0 (every host has identical observation, typically a
+        // tiny corpus) → treat any positive observation as outlier.
         let z = if mad > 0.0 {
-            0.6745 * (c.novelty_ratio - median).abs() / mad
+            0.6745 * (observed - median).abs() / mad
+        } else if observed > 0.0 {
+            f64::INFINITY
         } else {
-            f64::INFINITY  // degenerate; treat any positive-novelty host as outlier
+            0.0
         };
         if z < MAD_Z_THRESHOLD && mad > 0.0 {
             continue;
         }
-        let composite = c.rank * c.novelty_ratio;
+
+        // Composite score: in two-snapshot mode it's delta * novelty_ratio
+        // (must surface only hosts whose rank GAINED meaningfully AND whose
+        // incoming mix is novelty-skewed). In fallback it's the original
+        // rank * novelty_ratio.
+        let prev = baseline_rank.get(&c.host).copied().unwrap_or(0.0);
+        let composite = if two_snapshot {
+            (c.rank - prev).max(0.0) * c.novelty_ratio
+        } else {
+            c.rank * c.novelty_ratio
+        };
         if composite < MIN_SCORE {
             continue;
         }
 
-        let summary = format!(
-            "{host}: rank={rank:.5}, novelty_ratio={nr:.2} \
-             ({iw} window / {tot} total incoming), MAD-z={z:.1} \
-             (median novelty across qualified hosts = {med:.2}). \
-             Composite = rank * novelty.",
-            host = c.host,
-            rank = c.rank,
-            nr = c.novelty_ratio,
-            iw = c.in_window,
-            tot = c.in_base + c.in_window,
-            z = z,
-            med = median,
-        );
+        let summary = if two_snapshot {
+            format!(
+                "{host}: pagerank {prev:.5} -> {cur:.5} (delta={d:.5}), \
+                 novelty_ratio={nr:.2} ({iw} window / {tot} total incoming), \
+                 MAD-z={z:.1} (median delta = {med:.5}). \
+                 Two-snapshot composite = delta * novelty.",
+                host = c.host, prev = prev, cur = c.rank,
+                d = (c.rank - prev).max(0.0),
+                nr = c.novelty_ratio, iw = c.in_window, tot = c.in_base + c.in_window,
+                z = z, med = median,
+            )
+        } else {
+            format!(
+                "{host}: rank={rank:.5}, novelty_ratio={nr:.2} \
+                 ({iw} window / {tot} total incoming), MAD-z={z:.1} \
+                 (median novelty across qualified hosts = {med:.2}). \
+                 Single-snapshot fallback (no baseline projection) — \
+                 composite = rank * novelty.",
+                host = c.host, rank = c.rank, nr = c.novelty_ratio,
+                iw = c.in_window, tot = c.in_base + c.in_window,
+                z = z, med = median,
+            )
+        };
 
         let snippet = format!(
             "MATCH (a:host)-[r]->(b:host {{name: '{}'}}) \
@@ -182,6 +235,27 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
     }
     findings.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     findings
+}
+
+async fn fetch_baseline_pagerank(
+    graph: &Graph,
+    projection: &str,
+) -> neo4rs::Result<HashMap<String, f64>> {
+    let q = format!(
+        "CALL gds.pageRank.stream('{}') YIELD nodeId, score
+         RETURN gds.util.asNode(nodeId).name AS host, score AS rank",
+        projection
+    );
+    let mut stream = graph.execute(query(&q)).await?;
+    let mut out: HashMap<String, f64> = HashMap::new();
+    while let Some(row) = stream.next().await? {
+        let host: String = row.get("host").unwrap_or_default();
+        let rank: f64 = row.get("rank").unwrap_or(0.0);
+        if !host.is_empty() {
+            out.insert(host, rank);
+        }
+    }
+    Ok(out)
 }
 
 /// Median + Median Absolute Deviation. Both robust to outliers — exactly
