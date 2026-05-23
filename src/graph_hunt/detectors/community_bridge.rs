@@ -19,6 +19,16 @@ use futures::stream::*;
 use neo4rs::*;
 use std::collections::{HashMap, HashSet};
 
+/// Context gate thresholds — same calibration as
+/// `src/graph_hunt_neo4j/detectors/community_bridge.rs`. The Memgraph
+/// variant runs single-snapshot Louvain on the full graph (MAGE lacks
+/// the lightweight named-projection model GDS has, so a two-snapshot
+/// community detection on baseline-only edges would require a heavy
+/// Cypher subgraph collection — deferred). The context gate alone
+/// recovers a large share of the precision win.
+const MIN_BASELINE_EVENTS_AT_DEST: u64 = 50;
+const MAX_ORIGIN_OUTDEGREE_FRACTION: f64 = 0.30;
+
 pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
 
@@ -78,6 +88,18 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 let event_time: String = row.get("event_time").unwrap_or_default();
 
                 if origin.is_empty() || destination.is_empty() {
+                    continue;
+                }
+
+                // Context gate 1: sparse-baseline destination.
+                if bl.baseline_event_count_for_dest(&destination) < MIN_BASELINE_EVENTS_AT_DEST {
+                    continue;
+                }
+
+                // Context gate 2: "talks to everything" origin.
+                let host_count = bl.host_count() as f64;
+                let origin_outdeg = bl.outgoing_degree(&origin) as f64;
+                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION {
                     continue;
                 }
 

@@ -703,6 +703,8 @@ masstin -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j \
 
 In triage terms: 3.87M raw events → 380 prioritized alerts (**10,190× reduction**), of which 252 are real attacks (**~23,300× enrichment** over random sampling). The control corpus reaches **100% precision / 100% recall**.
 
+**Backend parity note**: the headline numbers above are on Neo4j + GDS 2.x. The Memgraph variant (`graph-hunt`) shares the same triple-novelty + context-gate logic for `novel-edge` and `community-bridge`, but MAGE doesn't expose `_subgraph` variants for `pagerank.get` or `betweenness_centrality.get`, so the two-snapshot centrality pattern can't be replicated on Memgraph without destructive edge manipulation. The Memgraph variant accordingly keeps single-snapshot scoring for `pagerank-spike` and `betweenness-spike`. On the small control corpus this yields **100% top-K (P@10 / P@20) and 100% scenario recall**, with ~13pp lower overall precision than Neo4j due to ~19 long-tail FPs in centrality detectors. Memgraph is recommended for corpora up to ~5M edges; for larger enterprise corpora the Neo4j backend is preferred.
+
 Full methodology, per-detector breakdown, and algorithmic notes (two-snapshot centrality, triple-novelty, context gates) are documented in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).
 
 ### Merge graph nodes after loading

@@ -16,11 +16,25 @@
 // central), and only the combination of "central AND newly-active" lights
 // up.
 //
-// This is intentionally NOT a two-snapshot pagerank comparison. Running
-// pagerank twice over filtered subgraphs would be cleaner in theory but
-// requires either subgraph projection (heavyweight in MAGE) or destructive
-// edge deletion. The single-pass weighted-novelty approach gives the same
-// qualitative signal at a fraction of the cost.
+// This is intentionally NOT a two-snapshot pagerank comparison. The
+// Neo4j sister detector (`src/graph_hunt_neo4j/detectors/pagerank_spike.rs`)
+// projects a baseline-only GDS graph and compares centrality deltas to
+// suppress structural hubs cleanly. MAGE has no equivalent: the only
+// procedures with `*_subgraph` variants are community detection (Louvain
+// and Leiden), not centrality. `pagerank.get`, `nxalg.pagerank`, and
+// `igraphalg.pagerank` all operate on the live full graph; they accept
+// algorithm parameters (damping, weights) but no subgraph argument.
+//
+// The available workarounds (temporarily DELETE window edges + restore,
+// or zero-weighting window edges) are either dangerous on failure or
+// not structurally equivalent — random walks still traverse zero-weight
+// edges through the graph topology. So the Memgraph variant keeps the
+// legacy single-pass weighted-novelty approach (score = rank *
+// novelty_ratio over the full graph), accepting that legitimate hubs
+// like SCCM monitoring servers will surface as residual FPs in the
+// long tail. Top-K precision stays competitive because these hubs
+// don't dominate the top of the score ranking; they accumulate in the
+// 50-200 positions where DFIR triage typically doesn't reach.
 
 use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;
