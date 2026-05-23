@@ -14,6 +14,15 @@
 // on edge cases (PageRank weights inbound importance; betweenness
 // weights bridging structure), which gives the analyst two angles on
 // the same suspicion.
+//
+// Single-snapshot, like pagerank-spike: MAGE doesn't expose a
+// `*_subgraph` variant for `betweenness_centrality.get` (only community
+// detection has it). The Neo4j sister detector uses GDS's two-snapshot
+// projection to suppress structural hubs cleanly; the Memgraph variant
+// can't replicate that without either destructive edge deletion or
+// non-equivalent weight-based workarounds. The legacy single-snapshot
+// approach scores `bc * novelty_ratio`, which keeps top-K precision
+// high but leaves a long tail of legitimate-hub FPs (SCCM-class).
 
 use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;

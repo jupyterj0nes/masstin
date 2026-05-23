@@ -52,6 +52,17 @@ pub struct Baseline {
     pub edge_pairs: HashMap<(String, String), EdgePairBaseline>,
     pub hosts: HashMap<String, HostBaseline>,
     pub users: HashMap<String, UserBaseline>,
+    /// Set of distinct (origin, user, destination) triples observed in the
+    /// baseline. Used by the refactored `novel-edge` to fire on triples
+    /// never seen pre-cutoff — strictly tighter than the original 3-axis
+    /// OR test and captures the classic compromised-host + stolen-cred
+    /// signature (both sub-pairs in baseline but never as the same event).
+    pub triples: HashSet<(String, String, String)>,
+    /// Per-destination total baseline event count, precomputed for O(1)
+    /// lookup. Powers novel-edge and community-bridge context gates —
+    /// destinations with too few baseline events have unreliable novelty
+    /// signal regardless of how the detector's structural test fires.
+    pub dest_event_count: HashMap<String, u64>,
 }
 
 impl Baseline {
@@ -79,6 +90,39 @@ impl Baseline {
             Some(h) => h.incoming_sources.contains(source),
             None => false,
         }
+    }
+
+    /// Triple-novelty check: did the (origin, user, destination) combo
+    /// occur even once before the cutoff? Mirrors the Neo4j variant.
+    pub fn is_known_triple(&self, origin: &str, user: &str, destination: &str) -> bool {
+        self.triples.contains(&(
+            origin.to_string(),
+            user.to_string(),
+            destination.to_string(),
+        ))
+    }
+
+    /// Total baseline event count landing at a given destination. O(1)
+    /// lookup. Returns 0 for destinations with no baseline presence.
+    pub fn baseline_event_count_for_dest(&self, destination: &str) -> u64 {
+        self.dest_event_count.get(destination).copied().unwrap_or(0)
+    }
+
+    /// Baseline out-degree of an origin host — distinct destinations
+    /// reached before the cutoff. Used as proxy for "talks to everything"
+    /// service/infrastructure hosts in context-gate suppression.
+    pub fn outgoing_degree(&self, origin: &str) -> usize {
+        self.hosts
+            .get(origin)
+            .map(|h| h.outgoing_destinations.len())
+            .unwrap_or(0)
+    }
+
+    /// Total distinct hosts in baseline. Denominator for out-degree
+    /// fraction comparisons. Floored at 1 so the caller's division
+    /// never blows up on a degenerately empty baseline.
+    pub fn host_count(&self) -> usize {
+        self.hosts.len().max(1)
     }
 }
 
@@ -112,13 +156,21 @@ pub async fn compute(
     // 2. (origin, destination) pair stats.
     let edge_pairs = fetch_edge_pairs(graph, &cutoff_str).await?;
 
-    // 3. Per-host incoming/outgoing stats. Built from the same edge data we
-    //    pulled above, plus one query for outgoing destinations.
+    // 3. Per-host incoming/outgoing stats, the (origin, user, destination)
+    //    triple set, AND the per-destination total event count — all
+    //    derived from the edge_pairs aggregation above with no extra
+    //    round-trip. Each pair entry already carries the DISTINCT users
+    //    seen on that pair; cross-joining pair with users yields the
+    //    triple set; summing pair.event_count by destination yields the
+    //    density map for context gates.
     let mut hosts: HashMap<String, HostBaseline> = HashMap::new();
+    let mut triples: HashSet<(String, String, String)> = HashSet::new();
+    let mut dest_event_count: HashMap<String, u64> = HashMap::new();
     for ((origin, destination), stats) in &edge_pairs {
         let host_in = hosts.entry(destination.clone()).or_default();
         for u in &stats.users {
             host_in.incoming_users.insert(u.clone());
+            triples.insert((origin.clone(), u.clone(), destination.clone()));
         }
         for lt in &stats.logon_types {
             host_in.incoming_logon_types.insert(lt.clone());
@@ -127,6 +179,8 @@ pub async fn compute(
 
         let host_out = hosts.entry(origin.clone()).or_default();
         host_out.outgoing_destinations.insert(destination.clone());
+
+        *dest_event_count.entry(destination.clone()).or_insert(0) += stats.event_count;
     }
 
     // 4. Per-user stats (label of the relationship is the username).
@@ -135,10 +189,11 @@ pub async fn compute(
     crate::banner::print_phase_detail(
         "Baseline shape:",
         &format!(
-            "{} edge-pairs, {} hosts, {} users",
+            "{} edge-pairs, {} hosts, {} users, {} triples",
             edge_pairs.len(),
             hosts.len(),
-            users.len()
+            users.len(),
+            triples.len(),
         ),
     );
 
@@ -150,6 +205,8 @@ pub async fn compute(
         edge_pairs,
         hosts,
         users,
+        triples,
+        dest_event_count,
     })
 }
 

@@ -1,26 +1,43 @@
-// novel-edge detector. For every edge in the investigation window, check
-// three independent novelty axes against the baseline:
+// novel-edge detector. Triple-novelty variant: for every edge in the
+// investigation window, ask the single direct question that defines
+// lateral movement at the topology level — has this exact (origin, user,
+// destination) combination ever occurred before the cutoff?
 //
-//   1. The (origin, destination) host pair never appeared before.
-//   2. The user (rel type) was never seen logging into this destination.
-//   3. The logon type was never seen on this destination.
+// The earlier 3-axis OR-disjunction (pair-novel | user-novel |
+// logon-type-novel) produced a noisy long tail at scale because each
+// axis fires independently and the dominant cause of single-axis
+// novelty at 200+ hosts is steady-state operational churn (admin
+// touching a previously-untouched server, service account onboarded to
+// a new host, etc.). The triple test eliminates that noise and adds a
+// case the old detector missed entirely: both (origin, dest) and (user,
+// dest) exist in baseline but never as the same event — exactly the
+// fingerprint of an attacker on a compromised host using a stolen
+// credential to reach a known target.
 //
-// An edge fires the detector when ANY of the three axes is novel. The score
-// is the number of novel axes divided by 3, so a fully unprecedented event
-// (new pair + new user + new logon type) lands at 1.0 and a single-axis
-// novelty at ~0.33.
+// Logon-type novelty is no longer this detector's responsibility. The
+// dedicated `rare-logon-type` detector handles it with destination-class
+// stratification and per-(origin, dest, user, type) deduplication —
+// signals that don't fit naturally into a generic "novel edge" score.
 //
-// Works identically in grouped and ungrouped graphs — the only difference is
-// that in grouped mode each "event" carries the earliest_date timestamp plus
-// a count, so a single novel edge may represent many original log lines.
+// Score: 1.0 for a triple-novel edge. As a tiebreaker only, +0.1 if the
+// logon_type observed on this edge is also unprecedented on the
+// destination — pushes the most novel events above pure-triple ones in
+// the ranking without introducing a separate firing rule.
 
 use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;
 use futures::stream::*;
 use neo4rs::*;
 
+/// Context gate thresholds. Mirror the GDS variant — see
+/// `src/graph_hunt_neo4j/detectors/novel_edge.rs` for the FP analysis
+/// against the stress corpus that produced these numbers.
+const MIN_BASELINE_EVENTS_AT_DEST: u64 = 50;
+const MAX_ORIGIN_OUTDEGREE_FRACTION: f64 = 0.30;
+
 pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let host_count = bl.host_count() as f64;
 
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
@@ -53,47 +70,59 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 let event_time: String = row.get("event_time").unwrap_or_default();
                 let event_count: String = row.get("event_count").unwrap_or_default();
 
-                if origin.is_empty() || destination.is_empty() {
+                if origin.is_empty() || destination.is_empty() || user.is_empty() {
                     continue;
                 }
 
-                let pair_novel = !bl.is_known_edge(&origin, &destination);
-                let user_novel = !bl.is_user_known_for(&destination, &user);
+                if bl.is_known_triple(&origin, &user, &destination) {
+                    continue;
+                }
+
+                // Context gate 1: destination must have enough baseline
+                // events to make novelty meaningful.
+                if bl.baseline_event_count_for_dest(&destination) < MIN_BASELINE_EVENTS_AT_DEST {
+                    continue;
+                }
+
+                // Context gate 2: origin must not be a "talks to
+                // everything" host (services / monitoring / very-active
+                // admins). New triples from those are operational
+                // rotation, not signal.
+                let origin_outdeg = bl.outgoing_degree(&origin) as f64;
+                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION {
+                    continue;
+                }
+
+                // Triple is novel — fire at base score 1.0. Tiebreaker:
+                // bump slightly if the logon_type is also unprecedented
+                // on the destination.
                 let type_novel = !bl.is_logon_type_known_for(&destination, &logon_type);
+                let score = if type_novel { 1.1 } else { 1.0 };
 
-                let novel_count =
-                    pair_novel as u32 + user_novel as u32 + type_novel as u32;
-                if novel_count == 0 {
-                    continue;
-                }
-
-                let score = novel_count as f64 / 3.0;
-
-                let mut reasons: Vec<String> = Vec::new();
-                if pair_novel {
-                    reasons.push(format!("origin→destination pair never seen before cutoff"));
-                }
-                if user_novel {
-                    reasons.push(format!(
-                        "user '{}' never logged into '{}' before cutoff",
-                        user, destination
-                    ));
-                }
-                if type_novel {
-                    reasons.push(format!(
-                        "logon_type '{}' never seen on '{}' before cutoff",
-                        logon_type, destination
-                    ));
-                }
+                let pair_was_known = bl.is_known_edge(&origin, &destination);
+                let user_was_known = bl.is_user_known_for(&destination, &user);
+                let context = match (pair_was_known, user_was_known) {
+                    (false, false) => "neither (origin,dest) nor (user,dest) had baseline history",
+                    (true, false) => "(origin,dest) existed in baseline but user never reached this destination",
+                    (false, true) => "user reached this destination from elsewhere but never from this origin",
+                    (true, true) => "both sub-pairs existed in baseline but never as the same event \
+                                     (classic compromised-host + stolen-cred signature)",
+                };
 
                 let summary = format!(
-                    "{} -> {} as user='{}' logon_type='{}' (count={}). Novel: {}",
+                    "{} -> {} as user='{}' logon_type='{}' (count={}). \
+                     Triple novel: {}.{}",
                     origin,
                     destination,
                     user,
                     logon_type,
                     if event_count.is_empty() { "?".into() } else { event_count },
-                    reasons.join("; ")
+                    context,
+                    if type_novel {
+                        " Logon-type also unprecedented on this destination (tiebreaker bump)."
+                    } else {
+                        ""
+                    },
                 );
 
                 let snippet = format!(
