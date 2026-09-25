@@ -58,13 +58,14 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
          WITH gds.util.asNode(nodeId) AS node, score AS bc
          MATCH (a:host)-[r]->(node)
          WITH node.name AS host, bc,
-              count(CASE WHEN r.time < datetime('{cutoff}') THEN 1 END) AS in_base,
-              count(CASE WHEN r.time >= datetime('{cutoff}') THEN 1 END) AS in_window
+              count(CASE WHEN r.time < datetime('{cutoff}') AND {auth} THEN 1 END) AS in_base,
+              count(CASE WHEN r.time >= datetime('{cutoff}') AND {auth} THEN 1 END) AS in_window
          WHERE in_window > 0 AND (in_base + in_window) > 0
          RETURN host, bc, in_base, in_window
          ORDER BY bc DESC",
         proj = projection,
         cutoff = cutoff_str,
+        auth = crate::graph_hunt_common::auth_ok("r"),
     );
 
     let full_rows = match collect_full(graph, &q_full).await {
@@ -160,6 +161,9 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
 
         findings.push(Finding {
             detector: "betweenness-spike",
+            origin: String::new(),
+            account: String::new(),
+            events: 1,
             host,
             time_window: format!("from {}", cutoff_str),
             score,

@@ -74,6 +74,9 @@ pub mod load {
 struct GroupedData {
     earliest_date: String,
     count: usize,
+    event_type: String,
+    event_id: String,
+    log_source: String,
     subject_user: String,
     subject_domain: String,
     target_domain: String,
@@ -89,6 +92,7 @@ struct ResolvedEdge {
     time: String,
     event_type: String,
     event_id: String,
+    log_source: String,
     logon_type: String,
     src_computer: String,
     src_ip: String,
@@ -96,13 +100,36 @@ struct ResolvedEdge {
     target_domain_name: String,
     subject_user_name: String,
     subject_domain_name: String,
-    count: String,
+    count: i64,
 }
 
 const EDGE_BATCH: usize = 5_000;
 
+/// Minimum unanimous same-login observations before an IP gets a
+/// `resolved_name` property.
+const MIN_RESOLVE_VOTES: u32 = 2;
+
 const OLD_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 const NEW_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
+
+/// Log family of a `log_filename` value (`archive.tar.gz:[root]/var/log/
+/// secure-20260830.gz` -> `secure`; any EVTX -> `evtx`).
+pub(crate) fn log_source_family(raw: &str) -> &'static str {
+    let base = raw.trim_matches('"')
+        .rsplit(|c: char| c == '/' || c == '\\' || c == ':')
+        .next().unwrap_or("").to_lowercase();
+    if base.starts_with("secure") || base.starts_with("auth.log") { "secure" }
+    else if base.starts_with("messages") { "messages" }
+    else if base.starts_with("wtmp") { "wtmp" }
+    else if base.starts_with("btmp") { "btmp" }
+    else if base.starts_with("utmp") { "utmp" }
+    else if base == "lastlog" { "lastlog" }
+    else if base.starts_with("audit.log") { "audit" }
+    else if base.ends_with(".journal") || base.ends_with(".journal~") { "journal" }
+    else if base.ends_with(".evtx") { "evtx" }
+    else if base.is_empty() { "" }
+    else { "other" }
+}
 
 /// Column position used when a layout lacks a column (`event_type` in
 /// the legacy 12-column CSV).
@@ -114,6 +141,7 @@ const NONE_COL: usize = usize::MAX;
 struct Indices {
     dst: usize,
     event_type: usize,
+    log_source: usize,
     event_id: usize,
     subject_user: usize,
     subject_domain: usize,
@@ -127,13 +155,13 @@ struct Indices {
 fn parse_indices(header: &str) -> Option<Indices> {
     if header == NEW_HEADER {
         Some(Indices {
-            dst: 1, event_type: 2, event_id: 3, subject_user: 9, subject_domain: 10,
+            dst: 1, event_type: 2, log_source: 13, event_id: 3, subject_user: 9, subject_domain: 10,
             target_user: 5, target_domain: 6, logon_type: 4,
             src_computer: 7, src_ip: 8,
         })
     } else if header == OLD_HEADER {
         Some(Indices {
-            dst: 1, event_type: NONE_COL, event_id: 2, subject_user: 3, subject_domain: 4,
+            dst: 1, event_type: NONE_COL, log_source: 11, event_id: 2, subject_user: 3, subject_domain: 4,
             target_user: 5, target_domain: 6, logon_type: 7,
             src_computer: 8, src_ip: 9,
         })
@@ -200,7 +228,11 @@ fn clean_row(
     let line = raw_line.replace("\\", "").replace("[", "").replace("]", "").to_uppercase();
     let mut row: Vec<&str> = line.split(',').collect();
     if row.len() <= idx.src_ip { return RowOutcome::Filtered; }
-    row.pop();  // drop log_filename — unused downstream
+    // log_filename is reduced to its log family (secure, wtmp, audit,
+    // Security.evtx ...) and kept as the edge's `log_source`, so
+    // graph-hunt can tell which sources cover which period.
+    let fam_owned = log_source_family(row.last().copied().unwrap_or(""));
+    if let Some(last) = row.last_mut() { *last = fam_owned; }
 
     // dst_computer
     if let Some(ip) = extract_leading_ip(row[idx.dst]) {
@@ -251,11 +283,21 @@ fn streaming_pass1(
     local_values: &HashSet<&str>,
     start_dt: Option<DateTime<Utc>>,
     end_dt: Option<DateTime<Utc>>,
-) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize)> {
+) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32)>)> {
     let mut counts: HashMap<(String, String), u32> = HashMap::new();
     let mut literal_hosts: HashSet<String> = HashSet::new();
     let mut filtered_by_time: usize = 0;
     let mut kept_rows: usize = 0;
+    // Same-login co-occurrence (Linux): sshd with `UseDNS yes` records the
+    // peer by name in secure/journald, while auditd, btmp and many wtmp
+    // records keep its IP. The same login therefore appears as two CSV rows,
+    // one carrying only a name and one only an IP, with the same
+    // destination, account, outcome and second. Pairing them gives IP ->
+    // host evidence that no single row carries; without it one source
+    // machine becomes two graph nodes and its history is split in half.
+    // Key: (dst, user, second, event_type) -> (ips, names), single-sided
+    // rows only.
+    let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
 
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -267,6 +309,29 @@ fn streaming_pass1(
             RowOutcome::Filtered => {}
             RowOutcome::Cleaned(parts) => {
                 kept_rows += 1;
+                {
+                    let sc = parts[idx.src_computer].as_str();
+                    let si = parts[idx.src_ip].as_str();
+                    let sc_local = local_values.contains(sc);
+                    let si_local = local_values.contains(si);
+                    let side = if sc_local && !si_local && looks_like_ip(si) {
+                        Some((si.to_string(), true))
+                    } else if !sc_local && si_local && !looks_like_ip(sc) {
+                        Some((sc.to_string(), false))
+                    } else { None };
+                    if let Some((v, is_ip)) = side {
+                        let et = if idx.event_type == NONE_COL { "" } else { parts[idx.event_type].as_str() };
+                        let key = (
+                            parts[idx.dst].clone(),
+                            parts[idx.target_user].clone(),
+                            parts[0].get(..19).unwrap_or(&parts[0]).to_string(),
+                            et.to_string(),
+                        );
+                        let e = cooc.entry(key).or_default();
+                        let list = if is_ip { &mut e.0 } else { &mut e.1 };
+                        if !list.contains(&v) { list.push(v); }
+                    }
+                }
                 // (src_ip, src_computer) direct evidence
                 if !local_values.contains(parts[idx.src_computer].as_str())
                     && !local_values.contains(parts[idx.src_ip].as_str())
@@ -306,7 +371,28 @@ fn streaming_pass1(
             }
         }
     }
-    Ok((counts, literal_hosts, filtered_by_time, kept_rows))
+    // One vote per unambiguous same-login pair (exactly one IP and one
+    // name recorded for that login). The mapping is NOT used to merge
+    // nodes: the name is only what the destination's sshd resolved by
+    // reverse DNS at that moment (stale PTR, DHCP reuse, NAT and aliases
+    // all break it). It is kept only when every vote agrees and there are
+    // at least MIN_RESOLVE_VOTES of them, and it is written to the IP node
+    // as `resolved_name` / `resolved_votes` for the analyst to judge.
+    let mut votes: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    for (ips, names) in cooc.values() {
+        if ips.len() == 1 && names.len() == 1 {
+            *votes.entry(ips[0].clone()).or_default().entry(names[0].clone()).or_insert(0) += 1;
+        }
+    }
+    let resolved_names: HashMap<String, (String, u32)> = votes
+        .into_iter()
+        .filter_map(|(ip, m)| {
+            if m.len() != 1 { return None; }
+            let (name, v) = m.into_iter().next()?;
+            if v >= MIN_RESOLVE_VOTES { Some((ip, (name, v))) } else { None }
+        })
+        .collect();
+    Ok((counts, literal_hosts, filtered_by_time, kept_rows, resolved_names))
 }
 
 fn derive_ip_to_host(counts: &HashMap<(String, String), u32>) -> HashMap<String, String> {
@@ -396,6 +482,7 @@ fn resolve_to_edge(
         time: parts[0].replace(" utc", "").replace(" ", "T"),
         event_type: if idx.event_type == NONE_COL { String::new() } else { parts[idx.event_type].clone() },
         event_id: if idx.event_id == NONE_COL { String::new() } else { parts[idx.event_id].clone() },
+        log_source: if idx.log_source == NONE_COL || idx.log_source >= parts.len() { String::new() } else { parts[idx.log_source].clone() },
         logon_type: parts[idx.logon_type].clone(),
         src_computer: src_computer_raw.to_string(),
         src_ip: src_ip_raw.to_string(),
@@ -403,7 +490,7 @@ fn resolve_to_edge(
         target_domain_name: parts[idx.target_domain].clone(),
         subject_user_name: clean_user(&parts[idx.subject_user]),
         subject_domain_name: parts[idx.subject_domain].clone(),
-        count: "1".to_string(),
+        count: 1,
     })
 }
 
@@ -421,7 +508,7 @@ async fn flush_batch(
          MATCH (o:host {{name: $origin[i]}}) \
          MATCH (d:host {{name: $destination[i]}}) \
          {} (o)-[r:{} {{time: datetime($time[i]), logon_type: $logon_type[i], \
-         event_type: $event_type[i], event_id: $event_id[i], \
+         event_type: $event_type[i], event_id: $event_id[i], log_source: $log_source[i], \
          src_computer: $src_computer[i], src_ip: $src_ip[i], \
          target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
          subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
@@ -436,13 +523,14 @@ async fn flush_batch(
         .param("logon_type", chunk.iter().map(|e| e.logon_type.clone()).collect::<Vec<String>>())
         .param("event_type", chunk.iter().map(|e| e.event_type.clone()).collect::<Vec<String>>())
         .param("event_id", chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<String>>())
+        .param("log_source", chunk.iter().map(|e| e.log_source.clone()).collect::<Vec<String>>())
         .param("src_computer", chunk.iter().map(|e| e.src_computer.clone()).collect::<Vec<String>>())
         .param("src_ip", chunk.iter().map(|e| e.src_ip.clone()).collect::<Vec<String>>())
         .param("target_user_name", chunk.iter().map(|e| e.target_user_name.clone()).collect::<Vec<String>>())
         .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
         .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
         .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
-        .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
+        .param("count", chunk.iter().map(|e| e.count).collect::<Vec<i64>>());
     match graph.execute(q).await {
         Ok(mut result) => {
             // Report what the server actually created, not what we sent:
@@ -582,7 +670,7 @@ pub async fn load_neo4j(
             "DEFAULT_VALUE", "\"\"", "-", "", " "].iter().cloned().collect();
 
         // ── Pass 1: stream-collect counts + literal hosts ──
-        let (counts, mut literal_hosts, filtered_by_time, kept_rows) =
+        let (counts, mut literal_hosts, filtered_by_time, kept_rows, resolved_names) =
             match streaming_pass1(file, &idx, &local_values, start_dt, end_dt) {
                 Ok(t) => t,
                 Err(e) => {
@@ -669,7 +757,7 @@ pub async fn load_neo4j(
 
         // GROUPED mode accumulator (bounded by distinct (dst,user,type)
         // tuples — small even for huge corpora).
-        let mut grouped_map: HashMap<(String, String, String), GroupedData> = HashMap::new();
+        let mut grouped_map: HashMap<(String, String, String, String, String, String), GroupedData> = HashMap::new();
 
         // ── Pass 2: stream the file again ──
         let f = match File::open(file) {
@@ -735,18 +823,29 @@ pub async fn load_neo4j(
                     }
                 }
             } else {
-                // GROUPED: accumulate per (dst, user_clean, logon_type)
+                // GROUPED: one edge per (dst, user, logon_type, source,
+                // outcome). The source and the outcome are part of the key:
+                // without them two origins using the same account on the
+                // same host collapsed into one edge (only the first origin
+                // survived), and refused attempts merged with successes.
                 let user_clean = parts[idx.target_user].split('@').next()
                     .unwrap_or(&parts[idx.target_user]).to_string();
+                let et = if idx.event_type == NONE_COL { String::new() } else { parts[idx.event_type].clone() };
                 let key = (
                     parts[idx.dst].clone(),
                     user_clean,
                     parts[idx.logon_type].clone(),
+                    parts[idx.src_computer].clone(),
+                    parts[idx.src_ip].clone(),
+                    et.clone(),
                 );
                 let date = parts[0].clone();
                 let entry = grouped_map.entry(key).or_insert(GroupedData {
                     earliest_date: date.clone(),
                     count: 0,
+                    event_type: et.clone(),
+                    event_id: if idx.event_id == NONE_COL { String::new() } else { parts[idx.event_id].clone() },
+                    log_source: if idx.log_source == NONE_COL || idx.log_source >= parts.len() { String::new() } else { parts[idx.log_source].clone() },
                     subject_user: parts[idx.subject_user].clone(),
                     subject_domain: parts[idx.subject_domain].clone(),
                     target_domain: parts[idx.target_domain].clone(),
@@ -762,7 +861,7 @@ pub async fn load_neo4j(
 
         // ── Drain grouped accumulator at end of stream ──
         if !ungrouped {
-            for ((dst_computer, target_user_name, logon_type), data) in grouped_map.drain() {
+            for ((dst_computer, target_user_name, logon_type, _sc, _si, _et), data) in grouped_map.drain() {
                 let parts: Vec<String> = vec![
                     data.earliest_date.clone(),
                     dst_computer.clone(),
@@ -774,17 +873,20 @@ pub async fn load_neo4j(
                     logon_type.clone(),
                     data.src_computer.clone(),
                     data.src_ip.clone(),
+                    data.event_type.clone(),
+                    data.event_id.clone(),
+                    data.log_source.clone(),
                 ];
                 // Local index map for the synthesized 10-col row (legacy
                 // shape from the previous in-memory pipeline).
                 let local_idx = Indices {
-                    dst: 1, event_type: NONE_COL, event_id: NONE_COL, subject_user: 3, subject_domain: 4,
+                    dst: 1, event_type: 10, log_source: 12, event_id: 11, subject_user: 3, subject_domain: 4,
                     target_user: 5, target_domain: 6, logon_type: 7,
                     src_computer: 8, src_ip: 9,
                 };
                 let edge = match resolve_to_edge(&parts, &local_idx, &ip_to_host, &local_values, &mut resolved_count) {
                     Some(mut e) => {
-                        e.count = data.count.to_string();
+                        e.count = data.count as i64;
                         e
                     }
                     None => continue,
@@ -817,6 +919,34 @@ pub async fn load_neo4j(
         }
 
         pb.finish_and_clear();
+
+        // IP nodes: annotate (never merge) with the unanimous sshd name.
+        if !resolved_names.is_empty() {
+            let ips: Vec<String> = resolved_names.keys().cloned().collect();
+            let names: Vec<String> = ips.iter().map(|i| resolved_names[i].0.clone()).collect();
+            let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
+            let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
+                           MATCH (h:host {name: $ips[i]}) \
+                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i] \
+                           RETURN count(h) AS n";
+            match graph
+                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts))
+                .await
+            {
+                Ok(mut r) => {
+                    let n: i64 = match r.next().await { Ok(Some(row)) => row.get("n").unwrap_or(0), _ => 0 };
+                    crate::banner::print_phase_detail(
+                        "IP nodes:",
+                        &format!("{} annotated with resolved_name (unanimous sshd reverse-DNS, >= {} logins; nodes not merged)", n, MIN_RESOLVE_VOTES),
+                    );
+                }
+                Err(e) => {
+                    if crate::parse::is_debug_mode() {
+                        eprintln!("[ERROR] resolved_name annotation failed: {:?}", e);
+                    }
+                }
+            }
+        }
         crate::banner::print_load_summary("Neo4j", loaded, resolved_count, errors, start_clock);
     }
 }

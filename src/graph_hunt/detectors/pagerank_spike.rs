@@ -59,8 +59,8 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
          WITH node, rank
          MATCH (a:host)-[r]->(node)
          WITH node.name AS host, rank,
-              count(CASE WHEN r.time < localDateTime('{cutoff}') THEN 1 END) AS in_base,
-              count(CASE WHEN r.time >= localDateTime('{cutoff}') THEN 1 END) AS in_window
+              count(CASE WHEN r.time < localDateTime('{cutoff}') AND {auth} THEN 1 END) AS in_base,
+              count(CASE WHEN r.time >= localDateTime('{cutoff}') AND {auth} THEN 1 END) AS in_window
          WHERE in_window > 0 AND (in_base + in_window) > 0
          WITH host, rank, in_base, in_window,
               toFloat(in_window) / toFloat(in_base + in_window) AS novelty_ratio
@@ -70,6 +70,7 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
          RETURN host, rank, in_base, in_window, novelty_ratio, score
          ORDER BY score DESC",
         cutoff = cutoff_str,
+        auth = crate::graph_hunt_common::auth_ok("r"),
         min_score = MIN_SCORE,
     );
 
@@ -118,6 +119,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 findings.push(Finding {
                     detector: "pagerank-spike",
+            origin: String::new(),
+            account: String::new(),
+            events: 1,
                     host,
                     time_window: format!("from {}", cutoff_str),
                     score,

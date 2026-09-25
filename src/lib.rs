@@ -49,6 +49,7 @@ pub mod filter;
 pub mod vmdk;
 pub use crate::vmdk::*;
 mod graph_hunt;
+mod graph_hunt_common;
 mod graph_hunt_neo4j;
 
 // -----------------------------------------------------------------------------
@@ -250,8 +251,9 @@ pub struct Cli {
     investigation_from: Option<String>,
 
     /// For `graph-hunt`: comma-separated list of detector names to skip.
-    /// Available: novel-edge, chain-motif, pagerank-spike, betweenness-spike,
-    /// community-bridge, cred-rotation, rare-logon-type.
+    /// Available: origin-fanout, probe-then-success, failed-sweep, novel-edge,
+    /// chain-motif, pagerank-spike, betweenness-spike, community-bridge,
+    /// cred-rotation, rare-logon-type.
     /// Example: --skip-detectors pagerank-spike,betweenness-spike
     #[arg(long)]
     skip_detectors: Option<String>,

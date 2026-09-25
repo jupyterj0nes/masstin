@@ -11,7 +11,6 @@ use std::collections::HashSet;
 
 mod baseline;
 mod detectors;
-mod report;
 mod schema;
 
 pub use schema::GraphMode;
@@ -135,7 +134,7 @@ pub async fn graph_hunt(
     crate::banner::print_phase_result(&format!("{} finding(s)", findings.len()));
 
     // Emit CSV
-    if let Err(e) = report::emit_csv(&findings, output) {
+    if let Err(e) = crate::graph_hunt_common::report::emit_csv(&findings, output) {
         eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
         return;
     }

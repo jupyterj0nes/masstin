@@ -76,8 +76,8 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
          WITH gds.util.asNode(nodeId) AS node, score AS rank
          MATCH (a:host)-[r]->(node)
          WITH node.name AS host, rank,
-              count(CASE WHEN r.time < datetime('{cutoff}') THEN 1 END) AS in_base,
-              count(CASE WHEN r.time >= datetime('{cutoff}') THEN 1 END) AS in_window
+              count(CASE WHEN r.time < datetime('{cutoff}') AND {auth} THEN 1 END) AS in_base,
+              count(CASE WHEN r.time >= datetime('{cutoff}') AND {auth} THEN 1 END) AS in_window
          WHERE in_window > 0
            AND in_base >= {min_base}
          WITH host, rank, in_base, in_window,
@@ -86,6 +86,7 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
          ORDER BY rank DESC",
         proj = projection,
         cutoff = cutoff_str,
+        auth = crate::graph_hunt_common::auth_ok("r"),
         min_base = MIN_BASELINE_EDGES,
     );
 
@@ -226,6 +227,9 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
 
         findings.push(Finding {
             detector: "pagerank-spike",
+            origin: String::new(),
+            account: String::new(),
+            events: 1,
             host: c.host.clone(),
             time_window: format!("from {}", cutoff_str),
             score: composite,

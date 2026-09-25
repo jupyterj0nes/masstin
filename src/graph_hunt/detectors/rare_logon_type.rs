@@ -19,6 +19,7 @@
 
 use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;
+use crate::graph_hunt_common::{auth_ok, is_series};
 use futures::stream::*;
 use neo4rs::*;
 use std::collections::{HashMap, HashSet};
@@ -62,6 +63,7 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
         return Vec::new();
     }
 
+    // Pre-compute per-class total to normalize the frequencies.
     let class_total: HashMap<&str, u64> = by_class
         .iter()
         .map(|(cls, counts)| (cls.as_str(), counts.values().sum()))
@@ -69,13 +71,13 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time >= localDateTime('{}')
+         WHERE r.time >= localDateTime('{}') AND {}
          RETURN a.name AS origin,
                 b.name AS destination,
                 type(r) AS user,
                 toString(r.logon_type) AS logon_type,
                 toString(r.time) AS event_time",
-        cutoff_str
+        cutoff_str, auth_ok("r")
     );
 
     let mut findings: Vec<Finding> = Vec::new();
@@ -101,6 +103,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     continue;
                 }
 
+                // Deduplicate identical occurrences — one finding per
+                // (origin, destination, user, logon_type) tuple is enough
+                // to draw the analyst's eye.
                 let key = (
                     origin.clone(),
                     destination.clone(),
@@ -111,6 +116,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     continue;
                 }
 
+                // Stratify: look up the rarity ONLY in the destination's
+                // host class. type=0 on Linux is the norm; on Windows
+                // it would still surface as "never seen".
                 let cls = host_class(&destination);
                 let class_freqs = match by_class.get(cls) {
                     Some(m) => m,
@@ -159,6 +167,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 findings.push(Finding {
                     detector: "rare-logon-type",
+                    origin: origin.clone(),
+                    account: user.clone(),
+                    events: 1,
                     host: destination,
                     time_window: event_time,
                     score,
@@ -186,9 +197,9 @@ async fn fetch_baseline_by_class(
 ) -> neo4rs::Result<HashMap<String, HashMap<String, u64>>> {
     let q = format!(
         "MATCH ()-[r]->(b:host)
-         WHERE r.time < localDateTime('{}')
+         WHERE r.time < localDateTime('{}') AND {} AND {}
          RETURN toString(r.logon_type) AS lt, b.name AS dst, count(r) AS c",
-        cutoff_str
+        cutoff_str, auth_ok("r"), is_series("r")
     );
     let mut stream = graph.execute(query(&q)).await?;
     let mut by_class: HashMap<String, HashMap<String, u64>> = HashMap::new();

@@ -16,6 +16,7 @@ use crate::graph_hunt_neo4j::detectors::Finding;
 use chrono::NaiveDateTime;
 use futures::stream::*;
 use neo4rs::*;
+use crate::graph_hunt_common::auth_ok;
 
 /// Maximum seconds allowed between consecutive hops in the chain. 5 minutes
 /// is intentionally generous for v1 — operator-driven pivoting can be slow
@@ -64,6 +65,7 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
            AND duration.inSeconds(r1.time, r2.time).seconds <= {gap}
            AND type(r1) <> type(r2)
            AND a.name <> c.name
+           AND {auth1} AND {auth2}
          RETURN a.name AS a, b.name AS b, c.name AS c,
                 type(r1) AS u1, type(r2) AS u2,
                 toString(r1.logon_type) AS lt1,
@@ -71,7 +73,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 toString(r1.time) AS t1, toString(r2.time) AS t2
          LIMIT 5000",
         cutoff = cutoff_str,
-        gap = MAX_HOP_GAP_SECONDS
+        gap = MAX_HOP_GAP_SECONDS,
+        auth1 = auth_ok("r1"),
+        auth2 = auth_ok("r2"),
     );
 
     let mut findings: Vec<Finding> = Vec::new();
@@ -145,6 +149,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 findings.push(Finding {
                     detector: "chain-motif",
+                    origin: a.clone(),
+                    account: u1.clone(),
+                    events: 2,
                     host: b,
                     time_window: format!("{} .. {}", t1, t2),
                     score,

@@ -50,6 +50,9 @@ pub mod load {
 struct GroupedData {
     earliest_date: String,
     count: usize,
+    event_type: String,
+    event_id: String,
+    log_source: String,
     // Non-key fields: stored from the first row seen for this group
     subject_user: String,
     subject_domain: String,
@@ -74,7 +77,10 @@ struct ResolvedEdge {
     target_domain_name: String,
     subject_user_name: String,
     subject_domain_name: String,
-    count: String,
+    event_type: String,
+    event_id: String,
+    log_source: String,
+    count: i64,
 }
 
 /// Edges per UNWIND batch. Each batch is a single Bolt round-trip carrying
@@ -183,6 +189,10 @@ pub async fn load_memgraph(
         } else {
             (1usize, 2usize, 3usize, 4usize, 5usize, 6usize, 7usize, 8usize, 9usize)
         };
+        // event_type exists only in the 14-column layout; log_filename is the
+        // last column in both and is reduced to its log family below.
+        let idx_event_type: Option<usize> = if is_new_format { Some(2) } else { None };
+        let idx_log_source: usize = if is_new_format { 13 } else { 11 };
 
         let local_values: HashSet<&str> =
                 ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "\"\"", "-", ""," ",]
@@ -209,7 +219,8 @@ pub async fn load_memgraph(
             }
 
             let mut row: Vec<&str> = line.split(',').collect();
-            row.pop();
+            let fam = crate::load_neo4j::log_source_family(row.last().copied().unwrap_or(""));
+            if let Some(last) = row.last_mut() { *last = fam; }
 
             if let Some(ip) = extract_leading_ip(row[idx_dst]) {
                 row[idx_dst] = ip;
@@ -305,6 +316,46 @@ pub async fn load_memgraph(
             }
         }
 
+        // ── Same-login IP/name co-occurrence (Linux) → resolved_name ──
+        // sshd (UseDNS) records the peer by name, auditd / btmp / wtmp keep
+        // its IP: the same login appears as two single-sided rows. A pair
+        // is only used to ANNOTATE the IP node (resolved_name), never to
+        // merge nodes, and only when every vote agrees (>= 2 logins).
+        let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
+        for line in &processed_lines {
+            let parts: Vec<&str> = line.split(',').collect();
+            let sc = parts[idx_src_computer];
+            let si = parts[idx_src_ip];
+            let side = if local_values.contains(sc) && !local_values.contains(si) && looks_like_ip(si) {
+                Some((si.to_string(), true))
+            } else if !local_values.contains(sc) && local_values.contains(si) && !looks_like_ip(sc) {
+                Some((sc.to_string(), false))
+            } else { None };
+            if let Some((v, is_ip)) = side {
+                let et = idx_event_type.map(|i| parts[i]).unwrap_or("");
+                let key = (parts[idx_dst].to_string(), parts[idx_target_user].to_string(),
+                           parts[0].get(..19).unwrap_or(parts[0]).to_string(), et.to_string());
+                let e = cooc.entry(key).or_default();
+                let list = if is_ip { &mut e.0 } else { &mut e.1 };
+                if !list.contains(&v) { list.push(v); }
+            }
+        }
+        let mut votes: HashMap<String, HashMap<String, u32>> = HashMap::new();
+        for (ips, names) in cooc.values() {
+            if ips.len() == 1 && names.len() == 1 {
+                *votes.entry(ips[0].clone()).or_default().entry(names[0].clone()).or_insert(0) += 1;
+            }
+        }
+        drop(cooc);
+        let resolved_names: HashMap<String, (String, u32)> = votes
+            .into_iter()
+            .filter_map(|(ip, m)| {
+                if m.len() != 1 { return None; }
+                let (name, v) = m.into_iter().next()?;
+                if v >= 2 { Some((ip, (name, v))) } else { None }
+            })
+            .collect();
+
         // ── Global IP→hostname map ──
         let mut ip_to_host: HashMap<String, String> = HashMap::new();
         {
@@ -327,7 +378,7 @@ pub async fn load_memgraph(
             for line in &processed_lines {
                 let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
                 edges_to_emit.push(format!(
-                    "{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     parts[0],
                     parts[idx_dst],
                     "1",
@@ -338,6 +389,9 @@ pub async fn load_memgraph(
                     parts[idx_logon_type],
                     parts[idx_src_computer],
                     parts[idx_src_ip],
+                    idx_event_type.map(|i| parts[i].as_str()).unwrap_or(""),
+                    parts[idx_event_id],
+                    parts.get(idx_log_source).map(|s| s.as_str()).unwrap_or(""),
                 ));
             }
         } else {
@@ -345,8 +399,11 @@ pub async fn load_memgraph(
             // The resolved origin node is determined downstream by ip_to_host;
             // src_ip is a detail for the CSV, not the graph. Keeping only
             // these 3 fields produces one edge per (origin, user, type, dest).
+            // Key includes source and outcome: without them two origins using
+            // the same account on the same host collapsed into one edge and
+            // refused attempts merged with successes.
             let mut grouped_map: HashMap<
-                (String, String, String),
+                (String, String, String, String, String, String),
                 GroupedData,
             > = HashMap::new();
 
@@ -357,15 +414,22 @@ pub async fn load_memgraph(
                 // events don't, causing duplicate edges for the same user.
                 let user_clean = parts[idx_target_user].split('@').next()
                     .unwrap_or(&parts[idx_target_user]).to_string();
+                let et = idx_event_type.map(|i| parts[i].clone()).unwrap_or_default();
                 let key = (
                     parts[idx_dst].clone(),
                     user_clean,
                     parts[idx_logon_type].clone(),
+                    parts[idx_src_computer].clone(),
+                    parts[idx_src_ip].clone(),
+                    et.clone(),
                 );
                 let date = parts[0].clone();
                 let entry = grouped_map.entry(key).or_insert(GroupedData {
                     earliest_date: date.clone(),
                     count: 0,
+                    event_type: et.clone(),
+                    event_id: parts[idx_event_id].clone(),
+                    log_source: parts.get(idx_log_source).cloned().unwrap_or_default(),
                     subject_user: parts[idx_subject_user].clone(),
                     subject_domain: parts[idx_subject_domain].clone(),
                     target_domain: parts[idx_target_domain].clone(),
@@ -378,9 +442,9 @@ pub async fn load_memgraph(
                 entry.count += 1;
             }
 
-            for ((dst_computer, target_user_name, logon_type), data) in grouped_map {
+            for ((dst_computer, target_user_name, logon_type, _sc, _si, _et), data) in grouped_map {
                 edges_to_emit.push(format!(
-                    "{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     data.earliest_date,
                     dst_computer,
                     data.count,
@@ -391,6 +455,9 @@ pub async fn load_memgraph(
                     logon_type,
                     data.src_computer,
                     data.src_ip,
+                    data.event_type,
+                    data.event_id,
+                    data.log_source,
                 ));
             }
         }
@@ -478,7 +545,10 @@ pub async fn load_memgraph(
                 target_domain_name: row[6].to_string(),
                 subject_user_name: clean_user(row[3]),
                 subject_domain_name: row[4].to_string(),
-                count: row[2].to_string(),
+                event_type: row.get(10).map(|s| s.to_string()).unwrap_or_default(),
+                event_id: row.get(11).map(|s| s.to_string()).unwrap_or_default(),
+                log_source: row.get(12).map(|s| s.to_string()).unwrap_or_default(),
+                count: row[2].parse::<i64>().unwrap_or(1),
             });
         }
 
@@ -550,6 +620,7 @@ pub async fn load_memgraph(
                      src_computer: $src_computer[i], src_ip: $src_ip[i], \
                      target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
                      subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
+                     event_type: $event_type[i], event_id: $event_id[i], log_source: $log_source[i], \
                      count: $count[i]}}]->(d)",
                     edge_op, rel_type,
                 );
@@ -564,7 +635,10 @@ pub async fn load_memgraph(
                     .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
                     .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
                     .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
-                    .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
+                    .param("event_type", chunk.iter().map(|e| e.event_type.clone()).collect::<Vec<String>>())
+                    .param("event_id", chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<String>>())
+                    .param("log_source", chunk.iter().map(|e| e.log_source.clone()).collect::<Vec<String>>())
+                    .param("count", chunk.iter().map(|e| e.count).collect::<Vec<i64>>());
                 match graph.execute(q).await {
                     Ok(mut result) => { let _ = result.next().await; }
                     Err(e) => {
@@ -579,6 +653,32 @@ pub async fn load_memgraph(
         }
 
         pb.finish_and_clear();
+
+        if !resolved_names.is_empty() {
+            let ips: Vec<String> = resolved_names.keys().cloned().collect();
+            let names: Vec<String> = ips.iter().map(|i| resolved_names[i].0.clone()).collect();
+            let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
+            let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
+                           MATCH (h:host {name: $ips[i]}) \
+                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i]";
+            match graph
+                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts))
+                .await
+            {
+                Ok(mut r) => {
+                    let _ = r.next().await;
+                    crate::banner::print_phase_detail(
+                        "IP nodes:",
+                        &format!("{} IPs annotated with resolved_name (unanimous sshd reverse-DNS, >= 2 logins; nodes not merged)", resolved_names.len()),
+                    );
+                }
+                Err(e) => {
+                    if crate::parse::is_debug_mode() {
+                        eprintln!("[ERROR] resolved_name annotation failed: {:?}", e);
+                    }
+                }
+            }
+        }
         let loaded = edge_total - errors;
         crate::banner::print_load_summary("Memgraph", loaded, resolved, errors, start_clock);
     }

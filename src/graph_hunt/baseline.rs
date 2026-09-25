@@ -12,6 +12,7 @@ use crate::graph_hunt::schema::GraphMode;
 use chrono::{DateTime, Utc};
 use futures::stream::*;
 use neo4rs::*;
+use crate::graph_hunt_common::{auth_ok, is_series};
 use std::collections::{HashMap, HashSet};
 
 /// Stats for a single (origin, destination) host pair seen in the baseline
@@ -152,6 +153,9 @@ pub async fn compute(
         "Window edges:",
         &format!("{} events at or after cutoff", edges_in_window),
     );
+    if let Err(e) = crate::graph_hunt_common::check_coverage(graph, &crate::graph_hunt_common::MEMGRAPH, cutoff).await {
+        crate::banner::print_warning(&format!("Coverage check failed: {}", e));
+    }
 
     // 2. (origin, destination) pair stats.
     let edge_pairs = fetch_edge_pairs(graph, &cutoff_str).await?;
@@ -232,13 +236,13 @@ async fn fetch_edge_pairs(
 ) -> neo4rs::Result<HashMap<(String, String), EdgePairBaseline>> {
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time < localDateTime('{}')
+         WHERE r.time < localDateTime('{}') AND {}
          RETURN a.name AS origin,
                 b.name AS destination,
                 collect(DISTINCT type(r)) AS users,
                 collect(DISTINCT toString(r.logon_type)) AS logon_types,
-                count(r) AS freq",
-        cutoff_str
+                count(CASE WHEN {} THEN 1 END) AS freq",
+        cutoff_str, auth_ok("r"), is_series("r")
     );
 
     let mut stream = graph.execute(query(&q)).await?;
@@ -272,11 +276,11 @@ async fn fetch_user_stats(
 ) -> neo4rs::Result<HashMap<String, UserBaseline>> {
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time < localDateTime('{}')
+         WHERE r.time < localDateTime('{}') AND {}
          RETURN type(r) AS user,
                 collect(DISTINCT b.name) AS hosts,
                 collect(DISTINCT toString(r.logon_type)) AS logon_types",
-        cutoff_str
+        cutoff_str, auth_ok("r")
     );
 
     let mut stream = graph.execute(query(&q)).await?;
