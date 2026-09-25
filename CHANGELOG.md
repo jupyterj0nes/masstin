@@ -12,6 +12,10 @@
 - `parse-linux`: wtmp/utmp/secure keep sources that are hostnames, not only IPs (`UseDNS yes` estates lost >99% of wtmp). Boot / runlevel utmp records dropped.
 - `parse-linux`: **lastlog parsed** (last login per account, uid resolved via the collected `/etc/passwd`).
 - `parse-linux`: journald ⟷ rsyslog duplicates removed across files; truncated archives reported with a warning.
+- `parse-linux`: audit.log now keeps `USER_LOGIN` only (one record per SSH connection; `USER_AUTH` PAM/key stages were producing 3–4 rows per login and are used only as a fallback), collapses the duplicate `USER_LOGIN` pairs sshd writes per pid, resolves the `id=`/`auid=` uid of successful logins through the collected `/etc/passwd` (previously an empty user → `NO_USER` in the graph) and tags `acct="(unknown)"` failures as `audit invalid-user` in `detail`. `logon_type` is `SSH` on every Linux row.
+- `load-neo4j`: **fix silent edge loss** — host nodes were merged lazily every 256 names while edge batches went out every 5000 rows; batches whose origin node did not exist yet were dropped by Cypher without an error while the summary still counted them (a 76k-row timeline came out as 21k edges). Nodes are now flushed before every edge batch and the summary reports the server-side count. Edges carry `event_type` and `event_id` so success and failure can be told apart in the graph.
+- `graph-hunt` / `graph-hunt-neo4j`: findings CSV is aggregated per (detector, host, origin/user/destination pattern) with an `events` column and a first..last `time_window`, instead of one row per edge (a 9000-attempt brute force is one row, not 9000).
+- `graph-hunt-neo4j`: works on GDS 1.x again (Neo4j 4.x installs): falls back to `gds.graph.create` / `gds.graph.create.cypher` when `gds.graph.project` is not registered.
 
 ## v1.0.0 — 2026-04-21
 
