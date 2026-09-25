@@ -390,24 +390,35 @@ pub async fn failed_sweep(graph: &Graph, d: &Dialect, bf: &BaselineFacts) -> Vec
 
 const PROBE_WINDOW_HOURS: i64 = 6;
 
-/// Same origin: failed or unauthenticated attempts, then within
-/// PROBE_WINDOW_HOURS a successful login with an account that was NOT among
-/// the ones that failed. The shape of "try, get refused, come back with a
-/// working credential". Score 1.5, +0.5 when the origin has no event of any
+/// Same origin: a refused NAMED account (a guess, `test`, a mistyped or
+/// sprayed user), followed within PROBE_WINDOW_HOURS by a successful login
+/// with an account that is new for that origin (or from an origin with no
+/// history at all). The working account may be a different one ("try,
+/// get refused, come back with a credential that works") or the same one
+/// ("guess until it works").
+///
+/// Every refused attempt is checked against the successes that follow it,
+/// so an unrelated failure days earlier does not hide a later probe.
+/// Unauthenticated connections alone (`_UNKNOWN_`) do not count as a
+/// probe: they precede ordinary logins all the time (key exchange, agents
+/// trying methods). Score 1.5, +0.5 when the origin has no event of any
 /// kind before the cutoff.
 pub async fn probe_then_success(graph: &Graph, d: &Dialect, bf: &BaselineFacts) -> Vec<Finding> {
     let qs = format!(
-        "MATCH (a:host)-[r]->(b:host) WHERE r.time >= {t}
-         RETURN a.name AS o, type(r) AS acct,
+        "MATCH (a:host)-[r]->(b:host)
+         WHERE r.time >= {t} AND NOT type(r) IN {na} AND ({f} OR {ok})
+         RETURN a.name AS o, type(r) AS acct, b.name AS dst,
                 CASE WHEN {f} THEN 'F' ELSE 'S' END AS res,
-                count(*) AS n, collect(DISTINCT b.name) AS dests,
-                toString(min(r.time)) AS first",
+                toString(r.time) AS t",
         t = d.t(&bf.cutoff),
+        na = NO_ACCOUNT_TYPES,
         f = failed("r"),
+        ok = auth_ok("r"),
     );
-    // origin -> (failures: acct -> (first, dests, n), successes: acct -> (first, dests, n))
-    type Side = HashMap<String, (NaiveDateTime, Vec<String>, i64)>;
-    let mut per: HashMap<String, (Side, Side)> = HashMap::new();
+    struct Ev { t: NaiveDateTime, acct: String, dst: String }
+    let mut fails: HashMap<String, Vec<Ev>> = HashMap::new();
+    let mut succ: HashMap<String, Vec<Ev>> = HashMap::new();
+    let empty = HashSet::new();
     let mut s = match graph.execute(query(&qs)).await {
         Ok(s) => s,
         Err(e) => { eprintln!("  [probe-then-success] query failed: {}", e); return Vec::new(); }
@@ -415,73 +426,85 @@ pub async fn probe_then_success(graph: &Graph, d: &Dialect, bf: &BaselineFacts) 
     while let Ok(Some(row)) = s.next().await {
         let o: String = row.get("o").unwrap_or_default();
         let acct: String = row.get("acct").unwrap_or_default();
+        let dst: String = row.get("dst").unwrap_or_default();
         let res: String = row.get("res").unwrap_or_default();
-        let n: i64 = row.get("n").unwrap_or(0);
-        let dests: Vec<String> = row.get("dests").unwrap_or_default();
-        let first: String = row.get("first").unwrap_or_default();
-        let ft = match parse_ts(&first) { Some(t) => t, None => continue };
+        let ts: String = row.get("t").unwrap_or_default();
+        let t = match parse_ts(&ts) { Some(t) => t, None => continue };
         if o.is_empty() { continue; }
-        let e = per.entry(o).or_default();
         if res == "F" {
-            e.0.insert(acct, (ft, dests, n));
-        } else if !is_no_account(&acct) {
-            e.1.insert(acct, (ft, dests, n));
+            fails.entry(o).or_default().push(Ev { t, acct, dst });
+        } else {
+            // only successes that would be news: new origin, or an account
+            // this origin never used before the cutoff
+            let never_seen = !bf.known_origins.contains(&o);
+            let used = bf.accounts_by_origin.get(&o).unwrap_or(&empty);
+            if never_seen || !used.contains(&acct) {
+                succ.entry(o).or_default().push(Ev { t, acct, dst });
+            }
         }
     }
+
+    let window = chrono::Duration::hours(PROBE_WINDOW_HOURS);
     let mut out = Vec::new();
-    let empty = HashSet::new();
-    for (o, (fails, succ)) in per {
-        if fails.is_empty() || succ.is_empty() { continue; }
-        // A probe needs a refused NAMED account (`test`, a guessed user).
-        // Unauthenticated connections alone (`_UNKNOWN_`) precede ordinary
-        // logins all the time — key exchange, agents trying methods — and
-        // would flag every automation account.
-        let named_fails: Vec<NaiveDateTime> = fails.iter().filter(|(a, _)| !is_no_account(a)).map(|(_, v)| v.0).collect();
-        if named_fails.is_empty() { continue; }
-        let first_fail = *named_fails.iter().min().unwrap();
+    for (o, mut f) in fails {
+        let mut sv = match succ.remove(&o) { Some(v) => v, None => continue };
+        f.sort_by_key(|e| e.t);
+        sv.sort_by_key(|e| e.t);
+        // successes that fall within (tf, tf + 6h] of at least one failure
+        let mut matched: Vec<&Ev> = Vec::new();
+        let mut first_pair: Option<(NaiveDateTime, NaiveDateTime)> = None;
+        let mut i = 0usize; // index of the latest failure strictly before each success
+        for e in &sv {
+            while i < f.len() && f[i].t < e.t { i += 1; }
+            if i == 0 { continue; }
+            let prev = &f[i - 1];
+            if e.t - prev.t <= window {
+                if first_pair.is_none() { first_pair = Some((prev.t, e.t)); }
+                matched.push(e);
+            }
+        }
+        if matched.is_empty() { continue; }
         let never_seen = !bf.known_origins.contains(&o);
-        let used_before = bf.accounts_by_origin.get(&o).unwrap_or(&empty);
-        // successes with an account that never failed, starting after the
-        // first failure and within the window
-        let mut hits: Vec<(&String, &(NaiveDateTime, Vec<String>, i64))> = succ
-            .iter()
-            .filter(|(acct, v)| {
-                !fails.contains_key(*acct)
-                    && v.0 > first_fail
-                    && (v.0 - first_fail).num_hours() < PROBE_WINDOW_HOURS
-                    // the working account must be new for this origin (or the
-                    // origin itself new): a known job account is not a find
-                    && (never_seen || !used_before.contains(*acct))
-            })
-            .collect();
-        if hits.is_empty() { continue; }
-        hits.sort_by_key(|(_, v)| v.0);
         let score = 1.5 + if never_seen { 0.5 } else { 0.0 };
-        let mut fail_desc: Vec<String> = fails
-            .iter()
-            .map(|(a, v)| format!("{} x{} on {} host(s) from {}", a, v.2, v.1.len(), v.0.format("%Y-%m-%d %H:%M:%S")))
-            .collect();
-        fail_desc.sort();
-        let succ_desc: Vec<String> = hits
-            .iter()
-            .map(|(a, v)| format!("{} x{} on {} host(s) from {}", a, v.2, v.1.len(), v.0.format("%Y-%m-%d %H:%M:%S")))
-            .collect();
-        let gap = (hits[0].1 .0 - first_fail).num_minutes();
-        let ev: i64 = fails.values().map(|v| v.2).sum::<i64>() + hits.iter().map(|(_, v)| v.2).sum::<i64>();
+
+        let describe = |evs: &[&Ev]| -> String {
+            let mut per: HashMap<&str, (usize, HashSet<&str>, NaiveDateTime)> = HashMap::new();
+            for e in evs {
+                let x = per.entry(e.acct.as_str()).or_insert((0, HashSet::new(), e.t));
+                x.0 += 1;
+                x.1.insert(e.dst.as_str());
+                if e.t < x.2 { x.2 = e.t; }
+            }
+            let mut v: Vec<String> = per
+                .iter()
+                .map(|(a, (n, h, t))| format!("{} x{} on {} host(s) from {}", a, n, h.len(), t.format("%Y-%m-%d %H:%M:%S")))
+                .collect();
+            v.sort();
+            v.join("; ")
+        };
+        let (tf, ts) = first_pair.unwrap();
+        let f_refs: Vec<&Ev> = f.iter().filter(|e| e.t <= ts).collect();
+        let same = matched.iter().any(|m| f_refs.iter().any(|x| x.acct == m.acct));
         let summary = format!(
-            "{o}: refused attempts [{f}], then {gap} min later successful logins with a different account [{s}]. Origin {seen}.",
-            o = o, f = fail_desc.join("; "), gap = gap, s = succ_desc.join("; "),
+            "{o}: refused named attempts [{fd}], then successful logins with an account new for this origin [{sd}] \
+             ({gap} min after the preceding refusal{same}). Origin {seen}.",
+            o = o,
+            fd = describe(&f_refs),
+            sd = describe(&matched),
+            gap = (ts - tf).num_minutes(),
+            same = if same { "; includes the same account that had been refused" } else { "" },
             seen = if never_seen { "has no event of any kind before the cutoff" } else { "was already active before the cutoff" },
         );
-        let last = hits.iter().map(|(_, v)| v.0).max().unwrap();
+        let last = matched.iter().map(|e| e.t).max().unwrap();
+        let first = f_refs.first().map(|e| e.t).unwrap_or(tf);
         out.push(Finding {
             detector: "probe-then-success",
             host: o.clone(),
             origin: o.clone(),
             account: String::new(),
-            time_window: format!("{} .. {}", first_fail.format("%Y-%m-%dT%H:%M:%S"), last.format("%Y-%m-%dT%H:%M:%S")),
+            time_window: format!("{} .. {}", first.format("%Y-%m-%dT%H:%M:%S"), last.format("%Y-%m-%dT%H:%M:%S")),
             score,
-            events: ev.max(0) as u64,
+            events: (f_refs.len() + matched.len()) as u64,
             summary,
             cypher_snippet: browser_snippet(d, &o, None, None, &bf.cutoff, None),
         });
@@ -495,26 +518,32 @@ const PERIODIC_MIN_DAYS: usize = 3;
 const PERIODIC_TOD_SD_SECS: f64 = 900.0;
 const PERIODIC_RATE_CV: f64 = 0.10;
 const PERIODIC_MIN_DAILY: f64 = 24.0;
+const PERIODIC_MIN_INTERIOR_DAYS: usize = 3;
 pub const PERIODIC_FACTOR: f64 = 0.3;
 
 /// (origin, account) pairs that, in the window, behave like a scheduled job
 /// AND were already active from that origin before the cutoff:
 ///   * seen on >= 3 distinct days, and
-///   * either the time of day is nearly constant (sd < 15 min: a daily
-///     job) or the daily volume is nearly constant (CV < 10% over the
-///     interior days, >= 24/day: a probe every N minutes).
+///   * either the time of day is nearly constant (circular sd < 15 min:
+///     a daily job) or the daily volume is nearly constant (CV < 10% over
+///     >= 3 full interior days, >= 24/day: a probe every N minutes).
 /// A new periodic job (a freshly planted cron) is NOT demoted: the pair
 /// must already exist in the baseline.
 pub async fn periodic_pairs(graph: &Graph, d: &Dialect, bf: &BaselineFacts) -> HashSet<(String, String)> {
+    // Time of day as an angle on the 24 h circle: a job at 23:59 and 00:01
+    // is one time of day, not 86 000 s apart. Per (origin, account, day)
+    // we sum cos/sin of that angle; the circular standard deviation over
+    // all events is sqrt(-2 ln R) with R the mean resultant length.
     let qs = format!(
-        "MATCH (a:host)-[r]->(:host) WHERE r.time >= {t}
+        "MATCH (a:host)-[r]->(:host) WHERE r.time >= {t} AND {series}
          WITH a.name AS o, type(r) AS acct,
               r.time.year * 10000 + r.time.month * 100 + r.time.day AS day,
-              r.time.hour * 3600 + r.time.minute * 60 + r.time.second AS tod
-         RETURN o, acct, day, count(*) AS n, sum(tod) AS s, sum(tod * tod) AS ss",
-        t = d.t(&bf.cutoff)
+              2.0 * pi() * (r.time.hour * 3600 + r.time.minute * 60 + r.time.second) / 86400.0 AS ang
+         RETURN o, acct, day, count(*) AS n, sum(cos(ang)) AS c, sum(sin(ang)) AS s",
+        t = d.t(&bf.cutoff),
+        series = is_series("r"),
     );
-    struct Agg { days: Vec<(i64, f64)>, n: f64, s: f64, ss: f64 }
+    struct Agg { days: Vec<(i64, f64)>, n: f64, c: f64, s: f64 }
     let mut per: HashMap<(String, String), Agg> = HashMap::new();
     let mut st = match graph.execute(query(&qs)).await {
         Ok(s) => s,
@@ -525,33 +554,36 @@ pub async fn periodic_pairs(graph: &Graph, d: &Dialect, bf: &BaselineFacts) -> H
         let acct: String = row.get("acct").unwrap_or_default();
         let day: i64 = row.get("day").unwrap_or(0);
         let n: i64 = row.get("n").unwrap_or(0);
-        let s: f64 = row.get::<i64>("s").map(|v| v as f64).or_else(|| row.get::<f64>("s")).unwrap_or(0.0);
-        let ss: f64 = row.get::<i64>("ss").map(|v| v as f64).or_else(|| row.get::<f64>("ss")).unwrap_or(0.0);
-        let a = per.entry((o, acct)).or_insert(Agg { days: Vec::new(), n: 0.0, s: 0.0, ss: 0.0 });
+        let c: f64 = row.get("c").unwrap_or(0.0);
+        let sn: f64 = row.get("s").unwrap_or(0.0);
+        let a = per.entry((o, acct)).or_insert(Agg { days: Vec::new(), n: 0.0, c: 0.0, s: 0.0 });
         a.days.push((day, n as f64));
         a.n += n as f64;
-        a.s += s;
-        a.ss += ss;
+        a.c += c;
+        a.s += sn;
     }
     let mut out = HashSet::new();
     for ((o, acct), mut a) in per {
-        if a.days.len() < PERIODIC_MIN_DAYS { continue; }
+        if a.days.len() < PERIODIC_MIN_DAYS || a.n <= 0.0 { continue; }
         let known = if is_no_account(&acct) {
             bf.known_origins.contains(&o)
         } else {
             bf.accounts_by_origin.get(&o).map(|s| s.contains(&acct)).unwrap_or(false)
         };
         if !known { continue; }
-        let mean = a.s / a.n;
-        let sd = ((a.ss / a.n) - mean * mean).max(0.0).sqrt();
+        let r = ((a.c * a.c + a.s * a.s).sqrt() / a.n).clamp(1e-12, 1.0);
+        let circ_sd_secs = (-2.0 * r.ln()).max(0.0).sqrt() * 86400.0 / (2.0 * std::f64::consts::PI);
+        // Constant daily volume needs enough full days to mean anything:
+        // the first and last day of the window are partial, and with a
+        // single interior day the coefficient of variation is always 0.
         a.days.sort_by_key(|x| x.0);
         let interior: Vec<f64> = if a.days.len() > 2 { a.days[1..a.days.len() - 1].iter().map(|x| x.1).collect() } else { Vec::new() };
-        let rate_regular = if interior.len() >= 1 {
+        let rate_regular = if interior.len() >= PERIODIC_MIN_INTERIOR_DAYS {
             let m = interior.iter().sum::<f64>() / interior.len() as f64;
             let v = interior.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / interior.len() as f64;
             m >= PERIODIC_MIN_DAILY && (v.sqrt() / m) < PERIODIC_RATE_CV
         } else { false };
-        if sd < PERIODIC_TOD_SD_SECS || rate_regular {
+        if circ_sd_secs < PERIODIC_TOD_SD_SECS || rate_regular {
             out.insert((o, acct));
         }
     }

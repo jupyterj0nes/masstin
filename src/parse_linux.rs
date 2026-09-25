@@ -769,6 +769,9 @@ fn parse_secure_or_messages(
     out
 }
 
+/// Records of one sshd pid arriving closer than this are one connection.
+const AUDIT_SESSION_GAP_SECS: i64 = 600;
+
 // audit.log* ------------------------------------------------------------------
 // One SSH login leaves several auditd records: USER_AUTH for each PAM /
 // key stage (`op=pubkey_auth`, `op=key`, `op=PAM:authentication`) and then
@@ -781,7 +784,9 @@ fn parse_secure_or_messages(
 fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
     let mut out = Vec::new();
     let mut auth_fallback: Vec<RawEvt> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, i64, String, String, String)> = std::collections::HashSet::new();
+    // (pid, source, account, record:outcome) -> last second seen. See the
+    // dedup comment below.
+    let mut last_seen: HashMap<(String, String, String, String), i64> = HashMap::new();
     let uid_name = |uid: &str| -> Option<String> {
         let u: u32 = uid.parse().ok()?;
         if u == 4294967295 { return None; }
@@ -849,12 +854,22 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
 
         let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
 
-        // Same sshd pid, same second, same outcome: one connection.
+        // One sshd process = one connection. sshd writes USER_LOGIN again
+        // for every channel a connection opens (scp, sftp, ansible, a
+        // second shell), seconds or minutes apart, all under the same pid:
+        // keying on the exact second turned one connection into up to ten
+        // "logins". Records of the same pid, source, account and outcome
+        // are collapsed while they keep arriving less than
+        // AUDIT_SESSION_GAP_SECS apart (rolling), so pid reuse days later
+        // still counts as a new connection.
         let pid = AUDIT_PID_RE
             .captures(&line)
             .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
-        if !seen.insert((pid, secs, ip.clone(), user.clone(), format!("{}:{}", evt_type, evt))) {
+        let key = (pid, ip.clone(), user.clone(), format!("{}:{}", evt_type, evt));
+        let repeat = matches!(last_seen.get(&key), Some(&prev) if (secs - prev).abs() <= AUDIT_SESSION_GAP_SECS);
+        last_seen.insert(key, secs);
+        if repeat {
             continue;
         }
 

@@ -7,7 +7,7 @@
 //
 // 2. Corroboration. Independent detectors firing on the same ORIGIN are
 //    stronger evidence than any of them alone. Each row gets
-//        final = score + CORROBORATION_BONUS x (other detectors on its origin)
+//        final = score + CORROBORATION_BONUS x (other evidence FAMILIES on its origin)
 //    and a `corroboration` column listing them. Periodic-demoted rows keep
 //    their demotion (the bonus is scaled by the same factor).
 //
@@ -85,13 +85,19 @@ pub fn emit_csv(findings: &[Finding], output: Option<&str>) -> std::io::Result<(
     let mut rows: Vec<(f64, Group, String)> = groups
         .drain(..)
         .map(|g| {
-            let others: Vec<&str> = by_origin
+            let dets: Vec<&str> = by_origin
                 .get(&g.rep.origin)
                 .map(|s| s.iter().copied().filter(|d| *d != g.rep.detector).collect())
                 .unwrap_or_default();
+            // The bonus counts independent KINDS of evidence, not detectors:
+            // novel-edge, community-bridge and origin-fanout are all built on
+            // the same fact ("this origin reached a destination it never had")
+            // and must not reinforce each other.
+            let own = family(g.rep.detector);
+            let fams: BTreeSet<&str> = dets.iter().map(|d| family(d)).filter(|f| *f != own).collect();
             let demoted = g.rep.summary.contains("[periodic:");
-            let bonus = CORROBORATION_BONUS * others.len() as f64 * if demoted { super::PERIODIC_FACTOR } else { 1.0 };
-            let corr = others.join("+");
+            let bonus = CORROBORATION_BONUS * fams.len() as f64 * if demoted { super::PERIODIC_FACTOR } else { 1.0 };
+            let corr = dets.join("+");
             (g.score + bonus, g, corr)
         })
         .collect();
@@ -129,6 +135,21 @@ pub fn emit_csv(findings: &[Finding], output: Option<&str>) -> std::io::Result<(
         None => print!("{}", buf),
     }
     Ok(())
+}
+
+/// Evidence family of a detector: detectors in the same family are
+/// derived from the same underlying fact.
+fn family(detector: &str) -> &'static str {
+    match detector {
+        "novel-edge" | "community-bridge" | "origin-fanout" => "new-destination",
+        "probe-then-success" => "probe",
+        "cred-rotation" => "account-rotation",
+        "failed-sweep" => "failures",
+        "chain-motif" => "chain",
+        "rare-logon-type" => "logon-type",
+        "pagerank-spike" | "betweenness-spike" => "centrality",
+        _ => "other",
+    }
 }
 
 fn csv_escape(s: &str) -> String {

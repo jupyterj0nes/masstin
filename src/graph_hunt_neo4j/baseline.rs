@@ -143,6 +143,23 @@ impl Baseline {
     pub fn host_count(&self) -> usize {
         self.hosts.len().max(1)
     }
+
+    /// Hosts that received at least one authenticated login before the
+    /// cutoff. This, not host_count (origins + destinations), is the
+    /// denominator for "what fraction of the estate does this origin
+    /// reach": in a collected-logs corpus there are hundreds of origins
+    /// and a few dozen destinations, and dividing by all nodes made the
+    /// fraction unable to exceed a few percent.
+    /// Did this origin log in with this account (anywhere) before the cutoff?
+    pub fn origin_used_account(&self, origin: &str, user: &str) -> bool {
+        self.edge_pairs
+            .iter()
+            .any(|((o, _), st)| o == origin && st.users.contains(user))
+    }
+
+    pub fn destination_count(&self) -> usize {
+        self.hosts.values().filter(|h| !h.incoming_sources.is_empty()).count().max(1)
+    }
 }
 
 /// Format a DateTime<Utc> as Memgraph's `datetime()` string. The loader

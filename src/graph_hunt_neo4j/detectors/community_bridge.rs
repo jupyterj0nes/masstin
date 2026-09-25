@@ -151,9 +151,13 @@ pub async fn run(graph: &Graph, bl: &Baseline, projection: &str) -> Vec<Finding>
                 // hosts (SIEM, monitoring, SCCM, backup) legitimately
                 // touch many communities; their cross-community window
                 // edges are operational rotation, not signal.
-                let host_count = bl.host_count() as f64;
+                let host_count = bl.destination_count() as f64;
                 let origin_outdeg = bl.outgoing_degree(&origin) as f64;
-                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION {
+                // Rotation = a known account of an infrastructure origin reaching
+                // one more host. A NEW account on such an origin is not rotation.
+                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION
+                    && bl.origin_used_account(&origin, &user)
+                {
                     continue;
                 }
 
