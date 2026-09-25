@@ -86,15 +86,17 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             None => continue,
         };
 
-        // SSH success: "Accepted (password|publickey) for USER from IP"
+        // SSH success: "Accepted <method> for USER from SRC" (captures:
+        // 1 method, 2 user, 3 source — shared regex with parse_linux)
         if let Some(cap) = SSH_OK_RE.captures(&msg) {
-            let user = cap[1].to_string();
-            let ip = cap[2].to_string();
+            let method = cap[1].to_string();
+            let user = cap[2].to_string();
+            let src = cap[3].to_string();
             out.push(RawEvt {
                 ts_rfc3339: ts_rfc3339.clone(),
                 user,
-                remote: ip,
-                tty_or_proc: "journal-ssh".into(),
+                remote: src,
+                tty_or_proc: format!("journal-ssh/{}", method),
                 evt: "SSH_SUCCESS".into(),
                 filename: path.display().to_string(),
                 dst_host: dst_host.to_string(),
@@ -103,15 +105,20 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             continue;
         }
 
-        // SSH failure: "Failed password for USER from IP"
+        // SSH failure: "Failed <method> for [invalid user] USER from SRC"
+        // (captures: 1 method, 2 invalid-user marker, 3 user, 4 source).
+        // "Failed none" is the method-query probe, not an attempt.
         if let Some(cap) = SSH_FAIL_RE.captures(&msg) {
-            let user = cap[1].to_string();
-            let ip = cap[2].to_string();
+            let method = cap[1].to_string();
+            if method == "none" { continue; }
+            let invalid = cap.get(2).is_some();
+            let user = cap[3].to_string();
+            let src = cap[4].to_string();
             out.push(RawEvt {
                 ts_rfc3339,
                 user,
-                remote: ip,
-                tty_or_proc: "journal-ssh".into(),
+                remote: src,
+                tty_or_proc: if invalid { format!("journal-ssh/{} invalid-user", method) } else { format!("journal-ssh/{}", method) },
                 evt: "SSH_FAILED".into(),
                 filename: path.display().to_string(),
                 dst_host: dst_host.to_string(),

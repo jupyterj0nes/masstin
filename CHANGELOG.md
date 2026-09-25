@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `parse-linux`: **UAC (Unix-like Artifacts Collector) triage detection**, alongside KAPE / Velociraptor / Cortex XDR. Detected by `uac.log` + `[root]/` layout or by the `uac-<host>-<os>-<timestamp>` filename; hostname from the filename, `[root]/etc/hostname`, `/etc/sysconfig/network`, `uac.log`, `/etc/hosts` or the syslog header when UAC was run against a mounted image (`unknown`).
+- `parse-linux`: **tar / tar.gz / tgz archives** are now walked (streamed, selective extraction of log files only), including nested combinations (zip → tar.gz, tar.gz → tar.gz). Archives copied off the victim filesystem under `[root]/` are never recursed into.
+- `parse-linux`: rotated `wtmp-YYYYMMDD` / `btmp-YYYYMMDD[.gz]` are parsed; the logrotate suffix drives the year of RFC3164 timestamps in rotated `secure` / `messages` / `auth.log` files.
+- `parse-linux`: `log_filename` shows `<archive>:<path inside>` for artifacts that came out of an archive instead of a temp path; `/etc/hosts` no longer yields `localhost.localdomain` as a hostname.
+- ZIP extraction streams entries to disk instead of loading the whole archive into memory.
+- `parse-linux`: **RFC3164 timestamps converted from the host's local zone to UTC** (zone from `/etc/timezone`, `/etc/sysconfig/clock`, `/etc/localtime` symlink or TZif contents, or live `timedatectl`). Previously syslog lines were taken as UTC and sat hours away from wtmp / audit / journald for the same login.
+- `parse-linux`: sshd regexes generalised — any `Accepted <method>`, `Failed <method>` **including `invalid user`** (previously unmatched), and `not allowed because` policy denials; method recorded in `detail`. `Failed none` probes ignored. `pam_unix(sshd:auth)` failures demoted to a fallback (false failed logons on SSSD hosts).
+- `parse-linux`: wtmp/utmp/secure keep sources that are hostnames, not only IPs (`UseDNS yes` estates lost >99% of wtmp). Boot / runlevel utmp records dropped.
+- `parse-linux`: **lastlog parsed** (last login per account, uid resolved via the collected `/etc/passwd`).
+- `parse-linux`: journald ⟷ rsyslog duplicates removed across files; truncated archives reported with a warning.
+
 ## v1.0.0 — 2026-04-21
 
 ### First official release

@@ -139,6 +139,10 @@ pub(crate) enum TriageType {
     Kape,
     Velociraptor,
     CortexXdr,
+    /// UAC — Unix-like Artifacts Collector (https://github.com/tclahr/uac).
+    /// Linux / macOS / *BSD / Solaris / ESXi triage. Output is a tar.gz by
+    /// default (zip with `-f zip`) named `uac-<host>-<os>-<YYYYMMDDhhmmss>`.
+    Uac,
 }
 
 impl TriageType {
@@ -147,6 +151,7 @@ impl TriageType {
             TriageType::Kape => "KAPE",
             TriageType::Velociraptor => "Velociraptor Offline Collector",
             TriageType::CortexXdr => "Cortex XDR Offline Collector",
+            TriageType::Uac => "UAC (Unix-like Artifacts Collector)",
         }
     }
     pub(crate) fn short_label(&self) -> &'static str {
@@ -154,8 +159,44 @@ impl TriageType {
             TriageType::Kape => "KAPE",
             TriageType::Velociraptor => "Velociraptor",
             TriageType::CortexXdr => "Cortex XDR",
+            TriageType::Uac => "UAC",
         }
     }
+}
+
+/// Archive stem without the compression AND container extensions:
+/// `host.zip` → `host`, `uac-x-linux-2026.tar.gz` → `uac-x-linux-2026`,
+/// `dump.tgz` → `dump`. `Path::file_stem` alone would leave the `.tar` in.
+pub(crate) fn archive_stem(archive_path: &str) -> Option<String> {
+    let name = std::path::Path::new(archive_path).file_name()?.to_str()?;
+    let lower = name.to_lowercase();
+    let cut = if lower.ends_with(".tar.gz") {
+        name.len() - 7
+    } else if lower.ends_with(".tgz") || lower.ends_with(".tar") || lower.ends_with(".zip") {
+        name.len() - 4
+    } else {
+        match name.rfind('.') {
+            Some(i) if i > 0 => i,
+            _ => name.len(),
+        }
+    };
+    Some(name[..cut].to_string())
+}
+
+/// UAC output naming convention: `uac-<hostname>-<os>-<YYYYMMDDhhmmss>`.
+/// `<os>` is one of the UAC platform names (linux, macos, freebsd, ...),
+/// the trailing stamp is exactly 14 digits. The hostname itself may contain
+/// dashes, so we anchor on the tail: `-<alpha>-<14 digits>`.
+fn is_uac_filename(stem: &str) -> bool {
+    if !stem.starts_with("uac-") { return false; }
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 4 { return false; }
+    let stamp = parts[parts.len() - 1];
+    let os = parts[parts.len() - 2];
+    stamp.len() == 14
+        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && !os.is_empty()
+        && os.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +248,32 @@ fn is_velociraptor_path(zip_path: &str) -> bool {
 /// filename convention under a `Velociraptor/` parent directory).
 /// Returns None if the ZIP doesn't match any known triage layout.
 pub(crate) fn detect_triage_type(zip_path: &str, entries: &[String]) -> Option<TriageType> {
+    // 0. UAC (Unix-like Artifacts Collector). Every UAC archive carries the
+    //    run log `uac.log` at its root, the collected files under `[root]/`
+    //    and the live-response output under `live_response/`. Require the
+    //    run log PLUS one of the two layout directories so an unrelated
+    //    archive that merely contains a file called uac.log is not
+    //    misclassified. GNU tar may prefix entries with `./`.
+    let has_uac_log = entries.iter().any(|n| {
+        let t = n.replace('\\', "/");
+        let t = t.trim_start_matches("./");
+        t == "uac.log" || t.ends_with("/uac.log")
+    });
+    let has_uac_layout = entries.iter().any(|n| {
+        let t = n.replace('\\', "/");
+        let t = t.trim_start_matches("./");
+        t.starts_with("[root]/") || t.contains("/[root]/")
+            || t.starts_with("live_response/") || t.contains("/live_response/")
+    });
+    if has_uac_log && has_uac_layout {
+        return Some(TriageType::Uac);
+    }
+    //    Filename fallback: `uac-<host>-<os>-<YYYYMMDDhhmmss>` is UAC's
+    //    enforced output name; no other collector uses it.
+    if archive_stem(zip_path).map(|s| is_uac_filename(&s)).unwrap_or(false) {
+        return Some(TriageType::Uac);
+    }
+
     // 1. Cortex XDR Offline Collector — REQUIRE BOTH `output/manifest.json`
     //    AND `output/cortex-xdr-payload.log` together at the OUTER zip root.
     //
@@ -312,10 +379,24 @@ pub(crate) fn detect_triage_type(zip_path: &str, entries: &[String]) -> Option<T
 
 /// Best-effort hostname extraction from a triage zip filename.
 pub(crate) fn extract_triage_hostname(zip_path: &str, kind: TriageType) -> Option<String> {
-    let stem = std::path::Path::new(zip_path)
-        .file_stem()
-        .and_then(|s| s.to_str())?;
+    let stem_owned = archive_stem(zip_path)?;
+    let stem = stem_owned.as_str();
     match kind {
+        TriageType::Uac => {
+            // uac-<hostname>-<os>-<YYYYMMDDhhmmss>; hostname may contain
+            // dashes, so drop the fixed prefix and the two trailing fields.
+            if !is_uac_filename(stem) { return None; }
+            let parts: Vec<&str> = stem.split('-').collect();
+            let host = parts[1..parts.len() - 2].join("-");
+            // UAC writes "unknown" when it was run against a mounted
+            // image (`-m /mnt/sysroot`); leave it to the log-content
+            // heuristics (/etc/hostname, syslog header) in that case.
+            if host.is_empty() || host.eq_ignore_ascii_case("unknown") {
+                None
+            } else {
+                Some(host)
+            }
+        }
         TriageType::CortexXdr => {
             // offline_collector_output_<HOST>_<YYYY-MM-DD>_<HH-MM-SS>
             let prefix = "offline_collector_output_";
