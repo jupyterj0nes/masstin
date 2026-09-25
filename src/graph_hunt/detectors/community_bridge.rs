@@ -17,6 +17,7 @@ use crate::graph_hunt::baseline::Baseline;
 use crate::graph_hunt::detectors::Finding;
 use futures::stream::*;
 use neo4rs::*;
+use crate::graph_hunt_common::{auth_ok, browser_snippet, MEMGRAPH as D};
 use std::collections::{HashMap, HashSet};
 
 /// Context gate thresholds — same calibration as
@@ -60,13 +61,15 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     // Step 3: walk the window edges, emit findings on genuine bridges.
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time >= localDateTime('{}')
+         WHERE r.time >= localDateTime('{}') AND {}
          RETURN a.name AS origin,
                 b.name AS destination,
                 type(r) AS user,
-                toString(r.logon_type) AS logon_type,
-                toString(r.time) AS event_time",
-        cutoff_str
+                toString(head(collect(r.logon_type))) AS logon_type,
+                toString(min(r.time)) AS event_time,
+                toString(max(r.time)) AS last_time,
+                count(*) AS n",
+        cutoff_str, auth_ok("r")
     );
 
     let mut findings: Vec<Finding> = Vec::new();
@@ -86,6 +89,8 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 let user: String = row.get("user").unwrap_or_default();
                 let logon_type: String = row.get("logon_type").unwrap_or_default();
                 let event_time: String = row.get("event_time").unwrap_or_default();
+                let last_time: String = row.get("last_time").unwrap_or_default();
+                let n: i64 = row.get("n").unwrap_or(1);
 
                 if origin.is_empty() || destination.is_empty() {
                     continue;
@@ -103,6 +108,13 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     continue;
                 }
 
+                // Origin must have authenticated history before the cutoff:
+                // a brand-new origin has no community of its own (it is a
+                // singleton in the baseline Louvain run), so every edge it
+                // makes would "bridge" trivially and only repeat novel-edge.
+                if bl.outgoing_degree(&origin) == 0 {
+                    continue;
+                }
                 let oc = community_of.get(&origin).copied();
                 let dc = community_of.get(&destination).copied();
                 let (oc, dc) = match (oc, dc) {
@@ -135,16 +147,15 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     oc = oc, dc = dc, user = user, lt = logon_type,
                 );
 
-                let snippet = format!(
-                    "MATCH (a:host {{name: '{}'}})-[r]->(b:host {{name: '{}'}}) \
-                     WHERE r.time = localDateTime('{}') RETURN a, r, b",
-                    origin, destination, event_time
-                );
+                let snippet = browser_snippet(&D, &origin, Some(&destination), Some(&user), &event_time, Some(&last_time));
 
                 findings.push(Finding {
                     detector: "community-bridge",
                     host: destination,
-                    time_window: event_time,
+                    origin: origin.clone(),
+                    account: user.clone(),
+                    events: n.max(1) as u64,
+                    time_window: format!("{} .. {}", event_time, last_time),
                     score,
                     summary,
                     cypher_snippet: snippet,
@@ -183,9 +194,9 @@ async fn fetch_origin_baseline_communities(
 ) -> neo4rs::Result<HashMap<String, HashSet<i64>>> {
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time < localDateTime('{}')
+         WHERE r.time < localDateTime('{}') AND {}
          RETURN a.name AS origin, collect(DISTINCT b.name) AS dests",
-        cutoff_str
+        cutoff_str, auth_ok("r")
     );
     let mut stream = graph.execute(query(&q)).await?;
     let mut out: HashMap<String, HashSet<i64>> = HashMap::new();

@@ -16,14 +16,7 @@ mod community_bridge;
 mod cred_rotation;
 mod rare_logon_type;
 
-pub struct Finding {
-    pub detector: &'static str,
-    pub host: String,
-    pub time_window: String,
-    pub score: f64,
-    pub summary: String,
-    pub cypher_snippet: String,
-}
+pub use crate::graph_hunt_common::Finding;
 
 #[derive(Clone, Copy)]
 struct DetectorSpec {
@@ -32,6 +25,9 @@ struct DetectorSpec {
 }
 
 const DETECTORS: &[DetectorSpec] = &[
+    DetectorSpec { name: "origin-fanout",      requires_ungrouped: false },
+    DetectorSpec { name: "probe-then-success", requires_ungrouped: true  },
+    DetectorSpec { name: "failed-sweep",       requires_ungrouped: false },
     DetectorSpec { name: "novel-edge",        requires_ungrouped: false },
     DetectorSpec { name: "community-bridge",  requires_ungrouped: false },
     DetectorSpec { name: "rare-logon-type",   requires_ungrouped: false },
@@ -64,6 +60,14 @@ pub async fn run_all(
     projection: &str,
 ) -> Vec<Finding> {
     let mut all: Vec<Finding> = Vec::new();
+    let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let d = crate::graph_hunt_common::NEO4J;
+    // Baseline facts shared by the origin-level detectors and the
+    // periodicity pass.
+    let facts = match crate::graph_hunt_common::fetch_baseline_facts(graph, &d, &cutoff_str).await {
+        Ok(f) => Some(f),
+        Err(e) => { eprintln!("  [baseline-facts] query failed: {}", e); None }
+    };
 
     for spec in DETECTORS {
         if !enabled(spec, bl.mode, skip, only) {
@@ -83,11 +87,20 @@ pub async fn run_all(
             "community-bridge" => community_bridge::run(graph, bl, projection).await,
             "cred-rotation" => cred_rotation::run(graph, bl).await,
             "rare-logon-type" => rare_logon_type::run(graph, bl).await,
+            "origin-fanout" => match &facts { Some(f) => crate::graph_hunt_common::origin_fanout(graph, &d, f).await, None => Vec::new() },
+            "probe-then-success" => match &facts { Some(f) => crate::graph_hunt_common::probe_then_success(graph, &d, f).await, None => Vec::new() },
+            "failed-sweep" => match &facts { Some(f) => crate::graph_hunt_common::failed_sweep(graph, &d, f).await, None => Vec::new() },
             _ => Vec::new(),
         };
 
         eprintln!("         -> {} finding(s)", findings.len());
         all.extend(findings);
+    }
+
+    // Demote scheduled, pre-existing activity (monitoring probes,
+    // inventory jobs) instead of relying on allow-lists.
+    if let Some(f) = &facts {
+        crate::graph_hunt_common::apply_periodicity(graph, &d, f, &mut all).await;
     }
 
     all

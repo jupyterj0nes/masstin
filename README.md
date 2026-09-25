@@ -632,14 +632,14 @@ When the variable is unset or empty the loader falls back to the interactive pro
 
 ### Detect lateral movement: graph-hunt
 
-Once the graph is loaded, masstin can run 7 detectors against it that surface lateral-movement anomalies — novel edges, chain motifs, credential rotation, community bridges, PageRank/betweenness spikes, rare logon types. Two flavors:
+Once the graph is loaded, masstin can run 10 detectors against it that surface lateral-movement anomalies — origin fan-out, probe-then-success, failed sweeps, novel edges, chain motifs, credential rotation, community bridges, PageRank/betweenness spikes, rare logon types. Two flavors:
 
 - **`-a graph-hunt`** — targets **Memgraph**. Uses MAGE algorithms (`pagerank.get`, `community_detection.get`, `betweenness_centrality.get`) that ship with the default Memgraph install. No extra plugin needed.
 - **`-a graph-hunt-neo4j`** — targets **Neo4j**. Uses the Neo4j Graph Data Science (GDS) library. **Requires GDS to be installed in the target Neo4j instance** (see prerequisites below).
 
 #### Prerequisites for `graph-hunt-neo4j`
 
-The detector calls procedures from the Graph Data Science plugin. masstin uses the GDS 2.x API (`gds.graph.project`, `gds.pageRank.stream`, `gds.louvain.stream`, `gds.betweenness.stream`), which means **Neo4j 5.x or later with GDS 2.x** is required. The cleanest install path is via Neo4j Desktop's UI:
+The detector calls procedures from the Graph Data Science plugin: `gds.pageRank.stream`, `gds.louvain.stream`, `gds.betweenness.stream` and a Cypher projection. Both **GDS 2.x (Neo4j 5.x / 2026.x)** and **GDS 1.x (Neo4j 4.x)** work: the generation is detected with `gds.version()` and the projection uses `gds.graph.project` or `gds.graph.create.cypher` accordingly. The cleanest install path is via Neo4j Desktop's UI:
 
 1. Open **Neo4j Desktop** → select your instance.
 2. Click the **`...`** menu (top-right of the instance card) → **Plugins**.
@@ -706,7 +706,17 @@ As a rule of thumb: 6 GB heap comfortably handles ~15 M edges + projection on a 
 
 #### Filtering detectors
 
-If the analyst only wants specific signals, `--only-detectors` / `--skip-detectors` accept a comma-separated list of detector names: `novel-edge`, `chain-motif`, `pagerank-spike`, `betweenness-spike`, `community-bridge`, `cred-rotation`, `rare-logon-type`. The two options are mutually exclusive.
+If the analyst only wants specific signals, `--only-detectors` / `--skip-detectors` accept a comma-separated list of detector names: `origin-fanout`, `probe-then-success`, `failed-sweep`, `novel-edge`, `chain-motif`, `pagerank-spike`, `betweenness-spike`, `community-bridge`, `cred-rotation`, `rare-logon-type`. The two options are mutually exclusive.
+
+#### How the hunt reads the graph
+
+- **Authenticated logins only for structure.** novel-edge, community-bridge, chain-motif, rare-logon-type, the baseline and the GDS projections (PageRank, betweenness, Louvain) use only successful logins with a real account. Failed and unauthenticated attempts (`_UNKNOWN_`, `NO_USER`) are not connectivity — a scanner "reaching" every host reached none — and are reported by `failed-sweep` instead. Louvain runs on a projection weighted by login count.
+- **Origin-level detectors.** `origin-fanout` emits one row per origin that logged in to 3+ destinations it had never reached, scored by origin novelty, breadth and burst (destinations first reached within 60 s). `probe-then-success` flags an origin whose named account was refused and that, within 6 h, logged in with a different account that is new for it. `failed-sweep` summarises refused / unauthenticated attempts per origin (score capped below any authenticated anomaly).
+- **Periodicity.** (origin, account) pairs that repeat at the same time every day, or at a constant daily rate, AND already existed before the cutoff are demoted x0.3 — monitoring probes and inventory jobs sink without an allow-list, while a freshly planted cron is not demoted.
+- **Corroboration.** Each row gains +0.25 per other detector firing on the same origin; the `corroboration` column lists them.
+- **Coverage warning.** Edges carry `log_source` (secure, wtmp, audit, journal, lastlog, evtx...). The hunt warns when the cutoff leaves a source with < 14 days of continuous baseline on some hosts — anything seen only there would look new for lack of history.
+- **Output.** `rank, score, events, detector, origin, host, time_window, corroboration, summary, cypher_snippet`. On Neo4j the snippet is a Browser-ready query returning an APOC virtual graph (one relationship per origin/account/destination/result with `count`, `primero`, `ultimo`); virtual nodes stop the Browser's "connect result nodes" from pulling the full history and hanging. Style: drag `neo4j-resources/style.grass` onto the Browser.
+- **IP ↔ hostname.** The loaders annotate IP nodes with `resolved_name` / `resolved_votes` when the same Linux login appears once with the IP (auditd, btmp) and once with the name (sshd `UseDNS`), unanimously and at least twice. Nodes are not merged: the name is the destination's reverse DNS at that moment.
 
 ```bash
 # Run only novelty + chain detectors
@@ -716,6 +726,8 @@ masstin -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j \
 ```
 
 #### Detection quality
+
+> The figures below were measured before the September 2026 detector rework (authenticated-only structure, origin-level detectors, periodicity, corroboration) and have not been re-run yet.
 
 `graph-hunt-neo4j` is validated on a dual-corpus harness — a small control corpus (50 hosts, 14 users, 5M events) plus a stress corpus modeling a 200-host / 85-account enterprise (3.87M events). Headline numbers on the stress corpus:
 

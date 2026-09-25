@@ -15,6 +15,20 @@
 - `parse-linux`: audit.log now keeps `USER_LOGIN` only (one record per SSH connection; `USER_AUTH` PAM/key stages were producing 3–4 rows per login and are used only as a fallback), collapses the duplicate `USER_LOGIN` pairs sshd writes per pid, resolves the `id=`/`auid=` uid of successful logins through the collected `/etc/passwd` (previously an empty user → `NO_USER` in the graph) and tags `acct="(unknown)"` failures as `audit invalid-user` in `detail`. `logon_type` is `SSH` on every Linux row.
 - `load-neo4j`: **fix silent edge loss** — host nodes were merged lazily every 256 names while edge batches went out every 5000 rows; batches whose origin node did not exist yet were dropped by Cypher without an error while the summary still counted them (a 76k-row timeline came out as 21k edges). Nodes are now flushed before every edge batch and the summary reports the server-side count. Edges carry `event_type` and `event_id` so success and failure can be told apart in the graph.
 - `graph-hunt` / `graph-hunt-neo4j`: findings CSV is aggregated per (detector, host, origin/user/destination pattern) with an `events` column and a first..last `time_window`, instead of one row per edge (a 9000-attempt brute force is one row, not 9000).
+- `graph-hunt` / `graph-hunt-neo4j` detector rework:
+  - structural detectors, the baseline and the GDS projections use **authenticated logins with a real account only**; failed / unauthenticated attempts go to the new `failed-sweep` detector. Fixes PageRank / betweenness "spikes" caused by monitoring probes.
+  - new **`origin-fanout`** (one row per origin reaching 3+ never-reached destinations, scored by novelty, breadth and 60 s burst) and **`probe-then-success`** (refused named account, then within 6 h a login with a different account new for that origin).
+  - **periodicity demotion** (x0.3) for (origin, account) pairs that repeat daily at a fixed time or constant rate and already existed before the cutoff.
+  - **corroboration**: +0.25 per other detector on the same origin; new `origin`, `corroboration` columns.
+  - community-bridge only for origins with authenticated baseline history; Louvain on a login-count-weighted projection.
+  - novel-edge / community-bridge aggregate per (origin, account, destination) in Cypher (events + first..last).
+  - lastlog counts as proof a relationship existed, not as frequency.
+  - Browser-ready snippets on Neo4j (APOC virtual graph — no "connect result nodes" explosion).
+  - coverage warning per log source (needs `log_source` on edges).
+  - shared code in `graph_hunt_common` for both backends.
+- `load-neo4j` / `load-memgraph`: `count` stored as an integer (was a string); edges carry `event_type`, `event_id`, `log_source`; IP nodes annotated with `resolved_name` from unanimous same-login IP/name pairs (not merged); **grouped mode keyed by source and outcome** — two origins using the same account on the same host used to collapse into one edge, and refused attempts merged with successes.
+- `neo4j-resources/style.grass`: fixed syntax (missing colons — Neo4j Browser ignored the file), host name as node caption, `origen` label style.
+- `parse-linux`: prints per-host log coverage (continuous since) for each source family. CSV output unchanged.
 - `graph-hunt-neo4j`: works on GDS 1.x again (Neo4j 4.x installs): falls back to `gds.graph.create` / `gds.graph.create.cypher` when `gds.graph.project` is not registered.
 
 ## v1.0.0 — 2026-04-21

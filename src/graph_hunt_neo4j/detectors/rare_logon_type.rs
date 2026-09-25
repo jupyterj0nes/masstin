@@ -19,6 +19,7 @@
 
 use crate::graph_hunt_neo4j::baseline::Baseline;
 use crate::graph_hunt_neo4j::detectors::Finding;
+use crate::graph_hunt_common::{auth_ok, is_series};
 use futures::stream::*;
 use neo4rs::*;
 use std::collections::{HashMap, HashSet};
@@ -70,13 +71,13 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time >= datetime('{}')
+         WHERE r.time >= datetime('{}') AND {}
          RETURN a.name AS origin,
                 b.name AS destination,
                 type(r) AS user,
                 toString(r.logon_type) AS logon_type,
                 toString(r.time) AS event_time",
-        cutoff_str
+        cutoff_str, auth_ok("r")
     );
 
     let mut findings: Vec<Finding> = Vec::new();
@@ -166,6 +167,9 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 findings.push(Finding {
                     detector: "rare-logon-type",
+                    origin: origin.clone(),
+                    account: user.clone(),
+                    events: 1,
                     host: destination,
                     time_window: event_time,
                     score,
@@ -193,9 +197,9 @@ async fn fetch_baseline_by_class(
 ) -> neo4rs::Result<HashMap<String, HashMap<String, u64>>> {
     let q = format!(
         "MATCH ()-[r]->(b:host)
-         WHERE r.time < datetime('{}')
+         WHERE r.time < datetime('{}') AND {} AND {}
          RETURN toString(r.logon_type) AS lt, b.name AS dst, count(r) AS c",
-        cutoff_str
+        cutoff_str, auth_ok("r"), is_series("r")
     );
     let mut stream = graph.execute(query(&q)).await?;
     let mut by_class: HashMap<String, HashMap<String, u64>> = HashMap::new();

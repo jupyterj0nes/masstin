@@ -955,6 +955,73 @@ fn resolve_audit_uids(rows: &mut Vec<RawEvt>) {
     }
 }
 
+// ────────────────────────── log coverage ─────────────────────────────────────
+/// Log family of an artifact file name, e.g. `secure-20260830.gz` -> secure.
+pub(crate) fn log_family(filename: &str) -> &'static str {
+    let base = filename
+        .rsplit(|c| c == '/' || c == '\\' || c == ':')
+        .next()
+        .unwrap_or(filename)
+        .to_lowercase();
+    if base.starts_with("secure") || base.starts_with("auth.log") { "secure" }
+    else if base.starts_with("messages") { "messages" }
+    else if base.starts_with("wtmp") { "wtmp" }
+    else if base.starts_with("btmp") { "btmp" }
+    else if base.starts_with("utmp") { "utmp" }
+    else if base == "lastlog" { "lastlog" }
+    else if base.starts_with("audit.log") { "audit" }
+    else if base.ends_with(".journal") || base.ends_with(".journal~") { "journal" }
+    else if base.ends_with(".evtx") { "evtx" }
+    else { "other" }
+}
+
+/// First day of the most recent stretch of days with no gap longer than
+/// `max_gap` days. A log family whose files were rotated away has old,
+/// isolated records (a 2023 wtmp, a lastlog entry) and then a continuous
+/// recent block; only the block is usable as a baseline.
+pub(crate) fn continuous_since(days: &mut Vec<NaiveDate>, max_gap: i64) -> Option<NaiveDate> {
+    days.sort();
+    days.dedup();
+    let mut start = *days.last()?;
+    for w in days.windows(2).rev() {
+        if (w[1] - w[0]).num_days() > max_gap { break; }
+        start = w[0];
+    }
+    Some(start)
+}
+
+/// Print, per destination host, from when each log family has continuous
+/// data. Anomaly detection against a baseline is only meaningful from the
+/// point every relevant source is present: before the first surviving
+/// `secure` rotation, sshd-only facts (source IP, auth method) are simply
+/// not visible.
+fn print_coverage(rows: &[&RawEvt]) {
+    let fams = ["secure", "journal", "audit", "wtmp", "btmp", "lastlog"];
+    let mut days: HashMap<(String, &'static str), Vec<NaiveDate>> = HashMap::new();
+    for r in rows {
+        let d = match r.ts_rfc3339.get(..10).and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) {
+            Some(d) => d,
+            None => continue,
+        };
+        let h = r.dst_host.split('.').next().unwrap_or(&r.dst_host).to_string();
+        days.entry((h, log_family(&r.filename))).or_default().push(d);
+    }
+    let mut hosts: Vec<String> = days.keys().map(|(h, _)| h.clone()).collect();
+    hosts.sort();
+    hosts.dedup();
+    crate::banner::print_info("Log coverage per host (continuous since, gaps <= 7 days; lastlog = oldest record):");
+    for h in hosts {
+        let mut parts = Vec::new();
+        for f in fams {
+            if let Some(v) = days.get_mut(&(h.clone(), f)) {
+                let since = if f == "lastlog" { v.iter().min().copied() } else { continuous_since(v, 7) };
+                if let Some(d) = since { parts.push(format!("{} {}", f, d)); }
+            }
+        }
+        crate::banner::print_info(&format!("  {:<18} {}", h, parts.join(" | ")));
+    }
+}
+
 // ────────────────────────── DataFrame builder ────────────────────────────────
 /// Write a masstin CSV containing only the canonical header.
 /// Used when no Linux events match, so downstream merge steps in parse-image /
@@ -1096,6 +1163,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     // same CSV they always did.
     let mut ordered: Vec<&RawEvt> = rows.to_vec();
     ordered.sort_by(|a, b| a.ts_rfc3339.cmp(&b.ts_rfc3339));
+    print_coverage(&ordered);
 
     fn q(s: &str) -> String {
         if s.is_empty() {
