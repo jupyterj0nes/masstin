@@ -200,10 +200,41 @@ pub async fn load_memgraph(
 
         let mut filtered_by_time: usize = 0;
 
+        // Short names shared by two different FQDNs (RUNDECK.DESA... vs
+        // RUNDECK....) stay fully qualified so two machines are not merged.
+        let ambiguous: HashSet<String> = {
+            let mut by_short: HashMap<String, HashSet<String>> = HashMap::new();
+            for line in lines.iter().skip(1) {
+                let cols: Vec<&str> = line.split(',').collect();
+                for c in [idx_dst, idx_src_computer, idx_src_ip] {
+                    if let Some(v) = cols.get(c) {
+                        let mut v = v.replace("\\", "").replace("[", "").replace("]", "").to_uppercase();
+                        if v.contains(':') && !looks_like_ip(&v) {
+                            v = v.split(':').next().unwrap_or("").to_string();
+                        }
+                        if v.contains('.') && !looks_like_ip(&v) {
+                            let short = v.split('.').next().unwrap_or("").to_string();
+                            by_short.entry(short).or_default().insert(v);
+                        }
+                    }
+                }
+            }
+            by_short.into_iter().filter(|(_, s)| s.len() > 1).map(|(k, _)| k).collect()
+        };
+
         let processed_lines: Vec<String> = lines
         .into_iter()
         .skip(1)
-        .map(|line| line.replace("\\", "").replace("[", "").replace("]", "").to_uppercase())
+        // Host / IP / type columns upper-cased for matching; the user
+        // columns keep their case (the rel TYPE is upper-cased anyway).
+        .map(|line| {
+            let l = line.replace("\\", "").replace("[", "").replace("]", "");
+            l.split(',')
+                .enumerate()
+                .map(|(i, f)| if i == idx_target_user || i == idx_subject_user { f.to_string() } else { f.to_uppercase() })
+                .collect::<Vec<String>>()
+                .join(",")
+        })
         .filter_map(|line| {
             if start_dt.is_some() || end_dt.is_some() {
                 if let Some(time_cell) = line.split(',').next() {
@@ -225,19 +256,28 @@ pub async fn load_memgraph(
             if let Some(ip) = extract_leading_ip(row[idx_dst]) {
                 row[idx_dst] = ip;
             } else if row[idx_dst].contains('.') && !looks_like_ip(row[idx_dst]) {
-                row[idx_dst] = row[idx_dst].split('.').next().unwrap_or(row[idx_dst]);
+                let short = row[idx_dst].split('.').next().unwrap_or(row[idx_dst]);
+                if !ambiguous.contains(short) {
+                    row[idx_dst] = short;
+                }
             }
 
             if let Some(ip) = extract_leading_ip(row[idx_src_computer]) {
                 row[idx_src_computer] = ip;
             } else if row[idx_src_computer].contains('.') && !looks_like_ip(row[idx_src_computer]) {
-                row[idx_src_computer] = row[idx_src_computer].split('.').next().unwrap_or(row[idx_src_computer]);
+                let short = row[idx_src_computer].split('.').next().unwrap_or(row[idx_src_computer]);
+                if !ambiguous.contains(short) {
+                    row[idx_src_computer] = short;
+                }
             }
 
             if let Some(ip) = extract_leading_ip(row[idx_src_ip]) {
                 row[idx_src_ip] = ip;
             } else if row[idx_src_ip].contains('.') && !looks_like_ip(row[idx_src_ip]) {
-                row[idx_src_ip] = row[idx_src_ip].split('.').next().unwrap_or(row[idx_src_ip]);
+                let short = row[idx_src_ip].split('.').next().unwrap_or(row[idx_src_ip]);
+                if !ambiguous.contains(short) {
+                    row[idx_src_ip] = short;
+                }
             }
 
             // Strip `hostname:port` / `hostname:instance` suffixes, but preserve
@@ -309,7 +349,7 @@ pub async fn load_memgraph(
                     // Reject if it still looks like an IP or has invalid chars
                     if !looks_like_ip(machine) && !machine.contains('.') && !machine.is_empty() {
                         *counts
-                            .entry((parts[idx_src_ip].clone(), machine.to_string()))
+                            .entry((parts[idx_src_ip].clone(), machine.to_uppercase()))
                             .or_insert(0) += 100;
                     }
                 }
@@ -333,7 +373,7 @@ pub async fn load_memgraph(
             } else { None };
             if let Some((v, is_ip)) = side {
                 let et = idx_event_type.map(|i| parts[i]).unwrap_or("");
-                let key = (parts[idx_dst].to_string(), parts[idx_target_user].to_string(),
+                let key = (parts[idx_dst].to_string(), parts[idx_target_user].to_uppercase(),
                            parts[0].get(..19).unwrap_or(parts[0]).to_string(), et.to_string());
                 let e = cooc.entry(key).or_default();
                 let list = if is_ip { &mut e.0 } else { &mut e.1 };
@@ -413,7 +453,7 @@ pub async fn load_memgraph(
                 // TGS events (4769) append @REALM to the username while 4624
                 // events don't, causing duplicate edges for the same user.
                 let user_clean = parts[idx_target_user].split('@').next()
-                    .unwrap_or(&parts[idx_target_user]).to_string();
+                    .unwrap_or(&parts[idx_target_user]).to_uppercase();
                 let et = idx_event_type.map(|i| parts[i].clone()).unwrap_or_default();
                 let key = (
                     parts[idx_dst].clone(),

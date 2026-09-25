@@ -13,7 +13,6 @@
 
 use crate::graph_hunt_neo4j::baseline::Baseline;
 use crate::graph_hunt_neo4j::detectors::Finding;
-use chrono::NaiveDateTime;
 use futures::stream::*;
 use neo4rs::*;
 use crate::graph_hunt_common::auth_ok;
@@ -176,16 +175,10 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 /// either side fails to parse — the caller falls back to the worst-case
 /// gap so the chain still gets reported, just with the lowest speed score.
 fn parse_gap_seconds(t1: &str, t2: &str) -> Option<i64> {
-    let fmts = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    let parse = |s: &str| -> Option<NaiveDateTime> {
-        for f in fmts {
-            if let Ok(dt) = NaiveDateTime::parse_from_str(s, f) {
-                return Some(dt);
-            }
-        }
-        None
-    };
-    let a = parse(t1)?;
-    let b = parse(t2)?;
+    // Neo4j prints `...:46Z`, Memgraph `...:46.000000`: the shared parser
+    // handles both (the old local formats failed on the `Z` and every
+    // Neo4j chain fell back to the 300 s worst case).
+    let a = crate::graph_hunt_common::parse_ts(t1)?;
+    let b = crate::graph_hunt_common::parse_ts(t2)?;
     Some((b - a).num_seconds())
 }
