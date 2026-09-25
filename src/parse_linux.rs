@@ -105,6 +105,18 @@ static AUDIT_RE: Lazy<Regex> = Lazy::new(|| {
 static AUDIT_USER_ACCT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"acct="([^"]+)""#).unwrap()
 });
+// USER_LOGIN success lines on RHEL carry the uid, not the name:
+//   msg='op=login id=1103 exe="/usr/sbin/sshd" ... res=success'
+// and the record header has auid=<uid> (4294967295 = unset).
+static AUDIT_USER_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bid=(\d+)\b"#).unwrap()
+});
+static AUDIT_USER_AUID_NUM_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bauid=(\d+)\b"#).unwrap()
+});
+static AUDIT_PID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"\bpid=(\d+)\b"#).unwrap()
+});
 static AUDIT_USER_AUID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"AUID="([^"?]+)""#).unwrap()
 });
@@ -758,8 +770,23 @@ fn parse_secure_or_messages(
 }
 
 // audit.log* ------------------------------------------------------------------
-fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
+// One SSH login leaves several auditd records: USER_AUTH for each PAM /
+// key stage (`op=pubkey_auth`, `op=key`, `op=PAM:authentication`) and then
+// USER_LOGIN with the final outcome — often written twice by the same
+// sshd pid. USER_LOGIN is the record we want (one per connection, success
+// or failure, `acct="(unknown)"` for non-existent accounts). USER_AUTH is
+// only used as a fallback for files that carry no USER_LOGIN at all, and
+// identical records from the same pid within the same second collapse
+// to one.
+fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
     let mut out = Vec::new();
+    let mut auth_fallback: Vec<RawEvt> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, i64, String, String, String)> = std::collections::HashSet::new();
+    let uid_name = |uid: &str| -> Option<String> {
+        let u: u32 = uid.parse().ok()?;
+        if u == 4294967295 { return None; }
+        Some(passwd.get(&u).cloned().unwrap_or_else(|| format!("uid:{}", u)))
+    };
     for line in open_plain_or_gzip(path).lines().flatten() {
         let cap = match AUDIT_RE.captures(&line) {
             Some(c) => c,
@@ -778,33 +805,40 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
             continue;
         }
 
+        // Only USER_LOGIN (outcome) and, as fallback, USER_AUTH (PAM stage).
+        // USER_ACCT / USER_START fire once more per session and would
+        // double-count.
+        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" {
+            continue;
+        }
+
         // Extract timestamp from msg=audit(<epoch>.<ms>:<serial>)
-        let ts = match line.find("msg=audit(") {
+        let secs = match line.find("msg=audit(") {
             Some(idx_start) => {
                 let rest = &line[idx_start + 10..];
                 match rest.find(':') {
-                    Some(idx_colon) => {
-                        match rest[..idx_colon].parse::<f64>() {
-                            Ok(frac) => {
-                                let secs = frac.trunc() as i64;
-                                DateTime::<Utc>::from_utc(
-                                    NaiveDateTime::from_timestamp(secs, 0), Utc,
-                                ).to_rfc3339()
-                            }
-                            Err(_) => continue,
-                        }
-                    }
+                    Some(idx_colon) => match rest[..idx_colon].parse::<f64>() {
+                        Ok(frac) => frac.trunc() as i64,
+                        Err(_) => continue,
+                    },
                     None => continue,
                 }
             }
             None => continue,
         };
+        let ts = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(secs, 0), Utc).to_rfc3339();
 
-        // Username: try acct="..." first (USER_AUTH/USER_START), then AUID="..."
-        // (USER_LOGIN on Ubuntu 22 + SSSD), then UID="..." as last resort.
-        let user = AUDIT_USER_ACCT_RE
+        // Username: acct="..." (USER_AUTH, failed USER_LOGIN — "(unknown)"
+        // for non-existent accounts), then the numeric id= / auid= of a
+        // successful USER_LOGIN resolved through the collected /etc/passwd,
+        // then the ausearch-style AUID="..." / UID="..." forms.
+        let acct = AUDIT_USER_ACCT_RE
             .captures(&line)
-            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+        let invalid_user = acct.as_deref() == Some("(unknown)");
+        let user = acct
+            .or_else(|| AUDIT_USER_ID_RE.captures(&line).and_then(|c| uid_name(c.get(1)?.as_str())))
+            .or_else(|| AUDIT_USER_AUID_NUM_RE.captures(&line).and_then(|c| uid_name(c.get(1)?.as_str())))
             .or_else(|| AUDIT_USER_AUID_RE
                 .captures(&line)
                 .and_then(|c| c.get(1).map(|m| m.as_str().to_string())))
@@ -813,27 +847,112 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
                 .and_then(|c| c.get(1).map(|m| m.as_str().to_string())))
             .unwrap_or_default();
 
-        // USER_LOGIN = SSH login itself; USER_AUTH/USER_ACCT/USER_START = PAM
-        // stages. Only USER_LOGIN and USER_AUTH are the lateral-movement
-        // signal; USER_START is session_open which fires once per session and
-        // would double-count. Keep USER_LOGIN + USER_AUTH, drop the rest.
-        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" {
+        let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
+
+        // Same sshd pid, same second, same outcome: one connection.
+        let pid = AUDIT_PID_RE
+            .captures(&line)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .unwrap_or_default();
+        if !seen.insert((pid, secs, ip.clone(), user.clone(), format!("{}:{}", evt_type, evt))) {
             continue;
         }
 
-        let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
-
-        out.push(RawEvt {
+        let raw = RawEvt {
             ts_rfc3339: ts,
             user,
             remote: ip,
-            tty_or_proc: "audit".into(),
+            // acct="(unknown)" is what sshd audits when a connection ends
+            // without an authenticated user: a guess against a non-existent
+            // account, but also a scanner that connects and hangs up, or a
+            // client that exceeds MaxAuthTries. The username, if any, is
+            // only in the sshd text log.
+            tty_or_proc: if invalid_user { "audit unauthenticated".into() } else { "audit".into() },
             evt: evt.into(),
             filename: path.display().to_string(),
             dst_host: dst_host.into(),
-        });
+        };
+        if evt_type == "USER_LOGIN" {
+            out.push(raw);
+        } else {
+            auth_fallback.push(raw);
+        }
+    }
+    if out.is_empty() && !auth_fallback.is_empty() {
+        if is_debug_mode() {
+            println!("    {}: no USER_LOGIN records, using {} USER_AUTH records as fallback",
+                     path.display(), auth_fallback.len());
+        }
+        out = auth_fallback;
     }
     out
+}
+
+// ────────────────────────── audit uid resolution ─────────────────────────────
+fn ts_secs(rfc3339: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(rfc3339).ok().map(|d| d.timestamp())
+}
+
+/// Successful `USER_LOGIN` audit records name the account by uid, and
+/// directory users (SSSD / LDAP) are not in the collected /etc/passwd, so
+/// they come out of `parse_audit` as `uid:<n>`. The same login is almost
+/// always also in the sshd text log and in wtmp with the real name, at the
+/// same second and from the same source: learn `uid → name` from those
+/// coincidences (per host; for directory-range uids, >= 10000, the vote is
+/// also pooled across hosts since the uid is global there) and rewrite.
+fn resolve_audit_uids(rows: &mut Vec<RawEvt>) {
+    let mut by_key: HashMap<(String, String, i64), Vec<String>> = HashMap::new();
+    for r in rows.iter() {
+        if r.user.is_empty() || r.user.starts_with("uid:") { continue; }
+        if r.evt != "SSH_SUCCESS" && r.evt != "LOGIN" { continue; }
+        if r.tty_or_proc.starts_with("audit") { continue; }
+        if let Some(sec) = ts_secs(&r.ts_rfc3339) {
+            by_key.entry((r.dst_host.clone(), r.remote.clone(), sec)).or_default().push(r.user.clone());
+        }
+    }
+    if by_key.is_empty() { return; }
+    // (host, "uid:n") -> name -> votes ; ("", "uid:n") pools directory uids
+    let mut votes: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
+    for r in rows.iter() {
+        if !r.user.starts_with("uid:") { continue; }
+        let sec = match ts_secs(&r.ts_rfc3339) { Some(s) => s, None => continue };
+        let directory = r.user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
+        for d in -2i64..=2 {
+            if let Some(names) = by_key.get(&(r.dst_host.clone(), r.remote.clone(), sec + d)) {
+                for n in names {
+                    *votes.entry((r.dst_host.clone(), r.user.clone())).or_default().entry(n.clone()).or_default() += 1;
+                    if directory {
+                        *votes.entry((String::new(), r.user.clone())).or_default().entry(n.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    let winner = |m: &HashMap<String, usize>| -> Option<String> {
+        let total: usize = m.values().sum();
+        m.iter().max_by_key(|(_, &c)| c).filter(|(_, &c)| c * 2 > total).map(|(n, _)| n.clone())
+    };
+    let resolved: HashMap<(String, String), String> = votes
+        .iter()
+        .filter_map(|(k, m)| winner(m).map(|n| (k.clone(), n)))
+        .collect();
+    let mut changed = 0usize;
+    for r in rows.iter_mut() {
+        if !r.user.starts_with("uid:") { continue; }
+        let directory = r.user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
+        let name = resolved
+            .get(&(r.dst_host.clone(), r.user.clone()))
+            .or_else(|| if directory { resolved.get(&(String::new(), r.user.clone())) } else { None });
+        if let Some(n) = name {
+            r.user = n.clone();
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        crate::banner::print_info(&format!(
+            "{} audit records: uid resolved to account name via sshd/wtmp coincidence", changed
+        ));
+    }
 }
 
 // ────────────────────────── DataFrame builder ────────────────────────────────
@@ -925,6 +1044,27 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     if removed > 0 {
         crate::banner::print_info(&format!("{} duplicate events removed (journald + rsyslog overlap)", removed));
     }
+    // auditd's USER_LOGIN is the same authentication event sshd already
+    // wrote to secure/auth.log/journald; when both are present (same host,
+    // outcome, account and source within a second) the audit copy adds
+    // nothing but a second edge. Audit rows without an sshd counterpart —
+    // hosts whose text logs rotated away, or the "(unknown)" failures
+    // that sshd never named — are kept.
+    let ssh_keys: std::collections::HashSet<(String, String, String, String, i64)> = deduped
+        .iter()
+        .filter(|r| channel_class(&r.tty_or_proc) == "ssh")
+        .filter_map(|r| ts_secs(&r.ts_rfc3339).map(|s| (r.dst_host.clone(), r.evt.clone(), r.user.clone(), r.remote.clone(), s)))
+        .collect();
+    let before = deduped.len();
+    deduped.retain(|r| {
+        if channel_class(&r.tty_or_proc) != "audit" { return true; }
+        let sec = match ts_secs(&r.ts_rfc3339) { Some(s) => s, None => return true };
+        !(-1i64..=1).any(|d| ssh_keys.contains(&(r.dst_host.clone(), r.evt.clone(), r.user.clone(), r.remote.clone(), sec + d)))
+    });
+    let audit_dups = before - deduped.len();
+    if audit_dups > 0 {
+        crate::banner::print_info(&format!("{} audit records dropped (same login already in sshd log)", audit_dups));
+    }
     let rows = &deduped[..];
 
     let col = |f: fn(&RawEvt) -> String| rows.iter().map(f).collect::<Vec<_>>();
@@ -942,7 +1082,11 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             }
         })),
         Series::new("event_id", col(|r| r.evt.clone())),
-        Series::new("logon_type", vec![""; rows.len()]),
+        // Every Linux row with a remote source is an SSH session (sshd
+        // logs, pts entries in wtmp/lastlog, auditd sshd records). Naming
+        // the channel — as parse-cortex does for port 22 — lets the graph
+        // loaders and detectors tell it apart from Windows logon types.
+        Series::new("logon_type", vec!["SSH"; rows.len()]),
         Series::new("target_user_name", col(|r| r.user.clone())),
         Series::new("target_domain_name", vec![""; rows.len()]),
         Series::new(
@@ -1614,7 +1758,10 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
         } else if fname.starts_with("messages") {
             parsed = parse_secure_or_messages(path, &dst_host, true, cached_year, tz);
         } else if fname.starts_with("audit.log") {
-            parsed = parse_audit(path, &dst_host, true);
+            let passwd = root2passwd
+                .entry(root.clone())
+                .or_insert_with(|| load_passwd(&root));
+            parsed = parse_audit(path, &dst_host, true, passwd);
         } else if fname.ends_with(".journal") || fname.ends_with(".journal~") {
             parsed = crate::parse_journal::parse_journal_file(path, &dst_host);
         }
@@ -1676,6 +1823,7 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
 
     // Phase 3: Generate output
     if !quiet { crate::banner::print_output_start(); }
+    resolve_audit_uids(&mut collected);
     let total_events = collected.len();
     build_dataframe(&collected, output);
 

@@ -87,6 +87,8 @@ struct ResolvedEdge {
     destination: String,
     rel_type: String,
     time: String,
+    event_type: String,
+    event_id: String,
     logon_type: String,
     src_computer: String,
     src_ip: String,
@@ -102,11 +104,16 @@ const EDGE_BATCH: usize = 5_000;
 const OLD_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 const NEW_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
 
+/// Column position used when a layout lacks a column (`event_type` in
+/// the legacy 12-column CSV).
+const NONE_COL: usize = usize::MAX;
+
 /// Column-index map for both supported masstin CSV layouts. Resolved once
 /// from the header line.
 #[derive(Clone, Copy)]
 struct Indices {
     dst: usize,
+    event_type: usize,
     event_id: usize,
     subject_user: usize,
     subject_domain: usize,
@@ -120,13 +127,13 @@ struct Indices {
 fn parse_indices(header: &str) -> Option<Indices> {
     if header == NEW_HEADER {
         Some(Indices {
-            dst: 1, event_id: 3, subject_user: 9, subject_domain: 10,
+            dst: 1, event_type: 2, event_id: 3, subject_user: 9, subject_domain: 10,
             target_user: 5, target_domain: 6, logon_type: 4,
             src_computer: 7, src_ip: 8,
         })
     } else if header == OLD_HEADER {
         Some(Indices {
-            dst: 1, event_id: 2, subject_user: 3, subject_domain: 4,
+            dst: 1, event_type: NONE_COL, event_id: 2, subject_user: 3, subject_domain: 4,
             target_user: 5, target_domain: 6, logon_type: 7,
             src_computer: 8, src_ip: 9,
         })
@@ -387,6 +394,8 @@ fn resolve_to_edge(
         destination: destination_name,
         rel_type: rel_type_normalized,
         time: parts[0].replace(" utc", "").replace(" ", "T"),
+        event_type: if idx.event_type == NONE_COL { String::new() } else { parts[idx.event_type].clone() },
+        event_id: if idx.event_id == NONE_COL { String::new() } else { parts[idx.event_id].clone() },
         logon_type: parts[idx.logon_type].clone(),
         src_computer: src_computer_raw.to_string(),
         src_ip: src_ip_raw.to_string(),
@@ -412,6 +421,7 @@ async fn flush_batch(
          MATCH (o:host {{name: $origin[i]}}) \
          MATCH (d:host {{name: $destination[i]}}) \
          {} (o)-[r:{} {{time: datetime($time[i]), logon_type: $logon_type[i], \
+         event_type: $event_type[i], event_id: $event_id[i], \
          src_computer: $src_computer[i], src_ip: $src_ip[i], \
          target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
          subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
@@ -424,6 +434,8 @@ async fn flush_batch(
         .param("destination", chunk.iter().map(|e| e.destination.clone()).collect::<Vec<String>>())
         .param("time", chunk.iter().map(|e| e.time.clone()).collect::<Vec<String>>())
         .param("logon_type", chunk.iter().map(|e| e.logon_type.clone()).collect::<Vec<String>>())
+        .param("event_type", chunk.iter().map(|e| e.event_type.clone()).collect::<Vec<String>>())
+        .param("event_id", chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<String>>())
         .param("src_computer", chunk.iter().map(|e| e.src_computer.clone()).collect::<Vec<String>>())
         .param("src_ip", chunk.iter().map(|e| e.src_ip.clone()).collect::<Vec<String>>())
         .param("target_user_name", chunk.iter().map(|e| e.target_user_name.clone()).collect::<Vec<String>>())
@@ -766,7 +778,7 @@ pub async fn load_neo4j(
                 // Local index map for the synthesized 10-col row (legacy
                 // shape from the previous in-memory pipeline).
                 let local_idx = Indices {
-                    dst: 1, event_id: 0, subject_user: 3, subject_domain: 4,
+                    dst: 1, event_type: NONE_COL, event_id: NONE_COL, subject_user: 3, subject_domain: 4,
                     target_user: 5, target_domain: 6, logon_type: 7,
                     src_computer: 8, src_ip: 9,
                 };
