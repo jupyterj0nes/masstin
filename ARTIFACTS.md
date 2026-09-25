@@ -45,9 +45,9 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 | Log Source | Event ID | Description |
 |------------|----------|-------------|
-| SMBServer/Security | 1009 | SMB server connection attempt |
-| SMBServer/Security | 551 | SMB authentication |
-| SMBClient/Security | 31001 | SMB client connection to share |
+| SMBServer/Security | 1009 | Server denied anonymous access to the client (FAILED_LOGON) |
+| SMBServer/Security | 551 | SMB session authentication failure (FAILED_LOGON) |
+| SMBClient/Security | 31001 | Client failed to authenticate to the server (FAILED_LOGON) |
 | SMBClient/Connectivity | 30803 | SMB connectivity event |
 | SMBClient/Connectivity | 30804 | SMB connectivity event |
 | SMBClient/Connectivity | 30805 | SMB connectivity event |
