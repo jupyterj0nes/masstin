@@ -188,6 +188,28 @@ fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
     }
 }
 
+/// Short host name of an FQDN (`SRV01.CORP.EXAMPLE` -> `SRV01`) —
+/// unless two different FQDNs in the corpus share that short name
+/// (`SRV.DEV.CORP.EXAMPLE` vs `SRV.CORP.EXAMPLE`), in which case
+/// the full name is kept so two machines do not become one node.
+fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
+    if v.contains('.') && !looks_like_ip(v) {
+        let short = v.split('.').next().unwrap_or(v);
+        if !short.is_empty() && !ambiguous.contains(short) {
+            return short.to_string();
+        }
+    }
+    v.to_string()
+}
+
+fn shorten_parts(parts: &mut [String], idx: &Indices, ambiguous: &HashSet<String>) {
+    for col in [idx.dst, idx.src_computer, idx.src_ip] {
+        if col < parts.len() {
+            parts[col] = short_name(&parts[col], ambiguous);
+        }
+    }
+}
+
 /// Outcome of cleaning one raw CSV line. `Filtered` covers time-window
 /// rejection and the self-loop / local-value drops; the caller bumps the
 /// time-filter counter on `FilteredTime`.
@@ -225,8 +247,18 @@ fn clean_row(
         }
     }
 
-    let line = raw_line.replace("\\", "").replace("[", "").replace("]", "").to_uppercase();
-    let mut row: Vec<&str> = line.split(',').collect();
+    // Host / IP / type columns are upper-cased for matching; the two user
+    // columns keep their original case (Linux accounts are case-sensitive;
+    // the relationship TYPE is still upper-cased by sanitize_rel_type, so
+    // directory accounts typed in different case stay one type, but the
+    // `target_user_name` property shows what was actually logged).
+    let line = raw_line.replace("\\", "").replace("[", "").replace("]", "");
+    let fields: Vec<String> = line
+        .split(',')
+        .enumerate()
+        .map(|(i, f)| if i == idx.target_user || i == idx.subject_user { f.to_string() } else { f.to_uppercase() })
+        .collect();
+    let mut row: Vec<&str> = fields.iter().map(|x| x.as_str()).collect();
     if row.len() <= idx.src_ip { return RowOutcome::Filtered; }
     // log_filename is reduced to its log family (secure, wtmp, audit,
     // Security.evtx ...) and kept as the edge's `log_source`, so
@@ -237,20 +269,14 @@ fn clean_row(
     // dst_computer
     if let Some(ip) = extract_leading_ip(row[idx.dst]) {
         row[idx.dst] = ip;
-    } else if row[idx.dst].contains('.') && !looks_like_ip(row[idx.dst]) {
-        row[idx.dst] = row[idx.dst].split('.').next().unwrap_or(row[idx.dst]);
     }
     // src_computer
     if let Some(ip) = extract_leading_ip(row[idx.src_computer]) {
         row[idx.src_computer] = ip;
-    } else if row[idx.src_computer].contains('.') && !looks_like_ip(row[idx.src_computer]) {
-        row[idx.src_computer] = row[idx.src_computer].split('.').next().unwrap_or(row[idx.src_computer]);
     }
     // src_ip
     if let Some(ip) = extract_leading_ip(row[idx.src_ip]) {
         row[idx.src_ip] = ip;
-    } else if row[idx.src_ip].contains('.') && !looks_like_ip(row[idx.src_ip]) {
-        row[idx.src_ip] = row[idx.src_ip].split('.').next().unwrap_or(row[idx.src_ip]);
     }
     // strip `host:port` / `host:instance` suffixes (preserve IPv6 literals)
     if row[idx.dst].contains(':') && !looks_like_ip(row[idx.dst]) {
@@ -283,7 +309,7 @@ fn streaming_pass1(
     local_values: &HashSet<&str>,
     start_dt: Option<DateTime<Utc>>,
     end_dt: Option<DateTime<Utc>>,
-) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32)>)> {
+) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32)>, HashSet<String>)> {
     let mut counts: HashMap<(String, String), u32> = HashMap::new();
     let mut literal_hosts: HashSet<String> = HashSet::new();
     let mut filtered_by_time: usize = 0;
@@ -298,6 +324,7 @@ fn streaming_pass1(
     // Key: (dst, user, second, event_type) -> (ips, names), single-sided
     // rows only.
     let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
 
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -309,6 +336,14 @@ fn streaming_pass1(
             RowOutcome::Filtered => {}
             RowOutcome::Cleaned(parts) => {
                 kept_rows += 1;
+                for col in [idx.dst, idx.src_computer, idx.src_ip] {
+                    let v = &parts[col];
+                    if v.contains('.') && !looks_like_ip(v) {
+                        if let Some(short) = v.split('.').next() {
+                            fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
+                        }
+                    }
+                }
                 {
                     let sc = parts[idx.src_computer].as_str();
                     let si = parts[idx.src_ip].as_str();
@@ -323,7 +358,7 @@ fn streaming_pass1(
                         let et = if idx.event_type == NONE_COL { "" } else { parts[idx.event_type].as_str() };
                         let key = (
                             parts[idx.dst].clone(),
-                            parts[idx.target_user].clone(),
+                            parts[idx.target_user].to_uppercase(),
                             parts[0].get(..19).unwrap_or(&parts[0]).to_string(),
                             et.to_string(),
                         );
@@ -354,7 +389,7 @@ fn streaming_pass1(
                         let machine = &target_user[..target_user.len() - 1];
                         if !looks_like_ip(machine) && !machine.contains('.') && !machine.is_empty() {
                             *counts
-                                .entry((parts[idx.src_ip].clone(), machine.to_string()))
+                                .entry((parts[idx.src_ip].clone(), machine.to_uppercase()))
                                 .or_insert(0) += 100;
                         }
                     }
@@ -392,7 +427,34 @@ fn streaming_pass1(
             if v >= MIN_RESOLVE_VOTES { Some((ip, (name, v))) } else { None }
         })
         .collect();
-    Ok((counts, literal_hosts, filtered_by_time, kept_rows, resolved_names))
+    // Short names shared by two or more different FQDNs stay fully
+    // qualified; everything collected above is mapped to its final name.
+    let ambiguous: HashSet<String> = fqdn_by_short
+        .into_iter()
+        .filter(|(_, set)| set.len() > 1)
+        .map(|(short, _)| short)
+        .collect();
+    if !ambiguous.is_empty() {
+        let mut list: Vec<&String> = ambiguous.iter().collect();
+        list.sort();
+        crate::banner::print_phase_detail(
+            "Host names:",
+            &format!("{} short name(s) shared by different FQDNs kept fully qualified: {}",
+                     ambiguous.len(), list.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+        );
+    }
+    let counts: HashMap<(String, String), u32> = counts
+        .into_iter()
+        .fold(HashMap::new(), |mut m, ((ip, host), w)| {
+            *m.entry((short_name(&ip, &ambiguous), short_name(&host, &ambiguous))).or_insert(0) += w;
+            m
+        });
+    let literal_hosts: HashSet<String> = literal_hosts.into_iter().map(|h| short_name(&h, &ambiguous)).collect();
+    let resolved_names: HashMap<String, (String, u32)> = resolved_names
+        .into_iter()
+        .map(|(ip, (name, v))| (ip, (short_name(&name, &ambiguous), v)))
+        .collect();
+    Ok((counts, literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous))
 }
 
 fn derive_ip_to_host(counts: &HashMap<(String, String), u32>) -> HashMap<String, String> {
@@ -670,7 +732,7 @@ pub async fn load_neo4j(
             "DEFAULT_VALUE", "\"\"", "-", "", " "].iter().cloned().collect();
 
         // ── Pass 1: stream-collect counts + literal hosts ──
-        let (counts, mut literal_hosts, filtered_by_time, kept_rows, resolved_names) =
+        let (counts, mut literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous) =
             match streaming_pass1(file, &idx, &local_values, start_dt, end_dt) {
                 Ok(t) => t,
                 Err(e) => {
@@ -778,6 +840,8 @@ pub async fn load_neo4j(
                 RowOutcome::Cleaned(p) => p,
                 _ => continue,
             };
+            let mut parts = parts;
+            shorten_parts(&mut parts, &idx, &ambiguous);
             pb.inc(1);
 
             if ungrouped {
@@ -829,7 +893,7 @@ pub async fn load_neo4j(
                 // same host collapsed into one edge (only the first origin
                 // survived), and refused attempts merged with successes.
                 let user_clean = parts[idx.target_user].split('@').next()
-                    .unwrap_or(&parts[idx.target_user]).to_string();
+                    .unwrap_or(&parts[idx.target_user]).to_uppercase();
                 let et = if idx.event_type == NONE_COL { String::new() } else { parts[idx.event_type].clone() };
                 let key = (
                     parts[idx.dst].clone(),

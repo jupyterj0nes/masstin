@@ -32,7 +32,7 @@ const MAX_ORIGIN_OUTDEGREE_FRACTION: f64 = 0.30;
 
 pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
     let cutoff_str = bl.cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
-    let host_count = (bl.host_count() as f64).max(1.0);
+    let host_count = bl.destination_count() as f64;
 
     let q = format!(
         "MATCH (a:host)-[r]->(b:host)
@@ -79,7 +79,11 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 let dest_events = bl.baseline_event_count_for_dest(&destination);
                 let thin_dest = dest_events < MIN_BASELINE_EVENTS_AT_DEST;
                 let origin_outdeg = bl.outgoing_degree(&origin) as f64;
-                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION {
+                // Rotation = a known account of an infrastructure origin reaching
+                // one more host. A NEW account on such an origin is not rotation.
+                if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION
+                    && bl.origin_used_account(&origin, &user)
+                {
                     continue;
                 }
 
