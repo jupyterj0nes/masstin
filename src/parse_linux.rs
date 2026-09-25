@@ -977,7 +977,10 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     // LogData view of each RawEvt just for the filter check — RawEvt's
     // `remote` field can be either an IP or a hostname, so we route it to
     // both src_ip and workstation_name for the classifier.
-    let filtered: Vec<RawEvt> = rows
+    // Everything below works on indices / references: at 1.5M+ rows (a
+    // 28-host UAC folder) cloning the row set twice and keying HashMaps
+    // with five owned Strings per row ran the process out of memory.
+    let filtered: Vec<&RawEvt> = rows
         .iter()
         .filter(|r| {
             let (src_ip, src_computer) = if r.remote.parse::<std::net::IpAddr>().is_ok() {
@@ -1003,7 +1006,6 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             };
             crate::filter::should_keep_record(&ld)
         })
-        .cloned()
         .collect();
     if filtered.is_empty() {
         eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
@@ -1020,108 +1022,128 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     // rsyslog text over journal (the file the analyst can open).
     let channel_class = |t: &str| -> &'static str {
         if t.starts_with("ssh") || t.starts_with("journal-ssh") { "ssh" }
-        else if t == "audit" { "audit" }
+        else if t.starts_with("audit") { "audit" }
         else if t == "pam" { "pam" }
         else { "other" }
     };
     let rank = |t: &str| -> u8 { if t.starts_with("journal-ssh") { 1 } else { 0 } };
-    let mut ordered: Vec<&RawEvt> = filtered.iter().collect();
+    let mut ordered: Vec<&RawEvt> = filtered.clone();
     ordered.sort_by_key(|r| rank(&r.tty_or_proc));
+    // Keys are 64-bit hashes of the tuple instead of owned tuples.
+    fn key_hash(parts: &[&str], sec: i64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in parts { p.hash(&mut h); }
+        sec.hash(&mut h);
+        h.finish()
+    }
+    // Filenames interned to a small id so the claim map stores u32s.
+    let mut file_ids: HashMap<String, u32> = HashMap::new();
+    let file_id = |f: &str, ids: &mut HashMap<String, u32>| -> u32 {
+        if let Some(&id) = ids.get(f) { return id; }
+        let next = ids.len() as u32;
+        ids.insert(f.to_string(), next);
+        next
+    };
     // A key is claimed by the first FILE that produced it; rows for the same
     // key from OTHER files are the cross-channel copies and go. Rows from
     // the claiming file itself are all kept: automation (Ansible, batch
     // scp) legitimately opens several sessions per second from the same
     // account and source, and those are distinct logins, not duplicates.
-    let mut owner: HashMap<(String, String, String, String, String, &'static str), String> = HashMap::new();
-    let mut deduped: Vec<RawEvt> = Vec::with_capacity(filtered.len());
+    let mut owner: HashMap<u64, u32> = HashMap::with_capacity(ordered.len());
+    let mut deduped: Vec<&RawEvt> = Vec::with_capacity(ordered.len());
     for r in ordered {
-        let ts_sec = r.ts_rfc3339.get(..19).unwrap_or(&r.ts_rfc3339).to_string();
-        let key = (ts_sec, r.dst_host.clone(), r.evt.clone(), r.user.clone(), r.remote.clone(), channel_class(&r.tty_or_proc));
-        let claimant = owner.entry(key).or_insert_with(|| r.filename.clone());
-        if *claimant == r.filename { deduped.push(r.clone()); }
+        let sec = ts_secs(&r.ts_rfc3339).unwrap_or(0);
+        let key = key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote, channel_class(&r.tty_or_proc)], sec);
+        let fid = file_id(&r.filename, &mut file_ids);
+        let claimant = owner.entry(key).or_insert(fid);
+        if *claimant == fid { deduped.push(r); }
     }
     let removed = filtered.len() - deduped.len();
     if removed > 0 {
         crate::banner::print_info(&format!("{} duplicate events removed (journald + rsyslog overlap)", removed));
     }
+    drop(owner);
     // auditd's USER_LOGIN is the same authentication event sshd already
     // wrote to secure/auth.log/journald; when both are present (same host,
     // outcome, account and source within a second) the audit copy adds
     // nothing but a second edge. Audit rows without an sshd counterpart —
     // hosts whose text logs rotated away, or the "(unknown)" failures
     // that sshd never named — are kept.
-    let ssh_keys: std::collections::HashSet<(String, String, String, String, i64)> = deduped
+    let ssh_keys: std::collections::HashSet<u64> = deduped
         .iter()
         .filter(|r| channel_class(&r.tty_or_proc) == "ssh")
-        .filter_map(|r| ts_secs(&r.ts_rfc3339).map(|s| (r.dst_host.clone(), r.evt.clone(), r.user.clone(), r.remote.clone(), s)))
+        .filter_map(|r| ts_secs(&r.ts_rfc3339).map(|s| key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote], s)))
         .collect();
     let before = deduped.len();
     deduped.retain(|r| {
         if channel_class(&r.tty_or_proc) != "audit" { return true; }
         let sec = match ts_secs(&r.ts_rfc3339) { Some(s) => s, None => return true };
-        !(-1i64..=1).any(|d| ssh_keys.contains(&(r.dst_host.clone(), r.evt.clone(), r.user.clone(), r.remote.clone(), sec + d)))
+        !(-1i64..=1).any(|d| ssh_keys.contains(&key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote], sec + d)))
     });
     let audit_dups = before - deduped.len();
     if audit_dups > 0 {
         crate::banner::print_info(&format!("{} audit records dropped (same login already in sshd log)", audit_dups));
     }
+    drop(ssh_keys);
     let rows = &deduped[..];
 
-    let col = |f: fn(&RawEvt) -> String| rows.iter().map(f).collect::<Vec<_>>();
+    // Written directly, row by row, instead of through a polars DataFrame:
+    // materialising 14 Utf8 columns for 1.5M rows and sorting them needed
+    // several GB on top of the rows themselves and aborted the process on
+    // the 28-host corpus. Quoting mirrors what polars produced (empty
+    // fields as "", quotes only when needed) so downstream readers see the
+    // same CSV they always did.
+    let mut ordered: Vec<&RawEvt> = rows.to_vec();
+    ordered.sort_by(|a, b| a.ts_rfc3339.cmp(&b.ts_rfc3339));
 
-    let df = DataFrame::new(vec![
-        Series::new("time_created", col(|r| r.ts_rfc3339.clone())),
-        Series::new("dst_computer", col(|r| r.dst_host.clone())),
-        Series::new("event_type", col(|r| {
-            match r.evt.as_str() {
-                "SSH_SUCCESS" | "LOGIN" | "LASTLOG" => "SUCCESSFUL_LOGON".to_string(),
-                "SSH_FAILED" | "FAILED_LOGIN" => "FAILED_LOGON".to_string(),
-                "SSH_CONNECT" => "CONNECT".to_string(),
-                "LOGOUT" => "LOGOFF".to_string(),
-                _ => "CONNECT".to_string(),
-            }
-        })),
-        Series::new("event_id", col(|r| r.evt.clone())),
+    fn q(s: &str) -> String {
+        if s.is_empty() {
+            "\"\"".to_string()
+        } else if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    let event_type = |evt: &str| -> &'static str {
+        match evt {
+            "SSH_SUCCESS" | "LOGIN" | "LASTLOG" => "SUCCESSFUL_LOGON",
+            "SSH_FAILED" | "FAILED_LOGIN" => "FAILED_LOGON",
+            "LOGOUT" => "LOGOFF",
+            _ => "CONNECT",
+        }
+    };
+    let header = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename\n";
+
+    let mut sink: Box<dyn std::io::Write> = match output {
+        Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p).unwrap())),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    use std::io::Write as _;
+    sink.write_all(header.as_bytes()).unwrap();
+    for r in ordered {
+        let is_ip = looks_like_ip(&r.remote);
+        let (src_computer, src_ip) = if is_ip { ("", r.remote.as_str()) } else { (r.remote.as_str(), "") };
         // Every Linux row with a remote source is an SSH session (sshd
         // logs, pts entries in wtmp/lastlog, auditd sshd records). Naming
         // the channel — as parse-cortex does for port 22 — lets the graph
         // loaders and detectors tell it apart from Windows logon types.
-        Series::new("logon_type", vec!["SSH"; rows.len()]),
-        Series::new("target_user_name", col(|r| r.user.clone())),
-        Series::new("target_domain_name", vec![""; rows.len()]),
-        Series::new(
-            "src_computer",
-            col(|r| if looks_like_ip(&r.remote) { "".into() } else { r.remote.clone() }),
-        ),
-        Series::new(
-            "src_ip",
-            col(|r| if looks_like_ip(&r.remote) { r.remote.clone() } else { "".into() }),
-        ),
-        Series::new("subject_user_name", vec![""; rows.len()]),
-        Series::new("subject_domain_name", vec![""; rows.len()]),
-        Series::new("logon_id", vec![""; rows.len()]),
-        Series::new("detail", col(|r| r.tty_or_proc.clone())),
-        Series::new("log_filename", col(|r| r.filename.clone())),
-    ])
-    .unwrap()
-    .sort(["time_created"], false)
-    .unwrap();
-
-    match output {
-        Some(p) => {
-            CsvWriter::new(&mut File::create(p).unwrap())
-                .has_header(true)
-                .finish(&mut df.clone())
-                .unwrap();
-            // Output path shown in summary
-        }
-        None => {
-            CsvWriter::new(std::io::stdout())
-                .has_header(true)
-                .finish(&mut df.clone())
-                .unwrap();
-        }
+        let line = format!(
+            "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",\"\",{},{}\n",
+            q(&r.ts_rfc3339),
+            q(&r.dst_host),
+            event_type(&r.evt),
+            q(&r.evt),
+            q(&r.user),
+            q(src_computer),
+            q(src_ip),
+            q(&r.tty_or_proc),
+            q(&r.filename),
+        );
+        sink.write_all(line.as_bytes()).unwrap();
     }
+    sink.flush().unwrap();
 }
 
 // ────────────────────────── main entry point ─────────────────────────────────
@@ -1291,7 +1313,23 @@ fn extract_tar_recursive(tar_path: &Path, dest_base: &Path, display_path: &str, 
         // absolute) and creates the parent directories itself.
         match entry.unpack_in(&extract_dir) {
             Ok(true) => {}
-            _ => continue,
+            Ok(false) => continue,
+            Err(e) => {
+                // The stream died inside this entry. If it was a nested
+                // archive, whatever tar managed to write is still a valid
+                // prefix of that archive: walk it (its own extractor will
+                // report where IT ends) instead of losing the whole host.
+                let partial = extract_dir.join(&rel);
+                let size = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+                if is_nested && size > 0 {
+                    crate::banner::print_warning(&format!(
+                        "{}: nested archive {} is cut short ({} MB arrived, {}); parsing what arrived.",
+                        archive_name, name, size / 1_048_576, e
+                    ));
+                    nested.push((partial, name));
+                }
+                continue;
+            }
         }
         if wanted { matched += 1; }
         if is_nested { nested.push((extract_dir.join(&rel), name)); }
