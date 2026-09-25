@@ -129,7 +129,7 @@ fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
     LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "SUCCESSFUL_LOGON".to_string(),
+        event_type: "FAILED_LOGON".to_string(), // 31001: client failed to authenticate
         event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
@@ -166,7 +166,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
 fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
     let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
     let event_type = match event_id_str.as_str() {
-        "1009" => "SUCCESSFUL_LOGON".to_string(),
+        "1009" => "FAILED_LOGON".to_string(), // server denied anonymous access
         "551" => "FAILED_LOGON".to_string(),
         _ => "CONNECT".to_string(),
     };
