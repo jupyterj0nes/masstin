@@ -244,7 +244,7 @@ pub fn print_triage_found(type_label: &str, hostname: Option<&str>, zip_fullpath
         eprintln!("           {} {} {}",
             style("entries inside:").dim(),
             style("0").dim(),
-            style("(no raw .evtx files — likely parsed JSON artifacts only)").dim(),
+            style("(no raw log files — e.g. a Velociraptor collection with parsed JSON only)").dim(),
         );
     }
 }

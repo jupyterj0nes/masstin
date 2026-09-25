@@ -53,7 +53,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Unified 14-column timeline** | All sources merged into a single chronological CSV with a canonical 14-column schema. Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons. `logon_id` carried through for session correlation. | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
 | **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy logs via YAML rule files with three extractor types (csv, regex, keyvalue) and nested sub-extract with `strip_before` preprocessing. Ships with **8 researched rules / 31 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
 | **Noise filtering** | Four opt-in flags to cut output down to signal only: `--ignore-local` drops records with no usable source (loopback IPs, LOCAL markers, service/interactive logons without src, MSTSC/default_value placeholders); `--exclude-users`, `--exclude-hosts`, `--exclude-ips` accept comma-separated lists, glob wildcards (`svc_*`, `*$`) and `@file.txt` imports; `--exclude-ips` also accepts CIDR ranges (`10.0.0.0/8`). Combine with `--dry-run` for a pre-flight stats report showing exactly what would be filtered. | [Noise filtering](https://weinvestigateanything.com/en/tools/masstin-noise-filtering/) |
-| **Triage-aware discovery** | When the directory walker hits a ZIP, masstin lists its top-level entries and matches against three known triage tool layouts: **KAPE** (`_kape.cli` / `Console/KAPE.log` / `<host>/C/Windows/System32/winevt/Logs/`), **Velociraptor Offline Collector** (`client_info.json` + `collection_context.json` / `uploads.json`), and **Cortex XDR Offline Collector** (`output/cortex-xdr-payload.log`). Detected packages surface as `=> Triage found: <type> [host: ...]` lines in phase 1 with hostname extracted from the ZIP filename when possible. | [Triage detection](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
+| **Triage-aware discovery** | When the directory walker hits an archive, masstin lists its entries and matches against four known triage tool layouts: **KAPE** (`_kape.cli` / `Console/KAPE.log` / `<host>/C/Windows/System32/winevt/Logs/`), **Velociraptor Offline Collector** (`client_info.json` + `collection_context.json` / `uploads.json`), **Cortex XDR Offline Collector** (`output/cortex-xdr-payload.log`) and **UAC — Unix-like Artifacts Collector** (`uac.log` + `[root]/`, tar.gz). Detected packages surface as `=> Triage found: <type> [host: ...]` lines in phase 1 with hostname extracted from the archive filename when possible. | [Triage detection](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
 | **Per-source breakdown** | The phase-2 summary groups every parsed artifact by its source — forensic image, triage zip, plain archive, or loose folder — instead of by its leaf directory name. Each group shows the total event count plus the per-EVTX list underneath. Lets the analyst tell at a glance how many events came from `HRServer.e01` vs from a Cortex XDR triage of `WIN-DC01` vs from a folder of loose EVTX dropped in `D:\evidence\`. | [Per-source breakdown](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
 | **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution. Ships with a Cypher query for **temporal path reconstruction** — find the chronologically coherent attacker route between any two nodes. | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
 | **Automation-ready** | `--silent` for Velociraptor / SOAR pipelines, single cross-platform binary for Windows / Linux / macOS, no runtime dependencies. | |
@@ -65,7 +65,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Forensic images** | E01 (ewf), VMDK (flat + sparse + streamOptimized with zlib-compressed grains), raw dd, multi-part images. Handles OVA exports, cloud templates, vSphere backups, and incomplete SFTP uploads via `.filepart` fallback. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Mounted volumes** | Point `-d D:` at a mounted drive or pass `--all-volumes` to scan every NTFS disk on the host — live EVTX + VSS recovery without imaging first. | |
 | **BitLocker detection** | Automatically detects BitLocker-encrypted partitions via the `-FVE-FS-` VBR signature, warns with the exact offset, and skips encrypted volumes instead of crashing on unreadable data. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Compressed triage** | Recursive ZIP extraction with auto-detection of standard forensic passwords (`infected`, `kape`, etc.). | |
+| **Compressed triage** | Recursive ZIP extraction with auto-detection of standard forensic passwords (`infected`, `kape`, etc.). `parse-linux` also streams `.tar` / `.tar.gz` / `.tgz` (nested in zips or in each other) and unpacks only the log files it needs. | |
 
 ### Artifact coverage
 
@@ -173,7 +173,26 @@ Parses Linux system logs and accounting entries to extract SSH sessions and auth
 
 ```bash
 masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
+
+# A folder of UAC (Unix-like Artifacts Collector) triages — every tar.gz is
+# detected, streamed and labelled [TRIAGE: UAC] in the per-source breakdown
+masstin -a parse-linux -d /evidence/uac-collections/ -o linux-timeline.csv
 ```
+
+Rotated logs are handled the way logrotate leaves them: `secure-20240616`, `messages-20260830.gz`, `wtmp-20231119`, `btmp-20260901.gz`. The `-YYYYMMDD` suffix also fixes the year of RFC3164 timestamps (which carry none), so a 2024 rotation is not stamped with the year of its 2026 siblings.
+
+**What comes out, per source**
+
+| Source | Events | Notes |
+|---|---|---|
+| `secure` / `auth.log` / `messages` (+ rotations, `.gz`) | `SSH_SUCCESS` for every `Accepted <method>` (password, publickey, keyboard-interactive/pam, gssapi-with-mic…), `SSH_FAILED` for every `Failed <method>` including `invalid user` guesses and `not allowed because` policy denials | `detail` carries the method (`ssh/publickey`, `ssh/password invalid-user`, `ssh/not-allowed`). Sources are kept whether sshd logged an IP or a resolved hostname (`UseDNS yes`). `pam_unix(sshd:auth)` failures are only used when sshd logged no outcome lines at all — on SSSD/LDAP hosts pam_unix fails for every directory user before pam_sss succeeds |
+| `audit.log*` | `USER_LOGIN` / `USER_AUTH` with `addr=` → `SSH_SUCCESS` / `SSH_FAILED` | epoch timestamps; `detail` = `audit` |
+| `wtmp*` / `utmp` | `LOGIN` / `LOGOUT` per session with a remote source (IP or hostname) | console sessions and boot/runlevel records are dropped |
+| `btmp*` | `FAILED_LOGIN` | rotated and gzipped files included |
+| `lastlog` | `LASTLOG`: last login per account with its source | uid → name via the collected `/etc/passwd`; the only trace left of accounts whose activity predates every surviving rotation |
+| `/var/log/journal`, `/run/log/journal` | same sshd events as above, from journald | de-duplicated against `secure` when rsyslog's imjournal copied them there |
+
+**Timestamps are made absolute.** RFC3164 lines are the host's local wall-clock time; masstin resolves the zone from the collected filesystem (`/etc/timezone`, `/etc/sysconfig/clock`, the `/etc/localtime` symlink target or the TZif file itself, or `timedatectl` output on a live UAC run) and converts them to UTC, so they line up with wtmp, audit and journald instead of sitting hours apart. If no zone can be found the run says so and leaves them as-is. If an archive ends early (interrupted transfer), the run prints a loud truncation warning naming the file — everything tar wrote after that point is missing.
 
 <div align="center">
   <img src="resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
@@ -409,7 +428,9 @@ The stats always attribute each filtered record to exactly one cause (the first 
 
 ### Triage detection and per-source breakdown
 
-When the directory walker encounters a ZIP archive, masstin reads its top-level entry list and runs pattern matching against three known triage tool layouts. Detected packages surface as `=> Triage found:` lines in phase 1 and drive the per-source grouping in phase 2 — so the analyst can tell at a glance which events came from which source.
+When the directory walker encounters a ZIP archive (or, in `parse-linux`, a `.tar` / `.tar.gz` / `.tgz`), masstin reads its entry list and runs pattern matching against four known triage tool layouts. Detected packages surface as `=> Triage found:` lines in phase 1 and drive the per-source grouping in phase 2 — so the analyst can tell at a glance which events came from which source.
+
+Archives nest freely: a zip wrapping two UAC tarballs, or a tar.gz wrapping another tar.gz, is walked all the way down and every level is labelled with its full chain (`outer.tar.gz -> inner/uac-host-linux-20260924230926.tar.gz`). Tar archives are streamed and only the files masstin can use are unpacked, so a multi-GB UAC collection costs seconds and a few MB of temp space, not a full extraction.
 
 **Detection signatures**
 
@@ -418,6 +439,7 @@ When the directory walker encounters a ZIP archive, masstin reads its top-level 
 | **KAPE** | `_kape.cli` at any level, `Console/KAPE.log`, or 5+ entries matching `<host>/C/Windows/System32/winevt/Logs/*.evtx` | Filename pattern `<host>_<digits>...zip` (only when the shape is unambiguous; KAPE has no enforced filename) |
 | **Velociraptor Offline Collector** | Top-level `client_info.json` + (`collection_context.json` OR `uploads.json`); encrypted variant uses `metadata.json` + `data.zip` | Filename pattern `Collection-<host>-<YYYY-MM-DD>T...Z.zip` |
 | **Cortex XDR Offline Collector** | Any entry ending in `cortex-xdr-payload.log` (this filename is unique to the XDR collector) | Filename pattern `offline_collector_output_<host>_<YYYY-MM-DD>_<HH-MM-SS>.zip` |
+| **UAC (Unix-like Artifacts Collector)** | `uac.log` at the archive root plus the `[root]/` or `live_response/` layout directory (tar.gz by default, zip with `-f zip`); or the enforced filename `uac-<host>-<os>-<YYYYMMDDhhmmss>` | Filename pattern `uac-<host>-<os>-<YYYYMMDDhhmmss>.tar.gz`. UAC writes `unknown` when it was run against a mounted image, so masstin then falls back to `[root]/etc/hostname`, `/etc/sysconfig/network`, `uac.log`, `/etc/hosts` and the syslog header of the collected logs |
 
 **Phase 1 output** (folder containing 2 triages plus a forensic image with NTUSER.DAT hives). Notice that every counter — triages, EVTX inside compressed archives, MountPoints2 from registry, Scheduled Tasks from XML — appears as `=>` lines INSIDE the same `[1/3]` block, not scattered before/after the phase header:
 

@@ -41,4 +41,6 @@ notatin = "1.0"
 serde_yaml = "0.9"
 ipnet = "2"
 systemd-journal-reader = "0.1.1"
+tar = "0.4"
+chrono-tz = "0.10"
 
