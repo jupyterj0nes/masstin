@@ -415,7 +415,8 @@ async fn flush_batch(
          src_computer: $src_computer[i], src_ip: $src_ip[i], \
          target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
          subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
-         count: $count[i]}}]->(d)",
+         count: $count[i]}}]->(d) \
+         RETURN count(r) AS created",
         edge_op, rel_type,
     );
     let q = query(&q_str)
@@ -431,12 +432,50 @@ async fn flush_batch(
         .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
         .param("count", chunk.iter().map(|e| e.count.clone()).collect::<Vec<String>>());
     match graph.execute(q).await {
-        Ok(mut result) => { let _ = result.next().await; (chunk.len(), 0) }
+        Ok(mut result) => {
+            // Report what the server actually created, not what we sent:
+            // an edge whose endpoint MATCH finds no node is dropped
+            // silently by Cypher and must show up as an error here.
+            let created: usize = match result.next().await {
+                Ok(Some(row)) => row.get::<i64>("created").unwrap_or(0).max(0) as usize,
+                _ => chunk.len(),
+            };
+            let missing = chunk.len().saturating_sub(created);
+            if missing > 0 && crate::parse::is_debug_mode() {
+                eprintln!("[ERROR] edge batch (r:{}): {} of {} edges not created (endpoint node missing)",
+                          rel_type, missing, chunk.len());
+            }
+            (created, missing)
+        }
         Err(e) => {
             if crate::parse::is_debug_mode() {
                 eprintln!("[ERROR] edge batch ({} edges, r:{}) failed: {:?}", chunk.len(), rel_type, e);
             }
             (0, chunk.len())
+        }
+    }
+}
+
+/// MERGE every host name queued in `new_nodes` and empty the queue. Must
+/// run before ANY edge batch is flushed: the edge query MATCHes both
+/// endpoints, so an origin/destination whose node has not been written
+/// yet makes Cypher drop that edge without an error. Previously nodes
+/// were only merged every 256 new names, while edge batches went out
+/// every 5000 rows — on a corpus with a few dozen IP sources the IP nodes
+/// were created only at the very end and every earlier batch from those
+/// sources vanished (a 76k-row UAC timeline came out as 21k edges).
+async fn merge_pending_nodes(graph: &Graph, new_nodes: &mut Vec<String>) {
+    if new_nodes.is_empty() { return; }
+    let batch: Vec<String> = new_nodes.drain(..).collect();
+    match graph
+        .execute(query("UNWIND $names AS n MERGE (:host {name: n})").param("names", batch))
+        .await
+    {
+        Ok(mut r) => { let _ = r.next().await; }
+        Err(e) => {
+            if crate::parse::is_debug_mode() {
+                eprintln!("[ERROR] host node pre-create failed: {:?}", e);
+            }
         }
     }
 }
@@ -650,18 +689,7 @@ pub async fn load_neo4j(
                 ensure_node(&edge.origin, &mut new_nodes, &mut nodes_known);
                 ensure_node(&edge.destination, &mut new_nodes, &mut nodes_known);
                 if new_nodes.len() >= 256 {
-                    let batch: Vec<String> = new_nodes.drain(..).collect();
-                    match graph
-                        .execute(query("UNWIND $names AS n MERGE (:host {name: n})").param("names", batch))
-                        .await
-                    {
-                        Ok(mut r) => { let _ = r.next().await; }
-                        Err(e) => {
-                            if crate::parse::is_debug_mode() {
-                                eprintln!("[ERROR] lazy host pre-create failed: {:?}", e);
-                            }
-                        }
-                    }
+                    merge_pending_nodes(&graph, &mut new_nodes).await;
                 }
 
                 let rt = edge.rel_type.clone();
@@ -671,6 +699,7 @@ pub async fn load_neo4j(
                 if buf.len() >= EDGE_BATCH {
                     let chunk: Vec<ResolvedEdge> = buf.drain(..).collect();
                     total_pending -= chunk.len();
+                    merge_pending_nodes(&graph, &mut new_nodes).await;
                     let (l, e) = flush_batch(&graph, &rt, &chunk, edge_op).await;
                     loaded += l;
                     errors += e;
@@ -682,6 +711,7 @@ pub async fn load_neo4j(
                         .filter(|(_, v)| v.len() >= 256)
                         .map(|(k, _)| k.clone())
                         .collect();
+                    merge_pending_nodes(&graph, &mut new_nodes).await;
                     for k in keys_to_flush {
                         if let Some(buf) = pending.get_mut(&k) {
                             let chunk: Vec<ResolvedEdge> = buf.drain(..).collect();
@@ -756,6 +786,7 @@ pub async fn load_neo4j(
                 if buf.len() >= EDGE_BATCH {
                     let chunk: Vec<ResolvedEdge> = buf.drain(..).collect();
                     total_pending -= chunk.len();
+                    merge_pending_nodes(&graph, &mut new_nodes).await;
                     let (l, e) = flush_batch(&graph, &rt, &chunk, edge_op).await;
                     loaded += l;
                     errors += e;
@@ -764,20 +795,7 @@ pub async fn load_neo4j(
         }
 
         // ── Final flush of any remaining new nodes + pending edge buffers ──
-        if !new_nodes.is_empty() {
-            let batch: Vec<String> = new_nodes.drain(..).collect();
-            match graph
-                .execute(query("UNWIND $names AS n MERGE (:host {name: n})").param("names", batch))
-                .await
-            {
-                Ok(mut r) => { let _ = r.next().await; }
-                Err(e) => {
-                    if crate::parse::is_debug_mode() {
-                        eprintln!("[ERROR] final lazy host pre-create failed: {:?}", e);
-                    }
-                }
-            }
-        }
+        merge_pending_nodes(&graph, &mut new_nodes).await;
         for (rt, mut buf) in pending.drain() {
             if buf.is_empty() { continue; }
             let chunk: Vec<ResolvedEdge> = buf.drain(..).collect();

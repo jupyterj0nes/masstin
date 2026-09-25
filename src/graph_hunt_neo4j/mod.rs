@@ -249,18 +249,55 @@ pub(crate) async fn ensure_projection(graph: &Graph, name: &str) -> neo4rs::Resu
     }
 }
 
+/// True once the server has been identified as running GDS 1.x, whose
+/// projection procedures are named `gds.graph.create[.cypher]` instead of
+/// the GDS 2.x `gds.graph.project`. Algorithm procedures (pageRank,
+/// louvain, betweenness, util.asNode) share their names across both
+/// generations, so the projection calls are the only thing that differs.
+/// Detected lazily: the first `gds.graph.project` failing with
+/// ProcedureNotFound flips the flag and the call is retried in 1.x form.
+static GDS_LEGACY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn gds_legacy() -> bool {
+    GDS_LEGACY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn is_procedure_not_found(e: &neo4rs::Error) -> bool {
+    let s = format!("{:?}", e);
+    s.contains("ProcedureNotFound") || s.contains("no procedure with the name")
+}
+
 /// Create the GDS graph projection over (:host) nodes and every relationship
 /// type (the loader uses the sanitized username as the rel type, so there's
-/// no canonical small set to enumerate). Uses `gds.graph.project()` which
-/// is the GDS 2.x procedure name (Neo4j 5.x / 2026.x). GDS 1.x used
-/// `gds.graph.create()` and is EOL — masstin requires GDS 2.x on the
-/// server side from this version on.
+/// no canonical small set to enumerate). Uses `gds.graph.project()` (GDS
+/// 2.x, Neo4j 5.x / 2026.x) and falls back to `gds.graph.create()` when
+/// the server still runs GDS 1.x (Neo4j 4.x installs, e.g. Neo4j Desktop
+/// 4.2 + GDS 1.4).
 pub(crate) async fn create_projection(graph: &Graph) -> neo4rs::Result<()> {
-    let q = format!(
+    let modern = format!(
         "CALL gds.graph.project('{}', 'host', '*') YIELD graphName, nodeCount, relationshipCount",
         PROJECTION_NAME
     );
-    let mut stream = graph.execute(query(&q)).await?;
+    let legacy = format!(
+        "CALL gds.graph.create('{}', 'host', '*') YIELD graphName, nodeCount, relationshipCount",
+        PROJECTION_NAME
+    );
+    let mut stream = if gds_legacy() {
+        graph.execute(query(&legacy)).await?
+    } else {
+        match graph.execute(query(&modern)).await {
+            Ok(s) => s,
+            Err(e) if is_procedure_not_found(&e) => {
+                GDS_LEGACY.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::banner::print_phase_detail(
+                    "GDS:",
+                    "1.x detected (gds.graph.project missing) — using gds.graph.create",
+                );
+                graph.execute(query(&legacy)).await?
+            }
+            Err(e) => return Err(e),
+        }
+    };
     if let Some(row) = stream.next().await? {
         let nodes: i64 = row.get("nodeCount").unwrap_or(0);
         let rels: i64 = row.get("relationshipCount").unwrap_or(0);
@@ -301,15 +338,29 @@ pub(crate) async fn create_baseline_projection(
     graph: &Graph,
     cutoff_str: &str,
 ) -> neo4rs::Result<()> {
-    let q = format!(
-        "MATCH (a:host)-[r]->(b:host)
-         WHERE r.time < datetime('{cutoff}')
-         WITH gds.graph.project('{name}', a, b) AS g
-         RETURN g.graphName AS graphName, g.nodeCount AS nodeCount, g.relationshipCount AS relationshipCount
-         LIMIT 1",
-        cutoff = cutoff_str,
-        name = PROJECTION_BASELINE_NAME,
-    );
+    let q = if gds_legacy() {
+        // GDS 1.x has no projection aggregation function; the Cypher
+        // projection procedure takes a node query and a relationship
+        // query as strings instead.
+        format!(
+            "CALL gds.graph.create.cypher('{name}',
+                'MATCH (n:host) RETURN id(n) AS id',
+                'MATCH (a:host)-[r]->(b:host) WHERE r.time < datetime(\"{cutoff}\") RETURN id(a) AS source, id(b) AS target')
+             YIELD graphName, nodeCount, relationshipCount",
+            cutoff = cutoff_str,
+            name = PROJECTION_BASELINE_NAME,
+        )
+    } else {
+        format!(
+            "MATCH (a:host)-[r]->(b:host)
+             WHERE r.time < datetime('{cutoff}')
+             WITH gds.graph.project('{name}', a, b) AS g
+             RETURN g.graphName AS graphName, g.nodeCount AS nodeCount, g.relationshipCount AS relationshipCount
+             LIMIT 1",
+            cutoff = cutoff_str,
+            name = PROJECTION_BASELINE_NAME,
+        )
+    };
     let mut stream = graph.execute(query(&q)).await?;
     if let Some(row) = stream.next().await? {
         let nodes: i64 = row.get("nodeCount").unwrap_or(0);
