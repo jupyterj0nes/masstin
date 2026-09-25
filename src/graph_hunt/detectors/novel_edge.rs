@@ -23,8 +23,8 @@ use futures::stream::*;
 use neo4rs::*;
 
 /// Context gates (see the long FP analysis in git history):
-///  * destinations with fewer baseline events than this are coverage
-///    artifacts, not anomalies;
+///  * destinations with fewer baseline events than this have thin history:
+///    novelty there is reported with a reduced score (0.6), not dropped;
 ///  * origins whose baseline out-degree covers more than this fraction of
 ///    the estate are infrastructure (SCCM-style) rotating targets.
 const MIN_BASELINE_EVENTS_AT_DEST: u64 = 50;
@@ -72,9 +72,12 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                 if bl.is_known_triple(&origin, &user, &destination) {
                     continue;
                 }
-                if bl.baseline_event_count_for_dest(&destination) < MIN_BASELINE_EVENTS_AT_DEST {
-                    continue;
-                }
+                // Thin destination history (new host, truncated collection,
+                // rotated logs): novelty there is weaker evidence, but it is
+                // still reported — silently dropping it hid a brand-new
+                // account on a host whose collection came in truncated.
+                let dest_events = bl.baseline_event_count_for_dest(&destination);
+                let thin_dest = dest_events < MIN_BASELINE_EVENTS_AT_DEST;
                 let origin_outdeg = bl.outgoing_degree(&origin) as f64;
                 if origin_outdeg / host_count > MAX_ORIGIN_OUTDEGREE_FRACTION {
                     continue;
@@ -82,7 +85,7 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
 
                 let logon_type = logon_types.first().cloned().unwrap_or_default();
                 let type_novel = logon_types.iter().any(|lt| !bl.is_logon_type_known_for(&destination, lt));
-                let score = if type_novel { 1.1 } else { 1.0 };
+                let score = if thin_dest { 0.6 } else if type_novel { 1.1 } else { 1.0 };
 
                 let context = match (bl.is_known_edge(&origin, &destination), bl.is_user_known_for(&destination, &user)) {
                     (false, false) => "neither (origin,dest) nor (user,dest) had baseline history",
@@ -97,6 +100,11 @@ pub async fn run(graph: &Graph, bl: &Baseline) -> Vec<Finding> {
                     origin, destination, user, logon_type, n, context,
                     if type_novel { " Logon type also unprecedented on this destination." } else { "" },
                 );
+                let summary = if thin_dest {
+                    format!("{} Destination has only {} baseline events (thin history: weaker evidence).", summary, dest_events)
+                } else {
+                    summary
+                };
 
                 let snippet = browser_snippet(&D, &origin, Some(&destination), Some(&user), &first_time, Some(&last_time));
 
