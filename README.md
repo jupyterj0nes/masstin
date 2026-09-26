@@ -632,114 +632,56 @@ When the variable is unset or empty the loader falls back to the interactive pro
 
 ### Detect lateral movement: graph-hunt
 
-Once the graph is loaded, masstin can run 10 detectors against it that surface lateral-movement anomalies — origin fan-out, probe-then-success, failed sweeps, novel edges, chain motifs, credential rotation, community bridges, PageRank/betweenness spikes, rare logon types. Two flavors:
+Once the graph is loaded (with `--ungrouped`: the hunt needs per-event times), masstin looks for lateral-movement anomalies and reports them with **probabilities measured in the network itself** — no hand-picked weights, windows or thresholds. Two flavors, same engine:
 
-- **`-a graph-hunt`** — targets **Memgraph**. Uses MAGE algorithms (`pagerank.get`, `community_detection.get`, `betweenness_centrality.get`) that ship with the default Memgraph install. No extra plugin needed.
-- **`-a graph-hunt-neo4j`** — targets **Neo4j**. Uses the Neo4j Graph Data Science (GDS) library. **Requires GDS to be installed in the target Neo4j instance** (see prerequisites below).
+- **`-a graph-hunt`** — reads a **Memgraph** graph.
+- **`-a graph-hunt-neo4j`** — reads a **Neo4j** graph.
 
-#### Prerequisites for `graph-hunt-neo4j`
-
-The detector calls procedures from the Graph Data Science plugin: `gds.pageRank.stream`, `gds.louvain.stream`, `gds.betweenness.stream` and a Cypher projection. Both **GDS 2.x (Neo4j 5.x / 2026.x)** and **GDS 1.x (Neo4j 4.x)** work: the generation is detected with `gds.version()` and the projection uses `gds.graph.project` or `gds.graph.create.cypher` accordingly. The cleanest install path is via Neo4j Desktop's UI:
-
-1. Open **Neo4j Desktop** → select your instance.
-2. Click the **`...`** menu (top-right of the instance card) → **Plugins**.
-3. Find **Graph Data Science** in the list → click **Install**.
-4. **Restart the instance** so the plugin loads into the JVM. Desktop shows the badge "Installed" once the JAR is in place; restarting is what makes the procedures actually callable.
-
-To verify GDS is live after restart:
-
-```cypher
-SHOW PROCEDURES YIELD name
-WHERE name STARTS WITH 'gds.graph.project'
-   OR name STARTS WITH 'gds.pageRank.stream'
-   OR name STARTS WITH 'gds.louvain.stream'
-   OR name STARTS WITH 'gds.betweenness.stream'
-RETURN name
-```
-
-All four families should appear. If `SHOW PROCEDURES` returns no `gds.*` rows even though the JAR is in `plugins/` and the startup log shows `Graph Data Science extension built`, the plugin loaded but its procedures were **denied by the allowlist**. Neo4j 2026.x ships with `dbms.security.procedures.allowlist` set to `apoc.*,genai.*,ai.*` and Desktop's plugin manager does **not** update that list when GDS is installed via the UI — a known plugin-manager gap. Fix: open `conf/neo4j.conf` in the instance folder (Desktop's `Open folder` button gets you there) and edit both lines:
-
-```
-dbms.security.procedures.unrestricted=apoc.*,gds.*
-dbms.security.procedures.allowlist=apoc.*,genai.*,ai.*,gds.*
-```
-
-Then restart the instance. The procedures should now be visible to `SHOW PROCEDURES` and callable from masstin.
-
-#### Running graph-hunt
-
-Both actions take a `--investigation-from` cutoff (any datetime in the corpus). Events strictly before the cutoff form the **baseline**; events at-or-after form the **investigation window**. The detectors compare the two.
+No server-side plugin is needed: masstin reads the edges once over bolt and computes everything — including PageRank, betweenness and Louvain — in memory.
 
 ```bash
 # Memgraph
-masstin -a graph-hunt \
-        --database bolt://localhost:7687 \
-        --investigation-from "2026-03-15 00:00:00" \
-        -o findings.csv
+masstin -a graph-hunt --database bolt://localhost:7687 \
+        --investigation-from "2026-03-15 00:00:00" -o findings.csv
 
-# Neo4j (default database = neo4j; password from $NEO4J_PASSWORD or prompt)
+# Neo4j (password from $NEO4J_PASSWORD or prompt; --db for a named database)
 NEO4J_PASSWORD='your-pass' masstin -a graph-hunt-neo4j \
-        --database bolt://localhost:7687 --user neo4j \
-        --investigation-from "2026-03-15 00:00:00" \
-        -o findings.csv
-
-# Neo4j with a named database (useful when one server holds multiple cases)
-masstin -a graph-hunt-neo4j \
-        --database bolt://localhost:7687 --user neo4j \
-        --db detection-test \
-        --investigation-from "2026-03-15 00:00:00" \
-        -o findings.csv
+        --database bolt://localhost:7687 --user neo4j --db mycase \
+        --investigation-from "2026-03-15 00:00:00" -o findings.csv
 ```
 
-The output CSV is ranked by score and includes the Cypher snippet to inspect each finding in Neo4j Browser / Memgraph Lab.
+Days before `--investigation-from` are the **baseline**, the rest the **window**. `--alpha` (default 0.05) is the false discovery rate and the only number the analyst chooses.
 
-#### Heap sizing for large corpora
+#### How it decides
 
-The seven detectors run quickly on graphs up to a few hundred thousand edges with the default Neo4j heap (1 GB). For DFIR-scale corpora (millions of edges), the GDS in-memory projection needs more headroom — bump the heap via Neo4j Desktop:
+The full design, with the reasons behind each choice, is in [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md). In short:
 
-1. Stop the instance.
-2. **`...`** menu → **Settings** (or open `conf/neo4j.conf` in the instance folder).
-3. Raise `server.memory.heap.max_size` (e.g. `6G`) and `server.memory.pagecache.size` (e.g. `2G`).
-4. Start the instance again.
+- **Leave-one-day-out reference.** A fact is *new* on a baseline day if it happens on no other baseline day, and on a window day if it happens on no baseline day. Every day is judged against the same amount of history, so baseline days are a fair yardstick for window days.
+- **Coverage from the log files.** The loaders record on every host node the time span of each collected log file (`cov_ok` for sources that show logins, `cov_fail` for sources that show failures). Counts are only compared over a **panel** of destinations watched continuously; its start day is the one that maximises panel size × baseline days. Window activity on hosts outside the panel is listed as *not evaluable* instead of being ranked.
+- **One joint test per origin and day** over ten signals: destinations reached for the first time (`origin-fanout`), new accounts for the origin (`cred-rotation`), never-seen account/destination pairs (`novel-edge`), new destinations outside the origin's Louvain community (`community-bridge`), destinations with failures (`failed-sweep`), SSH pre-auth touches (`preauth-sweep`), refused named attempts followed by a login with a new account (`probe-then-success`), origin without any history, rarest logon type (`rare-logon-type`) and fastest new-login chain (`chain-motif`). The combined surprise is calibrated against the baseline origin-days, which gives a p-value that stays valid however the signals depend on each other. Hosts get the same joint test on their PageRank / betweenness change (`pagerank-spike`, `betweenness-spike`).
+- **Decision.** Simes per machine, Benjamini-Hochberg across machines. Significant machines first; the rest stay in the CSV, marked.
+- **Campaigns.** Origins with no history that share a new account and hit overlapping destinations beyond chance (exact hypergeometric test) are grouped in one row. Nodes are not merged.
+- **Machines, not nodes.** An IP and a host name are reported as one machine when the same logins appear once with each (sshd IP vs wtmp reverse-DNS), unanimously, and a chance coincidence is statistically ruled out. The loaders store this on the IP node as `resolved_name` / `resolved_votes` / `resolved_p`; nodes are never merged.
 
-As a rule of thumb: 6 GB heap comfortably handles ~15 M edges + projection on a modern desktop; 2 GB heap is enough up to ~2-3 M edges.
+`--only-detectors` / `--skip-detectors` take the signal names above (mutually exclusive).
 
-#### Filtering detectors
+#### Output
 
-If the analyst only wants specific signals, `--only-detectors` / `--skip-detectors` accept a comma-separated list of detector names: `origin-fanout`, `probe-then-success`, `failed-sweep`, `novel-edge`, `chain-motif`, `pagerank-spike`, `betweenness-spike`, `community-bridge`, `cred-rotation`, `rare-logon-type`. The two options are mutually exclusive.
+`section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`
 
-#### How the hunt reads the graph
-
-- **Authenticated logins only for structure.** novel-edge, community-bridge, chain-motif, rare-logon-type, the baseline and the GDS projections (PageRank, betweenness, Louvain) use only successful logins with a real account. Failed and unauthenticated attempts (`_UNKNOWN_`, `NO_USER`) are not connectivity — a scanner "reaching" every host reached none — and are reported by `failed-sweep` instead. Louvain runs on a projection weighted by login count.
-- **Origin-level detectors.** `origin-fanout` emits one row per origin that logged in to 3+ destinations it had never reached, scored by origin novelty, breadth and burst (destinations first reached within 60 s). `probe-then-success` flags an origin whose named account was refused and that, within 6 h, logged in with a different account that is new for it. `failed-sweep` summarises refused / unauthenticated attempts per origin (score capped below any authenticated anomaly).
-- **Periodicity.** (origin, account) pairs that repeat at the same time every day, or at a constant daily rate, AND already existed before the cutoff are demoted x0.3 — monitoring probes and inventory jobs sink without an allow-list, while a freshly planted cron is not demoted.
-- **Corroboration.** Each row gains +0.25 per other detector firing on the same origin; the `corroboration` column lists them.
-- **Coverage warning.** Edges carry `log_source` (secure, wtmp, audit, journal, lastlog, evtx...). The hunt warns when the cutoff leaves a source with < 14 days of continuous baseline on some hosts — anything seen only there would look new for lack of history.
-- **Output.** `rank, score, events, detector, origin, host, time_window, corroboration, summary, cypher_snippet`. On Neo4j the snippet is a Browser-ready query returning an APOC virtual graph (one relationship per origin/account/destination/result with `count`, `primero`, `ultimo`); virtual nodes stop the Browser's "connect result nodes" from pulling the full history and hanging. Style: drag `neo4j-resources/style.grass` onto the Browser.
-- **IP ↔ hostname.** The loaders annotate IP nodes with `resolved_name` / `resolved_votes` when the same Linux login appears once with the IP (auditd, btmp) and once with the name (sshd `UseDNS`), unanimously and at least twice. Nodes are not merged: the name is the destination's reverse DNS at that moment.
-
-```bash
-# Run only novelty + chain detectors
-masstin -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j \
-        --investigation-from "2026-03-15 00:00:00" \
-        --only-detectors novel-edge,chain-motif -o findings.csv
-```
+- `role = decision` rows carry the joint p-value that counts for the machine; `component` rows show each signal with its own baseline tail; `detail` rows describe each first-time login.
+- Every summary states the counts behind its p-value ("0 of 1214 baseline origin-days at least as high").
+- On Neo4j the snippet returns an APOC virtual graph for Browser (drag `neo4j-resources/style.grass` onto it); virtual nodes keep "connect result nodes" from pulling the whole history.
 
 #### Detection quality
 
-> The figures below were measured before the September 2026 detector rework (authenticated-only structure, origin-level detectors, periodicity, corroboration) and have not been re-run yet.
-
-`graph-hunt-neo4j` is validated on a dual-corpus harness — a small control corpus (50 hosts, 14 users, 5M events) plus a stress corpus modeling a 200-host / 85-account enterprise (3.87M events). Headline numbers on the stress corpus:
+> The figures below were measured with the previous, hand-weighted detectors and have not been re-run with the statistical engine yet.
 
 | | Findings | TPs | Hit rate | Recall (events) | Recall (scenarios) | P@10 | P@20 | P@50 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **Stress (3.87M events)** | 380 | 252 | **66.3%** | **109/110 (99.1%)** | **23/23 (100%)** | **90%** | **85%** | **92%** |
 
-In triage terms: 3.87M raw events → 380 prioritized alerts (**10,190× reduction**), of which 252 are real attacks (**~23,300× enrichment** over random sampling). The control corpus reaches **100% precision / 100% recall**.
-
-**Backend parity note**: the headline numbers above are on Neo4j + GDS 2.x. The Memgraph variant (`graph-hunt`) shares the same triple-novelty + context-gate logic for `novel-edge` and `community-bridge`, but MAGE doesn't expose `_subgraph` variants for `pagerank.get` or `betweenness_centrality.get`, so the two-snapshot centrality pattern can't be replicated on Memgraph without destructive edge manipulation. The Memgraph variant accordingly keeps single-snapshot scoring for `pagerank-spike` and `betweenness-spike`. On the small control corpus this yields **100% top-K (P@10 / P@20) and 100% scenario recall**, with ~13pp lower overall precision than Neo4j due to ~19 long-tail FPs in centrality detectors. Memgraph is recommended for corpora up to ~5M edges; for larger enterprise corpora the Neo4j backend is preferred.
-
-Full methodology, per-detector breakdown, and algorithmic notes (two-snapshot centrality, triple-novelty, context gates) are documented in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).
+Methodology of that harness: [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).
 
 ### Merge graph nodes after loading
 

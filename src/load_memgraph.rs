@@ -128,6 +128,7 @@ pub async fn load_memgraph(
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
+    alpha: f64,
 ) {
     let start_clock = std::time::Instant::now();
 
@@ -222,6 +223,9 @@ pub async fn load_memgraph(
             by_short.into_iter().filter(|(_, s)| s.len() > 1).map(|(k, _)| k).collect()
         };
 
+        // (destination, log file) -> (first, last) record time; written to
+        // the host nodes as `cov_ok` / `cov_fail` spans for graph-hunt.
+        let mut file_spans: HashMap<(String, String), (i64, i64)> = HashMap::new();
         let processed_lines: Vec<String> = lines
         .into_iter()
         .skip(1)
@@ -250,6 +254,7 @@ pub async fn load_memgraph(
             }
 
             let mut row: Vec<&str> = line.split(',').collect();
+            let raw_file = row.last().copied().unwrap_or("").trim_matches('"').to_string();
             let fam = crate::load_neo4j::log_source_family(row.last().copied().unwrap_or(""));
             if let Some(last) = row.last_mut() { *last = fam; }
 
@@ -260,6 +265,12 @@ pub async fn load_memgraph(
                 if !ambiguous.contains(short) {
                     row[idx_dst] = short;
                 }
+            }
+            if let Some(t) = parse_csv_time(row[0]) {
+                let t = t.timestamp();
+                let e = file_spans.entry((row[idx_dst].to_string(), raw_file)).or_insert((t, t));
+                if t < e.0 { e.0 = t; }
+                if t > e.1 { e.1 = t; }
             }
 
             if let Some(ip) = extract_leading_ip(row[idx_src_computer]) {
@@ -360,7 +371,8 @@ pub async fn load_memgraph(
         // sshd (UseDNS) records the peer by name, auditd / btmp / wtmp keep
         // its IP: the same login appears as two single-sided rows. A pair
         // is only used to ANNOTATE the IP node (resolved_name), never to
-        // merge nodes, and only when every vote agrees (>= 2 logins).
+        // merge nodes, and only when every vote agrees and the votes are
+        // unlikely to be chance coincidences (graph_hunt_common::resolve).
         let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
         for line in &processed_lines {
             let parts: Vec<&str> = line.split(',').collect();
@@ -380,21 +392,9 @@ pub async fn load_memgraph(
                 if !list.contains(&v) { list.push(v); }
             }
         }
-        let mut votes: HashMap<String, HashMap<String, u32>> = HashMap::new();
-        for (ips, names) in cooc.values() {
-            if ips.len() == 1 && names.len() == 1 {
-                *votes.entry(ips[0].clone()).or_default().entry(names[0].clone()).or_insert(0) += 1;
-            }
-        }
+        let resolved_names: HashMap<String, (String, u32, f64)> =
+            crate::graph_hunt_common::resolve::resolve_from_cooc(&cooc, alpha);
         drop(cooc);
-        let resolved_names: HashMap<String, (String, u32)> = votes
-            .into_iter()
-            .filter_map(|(ip, m)| {
-                if m.len() != 1 { return None; }
-                let (name, v) = m.into_iter().next()?;
-                if v >= 2 { Some((ip, (name, v))) } else { None }
-            })
-            .collect();
 
         // ── Global IP→hostname map ──
         let mut ip_to_host: HashMap<String, String> = HashMap::new();
@@ -694,22 +694,46 @@ pub async fn load_memgraph(
 
         pb.finish_and_clear();
 
+        // Destination nodes: log coverage spans.
+        if ungrouped && !file_spans.is_empty() {
+            let mut per_dst: HashMap<String, (Vec<(i64, i64)>, Vec<(i64, i64)>)> = HashMap::new();
+            for ((dst, file), span) in file_spans.drain() {
+                let dst = if looks_like_ip(&dst) { ip_to_host.get(&dst).cloned().unwrap_or(dst) } else { dst };
+                let (ok, fail) = crate::graph_hunt_common::coverage_kinds(crate::load_neo4j::log_source_family(&file));
+                let x = per_dst.entry(dst).or_default();
+                if ok { x.0.push(span); }
+                if fail { x.1.push(span); }
+            }
+            let names: Vec<String> = per_dst.keys().cloned().collect();
+            let oks: Vec<Vec<i64>> = names.iter().map(|n| crate::graph_hunt_common::merge_spans(per_dst[n].0.clone())).collect();
+            let fails: Vec<Vec<i64>> = names.iter().map(|n| crate::graph_hunt_common::merge_spans(per_dst[n].1.clone())).collect();
+            let q_cov = "UNWIND range(0, size($names) - 1) AS i                          MATCH (h:host {name: $names[i]})                          SET h.cov_ok = $oks[i], h.cov_fail = $fails[i]";
+            match graph.execute(query(q_cov).param("names", names).param("oks", oks).param("fails", fails)).await {
+                Ok(mut r) => {
+                    let _ = r.next().await;
+                    crate::banner::print_phase_detail("Coverage:", &format!("{} destination node(s) annotated with log-file time spans (cov_ok / cov_fail)", per_dst.len()));
+                }
+                Err(e) => eprintln!("[ERROR] coverage annotation failed: {:?}", e),
+            }
+        }
+
         if !resolved_names.is_empty() {
             let ips: Vec<String> = resolved_names.keys().cloned().collect();
             let names: Vec<String> = ips.iter().map(|i| resolved_names[i].0.clone()).collect();
             let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
+            let pch: Vec<f64> = ips.iter().map(|i| resolved_names[i].2).collect();
             let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
                            MATCH (h:host {name: $ips[i]}) \
-                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i]";
+                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i], h.resolved_p = $pch[i]";
             match graph
-                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts))
+                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts).param("pch", pch))
                 .await
             {
                 Ok(mut r) => {
                     let _ = r.next().await;
                     crate::banner::print_phase_detail(
                         "IP nodes:",
-                        &format!("{} IPs annotated with resolved_name (unanimous sshd reverse-DNS, >= 2 logins; nodes not merged)", resolved_names.len()),
+                        &format!("{} IPs annotated with resolved_name (unanimous same-login evidence, chance coincidence significant at FDR {}; nodes not merged)", resolved_names.len(), alpha),
                     );
                 }
                 Err(e) => {
