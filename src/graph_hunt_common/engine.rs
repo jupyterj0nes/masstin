@@ -115,6 +115,8 @@ fn is_uid_account(a: &str) -> bool {
 
 struct RawRow {
     t: i64,
+    /// log family (secure, wtmp, audit, journal, btmp, evtx...)
+    fam: u32,
     o: u32,
     d: u32,
     a: u32,
@@ -128,6 +130,7 @@ struct RawRow {
 struct Corpus {
     /// node name -> (cov_ok, cov_fail) log-file spans written by the loader
     cov: HashMap<String, (Vec<i64>, Vec<i64>)>,
+    fams: Interner,
     nodes: Interner,
     accts: Interner,
     lts: Interner,
@@ -136,7 +139,7 @@ struct Corpus {
 }
 
 async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
-    let mut c = Corpus { cov: HashMap::new(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), rows: Vec::new() };
+    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), rows: Vec::new() };
     let aggregated = format!(
         "(coalesce(r.event_id, '') = 'SSH_PREAUTH' OR (coalesce(r.event_type, '') = 'FAILED_LOGON' AND type(r) IN {na}))",
         na = NO_ACCOUNT_TYPES
@@ -180,6 +183,7 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
             let cls = class_of(&et, &eid, &acct);
             let r = RawRow {
                 t,
+                fam: c.fams.id(&src),
                 o: c.nodes.id(&o),
                 d: c.nodes.id(&d),
                 a: c.accts.id(&acct),
@@ -262,6 +266,10 @@ struct TripleDay {
     o: u32,
     d: u32,
     a: u32,
+    /// OK / FAIL / PRE
+    cls: u8,
+    /// log families the connection was seen in (bit per family id)
+    fams: u64,
     flags: u8,
     /// reference days of the destination (its other covered baseline days)
     k: usize,
@@ -304,6 +312,18 @@ struct OkEvent {
     o: u32,
     d: u32,
     pair_new: bool,
+}
+
+/// a - b, with differences at the level of floating-point rounding (n
+/// accumulated operations on values of this size) treated as zero: a
+/// betweenness that "changes" by 1e-17 has not changed.
+fn clean_delta(a: f64, b: f64, n: usize) -> f64 {
+    let d = a - b;
+    if d.abs() <= (n.max(1) as f64) * f64::EPSILON * a.abs().max(b.abs()) {
+        0.0
+    } else {
+        d
+    }
 }
 
 fn day_of(t: i64) -> i32 {
@@ -371,6 +391,12 @@ impl JointNull {
         let dom = self.rows.iter().filter(|r| r.iter().zip(x).all(|(a, b)| a >= b)).count();
         (stats::empirical_p(ge, self.n), t, dom)
     }
+    /// (p, T, 0): the joint test without the all-coordinates dominance count
+    fn test_fast(&self, x: &[f64]) -> (f64, f64, usize) {
+        let t: f64 = x.iter().enumerate().map(|(k, v)| surprise(&self.cols[k], *v, self.n, false)).sum();
+        let ge = self.t_sorted.len() - self.t_sorted.partition_point(|v| *v < t - 1e-12);
+        (stats::empirical_p(ge, self.n), t, 0)
+    }
     /// marginal (count at least as high, share) for one coordinate
     fn marginal(&self, k: usize, v: f64) -> (usize, f64) {
         let ge = self.cols[k].len() - self.cols[k].partition_point(|x| *x < v);
@@ -380,24 +406,25 @@ impl JointNull {
 
 // ───────────────────────────── output rows ──────────────────────────────────
 
-struct Row {
-    section: &'static str,
-    /// decision (joint test that counts for the machine), component (one
-    /// coordinate of it, univariate tail), detail (per-login novelty)
-    role: &'static str,
-    /// machine p (Fisher of family Simes) and BH q; NaN when not tested
-    mp: f64,
-    mq: f64,
-    entity: u32,
-    detector: &'static str,
+/// One connection of the report: (origin, destination, account, result)
+/// on one day, with how unusual it is and why.
+struct Conn {
     p: f64,
+    q: f64,
+    tstat: f64,
     day: i32,
-    hosts: String,
+    first: i64,
+    last: i64,
+    origin: String,
+    dest: String,
     account: String,
+    result: &'static str,
     events: u64,
-    window: String,
-    summary: String,
-    snippet: String,
+    logs: String,
+    why: String,
+    campaign: String,
+    cypher: String,
+    evaluable: bool,
 }
 
 // ───────────────────────────── main entry ───────────────────────────────────
@@ -426,11 +453,11 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
         corpus.rows.retain(|r| r.t <= e);
         crate::banner::print_phase_detail("Window end:", &format!("{} (later events ignored)", end.to_rfc3339()));
     }
-    let (rows, summary_lines, labels, alpha) = analyse(&corpus, dialect, cfg);
+    let (rows, summary_lines, alpha) = analyse(&corpus, dialect, cfg);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
-    if let Err(e) = write_csv(&rows, &labels, alpha, output) {
+    if let Err(e) = write_csv(&rows, alpha, output) {
         eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
         return;
     }
@@ -543,7 +570,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<String>, Vec<String>, f64) {
+fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<String>, f64) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
     let (ents, res) = build_entities(c, alpha);
@@ -580,11 +607,12 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
         cls: u8,
         lt: u32,
         n: u64,
+        fam: u32,
     }
     let mut evs: Vec<Ev> = c
         .rows
         .iter()
-        .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n })
+        .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n, fam: r.fam })
         .collect();
     evs.sort_by_key(|e| e.t);
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
@@ -678,6 +706,8 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
 
     // ── baseline item indexes ──
     let mut ix_triple: DayIndex<(u32, u32, u32)> = DayIndex::new();
+    // (origin, destination, account, result): the connection itself
+    let mut ix_conn: DayIndex<(u32, u32, u32, u8)> = DayIndex::new();
     let mut ix_pair: DayIndex<(u32, u32)> = DayIndex::new();
     let mut ix_ad: DayIndex<(u32, u32)> = DayIndex::new();
     let mut ix_oa: DayIndex<(u32, u32)> = DayIndex::new();
@@ -686,6 +716,9 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
     let mut lt_day: HashMap<(i32, u32), HashMap<u32, u64>> = HashMap::new();
     for e in evs.iter().filter(|e| is_base(e.day)) {
         ix_org.add(e.o, e.day);
+        if e.cls == OK || e.cls == FAIL || e.cls == PRE {
+            ix_conn.add((e.o, e.d, e.a, e.cls), e.day);
+        }
         match e.cls {
             OK => {
                 ix_triple.add((e.o, e.d, e.a), e.day);
@@ -736,7 +769,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
         if need_m {
             let (pb, bb) = m_base.as_ref().unwrap();
             let (pr, bc) = (algos::pagerank(&g), algos::betweenness(&g));
-            delta_day.insert(*day, (pb.iter().zip(&pr).map(|(a, b)| a - b).collect(), bb.iter().zip(&bc).map(|(a, b)| a - b).collect()));
+            delta_day.insert(*day, (pb.iter().zip(&pr).map(|(a, b)| clean_delta(*a, *b, ne)).collect(), bb.iter().zip(&bc).map(|(a, b)| clean_delta(*a, *b, ne * ne)).collect()));
         }
     }
 
@@ -758,34 +791,42 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
             (true, Some(x)) => (&x.0, &x.1),
             _ => (&comm_base, &base_nodes),
         };
-        let mut tri: HashMap<(u32, u32, u32), (u64, i64, i64)> = HashMap::new();
+        let mut tri: HashMap<(u32, u32, u32, u8), (u64, i64, i64, u64)> = HashMap::new();
         let mut ltc: HashMap<(u32, u32, u32), u64> = HashMap::new();
-        for e in today.iter().filter(|e| e.cls == OK) {
-            let x = tri.entry((e.o, e.d, e.a)).or_insert((0, e.t, e.t));
+        for e in today.iter().filter(|e| e.cls == OK || e.cls == FAIL || e.cls == PRE) {
+            let x = tri.entry((e.o, e.d, e.a, e.cls)).or_insert((0, e.t, e.t, 0));
             x.0 += e.n;
             x.2 = e.t;
-            *ltc.entry((e.o, e.d, e.lt)).or_insert(0) += e.n;
+            x.3 |= 1u64 << e.fam.min(63);
+            if e.cls == OK {
+                *ltc.entry((e.o, e.d, e.lt)).or_insert(0) += e.n;
+            }
         }
-        for ((o, d, a), (n, t0, t1)) in tri {
-            let uid = is_uid_account(c.accts.name(a));
+        for ((o, d, a, cls), (n, t0, t1, fams)) in tri {
+            let an = c.accts.name(a);
+            let named = !is_no_account(an) && !is_uid_account(an);
             let mut f = 0u8;
-            if ix_triple.is_new(&(o, d, a), day, b) {
+            // the connection itself (same origin, destination, account and
+            // result) seen on another baseline day is habitual: nothing
+            // about it is new, whatever else happens that day
+            let conn_new = ix_conn.is_new(&(o, d, a, cls), day, b);
+            if conn_new && (cls != OK || ix_triple.is_new(&(o, d, a), day, b)) {
                 f |= F_TRIPLE;
             }
-            if !uid && ix_ad.is_new(&(a, d), day, b) {
+            if named && ix_ad.is_new(&(a, d), day, b) {
                 f |= F_ACCT_DST;
             }
             if ix_pair.is_new(&(o, d), day, b) {
                 f |= F_DST_ORIGIN;
             }
-            if !uid && ix_oa.is_new(&(o, a), day, b) {
+            if named && ix_oa.is_new(&(o, a), day, b) {
                 f |= F_ACCT_ORIGIN;
             }
             if ix_org.is_new(&o, day, b) {
                 f |= F_NO_HISTORY;
             }
             let k = if b { kref(&cov_ok, d).saturating_sub(1) } else { kref(&cov_ok, d) };
-            triples.push(TripleDay { day, o, d, a, flags: f, k, n, t0, t1 });
+            triples.push(TripleDay { day, o, d, a, cls, fams, flags: f, k, n, t0, t1 });
         }
         for e in today {
             let od = origin_days
@@ -889,177 +930,17 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
     let day_from = |day: i32| ts_str(day as i64 * 86_400);
     let day_to = |day: i32| ts_str((day as i64 + 1) * 86_400);
 
-    let mut tests: Vec<(u32, f64)> = Vec::new();
-    let mut rows: Vec<Row> = Vec::new();
+    // ═════════════ connection-level test ═════════════
+    //
+    // The unit is one connection: (origin, destination, account, result)
+    // on one day. Each is described by what is new about it and by the
+    // context it happened in; it is compared with the connections of the
+    // same result (login OK / failed / unauthenticated) on the baseline
+    // days, on the destinations both days could show.
 
-    // ── origin-day joint test, per window day on that day's panel ──
-    let mut null_od: Vec<&OriginDay> = Vec::new();
-    for ((day, _), od) in &origin_days {
-        if is_base(*day) && *day >= s_day {
-            null_od.push(od);
-        }
-    }
-    for wday in &win_days {
-        let pw_ok: HashSet<u32> = panel_ok.iter().copied().filter(|d| covered(&cov_ok, *d, *wday)).collect();
-        let pw_fail: HashSet<u32> = panel_fail.iter().copied().filter(|d| covered(&cov_fail, *d, *wday)).collect();
-        let okp = |d: u32| pw_ok.contains(&d);
-        let failp = |d: u32| pw_fail.contains(&d);
-        let jn = JointNull::new(null_od.iter().filter(|o| active(o, &okp, &failp)).map(|o| profile(o, &okp, &failp, &enabled).to_vec()).collect());
-        for ((_, oid), o) in origin_days.range((*wday, 0)..=(*wday, u32::MAX)) {
-            if !active(o, &okp, &failp) {
-                continue;
-            }
-            let x = profile(o, &okp, &failp, &enabled);
-            let (p, tstat, dx) = jn.test(&x);
-            tests.push((*oid, p));
-            if x.iter().all(|v| *v == 0.0) {
-                continue;
-            }
-            let mut parts: Vec<String> = Vec::new();
-            for k in 0..10 {
-                if x[k] > 0.0 {
-                    let (ge, tail) = jn.marginal(k, x[k]);
-                    let val = if k >= 8 { format!("{:.3}", x[k]) } else { format!("{}", x[k] as u64) };
-                    parts.push(format!("{} = {} ({} of {} baseline origin-days at least as high)", COORDS[k].0, val, ge, jn.n));
-                    // component row
-                    let (hosts, dn, acc): (Vec<u32>, Vec<String>, String) = match k {
-                        0 => {
-                            let v: Vec<u32> = o.new_dsts.iter().copied().filter(|d| okp(*d)).collect();
-                            let a: BTreeSet<&str> = o.new_acct_uses.iter().filter(|(_, d)| okp(*d)).map(|(a, _)| c.accts.name(*a)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), a.into_iter().collect::<Vec<_>>().join(" "))
-                        }
-                        1 => {
-                            let v: Vec<u32> = o.new_acct_uses.iter().filter(|(_, d)| okp(*d)).map(|(_, d)| *d).collect();
-                            let a: BTreeSet<&str> = o.new_acct_uses.iter().filter(|(_, d)| okp(*d)).map(|(a, _)| c.accts.name(*a)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), a.into_iter().collect::<Vec<_>>().join(" "))
-                        }
-                        2 => {
-                            let v: Vec<u32> = o.new_ad.iter().filter(|(_, d)| okp(*d)).map(|(_, d)| *d).collect();
-                            let a: BTreeSet<&str> = o.new_ad.iter().filter(|(_, d)| okp(*d)).map(|(a, _)| c.accts.name(*a)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), a.into_iter().collect::<Vec<_>>().join(" "))
-                        }
-                        3 => {
-                            let v: Vec<u32> = o.cross_dsts.iter().copied().filter(|d| okp(*d)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), String::new())
-                        }
-                        4 => {
-                            let v: Vec<u32> = o.fail_dsts.iter().copied().filter(|d| failp(*d)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), String::new())
-                        }
-                        5 => {
-                            let v: Vec<u32> = o.pre_dsts.iter().copied().filter(|d| failp(*d)).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), String::new())
-                        }
-                        6 => {
-                            let v: Vec<u32> = o.refused.iter().map(|(d, _, _)| *d).filter(|d| failp(*d)).collect();
-                            let a: BTreeSet<&str> = o.refused.iter().map(|(_, a, _)| c.accts.name(*a)).chain(o.new_acct_uses.iter().map(|(a, _)| c.accts.name(*a))).collect();
-                            (v.clone(), dest_nodes(&mut v.into_iter()), a.into_iter().collect::<Vec<_>>().join(" "))
-                        }
-                        8 => {
-                            let best = o.lt_surprise.iter().filter(|(d, _, _)| okp(*d)).fold(None, |acc: Option<&(u32, f64, u32)>, x| match acc {
-                                Some(a) if a.1 >= x.1 => Some(a),
-                                _ => Some(x),
-                            });
-                            match best {
-                                Some((d, _, lt)) => (vec![*d], alias_list(*d), format!("logon type {}", c.lts.name(*lt))),
-                                None => (Vec::new(), Vec::new(), String::new()),
-                            }
-                        }
-                        9 => {
-                            let best = o.chains.iter().filter(|(b, _, _)| okp(*b)).min_by_key(|x| x.2);
-                            match best {
-                                Some((b, cc, g)) => (vec![*b, *cc], alias_list(*b), format!("{} -> {} in {} s", ents.names.name(*b), ents.names.name(*cc), g)),
-                                None => (Vec::new(), Vec::new(), String::new()),
-                            }
-                        }
-                        _ => (Vec::new(), Vec::new(), String::new()),
-                    };
-                    if k == 7 {
-                        continue;
-                    }
-                    let n_ev = match k {
-                        4 => o.fail_n,
-                        5 => o.pre_n,
-                        _ => x[k].round() as u64,
-                    };
-                    rows.push(Row {
-                        mp: f64::NAN,
-                        mq: f64::NAN,
-                        section: "finding",
-                        entity: *oid,
-                        detector: COORDS[k].0,
-                        role: "component",
-                        p: tail,
-                        day: *wday,
-                        hosts: names(&mut hosts.iter().copied()),
-                        account: acc,
-                        events: n_ev,
-                        window: format!("{} .. {}", ts_str(o.t0), ts_str(o.t1)),
-                        summary: format!(
-                            "{}: {} {} on {}. {} of {} baseline origin-days reached at least as much on the same panel.",
-                            entity_label(&ents, *oid), val, COORDS[k].1, day_str(*wday), ge, jn.n
-                        ),
-                        snippet: super::browser_snippet_multi(dialect, &alias_list(*oid), &dn, None, &day_from(*wday), Some(&day_to(*wday))),
-                    });
-                }
-            }
-            let mut summary = format!(
-                "{} on {} ({}): {}. Joint test: combined surprise {:.1}; {} of {} baseline origin-days scored at least as high, {} were at least as high in every one of these respects at once.",
-                entity_label(&ents, *oid),
-                day_str(*wday),
-                if o.no_history { "origin has no event of any kind in the baseline" } else { "origin already active in the baseline" },
-                parts.join("; "),
-                tstat,
-                ((p * (jn.n as f64 + 1.0)).round() as usize).saturating_sub(1),
-                jn.n,
-                dx
-            );
-            if o.ok_secs.len() >= 2 {
-                let (r, pr) = stats::rayleigh(&o.ok_secs);
-                summary.push_str(&format!(" Time of day of its logins: mean resultant length {:.2}, Rayleigh p = {:.2e}.", r, pr));
-            }
-            let all_dsts: BTreeSet<u32> = o.ok_dsts.iter().chain(o.fail_dsts.iter()).chain(o.pre_dsts.iter()).copied().filter(|d| okp(*d) || failp(*d)).collect();
-            rows.push(Row {
-                mp: f64::NAN,
-                mq: f64::NAN,
-                section: "finding",
-                entity: *oid,
-                detector: "origin-profile",
-                role: "decision",
-                p,
-                day: *wday,
-                hosts: names(&mut o.new_dsts.iter().copied().filter(|d| okp(*d))),
-                account: o.new_acct_uses.iter().map(|(a, _)| c.accts.name(*a)).collect::<BTreeSet<&str>>().into_iter().collect::<Vec<_>>().join(" "),
-                events: 0,
-                window: format!("{} .. {}", ts_str(o.t0), ts_str(o.t1)),
-                summary,
-                snippet: super::browser_snippet_multi(dialect, &alias_list(*oid), &dest_nodes(&mut all_dsts.into_iter()), None, &day_from(*wday), Some(&day_to(*wday))),
-            });
-        }
-    }
-
-    // ── host-day centrality joint test (panel hosts) ──
-    if want_central {
-        let (pb, bb) = m_base.as_ref().unwrap();
-        let mut act: BTreeMap<i32, BTreeSet<u32>> = BTreeMap::new();
-        for e in &ok_events {
-            act.entry(e.day).or_default().insert(e.d);
-        }
-        let use_pr = cfg.enabled("pagerank-spike");
-        let use_bc = cfg.enabled("betweenness-spike");
-        let mut null: Vec<Vec<f64>> = Vec::new();
-        for day in &null_days {
-            if let Some(hs) = act.get(day) {
-                for h in hs.iter().filter(|h| panel_ok.contains(h)) {
-                    let (dp, db) = match delta_day.get(day) {
-                        Some(d) => (d.0[*h as usize], d.1[*h as usize]),
-                        None => (0.0, 0.0),
-                    };
-                    null.push(vec![if use_pr { dp } else { 0.0 }, if use_bc { db } else { 0.0 }]);
-                }
-            }
-        }
-        let jn = JointNull::new(null);
+    // window-day centrality deltas (baseline graph + the day's logins)
+    let mut win_delta: HashMap<i32, (Vec<f64>, Vec<f64>)> = HashMap::new();
+    if let Some((pb, bb)) = m_base.as_ref() {
         for wday in &win_days {
             let mut e: Vec<(usize, usize)> = base_pairs.clone();
             if let Some(ps) = pairs_by_day.get(wday) {
@@ -1067,130 +948,119 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
             }
             let g = DiGraph::from_edges(ne, &e);
             let (pr, bc) = (algos::pagerank(&g), algos::betweenness(&g));
-            if let Some(hs) = act.get(wday) {
-                for h in hs.iter().filter(|h| panel_ok.contains(h) && covered(&cov_ok, **h, *wday)) {
-                    let x = vec![if use_pr { pr[*h as usize] - pb[*h as usize] } else { 0.0 }, if use_bc { bc[*h as usize] - bb[*h as usize] } else { 0.0 }];
-                    let (p, _t, dx) = jn.test(&x);
-                    tests.push((*h, p));
-                    if x[0] > 0.0 || x[1] > 0.0 {
-                        rows.push(Row {
-                            mp: f64::NAN,
-                            mq: f64::NAN,
-                            section: "finding",
-                            entity: *h,
-                            detector: "centrality-profile",
-                            role: "decision",
-                            p,
-                            day: *wday,
-                            hosts: ents.names.name(*h).to_string(),
-                            account: String::new(),
-                            events: 0,
-                            window: day_str(*wday),
-                            summary: format!(
-                                "{}: when the day's logins are added to the baseline graph, PageRank (mean 1) changes by {:.4} and betweenness (normalised) by {:.5}. Joint test over baseline host-days (each day removed from the graph and added back): {} of {} scored at least as high; {} rose at least as much in both.",
-                                entity_label(&ents, *h), x[0], x[1], ((p * (jn.n as f64 + 1.0)).round() as usize).saturating_sub(1), jn.n, dx
-                            ),
-                            snippet: String::new(),
-                        });
-                    }
-                }
-            }
-        }
-        lines.push(format!("Centrality: {} baseline host-day(s) in the null", jn.n));
-    }
-
-    // ── novel-edge detail (descriptive): novelty profile per login triple,
-    //    pooled over destinations with at most the observation's reference
-    //    days ──
-    if enabled[2] {
-        let mut by_pat: Vec<Vec<usize>> = vec![Vec::new(); 32];
-        for t in triples.iter().filter(|t| is_base(t.day)) {
-            by_pat[t.flags as usize].push(t.k);
-        }
-        for v in by_pat.iter_mut() {
-            v.sort_unstable();
-        }
-        let count = |f: u8, k: usize| -> (usize, usize) {
-            let mut ge = 0usize;
-            let mut all = 0usize;
-            for (p, v) in by_pat.iter().enumerate() {
-                let n = v.partition_point(|x| *x <= k);
-                all += n;
-                if (p as u8) & f == f {
-                    ge += n;
-                }
-            }
-            (ge, all)
-        };
-        let mut agg: BTreeMap<(u32, i32, u32, u8), (Vec<u32>, u64, i64, i64, usize)> = BTreeMap::new();
-        for t in triples.iter().filter(|t| !is_base(t.day) && t.k >= 1 && t.flags & F_TRIPLE != 0) {
-            let x = agg.entry((t.o, t.day, t.a, t.flags)).or_insert((Vec::new(), 0, t.t0, t.t1, usize::MAX));
-            x.0.push(t.d);
-            x.1 += t.n;
-            x.2 = x.2.min(t.t0);
-            x.3 = x.3.max(t.t1);
-            x.4 = x.4.min(t.k);
-        }
-        for ((o, day, a, f), (ds, n, t0, t1, kmin)) in agg {
-            let (ge, all) = count(f, kmin);
-            let mut what = Vec::new();
-            if f & F_NO_HISTORY != 0 {
-                what.push("origin has no event of any kind in the baseline");
-            } else {
-                if f & F_ACCT_ORIGIN != 0 {
-                    what.push("account never used by this origin");
-                }
-                if f & F_DST_ORIGIN != 0 {
-                    what.push("destination never reached by this origin");
-                }
-            }
-            if f & F_ACCT_DST != 0 {
-                what.push("account never logged in to this destination");
-            }
-            if what.is_empty() {
-                what.push("combination never seen, each part known");
-            }
-            rows.push(Row {
-                mp: f64::NAN,
-                mq: f64::NAN,
-                section: "finding",
-                entity: o,
-                detector: "novel-edge",
-                role: "detail",
-                p: stats::empirical_p(ge, all),
-                day,
-                hosts: names(&mut ds.iter().copied()),
-                account: c.accts.name(a).to_string(),
-                events: n,
-                window: format!("{} .. {}", ts_str(t0), ts_str(t1)),
-                summary: format!(
-                    "{} logged in as {} to {} destination(s) for the first time: {}. Among baseline login-days on destinations with at most {} reference day(s), {} of {} were at least this new.",
-                    entity_label(&ents, o), c.accts.name(a), ds.len(), what.join("; "), kmin, ge, all
+            win_delta.insert(
+                *wday,
+                (
+                    pr.iter().zip(pb).map(|(a, b)| clean_delta(*a, *b, ne)).collect(),
+                    bc.iter().zip(bb).map(|(a, b)| clean_delta(*a, *b, ne * ne)).collect(),
                 ),
-                snippet: super::browser_snippet_multi(dialect, &alias_list(o), &dest_nodes(&mut ds.iter().copied()), Some(c.accts.name(a)), &day_from(day), Some(&day_to(day))),
-            });
+            );
         }
     }
-
-    // ── per machine: Simes over its decision tests; BH across machines ──
-    let mut per_entity: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
-    for (e, p) in &tests {
-        per_entity.entry(*e).or_default().push(*p);
+    let use_pr = cfg.enabled("pagerank-spike");
+    let use_bc = cfg.enabled("betweenness-spike");
+    let cen = |day: i32, d: u32| -> (f64, f64) {
+        let src = if is_base(day) { delta_day.get(&day) } else { win_delta.get(&day) };
+        match src {
+            Some((p, b)) => (if use_pr { p[d as usize].max(0.0) } else { 0.0 }, if use_bc { b[d as usize].max(0.0) } else { 0.0 }),
+            None => (0.0, 0.0),
+        }
+    };
+    let on = |det: &str| cfg.enabled(det);
+    let empty_od = OriginDay::default();
+    // connection features, for the destinations `okp` / `failp` accept
+    let features = |t: &TripleDay, okp: Pred, failp: Pred, cache: &mut HashMap<(i32, u32), [f64; 10]>| -> [f64; 15] {
+        let mut v = [0.0f64; 15];
+        // a habitual connection is not unusual, whatever its context
+        if t.flags & F_TRIPLE == 0 {
+            v[4] = 0.0;
+            return v;
+        }
+        let od = origin_days.get(&(t.day, t.o)).unwrap_or(&empty_od);
+        let ctx = *cache.entry((t.day, t.o)).or_insert_with(|| profile(od, okp, failp, &enabled));
+        let f = t.flags;
+        let bit = |m: u8| if f & m != 0 { 1.0 } else { 0.0 };
+        if on("novel-edge") {
+            v[0] = bit(F_TRIPLE);
+            v[1] = bit(F_ACCT_DST);
+        }
+        if on("origin-fanout") {
+            v[2] = bit(F_DST_ORIGIN);
+            v[5] = ctx[0];
+        }
+        if on("cred-rotation") {
+            v[3] = bit(F_ACCT_ORIGIN);
+            v[6] = ctx[1];
+        }
+        v[4] = bit(F_NO_HISTORY);
+        v[7] = ctx[4];
+        v[8] = ctx[5];
+        v[9] = ctx[6];
+        if t.cls == OK {
+            if on("community-bridge") && od.cross_dsts.contains(&t.d) {
+                v[10] = 1.0;
+            }
+            if on("rare-logon-type") {
+                v[11] = od.lt_surprise.iter().filter(|(d, _, _)| *d == t.d).map(|(_, s, _)| *s).fold(0.0, f64::max);
+            }
+            if on("chain-motif") {
+                v[12] = od.chains.iter().filter(|(b, _, _)| *b == t.d).map(|(_, _, g)| 1.0 / (1.0 + *g as f64)).fold(0.0, f64::max);
+            }
+            let (dp, db) = cen(t.day, t.d);
+            v[13] = dp;
+            v[14] = db;
+        }
+        v
+    };
+    struct Tested<'a> {
+        t: &'a TripleDay,
+        x: [f64; 15],
+        p: f64,
+        tstat: f64,
+        n_null: usize,
+        marg: Vec<(usize, f64)>,
     }
-    let ent_ids: Vec<u32> = per_entity.keys().copied().collect();
-    let ent_p: Vec<f64> = ent_ids.iter().map(|e| stats::simes(&per_entity[e])).collect();
-    let ent_q = stats::benjamini_hochberg(&ent_p);
-    let pq: HashMap<u32, (f64, f64)> = ent_ids.iter().enumerate().map(|(k, e)| (*e, (ent_p[k], ent_q[k]))).collect();
-    let n_sig = ent_q.iter().filter(|q| **q <= alpha).count();
+    let mut tested: Vec<Tested> = Vec::new();
+    let mut not_eval: Vec<&TripleDay> = Vec::new();
+    for wday in &win_days {
+        let pw_ok: HashSet<u32> = panel_ok.iter().copied().filter(|d| covered(&cov_ok, *d, *wday)).collect();
+        let pw_fail: HashSet<u32> = panel_fail.iter().copied().filter(|d| covered(&cov_fail, *d, *wday)).collect();
+        let okp = |d: u32| pw_ok.contains(&d);
+        let failp = |d: u32| pw_fail.contains(&d);
+        let on_panel = |t: &TripleDay| if t.cls == OK { okp(t.d) } else { failp(t.d) };
+        for cls in [OK, FAIL, PRE] {
+            let mut cache: HashMap<(i32, u32), [f64; 10]> = HashMap::new();
+            let null_rows: Vec<Vec<f64>> = triples
+                .iter()
+                .filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && on_panel(t))
+                .map(|t| features(t, &okp, &failp, &mut cache).to_vec())
+                .collect();
+            let jn = JointNull::new(null_rows);
+            for t in triples.iter().filter(|t| t.cls == cls && t.day == *wday) {
+                if !on_panel(t) {
+                    not_eval.push(t);
+                    continue;
+                }
+                let x = features(t, &okp, &failp, &mut cache);
+                let (p, tstat, _) = jn.test_fast(&x);
+                let marg: Vec<(usize, f64)> = (0..15).map(|k| if x[k] > 0.0 { jn.marginal(k, x[k]) } else { (jn.n, 1.0) }).collect();
+                tested.push(Tested { t, x, p, tstat, n_null: jn.n, marg });
+            }
+        }
+    }
+    let qs = stats::benjamini_hochberg(&tested.iter().map(|x| x.p).collect::<Vec<_>>());
+    let n_sig = qs.iter().filter(|q| **q <= alpha).count();
     lines.push(format!(
-        "Tests: {} joint test(s) over {} machine(s); {} machine(s) significant at FDR {} (Simes per machine, Benjamini-Hochberg across machines)",
-        tests.len(),
-        ent_ids.len(),
+        "Connections: {} tested (origin, destination, account, result, day) against {} baseline day(s); {} significant at FDR {} (Benjamini-Hochberg); {} on destinations without comparable coverage",
+        tested.len(),
+        null_days.len(),
         n_sig,
-        alpha
+        alpha,
+        not_eval.len()
     ));
 
-    // ── campaigns ──
+    // ── campaigns (origins with no history sharing a new account) ──
+    let mut campaign_of: HashMap<u32, String> = HashMap::new();
     {
         let pop_set: HashSet<u32> = panel_ok.iter().copied().filter(|d| win_days.iter().any(|w| covered(&cov_ok, *d, *w))).collect();
         let mut nod: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
@@ -1214,155 +1084,179 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Row>, Vec<Stri
                 }
                 let (da, db) = (&nod[&a], &nod[&b]);
                 let k = da.intersection(db).count();
-                let p = stats::hypergeom_upper(pop, da.len() as u64, db.len() as u64, k as u64);
-                pairs.push((a, b, p, k, shared));
+                pairs.push((a, b, stats::hypergeom_upper(pop, da.len() as u64, db.len() as u64, k as u64), k, shared));
             }
         }
-        let qs = stats::benjamini_hochberg(&pairs.iter().map(|p| p.2).collect::<Vec<_>>());
-        let mut parent: HashMap<u32, u32> = HashMap::new();
-        fn find(p: &mut HashMap<u32, u32>, x: u32) -> u32 {
-            let y = *p.get(&x).unwrap_or(&x);
-            if y == x {
-                return x;
-            }
-            let r = find(p, y);
-            p.insert(x, r);
-            r
-        }
-        let mut sig: Vec<usize> = Vec::new();
+        let pq = stats::benjamini_hochberg(&pairs.iter().map(|p| p.2).collect::<Vec<_>>());
+        let mut n_camp = 0usize;
         for (k, pr) in pairs.iter().enumerate() {
-            if qs[k] <= alpha {
-                let (ra, rb) = (find(&mut parent, pr.0), find(&mut parent, pr.1));
-                if ra != rb {
-                    parent.insert(ra, rb);
+            if pq[k] > alpha {
+                continue;
+            }
+            n_camp += 1;
+            let acc = pr.4.iter().map(|a| c.accts.name(*a)).collect::<Vec<_>>().join(" ");
+            for (me, other, mine) in [(pr.0, pr.1, &nod[&pr.0]), (pr.1, pr.0, &nod[&pr.1])] {
+                let txt = format!(
+                    "with {}: both never seen before, same new account {}, {} of its {} new destinations shared (exact test p = {:.1e}, q = {:.1e})",
+                    entity_label(&ents, other),
+                    acc,
+                    pr.3,
+                    mine.len(),
+                    pr.2,
+                    pq[k]
+                );
+                let e = campaign_of.entry(me).or_default();
+                if !e.is_empty() {
+                    e.push_str("; ");
                 }
-                sig.push(k);
+                e.push_str(&txt);
             }
         }
-        let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-        for k in &sig {
-            let r = find(&mut parent, pairs[*k].0);
-            groups.entry(r).or_default().push(*k);
-        }
-        for (_, ks) in groups {
-            let mut members: BTreeSet<u32> = BTreeSet::new();
-            let mut accts: BTreeSet<u32> = BTreeSet::new();
-            let mut qmax: f64 = 0.0;
-            for k in &ks {
-                let pr = &pairs[*k];
-                members.insert(pr.0);
-                members.insert(pr.1);
-                accts.extend(pr.4.iter().copied());
-                qmax = qmax.max(qs[*k]);
-            }
-            let detail: Vec<String> = ks
-                .iter()
-                .map(|k| {
-                    let pr = &pairs[*k];
-                    format!(
-                        "{} & {}: {} common new destinations of {} / {} (p = {:.2e})",
-                        ents.names.name(pr.0), ents.names.name(pr.1), pr.3, nod[&pr.0].len(), nod[&pr.1].len(), pr.2
-                    )
-                })
-                .collect();
-            let m0 = *members.iter().next().unwrap();
-            rows.push(Row {
-                mp: f64::NAN,
-                mq: f64::NAN,
-                section: "campaign",
-                entity: m0,
-                detector: "campaign",
-                role: "grouping",
-                p: qmax,
-                day: cutoff_day,
-                hosts: members.iter().map(|m| entity_label(&ents, *m)).collect::<Vec<_>>().join(" | "),
-                account: accts.iter().map(|a| c.accts.name(*a)).collect::<Vec<_>>().join(" "),
-                events: members.len() as u64,
-                window: String::new(),
-                summary: format!(
-                    "Origins with no event in the baseline that share new account(s) and reach overlapping destinations beyond chance (exact hypergeometric test over {} panel destinations, Benjamini-Hochberg across {} candidate pair(s); p_value = largest q): {}. Grouping only; nodes are not merged and scores are unchanged.",
-                    pop,
-                    pairs.len(),
-                    detail.join("; ")
-                ),
-                snippet: String::new(),
-            });
-        }
-        lines.push(format!("Campaigns: {} candidate pair(s) sharing a new account, {} significant", pairs.len(), sig.len()));
+        lines.push(format!("Campaigns: {} candidate pair(s) sharing a new account, {} significant", pairs.len(), n_camp));
     }
 
-    // ── not evaluable: window logins to destinations outside the panel ──
-    {
-        let mut ner: BTreeMap<u32, (BTreeSet<u32>, BTreeSet<u32>, u64, i32)> = BTreeMap::new();
-        for t in triples.iter().filter(|t| !is_base(t.day) && !(panel_ok.contains(&t.d) && covered(&cov_ok, t.d, t.day))) {
-            let x = ner.entry(t.d).or_insert((BTreeSet::new(), BTreeSet::new(), 0, t.day));
-            if t.flags & F_TRIPLE != 0 {
-                x.0.insert(t.o);
-                x.1.insert(t.a);
+    // ── report rows ──
+    let result_name = |cls: u8| match cls {
+        OK => "login OK",
+        FAIL => "login FAILED",
+        PRE => "connection without authentication (SSH pre-auth)",
+        _ => "other",
+    };
+    let class_name = |cls: u8| match cls {
+        OK => "successful logins",
+        FAIL => "failed logins",
+        _ => "unauthenticated connections",
+    };
+    let fam_list = |m: u64| -> String {
+        let mut v: Vec<&str> = (0..64u32).filter(|i| m & (1u64 << i) != 0).filter_map(|i| c.fams.names.get(i as usize).map(|s| s.as_str())).filter(|s| !s.is_empty()).collect();
+        v.sort();
+        v.join(" ")
+    };
+    let mut out: Vec<Conn> = Vec::new();
+    for (i, tt) in tested.iter().enumerate() {
+        let t = tt.t;
+        let od = origin_days.get(&(t.day, t.o)).unwrap_or(&empty_od);
+        let mut why: Vec<String> = Vec::new();
+        let base = |k: usize| format!("{} of {} baseline {}", tt.marg[k].0, tt.n_null, class_name(t.cls));
+        let x = &tt.x;
+        if x[4] > 0.0 {
+            why.push(format!("origin never seen before ({} from origins never seen before)", base(4)));
+        } else {
+            if x[2] > 0.0 {
+                why.push(format!("origin never connected to this destination before ({})", base(2)));
             }
-            x.2 += t.n;
-            x.3 = x.3.min(t.day);
-        }
-        for (d, (origins, accts, n, d0)) in ner {
-            let k = kref(&cov_ok, d);
-            let first = cov_ok.get(&d).and_then(|s| s.iter().next().copied());
-            let reason = if k == 0 {
-                format!("has no login coverage on any baseline day (first covered day {})", first.map(day_str).unwrap_or_else(|| "none".into()))
-            } else {
-                format!("has {} covered baseline day(s) but not continuously from {} to the cutoff", k, day_str(s_day))
-            };
-            rows.push(Row {
-                mp: f64::NAN,
-                mq: f64::NAN,
-                section: "not-evaluable",
-                entity: d,
-                detector: "not-evaluable",
-                role: "",
-                p: f64::NAN,
-                day: d0,
-                hosts: ents.names.name(d).to_string(),
-                account: accts.iter().map(|a| c.accts.name(*a)).collect::<Vec<_>>().join(" "),
-                events: n,
-                window: String::new(),
-                summary: format!(
-                    "{} {}: its window logins are left out of the tests. New origins there: {}.",
-                    ents.names.name(d),
-                    reason,
-                    if origins.is_empty() { "none".to_string() } else { origins.iter().map(|o| entity_label(&ents, *o)).collect::<Vec<_>>().join(", ") }
-                ),
-                snippet: String::new(),
-            });
-        }
-    }
-
-    for r in rows.iter_mut() {
-        if r.section == "finding" {
-            if let Some((p, q)) = pq.get(&r.entity) {
-                r.mp = *p;
-                r.mq = *q;
+            if x[3] > 0.0 {
+                why.push(format!("account never used by this origin before ({})", base(3)));
             }
         }
+        if x[1] > 0.0 {
+            why.push(format!("account never logged in to this destination before ({})", base(1)));
+        }
+        if x[0] > 0.0 && x[1] == 0.0 && x[2] == 0.0 && x[3] == 0.0 && x[4] == 0.0 {
+            why.push(format!("this origin/account/destination combination never seen, each part known ({})", base(0)));
+        }
+        if x[5] > 0.0 {
+            why.push(format!("that day the origin reached {} destinations for the first time ({} at least as many)", x[5], base(5)));
+        }
+        if x[6] > 0.0 {
+            why.push(format!("that day the origin used {} account(s) new to it ({} at least as many)", x[6], base(6)));
+        }
+        if x[7] > 0.0 {
+            why.push(format!("that day the origin failed to log in on {} destination(s) ({} at least as many)", x[7], base(7)));
+        }
+        if x[8] > 0.0 {
+            why.push(format!("that day the origin touched {} destination(s) without authenticating ({} at least as many)", x[8], base(8)));
+        }
+        if x[9] > 0.0 {
+            why.push(format!("that day the origin had {} refused named attempt(s) before logging in with an account new to it ({} at least as many)", x[9], base(9)));
+        }
+        if x[10] > 0.0 {
+            why.push(format!("destination outside the origin's usual group of hosts (Louvain community; {})", base(10)));
+        }
+        if x[11] > 0.0 {
+            let lt = od.lt_surprise.iter().filter(|(d, _, _)| *d == t.d).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| c.lts.name(x.2)).unwrap_or("");
+            why.push(format!("logon type {} is rare on this destination ({} at least as rare)", lt, base(11)));
+        }
+        if x[12] > 0.0 {
+            if let Some((_, cc, g)) = od.chains.iter().filter(|(b, _, _)| *b == t.d).min_by_key(|x| x.2) {
+                why.push(format!("{} s later the destination opened a new login to {} ({} with a chain at least as fast)", g, ents.names.name(*cc), base(12)));
+            }
+        }
+        if x[13] > 0.0 || x[14] > 0.0 {
+            why.push(format!("the destination's centrality rose that day (PageRank +{:.3}, betweenness +{:.5}; {} / {} at least as high)", x[13], x[14], base(13), base(14)));
+        }
+        if why.is_empty() {
+            why.push("nothing new: a connection like the usual ones".into());
+        }
+        let acct = c.accts.name(t.a);
+        out.push(Conn {
+            p: tt.p,
+            q: qs[i],
+            tstat: tt.tstat,
+            day: t.day,
+            first: t.t0,
+            last: t.t1,
+            origin: entity_label(&ents, t.o),
+            dest: entity_label(&ents, t.d),
+            account: if is_no_account(acct) { String::new() } else { acct.to_string() },
+            result: result_name(t.cls),
+            events: t.n,
+            logs: fam_list(t.fams),
+            why: why.join("; "),
+            campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
+            cypher: super::browser_snippet_multi(
+                dialect,
+                &alias_list(t.o),
+                &alias_list(t.d),
+                if is_no_account(acct) { None } else { Some(acct) },
+                &ts_str(t.t0 - 1),
+                Some(&ts_str(t.t1 + 1)),
+            ),
+            evaluable: true,
+        });
     }
-    let sec_rank = |s: &str| match s {
-        "campaign" => 0,
-        "finding" => 1,
-        _ => 2,
-    };
-    let role_rank = |s: &str| match s {
-        "decision" => 0,
-        "component" => 1,
-        _ => 2,
-    };
-    rows.sort_by(|a, b| {
-        sec_rank(a.section)
-            .cmp(&sec_rank(b.section))
-            .then(nan_last(a.mq).partial_cmp(&nan_last(b.mq)).unwrap())
-            .then(ents.names.name(a.entity).cmp(ents.names.name(b.entity)))
-            .then(role_rank(a.role).cmp(&role_rank(b.role)))
+    for t in not_eval {
+        let acct = c.accts.name(t.a);
+        let k = kref(&cov_ok, t.d);
+        out.push(Conn {
+            p: f64::NAN,
+            q: f64::NAN,
+            tstat: f64::NAN,
+            day: t.day,
+            first: t.t0,
+            last: t.t1,
+            origin: entity_label(&ents, t.o),
+            dest: entity_label(&ents, t.d),
+            account: if is_no_account(acct) { String::new() } else { acct.to_string() },
+            result: result_name(t.cls),
+            events: t.n,
+            logs: fam_list(t.fams),
+            why: format!(
+                "not evaluated: the destination has {} covered baseline day(s) and no continuous coverage from {} to the cutoff, so nothing there can be judged new or habitual",
+                k,
+                day_str(s_day)
+            ),
+            campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
+            cypher: super::browser_snippet_multi(
+                dialect,
+                &alias_list(t.o),
+                &alias_list(t.d),
+                if is_no_account(acct) { None } else { Some(acct) },
+                &ts_str(t.t0 - 1),
+                Some(&ts_str(t.t1 + 1)),
+            ),
+            evaluable: false,
+        });
+    }
+    // most unusual first: p, then combined surprise, then volume
+    out.sort_by(|a, b| {
+        (!a.evaluable)
+            .cmp(&!b.evaluable)
             .then(nan_last(a.p).partial_cmp(&nan_last(b.p)).unwrap())
+            .then(nan_last(-a.tstat).partial_cmp(&nan_last(-b.tstat)).unwrap())
+            .then(a.first.cmp(&b.first))
     });
-    let labels: Vec<String> = (0..ne as u32).map(|i| entity_label(&ents, i)).collect();
-    (rows, lines, labels, alpha)
+    (out, lines, alpha)
 }
 
 fn nan_last(x: f64) -> f64 {
@@ -1389,16 +1283,15 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn write_csv(rows: &[Row], labels: &[String], alpha: f64, output: Option<&str>) -> std::io::Result<()> {
+fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result<()> {
     let mut buf = String::from(
-        "section,rank,machine,machine_p,machine_q,significant,detector,role,p_value,day,hosts,account,events,time_window,summary,cypher_snippet
+        "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,why_unusual,campaign,cypher_snippet
 ",
     );
     for (k, r) in rows.iter().enumerate() {
-        let machine = if r.section == "campaign" { r.hosts.clone() } else { labels.get(r.entity as usize).cloned().unwrap_or_default() };
-        let sig = if r.section != "finding" {
-            ""
-        } else if r.mq <= alpha {
+        let sig = if !r.evaluable {
+            "not evaluated"
+        } else if r.q <= alpha {
             "yes"
         } else {
             "no"
@@ -1406,22 +1299,22 @@ fn write_csv(rows: &[Row], labels: &[String], alpha: f64, output: Option<&str>) 
         buf.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
 ",
-            r.section,
             k + 1,
-            csv_escape(&machine),
-            fmt_p(r.mp),
-            fmt_p(r.mq),
             sig,
-            r.detector,
-            r.role,
             fmt_p(r.p),
+            fmt_p(r.q),
             day_str(r.day),
-            csv_escape(&r.hosts),
+            ts_str(r.first),
+            ts_str(r.last),
+            csv_escape(&r.origin),
+            csv_escape(&r.dest),
             csv_escape(&r.account),
+            r.result,
             r.events,
-            csv_escape(&r.window),
-            csv_escape(&r.summary),
-            csv_escape(&r.snippet),
+            csv_escape(&r.logs),
+            csv_escape(&r.why),
+            csv_escape(&r.campaign),
+            csv_escape(&r.cypher),
         ));
     }
     match output {

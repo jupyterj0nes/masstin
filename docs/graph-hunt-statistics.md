@@ -56,7 +56,23 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
 9. **Host-day profile.** For destination hosts in the panel, the engine measures the change in PageRank (scaled to mean 1) and in normalised betweenness when the day's logins are added to the baseline graph. On baseline days the same is done by removing that day's unique pairs and adding them back. The same joint calibration applies.
 10. **Decision.** Each machine's joint tests are combined with Simes (valid under positive dependence). Benjamini-Hochberg across machines controls the false discovery rate at alpha. Significant machines come first; everything else stays in the CSV, marked `significant = no`.
 
-## Output (CSV)
+## Unit of the test: the connection
+
+The anomaly is a connection, not a machine: (origin, destination, account,
+result) on one day, where result is login OK, login failed or
+unauthenticated contact. A connection that already happened on another
+baseline day is habitual and scores zero, whatever its context. A new
+connection is described by what is new about it (triple, account on the
+destination, destination for the origin, account for the origin, origin
+never seen) and by its context: what its origin did that day (the
+origin-day profile below), a Louvain community crossing, the rarity of its
+logon type, a chain it starts, the destination's centrality change. It is
+compared, with the same conformal joint test, against the connections of
+the same result on the baseline days, on the destinations both days could
+show. Benjamini-Hochberg runs across all connections. The machine-level
+tests described below are the building blocks of that context.
+
+## Output (CSV, machine-level version, superseded)
 
 Columns: `section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`.
 

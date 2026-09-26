@@ -667,11 +667,15 @@ The full design, with the reasons behind each choice, is in [docs/graph-hunt-sta
 
 #### Output
 
-`section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`
+One row per connection, most unusual first:
 
-- `role = decision` rows carry the joint p-value that counts for the machine; `component` rows show each signal with its own baseline tail; `detail` rows describe each first-time login.
-- Every summary states the counts behind its p-value ("0 of 1214 baseline origin-days at least as high").
-- On Neo4j the snippet returns an APOC virtual graph for Browser (drag `neo4j-resources/style.grass` onto it); virtual nodes keep "connect result nodes" from pulling the whole history.
+`rank, significant, p_value, q_value, day, first_seen_utc, last_seen_utc, origin, destination, account, result, events, logs, why_unusual, campaign, cypher_snippet`
+
+- `result`: login OK, login FAILED, or connection without authentication (SSH pre-auth).
+- `logs`: the log families that recorded it (secure, wtmp, audit, btmp, journal, evtx...).
+- `why_unusual`: what is new about the connection and its context, each with the baseline count behind it ("account never used by this origin before (15 of 10519 baseline successful logins)").
+- `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage.
+- On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
 
 #### Detection quality
 
