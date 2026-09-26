@@ -105,10 +105,6 @@ struct ResolvedEdge {
 
 const EDGE_BATCH: usize = 5_000;
 
-/// Minimum unanimous same-login observations before an IP gets a
-/// `resolved_name` property.
-const MIN_RESOLVE_VOTES: u32 = 2;
-
 const OLD_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
 const NEW_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
 
@@ -309,7 +305,8 @@ fn streaming_pass1(
     local_values: &HashSet<&str>,
     start_dt: Option<DateTime<Utc>>,
     end_dt: Option<DateTime<Utc>>,
-) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32)>, HashSet<String>)> {
+    alpha: f64,
+) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32, f64)>, HashSet<String>)> {
     let mut counts: HashMap<(String, String), u32> = HashMap::new();
     let mut literal_hosts: HashSet<String> = HashSet::new();
     let mut filtered_by_time: usize = 0;
@@ -411,22 +408,12 @@ fn streaming_pass1(
     // nodes: the name is only what the destination's sshd resolved by
     // reverse DNS at that moment (stale PTR, DHCP reuse, NAT and aliases
     // all break it). It is kept only when every vote agrees and there are
-    // at least MIN_RESOLVE_VOTES of them, and it is written to the IP node
-    // as `resolved_name` / `resolved_votes` for the analyst to judge.
-    let mut votes: HashMap<String, HashMap<String, u32>> = HashMap::new();
-    for (ips, names) in cooc.values() {
-        if ips.len() == 1 && names.len() == 1 {
-            *votes.entry(ips[0].clone()).or_default().entry(names[0].clone()).or_insert(0) += 1;
-        }
-    }
-    let resolved_names: HashMap<String, (String, u32)> = votes
-        .into_iter()
-        .filter_map(|(ip, m)| {
-            if m.len() != 1 { return None; }
-            let (name, v) = m.into_iter().next()?;
-            if v >= MIN_RESOLVE_VOTES { Some((ip, (name, v))) } else { None }
-        })
-        .collect();
+    // unlikely to be chance coincidences (Poisson model of an unrelated
+    // login in the same second, Benjamini-Hochberg across IPs at alpha;
+    // graph_hunt_common::resolve), and it is written to the IP node as
+    // `resolved_name` / `resolved_votes` / `resolved_p` for the analyst.
+    let resolved_names: HashMap<String, (String, u32, f64)> =
+        crate::graph_hunt_common::resolve::resolve_from_cooc(&cooc, alpha);
     // Short names shared by two or more different FQDNs stay fully
     // qualified; everything collected above is mapped to its final name.
     let ambiguous: HashSet<String> = fqdn_by_short
@@ -450,9 +437,9 @@ fn streaming_pass1(
             m
         });
     let literal_hosts: HashSet<String> = literal_hosts.into_iter().map(|h| short_name(&h, &ambiguous)).collect();
-    let resolved_names: HashMap<String, (String, u32)> = resolved_names
+    let resolved_names: HashMap<String, (String, u32, f64)> = resolved_names
         .into_iter()
-        .map(|(ip, (name, v))| (ip, (short_name(&name, &ambiguous), v)))
+        .map(|(ip, (name, v, p))| (ip, (short_name(&name, &ambiguous), v, p)))
         .collect();
     Ok((counts, literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous))
 }
@@ -650,6 +637,7 @@ pub async fn load_neo4j(
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
+    alpha: f64,
 ) {
     let start_clock = std::time::Instant::now();
 
@@ -733,7 +721,7 @@ pub async fn load_neo4j(
 
         // ── Pass 1: stream-collect counts + literal hosts ──
         let (counts, mut literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous) =
-            match streaming_pass1(file, &idx, &local_values, start_dt, end_dt) {
+            match streaming_pass1(file, &idx, &local_values, start_dt, end_dt, alpha) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("MASSTIN - pass-1 read failed on {}: {}", file, e);
@@ -808,6 +796,10 @@ pub async fn load_neo4j(
         // batches resolved during Pass 2 (e.g. an unresolved IP, or an
         // "EXTERNAL" attacker source).
         let mut new_nodes: Vec<String> = Vec::new();
+        // (destination, log file) -> (first, last) record time: the period
+        // each collected log file covers on each host. Written to the host
+        // node as `cov_ok` / `cov_fail` spans for graph-hunt.
+        let mut file_spans: HashMap<(String, String), (i64, i64)> = HashMap::new();
         let mut ensure_node = |name: &str, new_nodes: &mut Vec<String>, known: &mut HashSet<String>| {
             if !known.contains(name) {
                 new_nodes.push(name.to_string());
@@ -849,6 +841,13 @@ pub async fn load_neo4j(
                     Some(e) => e,
                     None => continue,
                 };
+                if let Some(t) = crate::graph_hunt_common::parse_ts(&edge.time) {
+                    let t = t.and_utc().timestamp();
+                    let raw_file = line.rsplit(',').next().unwrap_or("").trim_matches('"').to_string();
+                    let e = file_spans.entry((edge.destination.clone(), raw_file)).or_insert((t, t));
+                    if t < e.0 { e.0 = t; }
+                    if t > e.1 { e.1 = t; }
+                }
                 // Lazy-merge any new nodes
                 ensure_node(&edge.origin, &mut new_nodes, &mut nodes_known);
                 ensure_node(&edge.destination, &mut new_nodes, &mut nodes_known);
@@ -984,24 +983,47 @@ pub async fn load_neo4j(
 
         pb.finish_and_clear();
 
+        // Destination nodes: log coverage spans (ungrouped loads only).
+        if !file_spans.is_empty() {
+            let mut per_dst: HashMap<String, (Vec<(i64, i64)>, Vec<(i64, i64)>)> = HashMap::new();
+            for ((dst, file), span) in file_spans.drain() {
+                let (ok, fail) = crate::graph_hunt_common::coverage_kinds(log_source_family(&file));
+                let x = per_dst.entry(dst).or_default();
+                if ok { x.0.push(span); }
+                if fail { x.1.push(span); }
+            }
+            let names: Vec<String> = per_dst.keys().cloned().collect();
+            let oks: Vec<Vec<i64>> = names.iter().map(|n| crate::graph_hunt_common::merge_spans(per_dst[n].0.clone())).collect();
+            let fails: Vec<Vec<i64>> = names.iter().map(|n| crate::graph_hunt_common::merge_spans(per_dst[n].1.clone())).collect();
+            let q_cov = "UNWIND range(0, size($names) - 1) AS i                          MATCH (h:host {name: $names[i]})                          SET h.cov_ok = $oks[i], h.cov_fail = $fails[i]                          RETURN count(h) AS n";
+            match graph.execute(query(q_cov).param("names", names).param("oks", oks).param("fails", fails)).await {
+                Ok(mut r) => {
+                    let n: i64 = match r.next().await { Ok(Some(row)) => row.get("n").unwrap_or(0), _ => 0 };
+                    crate::banner::print_phase_detail("Coverage:", &format!("{} destination node(s) annotated with log-file time spans (cov_ok / cov_fail)", n));
+                }
+                Err(e) => eprintln!("[ERROR] coverage annotation failed: {:?}", e),
+            }
+        }
+
         // IP nodes: annotate (never merge) with the unanimous sshd name.
         if !resolved_names.is_empty() {
             let ips: Vec<String> = resolved_names.keys().cloned().collect();
             let names: Vec<String> = ips.iter().map(|i| resolved_names[i].0.clone()).collect();
             let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
+            let pch: Vec<f64> = ips.iter().map(|i| resolved_names[i].2).collect();
             let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
                            MATCH (h:host {name: $ips[i]}) \
-                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i] \
+                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i], h.resolved_p = $pch[i] \
                            RETURN count(h) AS n";
             match graph
-                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts))
+                .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts).param("pch", pch))
                 .await
             {
                 Ok(mut r) => {
                     let n: i64 = match r.next().await { Ok(Some(row)) => row.get("n").unwrap_or(0), _ => 0 };
                     crate::banner::print_phase_detail(
                         "IP nodes:",
-                        &format!("{} annotated with resolved_name (unanimous sshd reverse-DNS, >= {} logins; nodes not merged)", n, MIN_RESOLVE_VOTES),
+                        &format!("{} annotated with resolved_name (unanimous same-login evidence, chance coincidence significant at FDR {}; nodes not merged)", n, alpha),
                     );
                 }
                 Err(e) => {

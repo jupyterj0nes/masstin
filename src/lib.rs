@@ -251,9 +251,9 @@ pub struct Cli {
     investigation_from: Option<String>,
 
     /// For `graph-hunt`: comma-separated list of detector names to skip.
-    /// Available: origin-fanout, probe-then-success, failed-sweep, novel-edge,
-    /// chain-motif, pagerank-spike, betweenness-spike, community-bridge,
-    /// cred-rotation, rare-logon-type.
+    /// Available: novel-edge, community-bridge, origin-fanout, cred-rotation,
+    /// pagerank-spike, betweenness-spike, failed-sweep, preauth-sweep,
+    /// probe-then-success, rare-logon-type, chain-motif.
     /// Example: --skip-detectors pagerank-spike,betweenness-spike
     #[arg(long)]
     skip_detectors: Option<String>,
@@ -263,6 +263,12 @@ pub struct Cli {
     /// Mutually exclusive with --skip-detectors.
     #[arg(long)]
     only_detectors: Option<String>,
+
+    /// For `graph-hunt` (and the loaders' IP -> name annotation): false
+    /// discovery rate controlled with Benjamini-Hochberg. It is the only
+    /// chosen number: every score is a probability measured in the corpus.
+    #[arg(long, default_value_t = 0.05)]
+    alpha: f64,
 }
 
 // -----------------------------------------------------------------------------
@@ -377,6 +383,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.alpha,
             )
             .await;
         }
@@ -389,6 +396,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.alpha,
             )
             .await;
         }
@@ -508,6 +516,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.investigation_from.as_ref().unwrap(),
                 config.skip_detectors.as_deref(),
                 config.only_detectors.as_deref(),
+                config.alpha,
+                config.end_time.as_deref(),
                 config.output.as_deref(),
             )
             .await;
@@ -521,6 +531,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.investigation_from.as_ref().unwrap(),
                 config.skip_detectors.as_deref(),
                 config.only_detectors.as_deref(),
+                config.alpha,
+                config.end_time.as_deref(),
                 config.output.as_deref(),
             )
             .await;

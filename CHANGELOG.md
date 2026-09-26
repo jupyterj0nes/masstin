@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`graph-hunt` / `graph-hunt-neo4j` rewritten as a statistical engine** ([design](docs/graph-hunt-statistics.md)). Every hand-picked weight, window, minimum and threshold is gone; each signal is an empirical probability measured against the network's own baseline, and `--alpha` (false discovery rate, default 0.05) is the only chosen number.
+  - leave-one-day-out reference (a fact is new on a baseline day if it occurs on no other baseline day), UTC day as unit;
+  - coverage from log-file time spans written by the loaders (`cov_ok` / `cov_fail` on host nodes); counts compared on a panel of continuously covered destinations, start day chosen to maximise panel size x baseline days; window logins elsewhere reported as *not evaluable*;
+  - one joint test per origin-day over ten signals (first-time destinations, new accounts, never-seen account/destination pairs, Louvain community crossings, failed destinations, SSH pre-auth touches, probe-then-success, no history, rarest logon type, fastest chain), calibrated empirically (conformal p-value, valid under any dependence); host-day joint test on PageRank / betweenness change;
+  - Simes per machine, Benjamini-Hochberg across machines; campaign rows via exact hypergeometric overlap test;
+  - IP and host name reported as one machine when same-login co-occurrence is unanimous and a chance coincidence is statistically ruled out;
+  - PageRank, betweenness (Brandes) and Louvain computed in memory: **GDS / MAGE no longer required**; grouped graphs are refused (no per-event times);
+  - new CSV layout: `section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`.
+- `parse-linux`: **SSH pre-authentication touches** ("Did not receive identification string", "Bad protocol version identification", closed/reset/disconnect `[preauth]`) are written as CONNECT rows, event_id `SSH_PREAUTH`, user empty.
+- `parse-linux`: **auditd paired with sshd by process id** (same host, pid, source and outcome, sshd line from a log file that covers the audit record, one-to-one) instead of a +-1 s same-account match; successful audit connections collapsed by `(pid, ses)` across rotated files instead of a 600 s window; USER_AUTH fallback limited to `op=success` / `op=PAM:authentication`.
+- `load-neo4j` / `load-memgraph`: `resolved_name` kept when unanimous and significant against chance coincidence (Poisson model, Benjamini-Hochberg across IPs; new `resolved_p`), replacing the fixed minimum of two votes; destination nodes get `cov_ok` / `cov_fail` log-file spans; `--alpha` applies.
+
 - `parse-linux`: **UAC (Unix-like Artifacts Collector) triage detection**, alongside KAPE / Velociraptor / Cortex XDR. Detected by `uac.log` + `[root]/` layout or by the `uac-<host>-<os>-<timestamp>` filename; hostname from the filename, `[root]/etc/hostname`, `/etc/sysconfig/network`, `uac.log`, `/etc/hosts` or the syslog header when UAC was run against a mounted image (`unknown`).
 - `parse-linux`: **tar / tar.gz / tgz archives** are now walked (streamed, selective extraction of log files only), including nested combinations (zip → tar.gz, tar.gz → tar.gz). Archives copied off the victim filesystem under `[root]/` are never recursed into.
 - `parse-linux`: rotated `wtmp-YYYYMMDD` / `btmp-YYYYMMDD[.gz]` are parsed; the logrotate suffix drives the year of RFC3164 timestamps in rotated `secure` / `messages` / `auth.log` files.

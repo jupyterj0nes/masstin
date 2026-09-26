@@ -30,7 +30,7 @@ use crate::parse::is_debug_mode;
 
 // We deliberately reuse the same SSH_OK_RE / SSH_FAIL_RE already compiled in
 // parse_linux — exposed via `pub(crate)` there so we don't duplicate regex.
-use crate::parse_linux::{RawEvt, SSH_OK_RE, SSH_FAIL_RE};
+use crate::parse_linux::{preauth_touch, RawEvt, SSH_OK_RE, SSH_FAIL_RE};
 
 /// Parse a single journal file, returning SSH lateral-movement events.
 /// `dst_host` is the hostname of the machine the journal came from.
@@ -72,6 +72,12 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             continue;
         }
 
+        // sshd process id (journald trusted field `_PID`, else SYSLOG_PID)
+        let pid: u32 = entry.fields.get("_PID")
+            .or_else(|| entry.fields.get("SYSLOG_PID"))
+            .and_then(|s| s.to_string().trim().parse().ok())
+            .unwrap_or(0);
+
         let msg = match entry.fields.get("MESSAGE") {
             Some(m) => m.to_string(),
             None => continue,
@@ -100,6 +106,8 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
                 evt: "SSH_SUCCESS".into(),
                 filename: path.display().to_string(),
                 dst_host: dst_host.to_string(),
+                pid,
+                conn: 0,
             });
             matched += 1;
             continue;
@@ -122,6 +130,25 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
                 evt: "SSH_FAILED".into(),
                 filename: path.display().to_string(),
                 dst_host: dst_host.to_string(),
+                pid,
+                conn: 0,
+            });
+            matched += 1;
+            continue;
+        }
+
+        // Pre-authentication touch (see parse_linux::preauth_touch).
+        if let Some((src, kind)) = preauth_touch(&msg) {
+            out.push(RawEvt {
+                ts_rfc3339,
+                user: String::new(),
+                remote: src,
+                tty_or_proc: format!("journal-ssh/{}", kind),
+                evt: "SSH_PREAUTH".into(),
+                filename: path.display().to_string(),
+                dst_host: dst_host.to_string(),
+                pid,
+                conn: 0,
             });
             matched += 1;
             continue;
