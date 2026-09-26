@@ -81,6 +81,52 @@ pub(crate) static SSH_FAIL_RE: Lazy<Regex> =
 // from the network's point of view, and the source is usually a hostname.
 static SSH_NOTALLOWED_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"User (\S+) from (\S+) not allowed because"#).unwrap());
+// SSH connections that ended before any authentication attempt. They are
+// not logons, but they are contact: a scanner, a banner grab, a client
+// that probes the port before the real login. Only lines that are
+// pre-authentication by definition are taken:
+//   "Did not receive identification string from SRC [port N]"
+//   "Bad protocol version identification 'HEAD / HTTP/1.0' from SRC [port N]"
+//   "Connection closed|reset by [invalid|authenticating user U] SRC port N [preauth]"
+//   "Received disconnect from SRC port N:11: ... [preauth]"
+//   "Disconnected from [invalid|authenticating user U] SRC port N [preauth]"
+// Ordinary session ends (same wording without `[preauth]`) are excluded.
+// Captures: source (1). For the closed/disconnect form, 1 = user
+// (optional), 2 = source.
+pub(crate) static PREAUTH_NOIDENT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"Did not receive identification string from (\S+)"#).unwrap());
+pub(crate) static PREAUTH_BADPROTO_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"Bad protocol version identification .* from (\S+)"#).unwrap());
+pub(crate) static PREAUTH_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(?:invalid|authenticating) user (\S+)\s+)?([0-9A-Fa-f][0-9A-Fa-f:.]*)\b.*\[preauth\]"#).unwrap()
+});
+
+/// Classify an sshd message as a pre-authentication touch. Returns
+/// (source, detail) — detail names the kind and, for closed/disconnect
+/// lines, the account the client had announced.
+pub(crate) fn preauth_touch(msg: &str) -> Option<(String, String)> {
+    let clean = |s: &str| s.trim_end_matches(|c: char| c == ',' || c == ':').to_string();
+    if let Some(c) = PREAUTH_NOIDENT_RE.captures(msg) {
+        return Some((clean(&c[1]), "preauth-no-ident".into()));
+    }
+    if let Some(c) = PREAUTH_BADPROTO_RE.captures(msg) {
+        return Some((clean(&c[1]), "preauth-bad-proto".into()));
+    }
+    if let Some(c) = PREAUTH_CLOSED_RE.captures(msg) {
+        let d = match c.get(1) {
+            Some(u) => format!("preauth-closed user={}", u.as_str()),
+            None => "preauth-closed".into(),
+        };
+        return Some((clean(&c[2]), d));
+    }
+    None
+}
+static SSHD_PID_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"sshd(?:-session)?\[(\d+)\]:"#).unwrap());
+static AUDIT_SES_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#" ses=(\d+)"#).unwrap());
+static AUDIT_OP_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"msg='op=(\S+)"#).unwrap());
 static PAM_FAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"pam_unix\(sshd:[^\)]*\).*rhost=(\S+)\s+user=(\S+)"#).unwrap()
 });
@@ -267,6 +313,14 @@ pub(crate) struct RawEvt {
     pub(crate) evt: String,
     pub(crate) filename: String,
     pub(crate) dst_host: String,
+    /// Process id of the sshd that wrote the line (syslog `sshd[pid]`,
+    /// journald `_PID`, auditd `pid=`); 0 when the source has none (utmp,
+    /// lastlog, xinetd). Used only to pair an auditd record with the sshd
+    /// log line of the same connection.
+    pub(crate) pid: u32,
+    /// auditd login session id (`ses=`) of a successful USER_LOGIN; 0
+    /// otherwise. With `pid` it identifies one connection exactly.
+    pub(crate) conn: u64,
 }
 
 // ────────────────────────── hostname discovery ───────────────────────────────
@@ -482,6 +536,8 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
             evt,
             filename: fname.clone(),
             dst_host: dst_host.into(),
+            pid: 0,
+            conn: 0,
         });
     }
     res
@@ -552,6 +608,8 @@ fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> 
             evt: "LASTLOG".into(),
             filename: fname.clone(),
             dst_host: dst_host.into(),
+            pid: 0,
+            conn: 0,
         });
     }
     out
@@ -655,6 +713,12 @@ fn parse_secure_or_messages(
             continue;
         };
 
+        // sshd process id ("sshd[1234]: ..."), 0 if the line has none.
+        let line_pid: u32 = SSHD_PID_RE
+            .captures(&msg)
+            .and_then(|c| c[1].parse().ok())
+            .unwrap_or(0);
+
         // Apply SSH/PAM regexes to the message part
         // 1) xinetd "START: ssh" → SSH_CONNECT
         if let Some(cap) = XINETD_RE.captures(&msg) {
@@ -668,6 +732,8 @@ fn parse_secure_or_messages(
                     evt:         "SSH_CONNECT".into(),
                     filename:    path.display().to_string(),
                     dst_host:    dst_host.into(),
+                    pid: 0,
+                    conn: 0,
                 });
             }
             continue;
@@ -688,6 +754,8 @@ fn parse_secure_or_messages(
                     evt:         "SSH_SUCCESS".into(),
                     filename:    path.display().to_string(),
                     dst_host:    dst_host.into(),
+                    pid: line_pid,
+                    conn: 0,
                 });
             }
             continue;
@@ -713,6 +781,8 @@ fn parse_secure_or_messages(
                     evt:         "SSH_FAILED".into(),
                     filename:    path.display().to_string(),
                     dst_host:    dst_host.into(),
+                    pid: line_pid,
+                    conn: 0,
                 });
             }
             continue;
@@ -733,7 +803,29 @@ fn parse_secure_or_messages(
                 evt:         "SSH_FAILED".into(),
                 filename:    path.display().to_string(),
                 dst_host:    dst_host.into(),
+                pid: line_pid,
+                conn: 0,
             });
+            continue;
+        }
+
+        // 3c) Pre-authentication touch (no account): CONNECT row. The
+        //     user column stays empty on purpose — an announced user name
+        //     is not an authenticated identity; it goes in the detail.
+        if let Some((src, kind)) = preauth_touch(&msg) {
+            if !filter_ip || looks_like_ip(&src) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user:        String::new(),
+                    remote:      src,
+                    tty_or_proc: format!("ssh/{}", kind),
+                    evt:         "SSH_PREAUTH".into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                    pid: line_pid,
+                    conn: 0,
+                });
+            }
             continue;
         }
 
@@ -752,6 +844,8 @@ fn parse_secure_or_messages(
                         evt:         "SSH_FAILED".into(),
                         filename:    path.display().to_string(),
                         dst_host:    dst_host.into(),
+                        pid: line_pid,
+                        conn: 0,
                     });
                 }
             }
@@ -769,24 +863,19 @@ fn parse_secure_or_messages(
     out
 }
 
-/// Records of one sshd pid arriving closer than this are one connection.
-const AUDIT_SESSION_GAP_SECS: i64 = 600;
-
 // audit.log* ------------------------------------------------------------------
 // One SSH login leaves several auditd records: USER_AUTH for each PAM /
 // key stage (`op=pubkey_auth`, `op=key`, `op=PAM:authentication`) and then
 // USER_LOGIN with the final outcome — often written twice by the same
 // sshd pid. USER_LOGIN is the record we want (one per connection, success
 // or failure, `acct="(unknown)"` for non-existent accounts). USER_AUTH is
-// only used as a fallback for files that carry no USER_LOGIN at all, and
-// identical records from the same pid within the same second collapse
-// to one.
+// only used as a fallback for files that carry no USER_LOGIN at all.
+// Repeats of one connection are collapsed by its audit session id.
 fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
     let mut out = Vec::new();
-    let mut auth_fallback: Vec<RawEvt> = Vec::new();
-    // (pid, source, account, record:outcome) -> last second seen. See the
-    // dedup comment below.
-    let mut last_seen: HashMap<(String, String, String, String), i64> = HashMap::new();
+    // USER_AUTH records with their `op=`, used only when the file has no
+    // USER_LOGIN at all (see the fallback at the end).
+    let mut auth_fallback: Vec<(RawEvt, String)> = Vec::new();
     let uid_name = |uid: &str| -> Option<String> {
         let u: u32 = uid.parse().ok()?;
         if u == 4294967295 { return None; }
@@ -854,24 +943,32 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
 
         let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
 
-        // One sshd process = one connection. sshd writes USER_LOGIN again
-        // for every channel a connection opens (scp, sftp, ansible, a
-        // second shell), seconds or minutes apart, all under the same pid:
-        // keying on the exact second turned one connection into up to ten
-        // "logins". Records of the same pid, source, account and outcome
-        // are collapsed while they keep arriving less than
-        // AUDIT_SESSION_GAP_SECS apart (rolling), so pid reuse days later
-        // still counts as a new connection.
-        let pid = AUDIT_PID_RE
+        // One connection = one row, identified by what auditd itself
+        // records, not by a time window:
+        //   * a successful USER_LOGIN carries the login session id (`ses=`)
+        //     that sshd opened; every further USER_LOGIN of the same
+        //     connection (one per channel: scp, sftp, ansible modules, a
+        //     second shell) repeats the same (pid, ses). Verified on
+        //     host-a: 780 success records = 667 distinct (pid, ses) =
+        //     667 `USER_AUTH op=success` records. The repeats are collapsed
+        //     per host after all files are read (a session can straddle an
+        //     audit.log rotation), see `conn`.
+        //   * a failed USER_LOGIN (ses unset) is written once per
+        //     connection; the same pid seen again is pid reuse by a later
+        //     connection (hours apart on the same host), so failures are
+        //     never collapsed.
+        let pid: u32 = AUDIT_PID_RE
             .captures(&line)
-            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .and_then(|c| c.get(1)?.as_str().parse().ok())
+            .unwrap_or(0);
+        let ses: u64 = AUDIT_SES_RE
+            .captures(&line)
+            .and_then(|c| c.get(1)?.as_str().parse().ok())
+            .unwrap_or(4294967295);
+        let op: String = AUDIT_OP_RE
+            .captures(&line)
+            .map(|c| c[1].to_string())
             .unwrap_or_default();
-        let key = (pid, ip.clone(), user.clone(), format!("{}:{}", evt_type, evt));
-        let repeat = matches!(last_seen.get(&key), Some(&prev) if (secs - prev).abs() <= AUDIT_SESSION_GAP_SECS);
-        last_seen.insert(key, secs);
-        if repeat {
-            continue;
-        }
 
         let raw = RawEvt {
             ts_rfc3339: ts,
@@ -886,19 +983,41 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             evt: evt.into(),
             filename: path.display().to_string(),
             dst_host: dst_host.into(),
+            pid,
+            conn: if evt_type == "USER_LOGIN" && res == "success" && ses != 4294967295 { ses } else { 0 },
         };
         if evt_type == "USER_LOGIN" {
             out.push(raw);
         } else {
-            auth_fallback.push(raw);
+            auth_fallback.push((raw, op));
         }
     }
+    // No USER_LOGIN in the file: take from USER_AUTH only the records that
+    // sshd writes once per outcome. A successful connection ends with one
+    // `op=success` record (the pubkey_auth / key stage records before it
+    // are not logins); older sshd audit code without `op=success` writes
+    // one `op=PAM:authentication` per password login. A failed attempt is
+    // `op=PAM:authentication res=failed` — `op=pubkey res=failed` is not
+    // one: it is an agent offering a key the server does not accept, which
+    // happens before most successful key logins.
     if out.is_empty() && !auth_fallback.is_empty() {
+        let has_op_success = auth_fallback.iter().any(|(_, op)| op == "success");
+        let n = auth_fallback.len();
+        out = auth_fallback
+            .into_iter()
+            .filter(|(r, op)| {
+                if r.evt == "SSH_SUCCESS" {
+                    if has_op_success { op == "success" } else { op == "PAM:authentication" }
+                } else {
+                    op == "PAM:authentication"
+                }
+            })
+            .map(|(r, _)| r)
+            .collect();
         if is_debug_mode() {
-            println!("    {}: no USER_LOGIN records, using {} USER_AUTH records as fallback",
-                     path.display(), auth_fallback.len());
+            println!("    {}: no USER_LOGIN records, {} of {} USER_AUTH records used as fallback",
+                     path.display(), out.len(), n);
         }
-        out = auth_fallback;
     }
     out
 }
@@ -1146,28 +1265,86 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
         crate::banner::print_info(&format!("{} duplicate events removed (journald + rsyslog overlap)", removed));
     }
     drop(owner);
-    // auditd's USER_LOGIN is the same authentication event sshd already
-    // wrote to secure/auth.log/journald; when both are present (same host,
-    // outcome, account and source within a second) the audit copy adds
-    // nothing but a second edge. Audit rows without an sshd counterpart —
-    // hosts whose text logs rotated away, or the "(unknown)" failures
-    // that sshd never named — are kept.
-    let ssh_keys: std::collections::HashSet<u64> = deduped
-        .iter()
-        .filter(|r| channel_class(&r.tty_or_proc) == "ssh")
-        .filter_map(|r| ts_secs(&r.ts_rfc3339).map(|s| key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote], s)))
-        .collect();
-    let before = deduped.len();
-    deduped.retain(|r| {
-        if channel_class(&r.tty_or_proc) != "audit" { return true; }
-        let sec = match ts_secs(&r.ts_rfc3339) { Some(s) => s, None => return true };
-        !(-1i64..=1).any(|d| ssh_keys.contains(&key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote], sec + d)))
-    });
-    let audit_dups = before - deduped.len();
-    if audit_dups > 0 {
-        crate::banner::print_info(&format!("{} audit records dropped (same login already in sshd log)", audit_dups));
+    // One successful audit connection = one row: records sharing (host,
+    // pid, ses, source) are the channels of one sshd connection, possibly
+    // spread over two rotated audit.log files. The earliest is kept.
+    let session_dups = {
+        let mut first: HashMap<(&str, u32, u64, &str), (i64, usize)> = HashMap::new();
+        for (i, r) in deduped.iter().enumerate() {
+            if r.conn == 0 { continue; }
+            let sec = ts_secs(&r.ts_rfc3339).unwrap_or(i64::MAX);
+            let e = first.entry((r.dst_host.as_str(), r.pid, r.conn, r.remote.as_str())).or_insert((sec, i));
+            if sec < e.0 { *e = (sec, i); }
+        }
+        let keep: std::collections::HashSet<usize> = first.values().map(|v| v.1).collect();
+        let before = deduped.len();
+        let mut k = 0usize;
+        deduped.retain(|r| { let ok = r.conn == 0 || keep.contains(&k); k += 1; ok });
+        before - deduped.len()
+    };
+    if session_dups > 0 {
+        crate::banner::print_info(&format!("{} audit records collapsed (further channels of an already counted session)", session_dups));
     }
-    drop(ssh_keys);
+    // auditd's USER_LOGIN is the same connection sshd already wrote to
+    // secure/auth.log/journald. The two are paired by the identifier they
+    // share — the sshd process id — never by time proximity or account
+    // (auditd names successful logins by uid, failed ones as "(unknown)"):
+    //   * same host, same pid, same source, same outcome (an audit failure
+    //     pairs with an sshd refusal or pre-authentication close);
+    //   * the sshd line comes from a log file whose time span covers the
+    //     audit record, so a pid reused on a day the sshd log does not
+    //     cover cannot be paired with a different connection;
+    //   * one-to-one, closest in time first (a pid is reused only after
+    //     the previous connection has ended).
+    // Audit rows left unpaired — hosts whose text logs rotated away,
+    // connections sshd did not log — are kept.
+    let audit_dups = {
+        let class = |evt: &str| -> u8 {
+            match evt { "SSH_SUCCESS" => 1, "SSH_FAILED" | "SSH_PREAUTH" => 2, _ => 0 }
+        };
+        let mut span: HashMap<&str, (i64, i64)> = HashMap::new();
+        let mut by_key: HashMap<(&str, u32, &str, u8), Vec<(i64, &str)>> = HashMap::new();
+        for r in deduped.iter() {
+            if channel_class(&r.tty_or_proc) != "ssh" { continue; }
+            let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
+            let e = span.entry(r.filename.as_str()).or_insert((sec, sec));
+            if sec < e.0 { e.0 = sec; }
+            if sec > e.1 { e.1 = sec; }
+            let c = class(&r.evt);
+            if r.pid != 0 && c != 0 {
+                by_key.entry((r.dst_host.as_str(), r.pid, r.remote.as_str(), c)).or_default().push((sec, r.filename.as_str()));
+            }
+        }
+        // candidate pairs (|dt|, audit index, sshd slot)
+        let mut slots: HashMap<(&str, u32, &str, u8, usize), ()> = HashMap::new();
+        let mut pairs: Vec<(i64, usize, (&str, u32, &str, u8, usize))> = Vec::new();
+        for (i, r) in deduped.iter().enumerate() {
+            if channel_class(&r.tty_or_proc) != "audit" || r.pid == 0 { continue; }
+            let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
+            let key = (r.dst_host.as_str(), r.pid, r.remote.as_str(), class(&r.evt));
+            if let Some(v) = by_key.get(&key) {
+                for (j, (t, f)) in v.iter().enumerate() {
+                    let (lo, hi) = span[f];
+                    if sec < lo || sec > hi { continue; }
+                    pairs.push(((sec - t).abs(), i, (key.0, key.1, key.2, key.3, j)));
+                }
+            }
+        }
+        pairs.sort_by_key(|p| p.0);
+        let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (_, i, slot) in pairs {
+            if drop_idx.contains(&i) || slots.contains_key(&slot) { continue; }
+            slots.insert(slot, ());
+            drop_idx.insert(i);
+        }
+        let n = drop_idx.len();
+        let mut k = 0usize;
+        deduped.retain(|_| { let keep = !drop_idx.contains(&k); k += 1; keep });
+        n
+    };
+    if audit_dups > 0 {
+        crate::banner::print_info(&format!("{} audit records dropped (same connection already in the sshd log, paired by pid)", audit_dups));
+    }
     let rows = &deduped[..];
 
     // Written directly, row by row, instead of through a polars DataFrame:

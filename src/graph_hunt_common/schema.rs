@@ -1,10 +1,8 @@
 // Schema inspection for graph-hunt. Determines whether the graph was loaded
 // in grouped mode (one edge per (origin,user,logon_type,destination) with
 // `earliest_date` only) or ungrouped mode (one edge per CSV row with its own
-// timestamp). Detector availability depends on this — see the disclaimer
-// banner.
+// timestamp). The statistical engine needs per-event times.
 
-use futures::stream::*;
 use neo4rs::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,26 +67,8 @@ pub async fn detect_mode(graph: &Graph) -> neo4rs::Result<GraphMode> {
     }
 }
 
-pub fn print_grouped_disclaimer() {
-    eprintln!();
-    eprintln!("╔══════════════════════════════════════════════════════════════════╗");
-    eprintln!("║  WARNING: GROUPED GRAPH DETECTED                                 ║");
-    eprintln!("║                                                                  ║");
-    eprintln!("║  The graph was loaded without --ungrouped, so per-event          ║");
-    eprintln!("║  timestamps are not available. The following detectors will     ║");
-    eprintln!("║  be SKIPPED:                                                     ║");
-    eprintln!("║                                                                  ║");
-    eprintln!("║    - chain-motif       (needs per-event timestamps)              ║");
-    eprintln!("║    - cred-rotation     (needs per-event timestamps)              ║");
-    eprintln!("║                                                                  ║");
-    eprintln!("║  And the following will run in DEGRADED mode (two-snapshot       ║");
-    eprintln!("║  comparison instead of sliding window):                          ║");
-    eprintln!("║                                                                  ║");
-    eprintln!("║    - pagerank-spike                                              ║");
-    eprintln!("║    - betweenness-spike                                           ║");
-    eprintln!("║                                                                  ║");
-    eprintln!("║  For full detection, reload with:                                ║");
-    eprintln!("║    masstin -a load-memgraph --ungrouped ...                      ║");
-    eprintln!("╚══════════════════════════════════════════════════════════════════╝");
-    eprintln!();
+pub fn print_grouped_error(loader: &str) {
+    eprintln!("Masstin - Error: the graph was loaded grouped (one edge per origin/account/destination),");
+    eprintln!("so it has no per-event times. graph-hunt measures every statistic per day and needs them.");
+    eprintln!("Reload with: masstin -a {} --ungrouped ...", loader);
 }
