@@ -30,13 +30,13 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
    PageRank, betweenness and Louvain are computed in memory, so no GDS or MAGE plugin is needed.
 2. **Machines.** An IP and a host name become one machine when the same-login co-occurrence evidence is unanimous and the chance of coincidence is significant (see below).
 3. **Unit.** The unit of observation is the UTC day. Days before the cutoff are the baseline, the rest are the window.
-4. **Reference (leave-one-day-out).** A fact is new on a baseline day when it occurs on no other baseline day. It is new on a window day when it occurs on no baseline day. Every day is therefore judged against almost the same amount of reference, wherever it falls in the calendar. That is what makes baseline days a fair null for window days.
+4. **Reference (the past only, with the window's gap).** A fact is new on a window day when it occurs on no baseline day. A fact is new on a baseline day *d* when it occurs on no baseline day up to *d* − *L*, where *L* is the length of the window in days: the window day *W* sees everything before the cutoff, which lies between 0 and *L* − 1 days before it, and a baseline day is given the same rule with the same gap. A fact that starts in the middle of the baseline and repeats every day is therefore new on its first day only, exactly as it would be in the window. Early baseline days have less reference and so more novelty, which makes the null heavier than the window: conservative. The first version used leave-one-day-out (a baseline day judged against all other baseline days, before and after it), which gave every day the same amount of reference but made a repeating fact *never* new in the baseline while it was new on *every* window day; on an incident-free window that asymmetry alone made every new connection significant.
 5. **Coverage.** The loaders record, for every destination, the time span of every collected log file: first to last record. Spans are merged per kind of evidence:
    - logins: every source except lastlog and btmp;
    - failures: every source except lastlog, wtmp and utmp.
 
    A destination is covered on a day when a span touches it. A quiet day inside a log file still counts as covered, and a missing rotation does not.
-6. **Panel.** Counts are only comparable over destinations that were watched on every compared day. The panel is the set of destinations covered on every day from a start day S to the cutoff. S is the baseline day that maximises min(login panel, failure panel) × null days: the information of the worse-served kind of evidence. It is purely data-driven. A plain sum was tried first and let four weeks of wtmp history buy out 25 of the 33 hosts with failure coverage. On each window day the panel is further restricted to destinations covered that day. Window logins to destinations outside the panel are listed in a *not evaluable* section and never ranked.
+6. **Panel.** Counts are only comparable over destinations that were watched on every compared day. The panel is the set of destinations covered on every day from a start day S to the last covered baseline day (normally the day before the cutoff; if no log reaches that day the panel ends on the last day any log does, and the run says so). S is the baseline day that maximises min(login panel, failure panel) × null days: the information of the worse-served kind of evidence. A kind of evidence absent from the whole graph does not veto the other. It is purely data-driven and depends on coverage only, never on the events, so it cannot bias the p-values. A plain sum was tried first and let four weeks of wtmp history buy out 25 of the 33 hosts with failure coverage. On each window day the panel is further restricted to destinations covered that day. Window logins to destinations outside the panel are listed as *not evaluated* and never ranked, unless the origin has no history at all (see below). An empty panel stops the run with a message instead of comparing against nothing.
 7. **Origin-day profile.** For each origin and day, restricted to panel destinations, the engine computes:
 
    | coordinate | meaning |
@@ -50,7 +50,8 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
    | probe-then-success | refused named attempts followed the same day by a login with an account new for the origin |
    | no-history | origin has no event of any kind on the other baseline days |
    | rare-logon-type | −ln(share of the destination's other-day logins whose logon type is at most as frequent) |
-   | chain-motif | 1 / (1 + seconds) for the fastest chain A→B (new) then B→C (new) |
+   | causal-path | causal paths through this origin as pivot with a credential switch and a new access, summed over path certainties (see below) |
+   | credential-switch | logins with a credential switch and a new access: the account belongs to other origins in the reference, this origin never used it, and the destination is new for the origin or for the account |
 
 8. **Joint test.** The statistic is T = Σ −ln(marginal tail share) over the coordinates above zero. It is calibrated empirically: p = (1 + #baseline origin-days with T ≥ T_obs) / (1 + N), with each baseline point's T computed leaving itself out. This is a conformal p-value. It is valid for exchangeable days whatever the dependence between coordinates, because dependence only costs power. Corroboration is therefore measured jointly, not added as a bonus. The number of baseline origin-days at least as high in every coordinate at once is reported alongside as a plain check.
 9. **Host-day profile.** For destination hosts in the panel, the engine measures the change in PageRank (scaled to mean 1) and in normalised betweenness when the day's logins are added to the baseline graph. On baseline days the same is done by removing that day's unique pairs and adding them back. The same joint calibration applies.
@@ -72,6 +73,93 @@ the same result on the baseline days, on the destinations both days could
 show. Benjamini-Hochberg runs across all connections. The machine-level
 tests described below are the building blocks of that context.
 
+### Hopper's signature: credential switch and new access
+
+Hopper (Ho et al., *Hopper: Modeling and Detecting Lateral Movement*,
+USENIX Security 2021) showed on 15 months of enterprise logins that
+lateral movement almost always combines two properties, and that requiring
+both cuts false alarms eightfold against per-login anomaly detection:
+
+- **credential switch**: a login uses an account that does not belong to
+  the actor. Here, without an inventory of machine owners, the account's
+  owners are the origins that used it on the reference days; a switch is
+  an account with owners that this origin never used. An account with no
+  owner anywhere is *unknown to the network* and is reported as such, not
+  as a switch.
+- **new access**: the destination is new for the origin or for the account.
+
+Both are facts already measured by the leave-one-day-out reference; no
+constant is involved. They enter the engine in two ways:
+
+1. as the origin-day coordinate `credential-switch` (logins that day with
+   both properties), tested like every other coordinate;
+2. as the **class** of each connection, which orders the rows within the
+   significant set and within the rest. The p-value is untouched. Classes,
+   in order: credential switch with new access (or a causal path with both,
+   or the same origin-day as one); account unknown to the network, or a
+   switch to a known destination; habitual credential on a new connection,
+   or no credential (failures, pre-auth); habitual connection.
+
+   The class is the first clause of `why_unusual`. On the test case it
+   separates the attacker (every one of its logins in the first class) from
+   the vulnerability scanner, the orchestration account and the
+   administrators on their own accounts, all of which reach new destinations
+   with their habitual credential and stay significant but rank behind.
+
+### Causal paths
+
+Hopper's unit is the path, not the login. Here a login B→C with account a2
+is *caused* by one of the logins A→B that entered B earlier on the same UTC
+day (the unit of the analysis; Hopper uses the session length, 24 h). Each
+distinct (A, a1) that entered B is a candidate cause with certainty
+1 / #candidates, as in Hopper. A path carries the signature when a1 ≠ a2
+(the credential changed at B) and a1 never logged in to C in the reference.
+Paths are attributed to the pivot B: the `causal-path` coordinate of B's
+origin-day is the sum of certainties of such paths, and the connection B→C
+shows its best path in words ("B had been entered from A as a1 at 15:35;
+it went on to C as a2, and a1 had never logged in there"). This replaces
+the former `chain-motif` (1 / (1 + seconds) between two new logins), which
+had no notion of who was acting.
+
+### Origins without history
+
+A connection to a destination outside the panel cannot be judged by the
+destination's history, but when the origin has no event of any kind in the
+reference, the connection is new by the origin alone. Such connections are
+evaluated with the destination-dependent fact (account new on the
+destination) switched off and are never listed as *not evaluated*. Without
+this rule the attacker's logins to the three hosts with journal-only
+coverage fell outside the ranking.
+
+## Analyst report (`--report`)
+
+The CSV lists connections; an analyst reads origins. With `--report path.md`
+the engine also writes one story per origin with a significant connection,
+in the order of the CSV: its baseline presence (days active, usual
+destinations and accounts) or its absence; what it did in the window as
+chronological phases (day, time range, result, accounts, hosts, events,
+how many connections were significant and the best p); why that is unusual,
+one clause per origin-level fact with its baseline count; who owns each
+account it used for the first time; its causal paths; the origins it moves
+with (campaign test); the log families that recorded it; and a Browser
+query for every connection of the origin in the window. Every number is one
+the engine already measured; the report computes nothing.
+
+## Assumptions, limits and what the numbers mean
+
+- **What is exchangeable.** The null is the set of baseline connections of the same result on the panel; each window connection is compared with all of them. The p-value is therefore valid when *connections* are exchangeable across baseline days, not merely days: a day with thousands of habitual batch connections weighs more than a quiet weekend day. Weekly seasonality can break this in either direction. The check that matters is the calibration run on an incident-free window (see Validation), which should be done on a window that contains both weekdays and weekend days. A day-weighted p-value (each baseline day counting once) would be valid under exchangeable days alone, but its floor would be 1 / (days + 1): with 28 baseline days nothing could ever pass a 5 % false discovery rate over thousands of tests. That is why the connection-level null is kept and stated.
+- **The null is the set of new baseline connections** of the same result, and the family of tests the set of new window connections: the question answered is "given that a connection is new, how unusual is its profile among the new connections of normal days?". With habitual connections in the null, merely being new read as a 4 % event (400 new among 10,519), and on an incident-free window every new connection passed a 5 % false discovery rate once habitual connections were taken out of the family. The rate of new connections itself is measured by the origin-day coordinates (destinations reached for the first time, accounts new to the origin), not by the fact of novelty alone.
+- **Null connections need prior coverage.** A baseline connection enters the null only if its destination was covered on some day before the day's reference gap: on the first covered day of a destination every connection to it is new for lack of history, not for being unusual, and those days would fill the null with spurious fan-outs.
+- **The family of tests** is the set of *new* window connections (some fact about them is new). Habitual connections are not tests: they are listed with p = 1 and stay outside Benjamini-Hochberg, so they cost no power. The run prints the smallest reachable p per result (1 / (N + 1), N being the null size), which is the resolution of the data.
+- **Ties.** Every connection more extreme than the whole null gets the floor p. Rows with the same p are ordered by the joint surprise T (the sum of the marginal surprises), then by time. T is informative but is not a probability and is not comparable across results (logins, failures, pre-auth have different nulls).
+- **Counts in the explanations.** "shared by 27 of 10519 baseline logins, on 9 of 28 days" gives the share of the null with that fact and the number of distinct baseline days it fell on. The second number is what an analyst can defend without reference to the model.
+- **Origins without history** are evaluated on off-panel destinations with every destination-side fact switched off (account on the destination, community, logon type, centrality): only what is known about the origin counts.
+- **Centrality.** PageRank is iterated to floating-point stationarity, and a change smaller than twice the difference between two starting points (the convergence noise of that graph) is no change. Betweenness is exact.
+- **Causal paths.** A path's certainty is 1 / #candidate causes; the pivot's coordinate sums, over its distinct (destination, account) connections of the day, the best certainty of each, so it is a count of connections weighted by certainty, not of sessions.
+- **Campaigns** are a grouping, not a detection: the hypergeometric test assumes destinations drawn uniformly from the panel, and real destinations are not uniform, so the p is indicative. Two origins whose window logins coincide in destination, account and second are one machine recorded twice and are never paired.
+- **Logon-type rarity** is weighted by events, so double-logged logins weigh twice; on Linux the type is the same for every row and the coordinate is inert.
+- **Conformal detail.** Each null point's surprise is computed leaving itself out; the exact full-conformal construction would also add the observation to the reference. The difference is ln((N + 1) / N) per positive coordinate and goes in the conservative direction for observations above the null.
+
 ## Output (CSV, machine-level version, superseded)
 
 Columns: `section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`.
@@ -87,13 +175,11 @@ Summaries state the counts behind every p-value, for example "0 of 1214 baseline
 
 ## IP ↔ host name (loaders and graph-hunt)
 
-The same SSH login is often recorded twice on the destination: sshd writes the IP, and wtmp (with UseDNS) writes the reverse-DNS name. When one (destination, account, second, outcome) shows exactly one IP and one name, that is one vote.
+The same SSH login is often recorded twice on the destination: sshd writes the IP, and wtmp (with UseDNS) writes the reverse-DNS name. When one (destination, account, outcome, second) shows exactly one IP and one name, that is one vote "IP is NAME".
 
-A vote can also be a coincidence: an unrelated login from that name in the same second. The model is Poisson, with λ = that name's logins on that (destination, account, outcome) divided by the observed seconds, so P(one coincidence) = 1 − e^−λ. The mapping is kept when:
-- all votes name the same host, and
-- the product of the per-vote coincidence probabilities is significant after Benjamini-Hochberg across candidate IPs.
+A vote can also be a coincidence: an unrelated login from that name in the same second. The test counts the trials as well as the votes. For a candidate pair (IP, NAME), every second in which the IP logged in alone, in any context (destination, account, outcome) the IP appears in, is a trial; the seconds where NAME, and only NAME, was recorded too are the votes. Under a Poisson model with NAME's own login rate in that context (λ = NAME's distinct login seconds / the destination's observed span), a trial coincides by chance with probability 1 − e^−λ; the number of chance votes is Binomial(trials, mean chance probability over the trials) and the p-value is its upper tail at the observed votes. Genuine double-logging gives votes = trials and a p-value that vanishes with the number of logins; coincidences at the expected rate stay unremarkable however many there are. (The first version multiplied the per-vote probabilities without counting the trials, which is a likelihood, not a tail probability, and folded busy machines that merely shared an account.)
 
-This replaces the former fixed minimum of two votes. The loaders write `resolved_name`, `resolved_votes` and `resolved_p` on the IP node and never merge nodes.
+Benjamini-Hochberg runs across every (IP, NAME) candidate. An IP is resolved when exactly one NAME is significant for it; two significant names are a conflict and the IP stays unresolved. The loaders write `resolved_name`, `resolved_votes` and `resolved_p` on the IP node and never merge nodes.
 
 ## Parser changes (parse-linux; they change the CSV, approved)
 
@@ -121,7 +207,7 @@ This replaces the former fixed minimum of two votes. The loaders write `resolved
 
 ## Deviations from the first version of the plan, and why
 
-- **History plateau H\* (Mann-Kendall) → leave-one-day-out.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). Leave-one-day-out gives every day the same reference instead.
+- **History plateau H\* (Mann-Kendall) → past-only reference with the window's gap.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). Leave-one-day-out gives every day the same reference instead.
 - **Simes within families + Fisher across families → one joint test per origin-day.** Fisher assumes independent families, which does not hold. Testing each signal separately also multiplied the testing burden: 31 novel-edge tests for one fan-out. The joint test measures corroboration directly and stays valid under any dependence.
 
 ## Validation

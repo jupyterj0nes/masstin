@@ -3,11 +3,10 @@
 //
 //   * empirical_p / upper_tail — tail probability of an observation against
 //                        the values the same statistic took on baseline days
-//   * simes            — combine the joint tests of one machine (valid
+//   * simes            — combine several p-values of one unit (valid
 //                        under positive dependence)
-//   * benjamini_hochberg — false-discovery-rate control across machines
+//   * benjamini_hochberg — false-discovery-rate control across connections
 //   * hypergeom_upper  — exact overlap test (campaign grouping)
-//   * rayleigh         — time-of-day concentration (descriptive)
 //
 // No tuning constants live here. The only externally chosen number in the
 // whole pipeline is alpha (CLI, default 0.05).
@@ -102,6 +101,25 @@ fn ln_choose(n: u64, k: u64) -> f64 {
     ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma((n - k) as f64 + 1.0)
 }
 
+/// P(X >= k) for X ~ Binomial(n, p), summed in log space.
+pub fn binom_upper(n: u64, k: u64, p: f64) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    if k > n || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    let (lp, lq) = (p.ln(), (1.0 - p).ln());
+    let mut acc = f64::NEG_INFINITY;
+    for i in k..=n {
+        acc = log_add(acc, ln_choose(n, i) + i as f64 * lp + (n - i) as f64 * lq);
+    }
+    acc.exp().min(1.0)
+}
+
 /// P(X >= k) for X ~ Hypergeometric(population, successes, draws).
 pub fn hypergeom_upper(pop: u64, succ: u64, draws: u64, k: u64) -> f64 {
     let hi = succ.min(draws);
@@ -115,26 +133,6 @@ pub fn hypergeom_upper(pop: u64, succ: u64, draws: u64, k: u64) -> f64 {
         acc = log_add(acc, ln_choose(succ, i) + ln_choose(pop - succ, draws - i) - denom);
     }
     acc.exp().min(1.0)
-}
-
-/// Rayleigh test for a preferred time of day. Input: seconds of day.
-/// Returns (mean resultant length R, p-value), Zar's approximation
-/// p = exp(sqrt(1 + 4n + 4(n^2 - Rn^2)) - (1 + 2n)), Rn = n * R.
-pub fn rayleigh(secs_of_day: &[f64]) -> (f64, f64) {
-    let n = secs_of_day.len();
-    if n < 2 {
-        return (0.0, 1.0);
-    }
-    let (mut c, mut s) = (0.0, 0.0);
-    for t in secs_of_day {
-        let a = 2.0 * std::f64::consts::PI * t / 86400.0;
-        c += a.cos();
-        s += a.sin();
-    }
-    let nf = n as f64;
-    let rn = (c * c + s * s).sqrt();
-    let p = ((1.0 + 4.0 * nf + 4.0 * (nf * nf - rn * rn)).sqrt() - (1.0 + 2.0 * nf)).exp();
-    (rn / nf, p.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -153,6 +151,14 @@ mod tests {
         // N=39 K=32 n=31 k=31 -> C(32,31) C(7,0) / C(39,31) = 32 / 61523748
         let p = hypergeom_upper(39, 32, 31, 31);
         assert!((p - 32.0 / 61_523_748.0).abs() / p < 1e-9);
+    }
+    #[test]
+    fn binom_known() {
+        // P(X >= 1), X ~ Bin(1, 0.3) = 0.3; P(X >= 2), X ~ Bin(3, 0.5) = 0.5
+        assert!((binom_upper(1, 1, 0.3) - 0.3).abs() < 1e-12);
+        assert!((binom_upper(3, 2, 0.5) - 0.5).abs() < 1e-12);
+        assert_eq!(binom_upper(5, 0, 0.1), 1.0);
+        assert_eq!(binom_upper(5, 6, 0.1), 0.0);
     }
     #[test]
     fn simes_known() {

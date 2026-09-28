@@ -8,8 +8,9 @@
 //
 // Contents:
 //   * engine   — the statistical hunt (docs/graph-hunt-statistics.md)
-//   * stats    — empirical p-values, Simes, Fisher, BH, Mann-Kendall, ...
+//   * stats    — empirical p-values, Simes, Benjamini-Hochberg, hypergeometric
 //   * algos    — PageRank, betweenness, Louvain (in memory)
+//   * report   — analyst report, one story per origin (--report)
 //   * resolve  — IP -> host name from same-login co-occurrence
 //   * helpers  — account predicates, timestamp parsing, Browser snippets
 
@@ -17,6 +18,7 @@ use chrono::NaiveDateTime;
 
 pub mod algos;
 pub mod engine;
+pub mod report;
 pub mod resolve;
 pub mod schema;
 pub mod stats;
