@@ -656,12 +656,14 @@ Days before `--investigation-from` are the **baseline**, the rest the **window**
 
 The full design, with the reasons behind each choice, is in [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md). In short:
 
-- **Leave-one-day-out reference.** A fact is *new* on a baseline day if it happens on no other baseline day, and on a window day if it happens on no baseline day. Every day is judged against the same amount of history, so baseline days are a fair yardstick for window days.
+- **The past only, with the window's gap.** A fact is *new* on a window day if it happens on no baseline day, and on a baseline day if it happens on no baseline day up to that day minus the window length, so a fact is new on the first day it appears, in the baseline and in the window alike. Baseline days are then a fair yardstick for window days: same rule, same statistics.
 - **Coverage from the log files.** The loaders record on every host node the time span of each collected log file (`cov_ok` for sources that show logins, `cov_fail` for sources that show failures). Counts are only compared over a **panel** of destinations watched continuously; its start day is the one that maximises panel size × baseline days. Window activity on hosts outside the panel is listed as *not evaluable* instead of being ranked.
-- **One joint test per origin and day** over ten signals: destinations reached for the first time (`origin-fanout`), new accounts for the origin (`cred-rotation`), never-seen account/destination pairs (`novel-edge`), new destinations outside the origin's Louvain community (`community-bridge`), destinations with failures (`failed-sweep`), SSH pre-auth touches (`preauth-sweep`), refused named attempts followed by a login with a new account (`probe-then-success`), origin without any history, rarest logon type (`rare-logon-type`) and fastest new-login chain (`chain-motif`). The combined surprise is calibrated against the baseline origin-days, which gives a p-value that stays valid however the signals depend on each other. Hosts get the same joint test on their PageRank / betweenness change (`pagerank-spike`, `betweenness-spike`).
-- **Decision.** Simes per machine, Benjamini-Hochberg across machines. Significant machines first; the rest stay in the CSV, marked.
+- **The unit is the connection**: (origin, destination, account, result) on one day. A connection seen on another baseline day is habitual and scores zero. A new one is described by what is new about it and by its origin's day: destinations reached for the first time (`origin-fanout`), new accounts for the origin (`cred-rotation`), never-seen account/destination pairs (`novel-edge`), new destinations outside the origin's Louvain community (`community-bridge`), destinations with failures (`failed-sweep`), SSH pre-auth touches (`preauth-sweep`), refused named attempts followed by a login with a new account (`probe-then-success`), origin without any history, rarest logon type (`rare-logon-type`), causal paths with a credential switch (`causal-path`), logins with a credential switch and a new access (`credential-switch`), and the destination's PageRank / betweenness change (`pagerank-spike`, `betweenness-spike`). One joint test combines them; its calibration against the baseline connections gives a p-value that stays valid however the signals depend on each other.
+- **Decision.** Benjamini-Hochberg across the new connections at `--alpha` (habitual ones have p = 1 and are not tests). Significant connections first; the rest stay in the CSV, marked. Every count in an explanation also says on how many baseline days it occurred.
+- **Hopper's signature orders the rows.** Following Hopper (Ho et al., USENIX Security 2021), a connection that combines a **credential switch** (an account owned by other origins, never used by this one) with a **new access** (destination new for the origin or the account) comes before one that reaches a new destination with its habitual credential (scanners, orchestration, administrators on their own account). The class is the first clause of `why_unusual`; the p-value is untouched. A **causal path** is the same signature across two hops: A entered B as a1, B went on to C as a2 ≠ a1, and a1 had never reached C.
+- **Origins without history** are judged by their own novelty even on destinations without comparable coverage, so their connections are never left out as *not evaluable*.
 - **Campaigns.** Origins with no history that share a new account and hit overlapping destinations beyond chance (exact hypergeometric test) are grouped in one row. Nodes are not merged.
-- **Machines, not nodes.** An IP and a host name are reported as one machine when the same logins appear once with each (sshd IP vs wtmp reverse-DNS), unanimously, and a chance coincidence is statistically ruled out. The loaders store this on the IP node as `resolved_name` / `resolved_votes` / `resolved_p`; nodes are never merged.
+- **Machines, not nodes.** An IP and a host name are reported as one machine when the same logins appear once with each (sshd IP vs wtmp reverse-DNS) far more often than chance allows (binomial test over the IP's logins, false discovery rate across candidates, one unambiguous name). The loaders store this on the IP node as `resolved_name` / `resolved_votes` / `resolved_p`; nodes are never merged.
 
 `--only-detectors` / `--skip-detectors` take the signal names above (mutually exclusive).
 
@@ -673,19 +675,25 @@ One row per connection, most unusual first:
 
 - `result`: login OK, login FAILED, or connection without authentication (SSH pre-auth).
 - `logs`: the log families that recorded it (secure, wtmp, audit, btmp, journal, evtx...).
-- `why_unusual`: what is new about the connection and its context, each with the baseline count behind it ("account never used by this origin before (15 of 10519 baseline successful logins)").
-- `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage.
+- `why_unusual`: the class first ("credential switch with new access"), then what is new about the connection and its context, each with the baseline count behind it ("account never used by this origin before (15 of 10519 baseline successful logins)").
+- `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage and the origin has a history.
 - On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
+
+**Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, and a Browser query to check everything. The CSV is unchanged.
 
 #### Detection quality
 
-> The figures below were measured with the previous, hand-weighted detectors and have not been re-run with the statistical engine yet.
+Measured on a real incident: 45 Linux hosts collected with UAC, 10.5M rows (1.43M logins, 657k failures, 8.4M SSH pre-auth touches), 28 baseline days, a 6-day window with 761,614 events. Ground truth from the raw logs, confirmed by the client: two never-seen origins that probe an account, sweep 29 hosts without authenticating and then log in with a stolen key on 32 hosts, plus the pre-auth sweep of the machine whose key was stolen. Everything else in the window (a credentialed vulnerability scanner, orchestration, monitoring probes, administrators, the incident-response team) counts as a false alarm.
 
-| | Findings | TPs | Hit rate | Recall (events) | Recall (scenarios) | P@10 | P@20 | P@50 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Stress (3.87M events)** | 380 | 252 | **66.3%** | **109/110 (99.1%)** | **23/23 (100%)** | **90%** | **85%** | **92%** |
+| engine | significant connections | attacker connections found | attacker's first row | first benign row | P@10 | P@50 | P@100 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| connection-level test (Sept 26) | 338 | 112 / 125 | rank 3 | rank 1 | 80% | 72% | 76% |
+| + Hopper signature, causal paths, no-history rule (Sept 28) | 362 | 123 / 125 | rank 1 | rank 3 | 80% | 90% | 91% |
+| **+ statistical review: past-only reference, null = new connections, BH over new connections (Sept 28)** | **220** | 108 / 125 | **rank 1** | **rank 66** | **100%** | **100%** | 86% |
 
-Methodology of that harness: [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).
+Within the significant set, the class does the triage: the *credential switch with new access* classes hold 108 attacker connections and 16 benign ones (the incident-response jump hosts, exactly the false-positive class Hopper reports); the *habitual credential*, *unknown account* and *no credential* classes hold 96 benign connections (the credentialed vulnerability scanner above all) and no attacker one. The 17 attacker connections not found are the pre-auth touches of the key's legitimate owner, a machine with a long history whose sweep is not unusual among the network's new unauthenticated connections once the null is conditioned properly (15 rows, p = 0.71), and 2 rows on hosts without comparable coverage. On the incident-free window 10-09 to 19-09 the same engine marks 25 of 103 new connections significant, all in the credential-switch class: the first days of the credentialed vulnerability scanner (a never-seen origin using an owned account on new hosts) and administrators' jump hosts with personal accounts. They are real novelties with benign causes, not calibration failures; the analyst report says so in one line each.
+
+The synthetic-corpus figures of the previous, hand-weighted detectors are in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/); they have not been re-run with the statistical engine.
 
 ### Merge graph nodes after loading
 

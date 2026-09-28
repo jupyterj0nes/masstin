@@ -2,21 +2,29 @@
 //
 // The same SSH login is often recorded twice on the destination: sshd
 // writes the source IP, wtmp (with UseDNS) writes the reverse-DNS name.
-// When, for one (destination, account, second, outcome), exactly one IP
+// When, for one (destination, account, outcome, second), exactly one IP
 // and exactly one name appear, that is one vote "IP is NAME".
 //
 // A vote can also be a coincidence: an unrelated login of the same account
 // on the same destination from machine NAME landing in the same second as
-// the IP's login. Under a Poisson model with that name's own login rate on
-// that (destination, account, outcome), lambda = logins / observed
-// seconds, the chance of one coincidence is 1 - exp(-lambda); independent
-// votes multiply. The mapping is accepted when
-//   * every vote names the same host (unanimity: conflicting evidence is
-//     not resolved by majority), and
-//   * the probability that all votes are coincidences is significant
-//     after Benjamini-Hochberg across all candidate IPs at `alpha`.
-// Nodes are never merged by the loaders; the result is an annotation
-// (loaders) and the machine identity used by graph-hunt's report.
+// the IP's login. The test counts the trials as well as the votes: for a
+// candidate pair (IP, NAME), every second in which the IP logged in alone
+// (in any context (destination, account, outcome) the IP appears in) is a
+// trial; the ones where NAME, and only NAME, was recorded in that second
+// are the votes. Under a Poisson model with NAME's own login rate in that
+// context, lambda = NAME's distinct login seconds / the destination's
+// observed span, a trial coincides by chance with probability
+// 1 - exp(-lambda). The number of chance votes is then Binomial(trials,
+// mean chance probability over the trials), and the p-value is the upper
+// tail at the observed votes. Genuine double-logging gives votes = trials
+// and a p-value that vanishes with the number of logins; coincidences at
+// the expected rate stay unremarkable however many there are.
+//
+// Benjamini-Hochberg runs across every (IP, NAME) candidate at `alpha`.
+// An IP is resolved when exactly one NAME is significant for it; two
+// significant names are a conflict and the IP stays unresolved. Nodes are
+// never merged by the loaders; the result is an annotation (loaders) and
+// the machine identity used by graph-hunt's report.
 
 use std::collections::{HashMap, HashSet};
 
@@ -35,10 +43,11 @@ pub struct Obs<'a> {
 #[derive(Debug, Clone)]
 pub struct Resolution {
     pub name: String,
+    /// seconds in which the IP and the name were recorded together, alone
     pub votes: u32,
-    /// Probability that every vote is a coincidence.
+    /// Binomial upper-tail probability of at least that many votes by chance
     pub p_chance: f64,
-    /// Benjamini-Hochberg adjusted value across candidate IPs.
+    /// Benjamini-Hochberg adjusted value across all (IP, name) candidates.
     #[allow(dead_code)]
     pub q: f64,
 }
@@ -68,39 +77,63 @@ pub fn resolve_ip_names<'a>(obs: impl Iterator<Item = Obs<'a>>, alpha: f64) -> H
             *n_name.entry((d, a, oc, nm)).or_insert(0) += 1;
         }
     }
-    // votes: ip -> (names seen, votes, sum ln p_vote)
-    struct Cand<'b> {
-        names: HashSet<&'b str>,
-        votes: u32,
-        ln_p: f64,
-        first: &'b str,
-    }
-    let mut cand: HashMap<&str, Cand> = HashMap::new();
+    // per IP: trials per context (seconds where the IP was the only IP)
+    // and votes per (context, name)
+    let mut trials: HashMap<&str, HashMap<(&str, &str, &str), u64>> = HashMap::new();
+    let mut votes: HashMap<(&str, &str), HashMap<(&str, &str, &str), u64>> = HashMap::new();
     for ((d, a, oc, _), (ips, names)) in &cooc {
-        if ips.len() != 1 || names.len() != 1 {
+        if ips.len() != 1 {
             continue;
         }
-        let (ip, nm) = (ips[0], names[0]);
-        let (lo, hi) = span[d];
-        let t = (hi - lo + 1).max(1) as f64;
-        let lambda = n_name[&(*d, *a, *oc, nm)] as f64 / t;
-        let p_vote = (-(-lambda).exp_m1()).clamp(f64::MIN_POSITIVE, 1.0); // 1 - e^-lambda
-        let c = cand.entry(ip).or_insert(Cand { names: HashSet::new(), votes: 0, ln_p: 0.0, first: nm });
-        c.names.insert(nm);
-        c.votes += 1;
-        c.ln_p += p_vote.ln();
-    }
-    let unanimous: Vec<(&str, &Cand)> = cand.iter().filter(|(_, c)| c.names.len() == 1).map(|(k, v)| (*k, v)).collect();
-    let ps: Vec<f64> = unanimous.iter().map(|(_, c)| c.ln_p.exp()).collect();
-    let qs = super::stats::benjamini_hochberg(&ps);
-    let mut out = HashMap::new();
-    for (i, (ip, c)) in unanimous.iter().enumerate() {
-        if qs[i] <= alpha {
-            out.insert(
-                ip.to_string(),
-                Resolution { name: c.first.to_string(), votes: c.votes, p_chance: ps[i], q: qs[i] },
-            );
+        let ip = ips[0];
+        *trials.entry(ip).or_default().entry((d, a, oc)).or_insert(0) += 1;
+        if names.len() == 1 {
+            *votes.entry((ip, names[0])).or_default().entry((d, a, oc)).or_insert(0) += 1;
         }
+    }
+    // one binomial test per (IP, name)
+    struct Cand<'b> {
+        ip: &'b str,
+        name: &'b str,
+        votes: u64,
+        p: f64,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for ((ip, nm), by_ctx) in &votes {
+        let tr = &trials[ip];
+        let mut n_tot = 0u64;
+        let mut k_tot = 0u64;
+        let mut p_sum = 0.0f64;
+        for ((d, a, oc), &n_c) in tr {
+            let (lo, hi) = span[d];
+            let t = (hi - lo + 1).max(1) as f64;
+            let lambda = n_name.get(&(d, a, oc, nm)).copied().unwrap_or(0) as f64 / t;
+            let p_c = -(-lambda).exp_m1(); // 1 - e^-lambda
+            n_tot += n_c;
+            p_sum += n_c as f64 * p_c;
+            k_tot += by_ctx.get(&(d, a, oc)).copied().unwrap_or(0);
+        }
+        if n_tot == 0 {
+            continue;
+        }
+        let p_mean = (p_sum / n_tot as f64).clamp(f64::MIN_POSITIVE, 1.0);
+        cands.push(Cand { ip, name: nm, votes: k_tot, p: super::stats::binom_upper(n_tot, k_tot, p_mean) });
+    }
+    let qs = super::stats::benjamini_hochberg(&cands.iter().map(|c| c.p).collect::<Vec<_>>());
+    // accept the unique significant name per IP
+    let mut sig_by_ip: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, c) in cands.iter().enumerate() {
+        if qs[i] <= alpha {
+            sig_by_ip.entry(c.ip).or_default().push(i);
+        }
+    }
+    let mut out = HashMap::new();
+    for (ip, idx) in sig_by_ip {
+        if idx.len() != 1 {
+            continue; // conflicting names: unresolved
+        }
+        let c = &cands[idx[0]];
+        out.insert(ip.to_string(), Resolution { name: c.name.to_string(), votes: c.votes as u32, p_chance: c.p, q: qs[idx[0]] });
     }
     out
 }
@@ -153,5 +186,34 @@ mod tests {
         let r = resolve_ip_names(v.into_iter(), 0.05);
         assert_eq!(r.get("10.0.0.1").map(|x| x.name.as_str()), Some("HOSTA"));
         assert!(r.get("10.0.0.2").is_none());
+    }
+    #[test]
+    fn coincidences_at_the_expected_rate_do_not_resolve() {
+        // two machines share account S on DST: 10.0.0.9 logs in on 1000
+        // seconds, HOSTB on 1000 other seconds spread over the day, and
+        // they coincide 12 times, about what chance predicts
+        // (1000 * 1000 / 86400 = 11.6)
+        let mut v = Vec::new();
+        v.push(Obs { dst: "DST", account: "S", outcome: "S", sec: 0, source: "HOSTB", source_is_ip: false });
+        v.push(Obs { dst: "DST", account: "S", outcome: "S", sec: 86_399, source: "HOSTB", source_is_ip: false });
+        for i in 0..1000i64 {
+            v.push(Obs { dst: "DST", account: "S", outcome: "S", sec: 10 + i * 80, source: "10.0.0.9", source_is_ip: true });
+        }
+        for i in 0..998i64 {
+            v.push(Obs { dst: "DST", account: "S", outcome: "S", sec: 50 + i * 80, source: "HOSTB", source_is_ip: false });
+        }
+        for i in 0..12i64 {
+            v.push(Obs { dst: "DST", account: "S", outcome: "S", sec: 10 + i * 80, source: "HOSTB", source_is_ip: false });
+        }
+        let r = resolve_ip_names(v.into_iter(), 0.05);
+        assert!(r.get("10.0.0.9").is_none());
+        // the same IP double-logged on every login resolves
+        let mut w = Vec::new();
+        for i in 0..200i64 {
+            w.push(Obs { dst: "DST2", account: "S", outcome: "S", sec: i * 300, source: "10.0.0.8", source_is_ip: true });
+            w.push(Obs { dst: "DST2", account: "S", outcome: "S", sec: i * 300, source: "HOSTC", source_is_ip: false });
+        }
+        let r2 = resolve_ip_names(w.into_iter(), 0.05);
+        assert_eq!(r2.get("10.0.0.8").map(|x| x.name.as_str()), Some("HOSTC"));
     }
 }
