@@ -20,6 +20,7 @@ pub async fn graph_hunt_neo4j(
     alpha: f64,
     end_time: Option<&str>,
     output: Option<&str>,
+    report: Option<&str>,
 ) {
     let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time) {
         Some(s) => s,
@@ -69,5 +70,5 @@ pub async fn graph_hunt_neo4j(
             return;
         }
     }
-    engine::run(&graph, &NEO4J, &settings, output).await;
+    engine::run(&graph, &NEO4J, &settings, output, report).await;
 }

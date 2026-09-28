@@ -253,7 +253,7 @@ pub struct Cli {
     /// For `graph-hunt`: comma-separated list of detector names to skip.
     /// Available: novel-edge, community-bridge, origin-fanout, cred-rotation,
     /// pagerank-spike, betweenness-spike, failed-sweep, preauth-sweep,
-    /// probe-then-success, rare-logon-type, chain-motif.
+    /// probe-then-success, rare-logon-type, causal-path, credential-switch.
     /// Example: --skip-detectors pagerank-spike,betweenness-spike
     #[arg(long)]
     skip_detectors: Option<String>,
@@ -269,6 +269,13 @@ pub struct Cli {
     /// chosen number: every score is a probability measured in the corpus.
     #[arg(long, default_value_t = 0.05)]
     alpha: f64,
+
+    /// For `graph-hunt` / `graph-hunt-neo4j`: also write an analyst report
+    /// (Markdown) to this path: one story per origin with a significant
+    /// connection, most unusual first, in words, with the baseline count
+    /// behind every statement. The CSV is unchanged.
+    #[arg(long)]
+    report: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -519,6 +526,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.alpha,
                 config.end_time.as_deref(),
                 config.output.as_deref(),
+                config.report.as_deref(),
             )
             .await;
         }
@@ -534,6 +542,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.alpha,
                 config.end_time.as_deref(),
                 config.output.as_deref(),
+                config.report.as_deref(),
             )
             .await;
         }

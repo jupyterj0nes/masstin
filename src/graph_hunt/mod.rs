@@ -70,6 +70,7 @@ pub async fn graph_hunt(
     alpha: f64,
     end_time: Option<&str>,
     output: Option<&str>,
+    report: Option<&str>,
 ) {
     let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time) {
         Some(s) => s,
@@ -111,5 +112,5 @@ pub async fn graph_hunt(
             return;
         }
     }
-    engine::run(&graph, &MEMGRAPH, &settings, output).await;
+    engine::run(&graph, &MEMGRAPH, &settings, output, report).await;
 }

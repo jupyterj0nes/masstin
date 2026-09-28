@@ -35,12 +35,37 @@ pub const PAGERANK_DAMPING: f64 = 0.85;
 /// PageRank scaled by n (mean 1.0) so values stay comparable when the node
 /// count grows from one day to the next.
 pub fn pagerank(g: &DiGraph) -> Vec<f64> {
+    let nf = g.n.max(1) as f64;
+    pagerank_from(g, &vec![1.0 / nf; g.n])
+}
+
+/// Convergence noise of PageRank on this graph: the largest difference
+/// between the values reached from the uniform start and from a start
+/// proportional to in-degree. A change smaller than this is not a change.
+pub fn pagerank_noise(g: &DiGraph) -> f64 {
+    if g.n == 0 {
+        return 0.0;
+    }
+    let mut indeg = vec![1.0f64; g.n];
+    for v in 0..g.n {
+        for &w in &g.out[v] {
+            indeg[w] += 1.0;
+        }
+    }
+    let tot: f64 = indeg.iter().sum();
+    let alt: Vec<f64> = indeg.iter().map(|x| x / tot).collect();
+    let a = pagerank(g);
+    let b = pagerank_from(g, &alt);
+    a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+}
+
+fn pagerank_from(g: &DiGraph, init: &[f64]) -> Vec<f64> {
     let n = g.n;
     if n == 0 {
         return Vec::new();
     }
     let nf = n as f64;
-    let mut pr = vec![1.0 / nf; n];
+    let mut pr: Vec<f64> = init.to_vec();
     for _ in 0..10_000 {
         let mut next = vec![(1.0 - PAGERANK_DAMPING) / nf; n];
         let mut dangling = 0.0;
@@ -60,7 +85,8 @@ pub fn pagerank(g: &DiGraph) -> Vec<f64> {
         }
         let diff: f64 = next.iter().zip(&pr).map(|(a, b)| (a - b).abs()).sum();
         pr = next;
-        if diff < 1e-13 {
+        // iterate to floating-point stationarity, not to a tolerance
+        if diff <= 4.0 * f64::EPSILON {
             break;
         }
     }
