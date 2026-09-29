@@ -28,6 +28,8 @@ pub(crate) fn settings(
     end_time: Option<&str>,
     seed: Option<&str>,
     report: Option<&str>,
+    seed_from: Option<&str>,
+    seed_to: Option<&str>,
 ) -> Option<engine::Settings> {
     let cutoff = match parse_cutoff(investigation_from) {
         Some(c) => c,
@@ -65,7 +67,22 @@ pub(crate) fn settings(
         eprintln!("Masstin - Error: --seed needs --report <file.md>: the reconstruction is written there");
         return None;
     }
-    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds })
+    // Some(None) = not given, Some(Some(t)) = parsed, None = bad input
+    let bound = |raw: Option<&str>, name: &str| -> Option<Option<DateTime<Utc>>> {
+        match raw {
+            None => Some(None),
+            Some(r) => match parse_cutoff(r.get(..19).unwrap_or(r)) {
+                Some(t) => Some(Some(t)),
+                None => {
+                    eprintln!("Masstin - Error: {} must be \"YYYY-MM-DD HH:MM:SS\" (got: {})", name, r);
+                    None
+                }
+            },
+        }
+    };
+    let seed_from = bound(seed_from, "--seed-from")?;
+    let seed_to = bound(seed_to, "--seed-to")?;
+    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to })
 }
 
 pub async fn graph_hunt(
@@ -79,8 +96,10 @@ pub async fn graph_hunt(
     output: Option<&str>,
     report: Option<&str>,
     seed: Option<&str>,
+    seed_from: Option<&str>,
+    seed_to: Option<&str>,
 ) {
-    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report) {
+    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
         Some(s) => s,
         None => return,
     };
