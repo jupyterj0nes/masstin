@@ -132,6 +132,42 @@ static PAM_FAIL_RE: Lazy<Regex> = Lazy::new(|| {
 });
 static XINETD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"START: ssh .* from=::ffff:(\S+)"#).unwrap());
+// Session end lines. pam's session close is written by the sshd process
+// that logged the Accepted line (same pid), so it pairs with the login
+// exactly; the "Disconnected from user" line comes from the unprivileged
+// child (another pid) but names user and source itself, and is used only
+// for files without pam session lines.
+//   "pam_unix(sshd:session): session closed for user planifica"
+//   "Disconnected from user planifica 10.240.240.86 port 51234"
+pub(crate) static PAM_CLOSE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"pam_unix\(sshd:session\): session closed for user (\S+)"#).unwrap());
+pub(crate) static SSH_DISCONNECT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"Disconnected from user (\S+) (\S+) port \d+"#).unwrap());
+
+/// Open SSH sessions of one log file, by sshd pid, so that a session close
+/// can be given the user and source of the login it ends.
+#[derive(Default)]
+pub(crate) struct SessionTracker {
+    open: HashMap<u32, (String, String)>,
+    /// pam session-close lines seen (with or without a matching login)
+    pub(crate) pam_closes: usize,
+}
+
+impl SessionTracker {
+    pub(crate) fn login(&mut self, pid: u32, user: &str, src: &str) {
+        if pid != 0 {
+            self.open.insert(pid, (user.to_string(), src.to_string()));
+        }
+    }
+    /// (user, source) of the login that the pam close of `pid` ends
+    pub(crate) fn close(&mut self, pid: u32) -> Option<(String, String)> {
+        self.pam_closes += 1;
+        if pid == 0 {
+            return None;
+        }
+        self.open.remove(&pid)
+    }
+}
 // Matches auditd SSH/PAM auth events on Debian/Ubuntu/RHEL:
 //   - USER_AUTH  : pam_unix / pam_sss authentication attempt
 //   - USER_LOGIN : sshd login (Ubuntu 22 + SSSD primary signal — no acct= field)
@@ -142,7 +178,7 @@ static XINETD_RE: Lazy<Regex> =
 // several possible fields: acct="...", id=<uid>, AUID="...", UID="...".
 static AUDIT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"type=(USER_AUTH|USER_LOGIN|USER_ACCT|USER_START).*?addr=([\d\.:a-fA-F]+).*?res=(\w+)"#,
+        r#"type=(USER_AUTH|USER_LOGIN|USER_ACCT|USER_START|USER_END).*?addr=([\d\.:a-fA-F]+).*?res=(\w+)"#,
     )
     .unwrap()
 });
@@ -494,6 +530,10 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
         .unwrap_or("")
         .to_lowercase();
     let is_btmp = is_rotated_name(&base_lower, "btmp");
+    // open sessions by terminal (ut_line): user, host and pid of the login,
+    // so that the DEAD_PROCESS record (which carries neither) becomes a
+    // logout of that session
+    let mut open: HashMap<String, (String, String, u32)> = HashMap::new();
     while rdr.read_exact(&mut buf).is_ok() {
         let rec: &UtmpEntry = unsafe { &*(buf.as_ptr() as *const UtmpEntry) };
         // Only session records matter: USER_PROCESS (login), DEAD_PROCESS
@@ -508,17 +548,31 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
 
         let user = c_chars(&rec.ut_user);
         let host = c_chars(&rec.ut_host);
-        let mut evt = match rec.ut_type {
-            USER_PROCESS => "LOGIN",
-            DEAD_PROCESS => "LOGOUT",
-            BOOT_TIME => "BOOT_TIME",
-            _ => "OTHER",
-        }
-        .to_string();
+        let line = c_chars(&rec.ut_line);
+        let pid = rec.ut_pid.max(0) as u32;
 
-        if is_btmp {
-            evt = "FAILED_LOGIN".into();
+        if !is_btmp && rec.ut_type == DEAD_PROCESS {
+            // logout: user, host and pid come from the login of the same
+            // terminal in this file; a logout whose login rotated away is
+            // not attributable and is dropped
+            if let Some((u, h, p)) = open.remove(&line) {
+                if !(filter_ip && h.is_empty()) {
+                    res.push(RawEvt {
+                        ts_rfc3339: when,
+                        user: u,
+                        remote: h,
+                        tty_or_proc: line,
+                        evt: "LOGOUT".into(),
+                        filename: fname.clone(),
+                        dst_host: dst_host.into(),
+                        pid: p,
+                        conn: 0,
+                    });
+                }
+            }
+            continue;
         }
+        let evt = if is_btmp { "FAILED_LOGIN" } else { "LOGIN" }.to_string();
 
         // Keep every record that names a remote source, IP or hostname —
         // with `UseDNS yes` sshd writes the resolved name into ut_host, and
@@ -527,16 +581,19 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
         if filter_ip && host.is_empty() && !evt.eq("FAILED_LOGIN") {
             continue;
         }
+        if evt == "LOGIN" {
+            open.insert(line.clone(), (user.clone(), host.clone(), pid));
+        }
 
         res.push(RawEvt {
             ts_rfc3339: when,
             user,
             remote: host,
-            tty_or_proc: c_chars(&rec.ut_line),
+            tty_or_proc: line,
             evt,
             filename: fname.clone(),
             dst_host: dst_host.into(),
-            pid: 0,
+            pid,
             conn: 0,
         });
     }
@@ -654,6 +711,10 @@ fn parse_secure_or_messages(
     // fallback for files where sshd logged no auth outcome at all.
     let mut pam_fallback: Vec<RawEvt> = Vec::new();
     let mut sshd_outcomes: usize = 0;
+    // session ends: pam's close paired with the login by pid; the
+    // "Disconnected from user" lines kept aside for files without pam
+    let mut tracker = SessionTracker::default();
+    let mut disconnect_fallback: Vec<RawEvt> = Vec::new();
     let fname = path.file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
@@ -745,6 +806,7 @@ fn parse_secure_or_messages(
             let user = cap[2].to_string();
             let src  = cap[3].to_string();
             sshd_outcomes += 1;
+            tracker.login(line_pid, &user, &src);
             if !filter_ip || !src.is_empty() {
                 out.push(RawEvt {
                     ts_rfc3339:  when.clone(),
@@ -829,6 +891,45 @@ fn parse_secure_or_messages(
             continue;
         }
 
+        // 3d) Session end: LOGOUT row with the user and source of the login
+        //     it closes (see PAM_CLOSE_RE / SSH_DISCONNECT_RE).
+        if PAM_CLOSE_RE.is_match(&msg) {
+            if let Some((user, src)) = tracker.close(line_pid) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user,
+                    remote:      src,
+                    tty_or_proc: "ssh/session-closed".into(),
+                    evt:         "LOGOUT".into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                    pid: line_pid,
+                    conn: 0,
+                });
+            }
+            continue;
+        }
+        if !msg.contains("[preauth]") {
+            if let Some(cap) = SSH_DISCONNECT_RE.captures(&msg) {
+                let user = cap[1].to_string();
+                let src  = cap[2].to_string();
+                if !filter_ip || !src.is_empty() {
+                    disconnect_fallback.push(RawEvt {
+                        ts_rfc3339:  when.clone(),
+                        user,
+                        remote:      src,
+                        tty_or_proc: "ssh/disconnected".into(),
+                        evt:         "LOGOUT".into(),
+                        filename:    path.display().to_string(),
+                        dst_host:    dst_host.into(),
+                        pid: line_pid,
+                        conn: 0,
+                    });
+                }
+                continue;
+            }
+        }
+
         // 4) PAM failure: "pam_unix(sshd:...) rhost=SRC user=USER" — kept
         //    only as a fallback, see `pam_fallback` above.
         if is_secure {
@@ -852,6 +953,13 @@ fn parse_secure_or_messages(
         }
     }
 
+    if tracker.pam_closes == 0 && !disconnect_fallback.is_empty() {
+        if is_debug_mode() {
+            println!("    {}: no pam session lines, using {} 'Disconnected from user' lines as session ends",
+                     fname, disconnect_fallback.len());
+        }
+        out.extend(disconnect_fallback);
+    }
     if sshd_outcomes == 0 && !pam_fallback.is_empty() {
         if is_debug_mode() {
             println!("    {}: no sshd auth outcome lines, using {} pam_unix failures as fallback",
@@ -876,6 +984,7 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
     // USER_AUTH records with their `op=`, used only when the file has no
     // USER_LOGIN at all (see the fallback at the end).
     let mut auth_fallback: Vec<(RawEvt, String)> = Vec::new();
+    let mut has_login = false;
     let uid_name = |uid: &str| -> Option<String> {
         let u: u32 = uid.parse().ok()?;
         if u == 4294967295 { return None; }
@@ -899,10 +1008,10 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             continue;
         }
 
-        // Only USER_LOGIN (outcome) and, as fallback, USER_AUTH (PAM stage).
-        // USER_ACCT / USER_START fire once more per session and would
-        // double-count.
-        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" {
+        // Only USER_LOGIN (outcome), USER_END (session end) and, as
+        // fallback, USER_AUTH (PAM stage). USER_ACCT / USER_START fire once
+        // more per session and would double-count.
+        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" && evt_type != "USER_END" {
             continue;
         }
 
@@ -941,7 +1050,13 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
                 .and_then(|c| c.get(1).map(|m| m.as_str().to_string())))
             .unwrap_or_default();
 
-        let evt = if res == "success" { "SSH_SUCCESS" } else { "SSH_FAILED" };
+        let evt = if evt_type == "USER_END" {
+            "LOGOUT"
+        } else if res == "success" {
+            "SSH_SUCCESS"
+        } else {
+            "SSH_FAILED"
+        };
 
         // One connection = one row, identified by what auditd itself
         // records, not by a time window:
@@ -979,14 +1094,25 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             // account, but also a scanner that connects and hangs up, or a
             // client that exceeds MaxAuthTries. The username, if any, is
             // only in the sshd text log.
-            tty_or_proc: if invalid_user { "audit unauthenticated".into() } else { "audit".into() },
+            tty_or_proc: if evt_type == "USER_END" {
+                "audit session-end".into()
+            } else if invalid_user {
+                "audit unauthenticated".into()
+            } else {
+                "audit".into()
+            },
             evt: evt.into(),
             filename: path.display().to_string(),
             dst_host: dst_host.into(),
             pid,
-            conn: if evt_type == "USER_LOGIN" && res == "success" && ses != 4294967295 { ses } else { 0 },
+            // a session end carries the same ses= as its login; the last
+            // USER_END of a session is its end (see the collapse)
+            conn: if ((evt_type == "USER_LOGIN" && res == "success") || evt_type == "USER_END") && ses != 4294967295 { ses } else { 0 },
         };
         if evt_type == "USER_LOGIN" {
+            has_login = true;
+            out.push(raw);
+        } else if evt_type == "USER_END" {
             out.push(raw);
         } else {
             auth_fallback.push((raw, op));
@@ -1000,10 +1126,10 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
     // `op=PAM:authentication res=failed` — `op=pubkey res=failed` is not
     // one: it is an agent offering a key the server does not accept, which
     // happens before most successful key logins.
-    if out.is_empty() && !auth_fallback.is_empty() {
+    if !has_login && !auth_fallback.is_empty() {
         let has_op_success = auth_fallback.iter().any(|(_, op)| op == "success");
         let n = auth_fallback.len();
-        out = auth_fallback
+        let picked: Vec<RawEvt> = auth_fallback
             .into_iter()
             .filter(|(r, op)| {
                 if r.evt == "SSH_SUCCESS" {
@@ -1016,8 +1142,9 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             .collect();
         if is_debug_mode() {
             println!("    {}: no USER_LOGIN records, {} of {} USER_AUTH records used as fallback",
-                     path.display(), out.len(), n);
+                     path.display(), picked.len(), n);
         }
+        out.extend(picked);
     }
     out
 }
@@ -1269,12 +1396,15 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     // pid, ses, source) are the channels of one sshd connection, possibly
     // spread over two rotated audit.log files. The earliest is kept.
     let session_dups = {
-        let mut first: HashMap<(&str, u32, u64, &str), (i64, usize)> = HashMap::new();
+        // logins keep the earliest record of the session, session ends
+        // (USER_END, one per channel) the latest
+        let mut first: HashMap<(&str, u32, u64, &str, bool), (i64, usize)> = HashMap::new();
         for (i, r) in deduped.iter().enumerate() {
             if r.conn == 0 { continue; }
-            let sec = ts_secs(&r.ts_rfc3339).unwrap_or(i64::MAX);
-            let e = first.entry((r.dst_host.as_str(), r.pid, r.conn, r.remote.as_str())).or_insert((sec, i));
-            if sec < e.0 { *e = (sec, i); }
+            let is_end = r.evt == "LOGOUT";
+            let sec = ts_secs(&r.ts_rfc3339).unwrap_or(if is_end { i64::MIN } else { i64::MAX });
+            let e = first.entry((r.dst_host.as_str(), r.pid, r.conn, r.remote.as_str(), is_end)).or_insert((sec, i));
+            if (is_end && sec > e.0) || (!is_end && sec < e.0) { *e = (sec, i); }
         }
         let keep: std::collections::HashSet<usize> = first.values().map(|v| v.1).collect();
         let before = deduped.len();
@@ -1300,7 +1430,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     // connections sshd did not log — are kept.
     let audit_dups = {
         let class = |evt: &str| -> u8 {
-            match evt { "SSH_SUCCESS" => 1, "SSH_FAILED" | "SSH_PREAUTH" => 2, _ => 0 }
+            match evt { "SSH_SUCCESS" => 1, "SSH_FAILED" | "SSH_PREAUTH" => 2, "LOGOUT" => 3, _ => 0 }
         };
         let mut span: HashMap<&str, (i64, i64)> = HashMap::new();
         let mut by_key: HashMap<(&str, u32, &str, u8), Vec<(i64, &str)>> = HashMap::new();
@@ -1389,8 +1519,12 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
         // logs, pts entries in wtmp/lastlog, auditd sshd records). Naming
         // the channel — as parse-cortex does for port 22 — lets the graph
         // loaders and detectors tell it apart from Windows logon types.
+        // logon_id: the sshd process id of the connection (syslog
+        // `sshd[pid]`, journald `_PID`, auditd `pid=`, wtmp `ut_pid`), the
+        // same on the login and on the LOGOFF row that closes it
+        let logon_id = if r.pid != 0 { r.pid.to_string() } else { String::new() };
         let line = format!(
-            "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",\"\",{},{}\n",
+            "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",{},{},{}\n",
             q(&r.ts_rfc3339),
             q(&r.dst_host),
             event_type(&r.evt),
@@ -1398,6 +1532,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             q(&r.user),
             q(src_computer),
             q(src_ip),
+            q(&logon_id),
             q(&r.tty_or_proc),
             q(&r.filename),
         );
