@@ -284,6 +284,16 @@ pub struct Cli {
     /// query that draws the whole chain. Requires --report.
     #[arg(long)]
     seed: Option<String>,
+
+    /// For `--seed`: only logins at or after this time start the chain
+    /// ("YYYY-MM-DD HH:MM:SS", UTC). Default: the cutoff.
+    #[arg(long)]
+    seed_from: Option<String>,
+
+    /// For `--seed`: only logins at or before this time start the chain
+    /// ("YYYY-MM-DD HH:MM:SS", UTC). Default: the end of the window.
+    #[arg(long)]
+    seed_to: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -536,6 +546,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.output.as_deref(),
                 config.report.as_deref(),
                 config.seed.as_deref(),
+                config.seed_from.as_deref(),
+                config.seed_to.as_deref(),
             )
             .await;
         }
@@ -553,6 +565,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.output.as_deref(),
                 config.report.as_deref(),
                 config.seed.as_deref(),
+                config.seed_from.as_deref(),
+                config.seed_to.as_deref(),
             )
             .await;
         }

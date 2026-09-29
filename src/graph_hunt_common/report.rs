@@ -128,6 +128,8 @@ pub struct SeedRecon {
     pub seeds: Vec<String>,
     pub matched: Vec<String>,
     pub unmatched: Vec<String>,
+    /// habitual logins of seeds with a history, not followed
+    pub skipped: Vec<String>,
     pub hops: Vec<SeedHop>,
     /// failed attempts and unauthenticated touches from chain machines
     pub touches: Vec<String>,
@@ -151,6 +153,12 @@ pub fn render_seed(r: &SeedRecon) -> String {
         s.push_str(&format!(" Not found in the graph: {}.", r.unmatched.join(", ")));
     }
     s.push_str("\n\n");
+    for l in &r.skipped {
+        s.push_str(&format!("- {}\n", l));
+    }
+    if !r.skipped.is_empty() {
+        s.push('\n');
+    }
     if r.hops.is_empty() {
         s.push_str("No login by the seeds in the window.\n\n");
         return s;
