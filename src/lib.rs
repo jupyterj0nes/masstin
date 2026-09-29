@@ -276,6 +276,14 @@ pub struct Cli {
     /// behind every statement. The CSV is unchanged.
     #[arg(long)]
     report: Option<String>,
+
+    /// For `graph-hunt` / `graph-hunt-neo4j`: reconstruct the incident from
+    /// known-bad seeds (comma-separated host names, IPs or accounts). The
+    /// report gets a first section with every hop the seeds took in the
+    /// window, in order, with session ends and certainty, and one Cypher
+    /// query that draws the whole chain. Requires --report.
+    #[arg(long)]
+    seed: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -527,6 +535,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.end_time.as_deref(),
                 config.output.as_deref(),
                 config.report.as_deref(),
+                config.seed.as_deref(),
             )
             .await;
         }
@@ -543,6 +552,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.end_time.as_deref(),
                 config.output.as_deref(),
                 config.report.as_deref(),
+                config.seed.as_deref(),
             )
             .await;
         }
