@@ -109,10 +109,12 @@ constant is involved. They enter the engine in two ways:
 ### Causal paths
 
 Hopper's unit is the path, not the login. Here a login B→C with account a2
-is *caused* by one of the logins A→B that entered B earlier on the same UTC
-day (the unit of the analysis; Hopper uses the session length, 24 h). Each
-distinct (A, a1) that entered B is a candidate cause with certainty
-1 / #candidates, as in Hopper. A path carries the signature when a1 ≠ a2
+is *caused* by one of the sessions open on B at that moment: a login A→B
+that entered before and had not ended yet. A session ends at its LOGOFF
+when one was recorded (parse-linux writes one per closed SSH session, with
+the same `logon_id`; Windows has 4634/4647), else at the end of the UTC
+day. Each distinct (A, a1) open on B is a candidate cause with certainty
+1 / #candidates, as in Hopper (who uses a fixed 24 h session). A path carries the signature when a1 ≠ a2
 (the credential changed at B) and a1 never logged in to C in the reference.
 Paths are attributed to the pivot B: the `causal-path` coordinate of B's
 origin-day is the sum of certainties of such paths, and the connection B→C

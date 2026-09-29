@@ -369,6 +369,8 @@ struct OkEvent {
     a: u32,
     /// a real account name (not NO_USER / _UNKNOWN_ / uid:N)
     named: bool,
+    /// session end: its LOGOFF when recorded, else the end of the UTC day
+    end: i64,
 }
 
 /// One inferred causal path A -(a1)-> B -(a2)-> C with Hopper's two attack
@@ -975,6 +977,29 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         }
     }
 
+    // session ends for every successful login: first LOGOFF of the same
+    // (origin, destination, account, session id) at or after the login,
+    // else the end of the UTC day
+    let logoff_idx: HashMap<(u32, u32, u32, u32), Vec<i64>> = {
+        let mut m: HashMap<(u32, u32, u32, u32), Vec<i64>> = HashMap::new();
+        for e in evs.iter().filter(|e| e.logoff) {
+            m.entry((e.o, e.d, e.a, e.lid)).or_default().push(e.t);
+        }
+        for v in m.values_mut() {
+            v.sort();
+        }
+        m
+    };
+    let session_end = |e: &Ev| -> i64 {
+        logoff_idx
+            .get(&(e.o, e.d, e.a, e.lid))
+            .and_then(|v| {
+                let k = v.partition_point(|t| *t < e.t);
+                v.get(k).copied()
+            })
+            .unwrap_or((e.day as i64 + 1) * 86_400 - 1)
+    };
+
     // ── per-day facts ──
     let mut triples: Vec<TripleDay> = Vec::new();
     let mut origin_days: BTreeMap<(i32, u32), OriginDay> = BTreeMap::new();
@@ -1081,7 +1106,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
                             od.switch_new.insert((e.a, e.d));
                         }
                     }
-                    ok_events.push(OkEvent { t: e.t, day, o: e.o, d: e.d, a: e.a, named: !is_uid_account(an) });
+                    ok_events.push(OkEvent { t: e.t, day, o: e.o, d: e.d, a: e.a, named: !is_uid_account(an), end: session_end(e) });
                 }
                 FAIL => {
                     od.fail_dsts.insert(e.d);
@@ -1128,22 +1153,26 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
     // are attributed to the pivot B: they describe what B did after being
     // entered, and the B -> C connection is the row that shows them.
     if enabled[9] {
-        let mut inbound: HashMap<(i32, u32), Vec<(i64, u32, u32)>> = HashMap::new();
+        // a login B -> C is caused by one of the sessions open on B at that
+        // moment: entered before, not ended yet (LOGOFF when recorded,
+        // else the end of the UTC day). With session ends the cause can
+        // have entered on an earlier day.
+        let mut inbound: HashMap<u32, Vec<(i64, u32, u32, i64)>> = HashMap::new();
         for e in ok_events.iter().filter(|e| e.named && e.o != e.d) {
-            inbound.entry((e.day, e.d)).or_default().push((e.t, e.o, e.a));
+            inbound.entry(e.d).or_default().push((e.t, e.o, e.a, e.end));
         }
         for v in inbound.values_mut() {
             v.sort();
         }
         for e2 in ok_events.iter().filter(|e| e.named && e.o != e.d) {
-            let v = match inbound.get(&(e2.day, e2.o)) {
+            let v = match inbound.get(&e2.o) {
                 Some(v) => v,
                 None => continue,
             };
-            let k = v.partition_point(|(t, _, _)| *t <= e2.t);
+            let k = v.partition_point(|(t, _, _, _)| *t <= e2.t);
             let mut cands: BTreeMap<(u32, u32), i64> = BTreeMap::new();
-            for (t1, a_node, a1) in &v[..k] {
-                if *a_node != e2.o && *a_node != e2.d {
+            for (t1, a_node, a1, end1) in &v[..k] {
+                if *end1 >= e2.t && *a_node != e2.o && *a_node != e2.d {
                     // latest entry of each candidate cause
                     cands.insert((*a_node, *a1), *t1);
                 }
