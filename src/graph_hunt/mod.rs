@@ -30,6 +30,7 @@ pub(crate) fn settings(
     report: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
+    sigma: Option<&str>,
 ) -> Option<engine::Settings> {
     let cutoff = match parse_cutoff(investigation_from) {
         Some(c) => c,
@@ -82,7 +83,8 @@ pub(crate) fn settings(
     };
     let seed_from = bound(seed_from, "--seed-from")?;
     let seed_to = bound(seed_to, "--seed-to")?;
-    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to })
+    let sigma: Vec<String> = sigma.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, sigma })
 }
 
 pub async fn graph_hunt(
@@ -98,8 +100,9 @@ pub async fn graph_hunt(
     seed: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
+    sigma: Option<&str>,
 ) {
-    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
+    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
         None => return,
     };

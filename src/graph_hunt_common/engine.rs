@@ -23,6 +23,7 @@
 use super::algos::{self, DiGraph};
 use super::report;
 use super::resolve::{self, Obs};
+use super::sigma;
 use super::stats;
 use super::{is_no_account, parse_ts, Dialect, NO_ACCOUNT_TYPES};
 use chrono::{DateTime, Utc};
@@ -49,6 +50,8 @@ pub struct Settings {
     /// only logins in [seed_from, seed_to] start the chain
     pub seed_from: Option<DateTime<Utc>>,
     pub seed_to: Option<DateTime<Utc>>,
+    /// Sigma hit files (Hayabusa / Chainsaw JSON), see sigma.rs
+    pub sigma: Vec<String>,
 }
 
 impl Settings {
@@ -76,6 +79,7 @@ pub const DETECTORS: &[&str] = &[
     "credential-switch",
     "pagerank-spike",
     "betweenness-spike",
+    "sigma",
 ];
 
 // ───────────────────────────── interning ────────────────────────────────────
@@ -318,6 +322,9 @@ struct TripleDay {
     n: u64,
     t0: i64,
     t1: i64,
+    /// end of the last session of the connection: its LOGOFF when
+    /// recorded, else the end of the day; t1 for failures and pre-auth
+    t_end: i64,
 }
 
 /// Everything one origin did on one day, as raw facts; the statistics are
@@ -531,7 +538,16 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
         corpus.rows.retain(|r| r.t <= e);
         crate::banner::print_phase_detail("Window end:", &format!("{} (later events ignored)", end.to_rfc3339()));
     }
-    let (rows, summary_lines, alpha, stories, seed) = analyse(&corpus, dialect, cfg);
+    let hits: Vec<sigma::SigmaHit> = if cfg.sigma.is_empty() {
+        Vec::new()
+    } else {
+        let (h, notes) = sigma::load(&cfg.sigma);
+        for n in &notes {
+            crate::banner::print_phase_detail("Sigma:", n);
+        }
+        h
+    };
+    let (rows, summary_lines, alpha, stories, seed) = analyse(&corpus, dialect, cfg, &hits);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
@@ -679,7 +695,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
+fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
     let (ents, res) = build_entities(c, alpha);
@@ -691,6 +707,38 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         alpha
     ));
     let ne = ents.names.names.len();
+    // Sigma hits matched to machines by short upper-case name (or IP)
+    let (hits_of, n_hits_matched): (HashMap<u32, Vec<usize>>, usize) = {
+        let mut by_name: HashMap<String, u32> = HashMap::new();
+        for e in 0..ne as u32 {
+            for a in &ents.aliases[e as usize] {
+                by_name.entry(sigma::norm_host(a)).or_insert(e);
+            }
+        }
+        let mut m: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut n = 0usize;
+        for (i, h) in hits.iter().enumerate() {
+            if let Some(&e) = by_name.get(&sigma::norm_host(&h.host)) {
+                m.entry(e).or_default().push(i);
+                n += 1;
+            }
+        }
+        (m, n)
+    };
+    if !hits.is_empty() {
+        lines.push(format!("Sigma: {} hit(s) read, {} on {} machine(s) of the graph", hits.len(), n_hits_matched, hits_of.len()));
+    }
+    // hits on a machine within [t0, t1] (indices into `hits`)
+    let hits_in = |d: u32, t0: i64, t1: i64| -> Vec<usize> {
+        match hits_of.get(&d) {
+            Some(v) => {
+                let lo = v.partition_point(|&i| hits[i].t < t0);
+                let hi = v.partition_point(|&i| hits[i].t <= t1);
+                v[lo..hi].to_vec()
+            }
+            None => Vec::new(),
+        }
+    };
     let cutoff_ts = cfg.cutoff.timestamp();
     let cutoff_day = day_of(cutoff_ts);
     if cutoff_ts % 86_400 != 0 {
@@ -947,6 +995,12 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         };
         let mut tri: HashMap<(u32, u32, u32, u8), (u64, i64, i64, u64)> = HashMap::new();
         let mut ltc: HashMap<(u32, u32, u32), u64> = HashMap::new();
+        // last LOGOFF of the day per (origin, destination, account)
+        let mut logoff_end: HashMap<(u32, u32, u32), i64> = HashMap::new();
+        for e in today.iter().filter(|e| e.logoff) {
+            let x = logoff_end.entry((e.o, e.d, e.a)).or_insert(e.t);
+            *x = (*x).max(e.t);
+        }
         for e in today.iter().filter(|e| e.cls == OK || e.cls == FAIL || e.cls == PRE) {
             let x = tri.entry((e.o, e.d, e.a, e.cls)).or_insert((0, e.t, e.t, 0));
             x.0 += e.n;
@@ -989,7 +1043,12 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
                     f |= F_SWITCH;
                 }
             }
-            triples.push(TripleDay { day, o, d, a, cls, fams, flags: f, n, t0, t1 });
+            let t_end = if cls == OK {
+                logoff_end.get(&(o, d, a)).copied().filter(|t| *t >= t1).unwrap_or((day as i64 + 1) * 86_400 - 1)
+            } else {
+                t1
+            };
+            triples.push(TripleDay { day, o, d, a, cls, fams, flags: f, n, t0, t1, t_end });
         }
         for e in today {
             let od = origin_days
@@ -1156,8 +1215,8 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
     // connection features, for the destinations `okp` / `failp` accept.
     // `off_panel`: the destination has no comparable coverage, so nothing
     // about the account's history on it can be asserted
-    let features = |t: &TripleDay, okp: Pred, failp: Pred, cache: &mut HashMap<(i32, u32), [f64; 11]>, off_panel: bool| -> [f64; 16] {
-        let mut v = [0.0f64; 16];
+    let features = |t: &TripleDay, okp: Pred, failp: Pred, cache: &mut HashMap<(i32, u32), [f64; 11]>, off_panel: bool| -> [f64; 17] {
+        let mut v = [0.0f64; 17];
         // a habitual connection is not unusual, whatever its context
         if t.flags & F_TRIPLE == 0 {
             v[4] = 0.0;
@@ -1199,19 +1258,26 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             let (dp, db) = cen(t.day, t.d);
             v[13] = dp;
             v[14] = db;
+            if on("sigma") {
+                // distinct Sigma rules that fired on the destination while
+                // the connection's session was open
+                let set: HashSet<&str> = hits_in(t.d, t.t0, t.t_end).into_iter().map(|i| hits[i].title.as_str()).collect();
+                v[16] = set.len() as f64;
+            }
             if off_panel {
                 // nothing destination-side is comparable with the panel
                 v[10] = 0.0;
                 v[11] = 0.0;
                 v[13] = 0.0;
                 v[14] = 0.0;
+                v[16] = 0.0;
             }
         }
         v
     };
     struct Tested<'a> {
         t: &'a TripleDay,
-        x: [f64; 16],
+        x: [f64; 17],
         p: f64,
         tstat: f64,
         n_null: usize,
@@ -1248,7 +1314,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
                 .filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && t.flags & F_TRIPLE != 0 && on_panel(t) && had_history(t))
                 .map(|t| (features(t, &okp, &failp, &mut cache, false).to_vec(), t.day))
                 .unzip();
-            let jn = JointNull::new(null_rows, null_row_days, 16);
+            let jn = JointNull::new(null_rows, null_row_days, 17);
             for t in triples.iter().filter(|t| t.cls == cls && t.day == *wday) {
                 let off = !on_panel(t);
                 // an origin with no baseline at all is new whatever the
@@ -1261,7 +1327,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
                 }
                 let x = features(t, &okp, &failp, &mut cache, off);
                 let (p, tstat) = jn.test_fast(&x);
-                let marg: Vec<(usize, f64, usize)> = (0..16).map(|k| if x[k] > 0.0 { jn.marginal(k, x[k]) } else { (jn.n, 1.0, null_days.len()) }).collect();
+                let marg: Vec<(usize, f64, usize)> = (0..17).map(|k| if x[k] > 0.0 { jn.marginal(k, x[k]) } else { (jn.n, 1.0, null_days.len()) }).collect();
                 tested.push(Tested { t, x, p, tstat, n_null: jn.n, marg, off_panel: off });
             }
         }
@@ -1475,6 +1541,25 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         if x[14] > 0.0 {
             why.push(format!("the destination's betweenness rose that day (+{:.5}; {})", x[14], matched(14)));
         }
+        if x[16] > 0.0 {
+            let idx = hits_in(t.d, t.t0, t.t_end);
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut examples: Vec<String> = Vec::new();
+            for i in idx {
+                let h = &hits[i];
+                if seen.insert(h.title.as_str()) && examples.len() < 3 {
+                    examples.push(format!("'{}' at {}{}", h.title, ts_str(h.t), if h.level.is_empty() { String::new() } else { format!(" ({})", h.level) }));
+                }
+            }
+            why.push(format!(
+                "Sigma: {} rule(s) fired on {} while the session was open ({}): {}{}",
+                x[16],
+                ents.names.name(t.d),
+                matched(16),
+                examples.join(", "),
+                if seen.len() > examples.len() { format!(" and {} more", seen.len() - examples.len()) } else { String::new() }
+            ));
+        }
         if tt.off_panel {
             why.push("destination without continuous coverage: judged by the origin's novelty only".into());
         }
@@ -1643,7 +1728,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             let mut clauses: Vec<String> = Vec::new();
             for cn in rows.iter().filter(|cn| cn.day == *d && cn.evaluable) {
                 for cl in cn.why.split("; ") {
-                    if (cl.starts_with("that day") || cl.starts_with("origin never seen before")) && !clauses.iter().any(|x| x == cl) {
+                    if (cl.starts_with("that day") || cl.starts_with("origin never seen before") || cl.starts_with("Sigma:")) && !clauses.iter().any(|x| x == cl) {
                         clauses.push(cl.to_string());
                     }
                 }
@@ -2216,8 +2301,8 @@ mod tests {
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None };
-        let (out, _lines, _alpha, stories, seed) = analyse(&c, &super::super::NEO4J, &cfg);
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new() };
+        let (out, _lines, _alpha, stories, seed) = analyse(&c, &super::super::NEO4J, &cfg, &[]);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
         let r = seed.expect("seed reconstruction");
@@ -2232,7 +2317,7 @@ mod tests {
         // seeding by the account that switched (A2, owned by X, used by B)
         // finds the B -> C login directly
         let cfg2 = Settings { seeds: vec!["a2".into()], ..cfg };
-        let (_, _, _, _, seed2) = analyse(&c, &super::super::NEO4J, &cfg2);
+        let (_, _, _, _, seed2) = analyse(&c, &super::super::NEO4J, &cfg2, &[]);
         let r = seed2.expect("seed reconstruction");
         assert_eq!(r.hops.len(), 1);
         assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "B", "C"));
@@ -2263,6 +2348,36 @@ mod tests {
         assert!(st.paths.iter().any(|p| p.starts_with("causal path:")));
         assert_eq!(st.phases.len(), 1);
         assert_eq!(st.phases[0].verb, "logged in");
+    }
+
+    #[test]
+    fn sigma_hits_during_the_session_are_reported() {
+        // same corpus as the causal-path test, plus the LOGOFF of B -> C at
+        // 12:00 on day 21 and two Sigma hits on C: one at 11:30 (inside the
+        // session) and one at 13:00 (after it)
+        let zs: Vec<String> = (1..=20).map(|k| format!("Z{}", k)).collect();
+        let mut rows: Vec<(i32, i64, &str, &str, &str, &str)> = Vec::new();
+        for day in 1..=20 {
+            rows.push((day, 9, "A", "B", "A1", "SUCCESSFUL_LOGON"));
+            rows.push((day, 9, "X", "C", "A2", "SUCCESSFUL_LOGON"));
+            rows.push((day, 12, zs[(day - 1) as usize].as_str(), "B", "A1", "SUCCESSFUL_LOGON"));
+        }
+        rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
+        rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
+        rows.push((21, 12, "B", "C", "A2", "LOGOFF"));
+        let c = corpus(&rows);
+        let day21 = 21 * 86_400;
+        let hits = vec![
+            sigma::SigmaHit { t: day21 + 11 * 3600 + 1800, host: "c.corp.local".into(), title: "PsExec Service Installation".into(), level: "high".into(), tags: String::new() },
+            sigma::SigmaHit { t: day21 + 13 * 3600, host: "C".into(), title: "Something later".into(), level: String::new(), tags: String::new() },
+        ];
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let (out, lines, _, _, _) = analyse(&c, &super::super::NEO4J, &cfg, &hits);
+        assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
+        let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
+        assert!(bc.why.contains("Sigma: 1 rule(s) fired on C while the session was open"), "{}", bc.why);
+        assert!(bc.why.contains("'PsExec Service Installation' at 1970-01-22T11:30:00Z (high)"), "{}", bc.why);
+        assert!(!bc.why.contains("Something later"), "{}", bc.why);
     }
 
     #[test]
