@@ -21,6 +21,7 @@ pub mod engine;
 pub mod report;
 pub mod resolve;
 pub mod schema;
+pub mod sigma;
 pub mod stats;
 
 // ───────────────────────────── Dialect ──────────────────────────────────────

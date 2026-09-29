@@ -294,6 +294,13 @@ pub struct Cli {
     /// ("YYYY-MM-DD HH:MM:SS", UTC). Default: the end of the window.
     #[arg(long)]
     seed_to: Option<String>,
+
+    /// For `graph-hunt` / `graph-hunt-neo4j`: Sigma hits from Hayabusa or
+    /// Chainsaw (JSON / JSONL files or directories, comma-separated). A hit
+    /// on a machine while a login session is open on it corroborates that
+    /// connection (coordinate `sigma`), and the report names the rule.
+    #[arg(long)]
+    sigma: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -548,6 +555,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed.as_deref(),
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
+                config.sigma.as_deref(),
             )
             .await;
         }
@@ -567,6 +575,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed.as_deref(),
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
+                config.sigma.as_deref(),
             )
             .await;
         }
