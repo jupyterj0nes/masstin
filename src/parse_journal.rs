@@ -30,7 +30,7 @@ use crate::parse::is_debug_mode;
 
 // We deliberately reuse the same SSH_OK_RE / SSH_FAIL_RE already compiled in
 // parse_linux — exposed via `pub(crate)` there so we don't duplicate regex.
-use crate::parse_linux::{preauth_touch, RawEvt, SSH_OK_RE, SSH_FAIL_RE};
+use crate::parse_linux::{preauth_touch, RawEvt, SessionTracker, PAM_CLOSE_RE, SSH_DISCONNECT_RE, SSH_OK_RE, SSH_FAIL_RE};
 
 /// Parse a single journal file, returning SSH lateral-movement events.
 /// `dst_host` is the hostname of the machine the journal came from.
@@ -59,6 +59,8 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
 
     let mut scanned = 0usize;
     let mut matched = 0usize;
+    let mut tracker = SessionTracker::default();
+    let mut disconnect_fallback: Vec<RawEvt> = Vec::new();
 
     while let Some(entry) = reader.next_entry() {
         scanned += 1;
@@ -98,6 +100,7 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             let method = cap[1].to_string();
             let user = cap[2].to_string();
             let src = cap[3].to_string();
+            tracker.login(pid, &user, &src);
             out.push(RawEvt {
                 ts_rfc3339: ts_rfc3339.clone(),
                 user,
@@ -153,6 +156,45 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             matched += 1;
             continue;
         }
+
+        // Session end (see parse_linux: PAM_CLOSE_RE / SSH_DISCONNECT_RE).
+        if PAM_CLOSE_RE.is_match(&msg) {
+            if let Some((user, src)) = tracker.close(pid) {
+                out.push(RawEvt {
+                    ts_rfc3339,
+                    user,
+                    remote: src,
+                    tty_or_proc: "journal-ssh/session-closed".into(),
+                    evt: "LOGOUT".into(),
+                    filename: path.display().to_string(),
+                    dst_host: dst_host.to_string(),
+                    pid,
+                    conn: 0,
+                });
+                matched += 1;
+            }
+            continue;
+        }
+        if !msg.contains("[preauth]") {
+            if let Some(cap) = SSH_DISCONNECT_RE.captures(&msg) {
+                disconnect_fallback.push(RawEvt {
+                    ts_rfc3339,
+                    user: cap[1].to_string(),
+                    remote: cap[2].to_string(),
+                    tty_or_proc: "journal-ssh/disconnected".into(),
+                    evt: "LOGOUT".into(),
+                    filename: path.display().to_string(),
+                    dst_host: dst_host.to_string(),
+                    pid,
+                    conn: 0,
+                });
+                continue;
+            }
+        }
+    }
+    if tracker.pam_closes == 0 && !disconnect_fallback.is_empty() {
+        matched += disconnect_fallback.len();
+        out.extend(disconnect_fallback);
     }
 
     if is_debug_mode() {
