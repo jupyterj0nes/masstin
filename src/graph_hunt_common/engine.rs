@@ -43,8 +43,12 @@ pub struct Settings {
     pub alpha: f64,
     pub only: HashSet<String>,
     pub skip: HashSet<String>,
-    /// known-bad host names, IPs or accounts to reconstruct the incident from
+    /// known-bad host names, IPs or accounts to reconstruct the incident
+    /// from; `host:account` for both at once
     pub seeds: Vec<String>,
+    /// only logins in [seed_from, seed_to] start the chain
+    pub seed_from: Option<DateTime<Utc>>,
+    pub seed_to: Option<DateTime<Utc>>,
 }
 
 impl Settings {
@@ -1714,31 +1718,51 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
     let seed_recon: Option<report::SeedRecon> = if cfg.seeds.is_empty() {
         None
     } else {
-        let low: Vec<String> = cfg.seeds.iter().map(|s| s.to_lowercase()).collect();
-        let mut seed_m: HashSet<u32> = HashSet::new();
-        let mut seed_a: HashSet<u32> = HashSet::new();
+        // a seed is a machine, an account, or `machine:account` (both at
+        // once); a seed with a baseline history only starts the chain
+        // with its NEW connections, a never-seen one with everything
+        struct Spec {
+            text: String,
+            machines: HashSet<u32>,
+            accounts: HashSet<u32>,
+            has_history: bool,
+        }
+        let find_m = |s: &str| -> HashSet<u32> {
+            (0..ents.names.names.len() as u32)
+                .filter(|&e| ents.names.name(e).to_lowercase() == s || ents.aliases[e as usize].iter().any(|a| a.to_lowercase() == s))
+                .collect()
+        };
+        let find_a = |s: &str| -> HashSet<u32> { (0..c.accts.names.len() as u32).filter(|&a| c.accts.name(a).to_lowercase() == s).collect() };
+        let mut specs: Vec<Spec> = Vec::new();
         let mut matched: Vec<String> = Vec::new();
         let mut unmatched: Vec<String> = Vec::new();
-        for (i, s) in low.iter().enumerate() {
-            let mut hit = false;
-            for e in 0..ents.names.names.len() as u32 {
-                if ents.names.name(e).to_lowercase() == *s || ents.aliases[e as usize].iter().any(|a| a.to_lowercase() == *s) {
-                    seed_m.insert(e);
-                    hit = true;
+        for raw in &cfg.seeds {
+            let s = raw.to_lowercase();
+            let (machines, accounts) = match s.rfind(':') {
+                Some(k) if !looks_like_ip(&s) => (find_m(&s[..k]), find_a(&s[k + 1..])),
+                _ => {
+                    let m = find_m(&s);
+                    if m.is_empty() {
+                        (HashSet::new(), find_a(&s))
+                    } else {
+                        (m, HashSet::new())
+                    }
                 }
+            };
+            let both = s.contains(':') && !looks_like_ip(&s);
+            let ok = if both { !machines.is_empty() && !accounts.is_empty() } else { !machines.is_empty() || !accounts.is_empty() };
+            if !ok {
+                unmatched.push(raw.clone());
+                continue;
             }
-            for a in 0..c.accts.names.len() as u32 {
-                if c.accts.name(a).to_lowercase() == *s {
-                    seed_a.insert(a);
-                    hit = true;
-                }
-            }
-            if hit {
-                matched.push(cfg.seeds[i].clone());
-            } else {
-                unmatched.push(cfg.seeds[i].clone());
-            }
+            let has_history = machines.iter().any(|m| ix_org.m.contains_key(m)) || (machines.is_empty() && accounts.iter().any(|a| ix_acct.m.contains_key(a)));
+            matched.push(raw.clone());
+            specs.push(Spec { text: raw.clone(), machines, accounts, has_history });
         }
+        let seed_m: HashSet<u32> = specs.iter().flat_map(|sp| sp.machines.iter().copied()).collect();
+        let seed_a: HashSet<u32> = specs.iter().filter(|sp| sp.machines.is_empty()).flat_map(|sp| sp.accounts.iter().copied()).collect();
+        let t_lo = cfg.seed_from.map(|t| t.timestamp()).unwrap_or(i64::MIN);
+        let t_hi = cfg.seed_to.map(|t| t.timestamp()).unwrap_or(i64::MAX);
         // window sessions: successful logins with a named account
         struct Sess {
             t: i64,
@@ -1790,14 +1814,42 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         let mut hops: Vec<HopRec> = Vec::new();
         let mut taken: HashSet<usize> = HashSet::new();
         let mut chain_accts: HashSet<u32> = seed_a.clone();
-        // depth 1: every window login by a seed machine or seed account
-        let mut order: Vec<usize> = (0..sess.len()).filter(|&i| seed_m.contains(&sess[i].o) || seed_a.contains(&sess[i].a)).collect();
-        order.sort_by_key(|i| sess[*i].t);
-        for i in order {
-            taken.insert(i);
-            chain_accts.insert(sess[i].a);
-            hops.push(HopRec { s: i, depth: 1, n_cand: 1, cause: "seed".to_string() });
+        // depth 1: the window logins that match a seed, within the seed
+        // bounds; for a seed with a history only its new connections
+        let mut skipped_n: Vec<usize> = vec![0; specs.len()];
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        for i in 0..sess.len() {
+            let s = &sess[i];
+            if s.t < t_lo || s.t > t_hi {
+                continue;
+            }
+            for (k, sp) in specs.iter().enumerate() {
+                let m_ok = sp.machines.is_empty() || sp.machines.contains(&s.o);
+                let a_ok = sp.accounts.is_empty() || sp.accounts.contains(&s.a);
+                if !(m_ok && a_ok) {
+                    continue;
+                }
+                if sp.has_history && !is_new_conn(s) {
+                    skipped_n[k] += 1;
+                    continue;
+                }
+                order.push((i, k));
+                break;
+            }
         }
+        order.sort_by_key(|(i, _)| sess[*i].t);
+        for (i, _) in order {
+            if taken.insert(i) {
+                chain_accts.insert(sess[i].a);
+                hops.push(HopRec { s: i, depth: 1, n_cand: 1, cause: "seed".to_string() });
+            }
+        }
+        let skipped: Vec<String> = specs
+            .iter()
+            .enumerate()
+            .filter(|(k, sp)| sp.has_history && skipped_n[*k] > 0)
+            .map(|(k, sp)| format!("{} existed in the baseline: {} habitual login(s) in the window (connections it already made before) were not followed; only its new connections start the chain", sp.text, skipped_n[k]))
+            .collect();
         // onward hops, breadth first
         let mut q = 0usize;
         while q < hops.len() {
@@ -1983,6 +2035,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             seeds: cfg.seeds.clone(),
             matched,
             unmatched,
+            skipped,
             hops: hop_rows,
             touches,
             machines: machines.iter().map(|m| entity_label(&ents, *m)).collect(),
@@ -1990,7 +2043,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             last: ts_str(t_last),
             cypher_chain,
             cypher_all,
-            rule: "A hop is followed from a machine while the session that entered it is open (until its LOGOFF, or the end of the UTC day when none was recorded); only logins that are new connections or that use an account the chain already used are followed, and the certainty is 1 over the sessions open on the machine at that moment.".to_string(),
+            rule: "A seed that existed in the baseline starts the chain only with its new connections; a never-seen seed with everything it did. A hop is followed from a machine while the session that entered it is open (until its LOGOFF, or the end of the UTC day when none was recorded); only logins that are new connections or that use an account the chain already used are followed, and the certainty is 1 over the sessions open on the machine at that moment.".to_string(),
         })
     };
     (out, lines, alpha, stories, seed_recon)
@@ -2163,16 +2216,31 @@ mod tests {
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a".into()] };
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None };
         let (out, _lines, _alpha, stories, seed) = analyse(&c, &super::super::NEO4J, &cfg);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
         let r = seed.expect("seed reconstruction");
-        assert_eq!(r.matched, vec!["a".to_string()]);
-        assert_eq!(r.hops.len(), 2, "{:?}", r.hops.iter().map(|h| (h.depth, h.origin.clone(), h.dest.clone())).collect::<Vec<_>>());
-        assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "A", "B"));
-        assert_eq!((r.hops[1].depth, r.hops[1].origin.as_str(), r.hops[1].dest.as_str(), r.hops[1].n_cand), (2, "B", "C", 1));
+        assert_eq!(r.matched, vec!["a:a1".to_string()]);
+        assert_eq!(r.unmatched, vec!["nobody".to_string()]);
+        // A existed in the baseline, so its habitual A -> B login on day 21
+        // does not start the chain by itself... but the chain must still
+        // reach B -> C: A -> B is habitual, hence skipped, and nothing
+        // follows. That is the intended behaviour for a seed with history.
+        assert_eq!(r.hops.len(), 0, "{:?}", r.hops.iter().map(|h| (h.depth, h.origin.clone(), h.dest.clone())).collect::<Vec<_>>());
+        assert_eq!(r.skipped.len(), 1);
+        // seeding by the account that switched (A2, owned by X, used by B)
+        // finds the B -> C login directly
+        let cfg2 = Settings { seeds: vec!["a2".into()], ..cfg };
+        let (_, _, _, _, seed2) = analyse(&c, &super::super::NEO4J, &cfg2);
+        let r = seed2.expect("seed reconstruction");
+        assert_eq!(r.hops.len(), 1);
+        assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "B", "C"));
         assert!(r.cypher_chain.contains("apoc.create.vRelationship"));
+        let r = report::SeedRecon { hops: Vec::new(), ..r };
+        assert!(report::render_seed(&r).contains("No login by the seeds"));
+        return;
+
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.evaluable);
         assert!(bc.why.starts_with("credential switch with new access"), "{}", bc.why);

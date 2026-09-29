@@ -22,8 +22,10 @@ pub async fn graph_hunt_neo4j(
     output: Option<&str>,
     report: Option<&str>,
     seed: Option<&str>,
+    seed_from: Option<&str>,
+    seed_to: Option<&str>,
 ) {
-    let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report) {
+    let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
         Some(s) => s,
         None => return,
     };
