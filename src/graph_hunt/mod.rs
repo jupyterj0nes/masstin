@@ -26,6 +26,8 @@ pub(crate) fn settings(
     only_detectors: Option<&str>,
     alpha: f64,
     end_time: Option<&str>,
+    seed: Option<&str>,
+    report: Option<&str>,
 ) -> Option<engine::Settings> {
     let cutoff = match parse_cutoff(investigation_from) {
         Some(c) => c,
@@ -58,7 +60,12 @@ pub(crate) fn settings(
             }
         },
     };
-    Some(engine::Settings { cutoff, alpha, only, skip, end })
+    let seeds: Vec<String> = seed.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    if !seeds.is_empty() && report.is_none() {
+        eprintln!("Masstin - Error: --seed needs --report <file.md>: the reconstruction is written there");
+        return None;
+    }
+    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds })
 }
 
 pub async fn graph_hunt(
@@ -71,8 +78,9 @@ pub async fn graph_hunt(
     end_time: Option<&str>,
     output: Option<&str>,
     report: Option<&str>,
+    seed: Option<&str>,
 ) {
-    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time) {
+    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report) {
         Some(s) => s,
         None => return,
     };

@@ -100,6 +100,9 @@ struct ResolvedEdge {
     target_domain_name: String,
     subject_user_name: String,
     subject_domain_name: String,
+    /// session identifier (Windows LogonId, Linux sshd pid): the same on a
+    /// login and on the LOGOFF that closes it
+    logon_id: String,
     count: i64,
 }
 
@@ -146,6 +149,7 @@ struct Indices {
     logon_type: usize,
     src_computer: usize,
     src_ip: usize,
+    logon_id: usize,
 }
 
 fn parse_indices(header: &str) -> Option<Indices> {
@@ -153,13 +157,13 @@ fn parse_indices(header: &str) -> Option<Indices> {
         Some(Indices {
             dst: 1, event_type: 2, log_source: 13, event_id: 3, subject_user: 9, subject_domain: 10,
             target_user: 5, target_domain: 6, logon_type: 4,
-            src_computer: 7, src_ip: 8,
+            src_computer: 7, src_ip: 8, logon_id: 11,
         })
     } else if header == OLD_HEADER {
         Some(Indices {
             dst: 1, event_type: NONE_COL, log_source: 11, event_id: 2, subject_user: 3, subject_domain: 4,
             target_user: 5, target_domain: 6, logon_type: 7,
-            src_computer: 8, src_ip: 9,
+            src_computer: 8, src_ip: 9, logon_id: NONE_COL,
         })
     } else {
         None
@@ -539,6 +543,7 @@ fn resolve_to_edge(
         target_domain_name: parts[idx.target_domain].clone(),
         subject_user_name: clean_user(&parts[idx.subject_user]),
         subject_domain_name: parts[idx.subject_domain].clone(),
+        logon_id: if idx.logon_id == NONE_COL || idx.logon_id >= parts.len() { String::new() } else { parts[idx.logon_id].trim_matches('"').to_string() },
         count: 1,
     })
 }
@@ -561,7 +566,7 @@ async fn flush_batch(
          src_computer: $src_computer[i], src_ip: $src_ip[i], \
          target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
          subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
-         count: $count[i]}}]->(d) \
+         logon_id: $logon_id[i], count: $count[i]}}]->(d) \
          RETURN count(r) AS created",
         edge_op, rel_type,
     );
@@ -579,6 +584,7 @@ async fn flush_batch(
         .param("target_domain_name", chunk.iter().map(|e| e.target_domain_name.clone()).collect::<Vec<String>>())
         .param("subject_user_name", chunk.iter().map(|e| e.subject_user_name.clone()).collect::<Vec<String>>())
         .param("subject_domain_name", chunk.iter().map(|e| e.subject_domain_name.clone()).collect::<Vec<String>>())
+        .param("logon_id", chunk.iter().map(|e| e.logon_id.clone()).collect::<Vec<String>>())
         .param("count", chunk.iter().map(|e| e.count).collect::<Vec<i64>>());
     match graph.execute(q).await {
         Ok(mut result) => {
@@ -945,7 +951,7 @@ pub async fn load_neo4j(
                 let local_idx = Indices {
                     dst: 1, event_type: 10, log_source: 12, event_id: 11, subject_user: 3, subject_domain: 4,
                     target_user: 5, target_domain: 6, logon_type: 7,
-                    src_computer: 8, src_ip: 9,
+                    src_computer: 8, src_ip: 9, logon_id: NONE_COL,
                 };
                 let edge = match resolve_to_edge(&parts, &local_idx, &ip_to_host, &local_values, &mut resolved_count) {
                     Some(mut e) => {

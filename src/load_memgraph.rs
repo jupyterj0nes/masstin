@@ -80,6 +80,8 @@ struct ResolvedEdge {
     event_type: String,
     event_id: String,
     log_source: String,
+    /// session identifier (Windows LogonId, Linux sshd pid)
+    logon_id: String,
     count: i64,
 }
 
@@ -418,7 +420,7 @@ pub async fn load_memgraph(
             for line in &processed_lines {
                 let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
                 edges_to_emit.push(format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     parts[0],
                     parts[idx_dst],
                     "1",
@@ -432,6 +434,7 @@ pub async fn load_memgraph(
                     idx_event_type.map(|i| parts[i].as_str()).unwrap_or(""),
                     parts[idx_event_id],
                     parts.get(idx_log_source).map(|s| s.as_str()).unwrap_or(""),
+                    if is_new_format { parts.get(11).map(|s| s.trim_matches('"')).unwrap_or("") } else { "" },
                 ));
             }
         } else {
@@ -484,7 +487,7 @@ pub async fn load_memgraph(
 
             for ((dst_computer, target_user_name, logon_type, _sc, _si, _et), data) in grouped_map {
                 edges_to_emit.push(format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},",
                     data.earliest_date,
                     dst_computer,
                     data.count,
@@ -588,6 +591,7 @@ pub async fn load_memgraph(
                 event_type: row.get(10).map(|s| s.to_string()).unwrap_or_default(),
                 event_id: row.get(11).map(|s| s.to_string()).unwrap_or_default(),
                 log_source: row.get(12).map(|s| s.to_string()).unwrap_or_default(),
+                logon_id: row.get(13).map(|s| s.to_string()).unwrap_or_default(),
                 count: row[2].parse::<i64>().unwrap_or(1),
             });
         }
@@ -661,7 +665,7 @@ pub async fn load_memgraph(
                      target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
                      subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
                      event_type: $event_type[i], event_id: $event_id[i], log_source: $log_source[i], \
-                     count: $count[i]}}]->(d)",
+                     logon_id: $logon_id[i], count: $count[i]}}]->(d)",
                     edge_op, rel_type,
                 );
                 let q = query(&q_str)
@@ -678,6 +682,7 @@ pub async fn load_memgraph(
                     .param("event_type", chunk.iter().map(|e| e.event_type.clone()).collect::<Vec<String>>())
                     .param("event_id", chunk.iter().map(|e| e.event_id.clone()).collect::<Vec<String>>())
                     .param("log_source", chunk.iter().map(|e| e.log_source.clone()).collect::<Vec<String>>())
+                    .param("logon_id", chunk.iter().map(|e| e.logon_id.clone()).collect::<Vec<String>>())
                     .param("count", chunk.iter().map(|e| e.count).collect::<Vec<i64>>());
                 match graph.execute(q).await {
                     Ok(mut result) => { let _ = result.next().await; }

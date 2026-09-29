@@ -679,6 +679,8 @@ One row per connection, most unusual first:
 - `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage and the origin has a history.
 - On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
 
+**Reconstruction from seeds.** Add `--seed 10.0.0.5,alice` (host names, IPs or accounts you already know to be bad) and the report opens with the chain: every login the seeds made in the window, then every login that left the entered machine while that session was open and was either a new connection or used an account the chain already used, with a certainty of 1 over the sessions open on that machine at the moment; what was open on a seed machine when it first acted; the failed attempts and unauthenticated touches of the chain machines; and one Cypher query that draws the whole chain, plus one that returns everything between the chain machines in that time span.
+
 **Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, and a Browser query to check everything. The CSV is unchanged.
 
 #### Detection quality

@@ -43,6 +43,8 @@ pub struct Settings {
     pub alpha: f64,
     pub only: HashSet<String>,
     pub skip: HashSet<String>,
+    /// known-bad host names, IPs or accounts to reconstruct the incident from
+    pub seeds: Vec<String>,
 }
 
 impl Settings {
@@ -136,6 +138,10 @@ struct RawRow {
     lt: u32,
     cov: (bool, bool),
     n: u64,
+    /// session identifier (interned); 0 = none
+    lid: u32,
+    /// a session end (event_type LOGOFF)
+    logoff: bool,
 }
 
 struct Corpus {
@@ -146,13 +152,15 @@ struct Corpus {
     accts: Interner,
     lts: Interner,
     ets: Interner,
+    lids: Interner,
     rows: Vec<RawRow>,
     /// edge rows whose time could not be parsed (ignored, reported)
     bad_ts: usize,
 }
 
 async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
-    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    c.lids.id("");
     let aggregated = format!(
         "(coalesce(r.event_id, '') = 'SSH_PREAUTH' OR (coalesce(r.event_type, '') = 'FAILED_LOGON' AND type(r) IN {na}))",
         na = NO_ACCOUNT_TYPES
@@ -162,7 +170,7 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
          RETURN a.name AS o, b.name AS d, type(r) AS acct, coalesce(r.event_type, '') AS et,
                 coalesce(r.event_id, '') AS eid, coalesce(toString(r.logon_type), '') AS lt,
                 coalesce(r.log_source, '') AS src, toString(r.time) AS t,
-                toInteger(coalesce(r.count, 1)) AS c",
+                toInteger(coalesce(r.count, 1)) AS c, coalesce(r.logon_id, '') AS lid",
         agg = aggregated
     );
     let qb = format!(
@@ -171,7 +179,7 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
               coalesce(r.event_id, '') AS eid, coalesce(r.log_source, '') AS src,
               r.time.year * 10000 + r.time.month * 100 + r.time.day AS dk,
               sum(toInteger(coalesce(r.count, 1))) AS c, min(r.time) AS t0
-         RETURN o, d, acct, et, eid, '' AS lt, src, toString(t0) AS t, c",
+         RETURN o, d, acct, et, eid, '' AS lt, src, toString(t0) AS t, c, '' AS lid",
         agg = aggregated
     );
     for q in [qa, qb] {
@@ -189,6 +197,7 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
             let src: String = row.get("src").unwrap_or_default();
             let ts: String = row.get("t").unwrap_or_default();
             let n: i64 = row.get("c").unwrap_or(1);
+            let lid: String = row.get("lid").unwrap_or_default();
             let t = match parse_ts(&ts) {
                 Some(x) => x.and_utc().timestamp(),
                 None => {
@@ -208,6 +217,8 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
                 lt: c.lts.id(&lt),
                 cov: super::coverage_kinds(&src),
                 n: n.max(1) as u64,
+                lid: c.lids.id(&lid),
+                logoff: et == "LOGOFF",
             };
             c.rows.push(r);
         }
@@ -475,8 +486,9 @@ struct Conn {
     campaign: String,
     cypher: String,
     evaluable: bool,
-    /// origin and account ids and the novelty flags, for the report
+    /// origin, destination and account ids and the novelty flags, for the report
     oid: u32,
+    did: u32,
     aid: u32,
     flags: u8,
     /// Hopper-style class, used for ordering within the significant rows:
@@ -515,7 +527,7 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
         corpus.rows.retain(|r| r.t <= e);
         crate::banner::print_phase_detail("Window end:", &format!("{} (later events ignored)", end.to_rfc3339()));
     }
-    let (rows, summary_lines, alpha, stories) = analyse(&corpus, dialect, cfg);
+    let (rows, summary_lines, alpha, stories, seed) = analyse(&corpus, dialect, cfg);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
@@ -536,8 +548,8 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
             n_sig: rows.iter().filter(|r| r.evaluable && r.q <= alpha).count(),
             n_not_eval: rows.iter().filter(|r| !r.evaluable).count(),
         };
-        match report::write(path, &h, &stories) {
-            Ok(()) => crate::banner::print_phase_detail("Report:", &format!("{} ({} origin(s))", path, stories.len())),
+        match report::write(path, &h, &stories, seed.as_ref()) {
+            Ok(()) => crate::banner::print_phase_detail("Report:", &format!("{} ({} origin(s){})", path, stories.len(), seed.as_ref().map(|s| format!(", seed reconstruction with {} hop(s)", s.hops.len())).unwrap_or_default())),
             Err(e) => eprintln!("Masstin - Error: cannot write report: {}", e),
         }
     }
@@ -663,7 +675,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>) {
+fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
     let (ents, res) = build_entities(c, alpha);
@@ -701,11 +713,13 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         lt: u32,
         n: u64,
         fam: u32,
+        lid: u32,
+        logoff: bool,
     }
     let mut evs: Vec<Ev> = c
         .rows
         .iter()
-        .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n, fam: r.fam })
+        .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n, fam: r.fam, lid: r.lid, logoff: r.logoff })
         .collect();
     evs.sort_by_key(|e| e.t);
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
@@ -753,7 +767,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
         Some(a) => a,
         None => {
             lines.push("No destination has log coverage before the cutoff: nothing can be compared. Check --investigation-from and the coverage spans written by the loader.".to_string());
-            return (Vec::new(), lines, alpha, Vec::new());
+            return (Vec::new(), lines, alpha, Vec::new(), None);
         }
     };
     if anchor != cutoff_day - 1 {
@@ -802,7 +816,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
     }
     if best.0 == 0 {
         lines.push("Panel is empty: no destination is covered continuously up to the last covered baseline day. Nothing can be compared.".to_string());
-        return (Vec::new(), lines, alpha, Vec::new());
+        return (Vec::new(), lines, alpha, Vec::new(), None);
     }
     let s_day = best.1;
     let in_run = |m: &HashMap<u32, BTreeSet<i32>>, d: u32| -> bool {
@@ -1489,6 +1503,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             ),
             evaluable: true,
             oid: t.o,
+            did: t.d,
             aid: t.a,
             flags: t.flags,
             group,
@@ -1526,6 +1541,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             ),
             evaluable: false,
             oid: t.o,
+            did: t.d,
             aid: t.a,
             flags: t.flags,
             group: 3,
@@ -1682,7 +1698,302 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings) -> (Vec<Conn>, Vec<Str
             cypher: super::browser_snippet_multi(dialect, &alias_list(o), &[], None, &day_from(d0), Some(&day_to(d1))),
         });
     }
-    (out, lines, alpha, stories)
+    // ═════════════ reconstruction from seeds ═════════════
+    //
+    // The analyst names what is already known to be bad (hosts, IPs,
+    // accounts). Every window login by a seed is a hop; from each hop's
+    // destination, the logins that leave it while the hop's session is
+    // open are the next hops, with certainty 1 / (sessions open on that
+    // machine at that moment), as in the causal paths. Only logins that
+    // are new connections, or that use an account the chain already used,
+    // are followed: routine traffic leaving a machine the attacker entered
+    // (its daily jobs) is not the attacker's chain. Sessions end at their
+    // LOGOFF when one was recorded, else at the end of the UTC day. One
+    // level backward is given too: the sessions open on a seed machine
+    // when it made its first hop.
+    let seed_recon: Option<report::SeedRecon> = if cfg.seeds.is_empty() {
+        None
+    } else {
+        let low: Vec<String> = cfg.seeds.iter().map(|s| s.to_lowercase()).collect();
+        let mut seed_m: HashSet<u32> = HashSet::new();
+        let mut seed_a: HashSet<u32> = HashSet::new();
+        let mut matched: Vec<String> = Vec::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        for (i, s) in low.iter().enumerate() {
+            let mut hit = false;
+            for e in 0..ents.names.names.len() as u32 {
+                if ents.names.name(e).to_lowercase() == *s || ents.aliases[e as usize].iter().any(|a| a.to_lowercase() == *s) {
+                    seed_m.insert(e);
+                    hit = true;
+                }
+            }
+            for a in 0..c.accts.names.len() as u32 {
+                if c.accts.name(a).to_lowercase() == *s {
+                    seed_a.insert(a);
+                    hit = true;
+                }
+            }
+            if hit {
+                matched.push(cfg.seeds[i].clone());
+            } else {
+                unmatched.push(cfg.seeds[i].clone());
+            }
+        }
+        // window sessions: successful logins with a named account
+        struct Sess {
+            t: i64,
+            end: Option<i64>,
+            o: u32,
+            d: u32,
+            a: u32,
+            day: i32,
+        }
+        let mut logoffs: HashMap<(u32, u32, u32, u32), Vec<i64>> = HashMap::new();
+        for e in evs.iter().filter(|e| e.logoff && !is_base(e.day)) {
+            logoffs.entry((e.o, e.d, e.a, e.lid)).or_default().push(e.t);
+        }
+        for v in logoffs.values_mut() {
+            v.sort();
+        }
+        let mut sess: Vec<Sess> = Vec::new();
+        for e in evs.iter().filter(|e| e.cls == OK && !is_base(e.day) && e.o != e.d) {
+            let an = c.accts.name(e.a);
+            if is_no_account(an) {
+                continue;
+            }
+            let end = logoffs.get(&(e.o, e.d, e.a, e.lid)).and_then(|v| {
+                let k = v.partition_point(|t| *t < e.t);
+                v.get(k).copied()
+            });
+            sess.push(Sess { t: e.t, end, o: e.o, d: e.d, a: e.a, day: e.day });
+        }
+        let end_of = |s: &Sess| s.end.unwrap_or((s.day as i64 + 1) * 86_400 - 1);
+        // sessions by destination, in time order, and by origin
+        let mut by_dst: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut by_org: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, s) in sess.iter().enumerate() {
+            by_dst.entry(s.d).or_default().push(i);
+            by_org.entry(s.o).or_default().push(i);
+        }
+        for v in by_dst.values_mut().chain(by_org.values_mut()) {
+            v.sort_by_key(|i| sess[*i].t);
+        }
+        // is a session a new connection in the hunt? (origin, dest, account, day)
+        let conn_of: HashMap<(u32, u32, u32, i32), usize> = out.iter().enumerate().map(|(i, cn)| ((cn.oid, cn.did, cn.aid, cn.day), i)).collect();
+        let is_new_conn = |s: &Sess| conn_of.get(&(s.o, s.d, s.a, s.day)).map(|&i| out[i].flags & F_TRIPLE != 0).unwrap_or(false);
+        struct HopRec {
+            s: usize,
+            depth: i32,
+            n_cand: usize,
+            cause: String,
+        }
+        let mut hops: Vec<HopRec> = Vec::new();
+        let mut taken: HashSet<usize> = HashSet::new();
+        let mut chain_accts: HashSet<u32> = seed_a.clone();
+        // depth 1: every window login by a seed machine or seed account
+        let mut order: Vec<usize> = (0..sess.len()).filter(|&i| seed_m.contains(&sess[i].o) || seed_a.contains(&sess[i].a)).collect();
+        order.sort_by_key(|i| sess[*i].t);
+        for i in order {
+            taken.insert(i);
+            chain_accts.insert(sess[i].a);
+            hops.push(HopRec { s: i, depth: 1, n_cand: 1, cause: "seed".to_string() });
+        }
+        // onward hops, breadth first
+        let mut q = 0usize;
+        while q < hops.len() {
+            let hi = q;
+            q += 1;
+            let s = &sess[hops[hi].s];
+            let t_end = end_of(s);
+            let outs: Vec<usize> = by_org.get(&s.d).map(|v| v.iter().copied().filter(|&j| sess[j].t >= s.t && sess[j].t <= t_end && !taken.contains(&j)).collect()).unwrap_or_default();
+            for j in outs {
+                let x = &sess[j];
+                if !(is_new_conn(x) || chain_accts.contains(&x.a)) {
+                    continue;
+                }
+                // sessions open on the pivot at that moment
+                let open = by_dst.get(&s.d).map(|v| v.iter().filter(|&&k| sess[k].t <= x.t && end_of(&sess[k]) >= x.t).count()).unwrap_or(1).max(1);
+                taken.insert(j);
+                chain_accts.insert(x.a);
+                let cause = format!("hop {}: {} entered {} as {}", hi + 1, ents.names.name(s.o), ents.names.name(s.d), c.accts.name(s.a));
+                hops.push(HopRec { s: j, depth: hops[hi].depth + 1, n_cand: open, cause });
+            }
+        }
+        // one level back: what was open on a seed machine when it first acted
+        let mut back: Vec<HopRec> = Vec::new();
+        for &m in &seed_m {
+            if let Some(first) = hops.iter().filter(|h| sess[h.s].o == m).map(|h| sess[h.s].t).min() {
+                let open: Vec<usize> = by_dst.get(&m).map(|v| v.iter().copied().filter(|&k| sess[k].t <= first && end_of(&sess[k]) >= first && !taken.contains(&k)).collect()).unwrap_or_default();
+                let n = open.len().max(1);
+                for k in open {
+                    taken.insert(k);
+                    back.push(HopRec { s: k, depth: 0, n_cand: n, cause: format!("open on {} when it first acted", ents.names.name(m)) });
+                }
+            }
+        }
+        let mut all: Vec<HopRec> = back;
+        all.extend(hops);
+        all.sort_by_key(|h| (sess[h.s].t, h.depth));
+        // group the sessions of one movement: same depth, origin, account,
+        // destination and cause (an automated fan-out opens several
+        // sessions per host)
+        struct Grp {
+            depth: i32,
+            o: u32,
+            d: u32,
+            a: u32,
+            day: i32,
+            cause: String,
+            n_cand: usize,
+            first: i64,
+            last: i64,
+            end: Option<i64>,
+            n: usize,
+        }
+        let mut groups: Vec<Grp> = Vec::new();
+        let mut gidx: HashMap<(i32, u32, u32, u32, String), usize> = HashMap::new();
+        for h in &all {
+            let s = &sess[h.s];
+            let key = (h.depth, s.o, s.d, s.a, h.cause.clone());
+            match gidx.get(&key) {
+                Some(&g) => {
+                    let gr = &mut groups[g];
+                    gr.last = gr.last.max(s.t);
+                    gr.end = match (gr.end, s.end) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        (None, y) => y,
+                        (x, None) => x,
+                    };
+                    gr.n += 1;
+                    gr.n_cand = gr.n_cand.max(h.n_cand);
+                }
+                None => {
+                    gidx.insert(key, groups.len());
+                    groups.push(Grp { depth: h.depth, o: s.o, d: s.d, a: s.a, day: s.day, cause: h.cause.clone(), n_cand: h.n_cand, first: s.t, last: s.t, end: s.end, n: 1 });
+                }
+            }
+        }
+        // machines of the chain and its time span
+        let mut machines: BTreeSet<u32> = seed_m.iter().copied().collect();
+        for h in &all {
+            machines.insert(sess[h.s].o);
+            machines.insert(sess[h.s].d);
+        }
+        let t_first = all.iter().map(|h| sess[h.s].t).min().unwrap_or(cutoff_ts);
+        let t_last = all.iter().map(|h| end_of(&sess[h.s]).max(sess[h.s].t)).max().unwrap_or(cutoff_ts);
+        // failed / pre-auth touches from chain machines in the window
+        let mut touch: BTreeMap<(u32, u32, u8), (u64, i64, i64)> = BTreeMap::new();
+        for e in evs.iter().filter(|e| !is_base(e.day) && (e.cls == FAIL || e.cls == PRE) && machines.contains(&e.o)) {
+            let x = touch.entry((e.o, e.d, e.cls)).or_insert((0, e.t, e.t));
+            x.0 += e.n;
+            x.1 = x.1.min(e.t);
+            x.2 = x.2.max(e.t);
+        }
+        let touches: Vec<String> = touch
+            .iter()
+            .map(|((o, d, cls), (n, a, b))| {
+                format!(
+                    "{} -> {}: {} {} {}",
+                    ents.names.name(*o),
+                    ents.names.name(*d),
+                    n,
+                    if *cls == FAIL { "failed attempt(s)" } else { "unauthenticated touch(es)" },
+                    if a == b { format!("at {}", ts_str(*a)) } else { format!("between {} and {}", ts_str(*a), ts_str(*b)) }
+                )
+            })
+            .collect();
+        let hop_rows: Vec<report::SeedHop> = groups
+            .iter()
+            .map(|g| {
+                let (p, sig, class) = match conn_of.get(&(g.o, g.d, g.a, g.day)) {
+                    Some(&i) if out[i].evaluable => (out[i].p, if out[i].q <= alpha { "significant".to_string() } else { "not significant".to_string() }, out[i].why.split("; ").next().unwrap_or("").to_string()),
+                    _ => (f64::NAN, String::new(), String::new()),
+                };
+                report::SeedHop {
+                    depth: g.depth,
+                    time: ts_str(g.first),
+                    last: ts_str(g.last),
+                    sessions: g.n,
+                    end: g.end.map(ts_str).unwrap_or_default(),
+                    origin: entity_label(&ents, g.o),
+                    account: c.accts.name(g.a).to_string(),
+                    dest: entity_label(&ents, g.d),
+                    certainty: 1.0 / g.n_cand as f64,
+                    n_cand: g.n_cand,
+                    cause: g.cause.clone(),
+                    p,
+                    significant: sig,
+                    class,
+                }
+            })
+            .collect();
+        // Cypher: the chain as a virtual graph (APOC) or as the real edges
+        // of each hop (Memgraph); and everything between the chain machines
+        let qs = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+        let cypher_chain = if dialect.apoc {
+            let items: Vec<String> = groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    format!(
+                        "{{h: {}, o: '{}', d: '{}', c: '{}', t: '{}', u: '{}', n: {}, e: '{}', k: '{}'}}",
+                        i + 1,
+                        qs(ents.names.name(g.o)),
+                        qs(ents.names.name(g.d)),
+                        qs(c.accts.name(g.a)),
+                        ts_str(g.first),
+                        ts_str(g.last),
+                        g.n,
+                        g.end.map(ts_str).unwrap_or_else(|| "?".into()),
+                        if g.n_cand <= 1 { "1".to_string() } else { format!("1/{}", g.n_cand) }
+                    )
+                })
+                .collect();
+            format!(
+                "WITH [{}] AS hops\nWITH hops, apoc.coll.toSet([x IN hops | x.o] + [x IN hops | x.d]) AS names\nWITH hops, apoc.map.fromLists(names, [x IN names | apoc.create.vNode(CASE WHEN x IN [{}] THEN ['seed'] ELSE ['host'] END, {{name: x}})]) AS node\nUNWIND hops AS x\nRETURN node[x.o], apoc.create.vRelationship(node[x.o], x.c, {{hop: x.h, first: x.t, last: x.u, sessions: x.n, end: x.e, certainty: x.k}}, node[x.d]) AS salto, node[x.d]",
+                items.join(",\n      "),
+                seed_m.iter().map(|m| format!("'{}'", qs(ents.names.name(*m)))).collect::<Vec<_>>().join(", ")
+            )
+        } else {
+            let conds: Vec<String> = groups
+                .iter()
+                .map(|g| {
+                    format!(
+                        "(a.name IN [{}] AND b.name IN [{}] AND type(r) = '{}' AND r.time >= {} AND r.time < {})",
+                        alias_list(g.o).iter().map(|x| format!("'{}'", qs(x))).collect::<Vec<_>>().join(", "),
+                        alias_list(g.d).iter().map(|x| format!("'{}'", qs(x))).collect::<Vec<_>>().join(", "),
+                        qs(c.accts.name(g.a)),
+                        dialect.t(ts_str(g.first - 1).trim_end_matches('Z')),
+                        dialect.t(ts_str(g.last + 1).trim_end_matches('Z'))
+                    )
+                })
+                .collect();
+            format!("MATCH (a:host)-[r]->(b:host) WHERE {} RETURN a, r, b", conds.join("\n   OR "))
+        };
+        let names: Vec<String> = machines.iter().flat_map(|m| alias_list(*m)).collect();
+        let cypher_all = super::browser_snippet_multi(dialect, &names, &names, None, &ts_str(t_first - 1), Some(&ts_str(t_last + 1)));
+        lines.push(format!(
+            "Seeds: {} matched, {} movement(s) ({} session(s)) reconstructed over {} machine(s)",
+            matched.len(),
+            groups.len(),
+            all.len(),
+            machines.len()
+        ));
+        Some(report::SeedRecon {
+            seeds: cfg.seeds.clone(),
+            matched,
+            unmatched,
+            hops: hop_rows,
+            touches,
+            machines: machines.iter().map(|m| entity_label(&ents, *m)).collect(),
+            first: ts_str(t_first),
+            last: ts_str(t_last),
+            cypher_chain,
+            cypher_all,
+            rule: "A hop is followed from a machine while the session that entered it is open (until its LOGOFF, or the end of the UTC day when none was recorded); only logins that are new connections or that use an account the chain already used are followed, and the certainty is 1 over the sessions open on the machine at that moment.".to_string(),
+        })
+    };
+    (out, lines, alpha, stories, seed_recon)
 }
 
 fn nan_last(x: f64) -> f64 {
@@ -1808,7 +2119,8 @@ mod tests {
     }
     /// Build a corpus from (day, hour, origin, destination, account, event_type) rows.
     fn corpus(rows: &[(i32, i64, &str, &str, &str, &str)]) -> Corpus {
-        let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+        let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+        c.lids.id("");
         for (day, hour, o, d, a, et) in rows {
             let eid = if *et == "CONNECT" { "SSH_PREAUTH" } else { "" };
             let cls = class_of(et, eid, a);
@@ -1823,6 +2135,8 @@ mod tests {
                 lt: c.lts.id("SSH"),
                 cov: (true, true),
                 n: 1,
+                lid: 0,
+                logoff: *et == "LOGOFF",
             });
         }
         c
@@ -1849,8 +2163,16 @@ mod tests {
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new() };
-        let (out, _lines, _alpha, stories) = analyse(&c, &super::super::NEO4J, &cfg);
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a".into()] };
+        let (out, _lines, _alpha, stories, seed) = analyse(&c, &super::super::NEO4J, &cfg);
+        // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
+        // connection, one session open on B: certainty 1)
+        let r = seed.expect("seed reconstruction");
+        assert_eq!(r.matched, vec!["a".to_string()]);
+        assert_eq!(r.hops.len(), 2, "{:?}", r.hops.iter().map(|h| (h.depth, h.origin.clone(), h.dest.clone())).collect::<Vec<_>>());
+        assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "A", "B"));
+        assert_eq!((r.hops[1].depth, r.hops[1].origin.as_str(), r.hops[1].dest.as_str(), r.hops[1].n_cand), (2, "B", "C", 1));
+        assert!(r.cypher_chain.contains("apoc.create.vRelationship"));
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.evaluable);
         assert!(bc.why.starts_with("credential switch with new access"), "{}", bc.why);

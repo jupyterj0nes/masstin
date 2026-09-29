@@ -96,7 +96,118 @@ fn hm(ts: &str) -> &str {
     ts.get(11..19).unwrap_or(ts)
 }
 
+/// One hop of the seed reconstruction.
+pub struct SeedHop {
+    /// 0 = a session that entered a seed machine before it acted; 1 = a
+    /// login by a seed; 2, 3, ... = the chain onward
+    pub depth: i32,
+    /// first and last login of the group (same origin, account,
+    /// destination, depth and cause), and how many sessions it holds
+    pub time: String,
+    pub last: String,
+    pub sessions: usize,
+    /// end of the last session, empty when no LOGOFF was recorded (the
+    /// day's end is assumed)
+    pub end: String,
+    pub origin: String,
+    pub account: String,
+    pub dest: String,
+    /// 1 / number of sessions open on the origin when this login happened
+    pub certainty: f64,
+    pub n_cand: usize,
+    /// the hop this one follows from ("seed", or "hop 3: ...")
+    pub cause: String,
+    /// p-value of the connection in the hunt, NaN when not evaluated
+    pub p: f64,
+    pub significant: String,
+    /// class of the connection in the hunt
+    pub class: String,
+}
+
+pub struct SeedRecon {
+    pub seeds: Vec<String>,
+    pub matched: Vec<String>,
+    pub unmatched: Vec<String>,
+    pub hops: Vec<SeedHop>,
+    /// failed attempts and unauthenticated touches from chain machines
+    pub touches: Vec<String>,
+    pub machines: Vec<String>,
+    pub first: String,
+    pub last: String,
+    pub cypher_chain: String,
+    pub cypher_all: String,
+    /// why hops are followed (stated once)
+    pub rule: String,
+}
+
+pub fn render_seed(r: &SeedRecon) -> String {
+    let mut s = String::new();
+    s.push_str("## Reconstruction from seeds\n\n");
+    s.push_str(&format!("Seeds: {}.", r.seeds.join(", ")));
+    if !r.matched.is_empty() {
+        s.push_str(&format!(" Matched: {}.", r.matched.join(", ")));
+    }
+    if !r.unmatched.is_empty() {
+        s.push_str(&format!(" Not found in the graph: {}.", r.unmatched.join(", ")));
+    }
+    s.push_str("\n\n");
+    if r.hops.is_empty() {
+        s.push_str("No login by the seeds in the window.\n\n");
+        return s;
+    }
+    s.push_str(&format!(
+        "{} hop(s) over {} machine(s), from {} to {} UTC. {}\n\n",
+        r.hops.len(),
+        r.machines.len(),
+        r.first,
+        r.last,
+        r.rule
+    ));
+    s.push_str("| # | depth | first login (UTC) | last login | sessions | last session end | origin | account | destination | certainty | follows | hunt |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for (i, h) in r.hops.iter().enumerate() {
+        let cert = if h.n_cand <= 1 { "1".to_string() } else { format!("1/{}", h.n_cand) };
+        let hunt = if h.p.is_nan() {
+            "not evaluated".to_string()
+        } else {
+            format!("p = {}, {}; {}", p_str(h.p), h.significant, h.class)
+        };
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            i + 1,
+            h.depth,
+            h.time,
+            if h.last == h.time { "same".to_string() } else { h.last.clone() },
+            h.sessions,
+            if h.end.is_empty() { "unknown" } else { h.end.as_str() },
+            h.origin,
+            h.account,
+            h.dest,
+            cert,
+            h.cause,
+            hunt
+        ));
+    }
+    s.push('\n');
+    if !r.touches.is_empty() {
+        s.push_str("**Failed attempts and unauthenticated touches from the chain machines in the window.**\n\n");
+        for t in &r.touches {
+            s.push_str(&format!("- {}\n", t));
+        }
+        s.push('\n');
+    }
+    s.push_str("**Draw the chain** (exactly these hops, as a virtual graph):\n\n```cypher\n");
+    s.push_str(&r.cypher_chain);
+    s.push_str("\n```\n\n**Everything between the chain machines in that time span** (real edges, for verification):\n\n```cypher\n");
+    s.push_str(&r.cypher_all);
+    s.push_str("\n```\n\n");
+    s
+}
+
 pub fn render(h: &Header, stories: &[OriginStory]) -> String {
+    render_with_seed(h, stories, None)
+}
+
+pub fn render_with_seed(h: &Header, stories: &[OriginStory], seed: Option<&SeedRecon>) -> String {
     let mut s = String::new();
     s.push_str("# graph-hunt report\n\n");
     s.push_str(&format!(
@@ -110,6 +221,9 @@ pub fn render(h: &Header, stories: &[OriginStory]) -> String {
         "\n{} connections in the window: {} significant, {} not evaluated (destination without comparable coverage). {} origin(s) have at least one significant connection and are described below, most unusual first.\n\n",
         h.n_rows, h.n_sig, h.n_not_eval, h.n_origins_sig
     ));
+    if let Some(r) = seed {
+        s.push_str(&render_seed(r));
+    }
     s.push_str("## How to read this\n\n");
     s.push_str("A connection is one origin logging in (or failing, or connecting without authenticating) to one destination with one account on one day. A connection that already happened on another baseline day is habitual and is never reported. A new connection is compared with the new connections of the baseline days: the p-value is the share of baseline connections at least as unusual, and q is the p-value adjusted so that, among everything marked significant, the expected share of false alarms is alpha. Every statement below carries the baseline count it rests on.\n\n");
     s.push_str("Classes follow Hopper (Ho et al., USENIX Security 2021), which found that lateral movement almost always combines a **credential switch** (an account that belongs to other origins, used from one that never used it) with a **new access** (a destination that origin or account never reached). Origins with that signature come first. Origins that reach new destinations with their habitual credential (scanners, orchestration, administrators on their own account) are still measured and listed, but after them.\n\n");
@@ -231,7 +345,7 @@ pub fn render(h: &Header, stories: &[OriginStory]) -> String {
     s
 }
 
-pub fn write(path: &str, h: &Header, stories: &[OriginStory]) -> std::io::Result<()> {
-    let text = render(h, stories);
+pub fn write(path: &str, h: &Header, stories: &[OriginStory], seed: Option<&SeedRecon>) -> std::io::Result<()> {
+    let text = render_with_seed(h, stories, seed);
     std::fs::File::create(path)?.write_all(text.as_bytes())
 }
