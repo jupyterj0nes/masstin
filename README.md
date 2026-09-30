@@ -686,7 +686,7 @@ One row per connection, most unusual first:
 
 **Corroboration with Sigma tools.** Add `--sigma hayabusa.jsonl,chainsaw/` (Hayabusa or Chainsaw JSON output). A rule that fired on a machine while a login session was open on it becomes one more measured signal of that connection, and the explanation says which rule, when and at what level: "Sigma: 2 rule(s) fired on SRV01 while the session was open: 'PsExec Service Installation' at 15:36:02 (high), ...". masstin does not detect PsExec, WMI or service installs itself; it joins what those tools found to the login that made it possible.
 
-**Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, and a Browser query to check everything. The CSV is unchanged.
+**Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, what legitimate situation produces the same pattern and how to rule it out, which raw events to pull, and a Browser query to check everything. The CSV is unchanged.
 
 #### Detection quality
 
