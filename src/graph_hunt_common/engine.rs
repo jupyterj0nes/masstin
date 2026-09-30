@@ -495,7 +495,13 @@ struct Conn {
     result: &'static str,
     events: u64,
     logs: String,
+    /// Hopper class of the connection (`signature` column)
+    class: String,
     why: String,
+    /// every reason with the baseline count behind it (`evidence` column)
+    evidence: String,
+    /// position in the seed reconstruction ("hop 3 depth 1"), else empty
+    chain: String,
     campaign: String,
     cypher: String,
     evaluable: bool,
@@ -1476,9 +1482,11 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
     for (i, tt) in tested.iter().enumerate() {
         let t = tt.t;
         let od = origin_days.get(&(t.day, t.o)).unwrap_or(&empty_od);
-        let mut why: Vec<String> = Vec::new();
-        // "(shared by N of M baseline logins)" for a yes/no fact, "(matched or
-        // exceeded by N of M baseline logins)" for a count: N baseline
+        // each reason is (what happened, the baseline count behind it):
+        // `why_unusual` lists the first parts, `evidence` the pairs
+        let mut why: Vec<(String, String)> = Vec::new();
+        // "shared by N of M baseline logins" for a yes/no fact, "matched or
+        // exceeded by N of M baseline logins" for a count: N baseline
         // connections of the same result were at least as extreme
         let nd = null_days.len();
         let shared = |k: usize| format!("shared by {} of {} {}, on {} of {} days", tt.marg[k].0, tt.n_null, class_name(t.cls), tt.marg[k].2, nd);
@@ -1505,70 +1513,71 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         } else {
             (2, "no credential")
         };
-        why.push(class.to_string());
         if x[4] > 0.0 {
-            why.push(format!("origin never seen before ({})", shared(4)));
+            why.push(("origin never seen before".into(), shared(4)));
         } else {
             if x[2] > 0.0 {
-                why.push(format!("origin never connected to this destination before ({})", shared(2)));
+                why.push(("origin never connected to this destination before".into(), shared(2)));
             }
             if x[3] > 0.0 {
-                why.push(format!("account never used by this origin before ({})", shared(3)));
+                why.push(("account never used by this origin before".into(), shared(3)));
             }
         }
         if x[1] > 0.0 {
-            why.push(format!("account never logged in to this destination before ({})", shared(1)));
+            why.push(("account never logged in to this destination before".into(), shared(1)));
         }
         if x[0] > 0.0 && x[1] == 0.0 && x[2] == 0.0 && x[3] == 0.0 && x[4] == 0.0 {
-            why.push(format!("this origin/account/destination combination never seen, each part known ({})", shared(0)));
+            why.push(("this origin/account/destination combination never seen, each part known".into(), shared(0)));
         }
         if x[5] > 0.0 {
-            why.push(format!("that day the origin reached {} destination(s) for the first time ({})", x[5], matched(5)));
+            why.push((format!("that day the origin reached {} destination(s) for the first time", x[5]), matched(5)));
         }
         if x[6] > 0.0 {
-            why.push(format!("that day the origin used {} account(s) new to it ({})", x[6], matched(6)));
+            why.push((format!("that day the origin used {} account(s) new to it", x[6]), matched(6)));
         }
         if x[7] > 0.0 {
-            why.push(format!("that day the origin failed to log in on {} destination(s) ({})", x[7], matched(7)));
+            why.push((format!("that day the origin failed to log in on {} destination(s)", x[7]), matched(7)));
         }
         if x[8] > 0.0 {
-            why.push(format!("that day the origin touched {} destination(s) without authenticating ({})", x[8], matched(8)));
+            why.push((format!("that day the origin touched {} destination(s) without authenticating", x[8]), matched(8)));
         }
         if x[9] > 0.0 {
-            why.push(format!("that day the origin had {} refused named attempt(s) before logging in with an account new to it ({})", x[9], matched(9)));
+            why.push((format!("that day the origin had {} refused named attempt(s) before logging in with an account new to it", x[9]), matched(9)));
         }
         if x[10] > 0.0 {
-            why.push(format!("destination outside the origin's usual group of hosts (Louvain community; {})", shared(10)));
+            why.push(("destination outside the origin's usual group of hosts (Louvain community)".into(), shared(10)));
         }
         if x[11] > 0.0 {
             let lt = od.lt_surprise.iter().filter(|(d, _, _)| *d == t.d).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| c.lts.name(x.2)).unwrap_or("");
-            why.push(format!("logon type {} is rare on this destination ({})", lt, matched(11)));
+            why.push((format!("logon type {} is rare on this destination", lt), matched(11)));
         }
         if x[12] > 0.0 {
             if let Some(p) = od.paths.iter().filter(|p| p.c_node == t.d && p.a2 == t.a).max_by(|a, b| a.cert.partial_cmp(&b.cert).unwrap()) {
-                why.push(format!(
-                    "causal path: {} had been entered from {} as {} at {} ({} s earlier); it went on to {} as {}, and {} had never logged in there (1 of {} candidate cause(s); {})",
-                    ents.names.name(t.o),
-                    ents.names.name(p.a_node),
-                    c.accts.name(p.a1),
-                    ts_str(p.t1),
-                    p.t2 - p.t1,
-                    ents.names.name(t.d),
-                    c.accts.name(p.a2),
-                    c.accts.name(p.a1),
-                    p.n_cand,
-                    matched(12)
+                why.push((
+                    format!(
+                        "causal path: {} had been entered from {} as {} at {} ({} s earlier); it went on to {} as {}, and {} had never logged in there (1 of {} candidate cause(s))",
+                        ents.names.name(t.o),
+                        ents.names.name(p.a_node),
+                        c.accts.name(p.a1),
+                        ts_str(p.t1),
+                        p.t2 - p.t1,
+                        ents.names.name(t.d),
+                        c.accts.name(p.a2),
+                        c.accts.name(p.a1),
+                        p.n_cand
+                    ),
+                    matched(12),
                 ));
             }
         }
         if x[15] > 0.0 {
-            why.push(format!("that day the origin made {} login(s) with a credential switch to a new access ({})", x[15], matched(15)));
+            why.push((format!("that day the origin made {} login(s) with a credential switch to a new access", x[15]), matched(15)));
         }
         if x[13] > 0.0 {
-            why.push(format!("the destination's PageRank rose that day (+{:.3}; {})", x[13], matched(13)));
+            why.push((format!("the destination's PageRank rose that day (+{:.3})", x[13]), matched(13)));
         }
         if x[14] > 0.0 {
-            why.push(format!("the destination's betweenness rose that day (+{:.5}; {})", x[14], matched(14)));
+            why.push((format!("the destination's betweenness rose that day (+{:.5})", x[14]), matched(14)));
         }
         if x[16] > 0.0 {
             let idx = hits_in(t.d, t.t0, t.t_end);
@@ -1580,21 +1589,25 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
                     examples.push(format!("'{}' at {}{}", h.title, ts_str(h.t), if h.level.is_empty() { String::new() } else { format!(" ({})", h.level) }));
                 }
             }
-            why.push(format!(
-                "Sigma: {} rule(s) fired on {} while the session was open ({}): {}{}",
-                x[16],
-                ents.names.name(t.d),
+            why.push((
+                format!(
+                    "Sigma: {} rule(s) fired on {} while the session was open: {}{}",
+                    x[16],
+                    ents.names.name(t.d),
+                    examples.join(", "),
+                    if seen.len() > examples.len() { format!(" and {} more", seen.len() - examples.len()) } else { String::new() }
+                ),
                 matched(16),
-                examples.join(", "),
-                if seen.len() > examples.len() { format!(" and {} more", seen.len() - examples.len()) } else { String::new() }
             ));
         }
         if tt.off_panel {
-            why.push("destination without continuous coverage: judged by the origin's novelty only".into());
+            why.push(("destination without continuous coverage: judged by the origin's novelty only".into(), String::new()));
         }
-        if why.len() == 1 && group == 3 {
-            why.push("nothing new: a connection like the usual ones".into());
+        if why.is_empty() && group == 3 {
+            why.push(("nothing new: a connection like the usual ones".into(), String::new()));
         }
+        let why_text = why.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>().join("; ");
+        let evidence = why.iter().filter(|(_, e)| !e.is_empty()).map(|(w, e)| format!("{}: {}", w, e)).collect::<Vec<_>>().join("; ");
         let acct = c.accts.name(t.a);
         out.push(Conn {
             p: tt.p,
@@ -1609,7 +1622,10 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
             result: result_name(t.cls),
             events: t.n,
             logs: fam_list(t.fams),
-            why: why.join("; "),
+            class: class.to_string(),
+            why: why_text,
+            evidence,
+            chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
             cypher: super::browser_snippet_multi(
                 dialect,
@@ -1643,11 +1659,14 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
             result: result_name(t.cls),
             events: t.n,
             logs: fam_list(t.fams),
+            class: "not evaluated".to_string(),
             why: format!(
                 "not evaluated: the destination has {} covered baseline day(s) and no continuous coverage from {} to the cutoff, so nothing there can be judged new or habitual",
                 k,
                 day_str(s_day)
             ),
+            evidence: String::new(),
+            chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
             cypher: super::browser_snippet_multi(
                 dialect,
@@ -1713,7 +1732,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         let sig_rows: Vec<&Conn> = rows.iter().copied().filter(|cn| is_sig(cn)).collect();
         let best_p = sig_rows.iter().map(|cn| cn.p).fold(f64::INFINITY, f64::min);
         let best_q = sig_rows.iter().map(|cn| cn.q).fold(f64::INFINITY, f64::min);
-        let class = sig_rows[0].why.split("; ").next().unwrap_or("").to_string();
+        let class = sig_rows[0].class.clone();
         // phases: (day, result) in time order
         let mut ph: BTreeMap<(i32, String), Vec<&Conn>> = BTreeMap::new();
         for cn in &rows {
@@ -1756,7 +1775,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         for d in &days {
             let mut clauses: Vec<String> = Vec::new();
             for cn in rows.iter().filter(|cn| cn.day == *d && cn.evaluable) {
-                for cl in cn.why.split("; ") {
+                for cl in cn.evidence.split("; ") {
                     if (cl.starts_with("that day") || cl.starts_with("origin never seen before") || cl.starts_with("Sigma:")) && !clauses.iter().any(|x| x == cl) {
                         clauses.push(cl.to_string());
                     }
@@ -1829,6 +1848,7 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
     // LOGOFF when one was recorded, else at the end of the UTC day. One
     // level backward is given too: the sessions open on a seed machine
     // when it made its first hop.
+    let mut chain_set: Vec<(usize, String)> = Vec::new();
     let seed_recon: Option<report::SeedRecon> = if cfg.seeds.is_empty() {
         None
     } else {
@@ -2068,11 +2088,16 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
                 )
             })
             .collect();
+        for (i, g) in groups.iter().enumerate() {
+            if let Some(&idx) = conn_of.get(&(g.o, g.d, g.a, g.day)) {
+                chain_set.push((idx, format!("hop {} depth {}", i + 1, g.depth)));
+            }
+        }
         let hop_rows: Vec<report::SeedHop> = groups
             .iter()
             .map(|g| {
                 let (p, sig, class) = match conn_of.get(&(g.o, g.d, g.a, g.day)) {
-                    Some(&i) if out[i].evaluable => (out[i].p, if out[i].q <= alpha { "significant".to_string() } else { "not significant".to_string() }, out[i].why.split("; ").next().unwrap_or("").to_string()),
+                    Some(&i) if out[i].evaluable => (out[i].p, if out[i].q <= alpha { "significant".to_string() } else { "not significant".to_string() }, out[i].class.clone()),
                     _ => (f64::NAN, String::new(), String::new()),
                 };
                 report::SeedHop {
@@ -2160,6 +2185,9 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
             rule: "A seed that existed in the baseline starts the chain only with its new connections; a never-seen seed with everything it did. A hop is followed from a machine while the session that entered it is open (until its LOGOFF, or the end of the UTC day when none was recorded); only logins that are new connections or that use an account the chain already used are followed, and the certainty is 1 over the sessions open on the machine at that moment.".to_string(),
         })
     };
+    for (i, s) in chain_set {
+        out[i].chain = s;
+    }
     (out, lines, alpha, stories, seed_recon)
 }
 
@@ -2189,7 +2217,7 @@ fn csv_escape(s: &str) -> String {
 
 fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result<()> {
     let mut buf = String::from(
-        "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,why_unusual,campaign,cypher_snippet
+        "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,signature,why_unusual,evidence,chain,campaign,cypher_snippet
 ",
     );
     for (k, r) in rows.iter().enumerate() {
@@ -2201,7 +2229,7 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result
             "no"
         };
         buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
 ",
             k + 1,
             sig,
@@ -2216,7 +2244,10 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result
             r.result,
             r.events,
             csv_escape(&r.logs),
+            csv_escape(&r.class),
             csv_escape(&r.why),
+            csv_escape(&r.evidence),
+            csv_escape(&r.chain),
             csv_escape(&r.campaign),
             csv_escape(&r.cypher),
         ));
@@ -2357,12 +2388,13 @@ mod tests {
 
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.evaluable);
-        assert!(bc.why.starts_with("credential switch with new access"), "{}", bc.why);
+        assert_eq!(bc.class, "credential switch with new access");
         assert!(bc.why.contains("causal path: B had been entered from A as A1"), "{}", bc.why);
-        assert!(bc.why.contains("went on to C as A2, and A1 had never logged in there (1 of 1 candidate cause(s)"), "{}", bc.why);
+        assert!(bc.why.contains("went on to C as A2, and A1 had never logged in there (1 of 1 candidate cause(s))"), "{}", bc.why);
+        assert!(bc.evidence.contains("origin never connected to this destination before: shared by"), "{}", bc.evidence);
         // the habitual A -> B login on day 21 is not new
         let ab = out.iter().find(|r| r.origin == "A" && r.dest == "B" && r.day == 21).expect("A -> B row");
-        assert!(ab.why.starts_with("habitual connection"), "{}", ab.why);
+        assert_eq!(ab.class, "habitual connection");
         // B -> C is the only new connection of the window and beats the 19
         // new baseline connections that count (Zk -> B on days 2..=20; day 1
         // has no prior coverage): p = 1/20, significant alone
@@ -2405,6 +2437,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.why.contains("Sigma: 1 rule(s) fired on C while the session was open"), "{}", bc.why);
+        assert!(bc.evidence.contains("Sigma: 1 rule(s) fired on C while the session was open: 'PsExec Service Installation' at 1970-01-22T11:30:00Z (high): matched or exceeded by"), "{}", bc.evidence);
         assert!(bc.why.contains("'PsExec Service Installation' at 1970-01-22T11:30:00Z (high)"), "{}", bc.why);
         assert!(!bc.why.contains("Something later"), "{}", bc.why);
     }
