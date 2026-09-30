@@ -100,7 +100,8 @@ constant is involved. They enter the engine in two ways:
    switch to a known destination; habitual credential on a new connection,
    or no credential (failures, pre-auth); habitual connection.
 
-   The class is the first clause of `why_unusual`. On the test case it
+   The class is the `signature` column of the CSV (and the first clause of
+   `why_unusual` in versions before 2026-09-30). On the test case it
    separates the attacker (every one of its logins in the first class) from
    the vulnerability scanner, the orchestration account and the
    administrators on their own accounts, all of which reach new destinations

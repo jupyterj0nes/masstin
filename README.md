@@ -671,11 +671,14 @@ The full design, with the reasons behind each choice, is in [docs/graph-hunt-sta
 
 One row per connection, most unusual first:
 
-`rank, significant, p_value, q_value, day, first_seen_utc, last_seen_utc, origin, destination, account, result, events, logs, why_unusual, campaign, cypher_snippet`
+`rank, significant, p_value, q_value, day, first_seen_utc, last_seen_utc, origin, destination, account, result, events, logs, signature, why_unusual, evidence, chain, campaign, cypher_snippet`
 
 - `result`: login OK, login FAILED, or connection without authentication (SSH pre-auth).
 - `logs`: the log families that recorded it (secure, wtmp, audit, btmp, journal, evtx...).
-- `why_unusual`: the class first ("credential switch with new access"), then what is new about the connection and its context, each with the baseline count behind it ("account never used by this origin before (15 of 10519 baseline successful logins)").
+- `signature`: the Hopper class ("credential switch with new access", "account unknown to the network", "habitual credential on a new connection", "no credential", "habitual connection"), one value per row, made to filter on.
+- `why_unusual`: what is new about the connection and its context, in short phrases without numbers ("origin never seen before; that day the origin reached 29 destination(s) for the first time").
+- `evidence`: the same reasons with the baseline count behind each one ("origin never seen before: shared by 56 of 1280 new baseline logins, on 19 of 28 days; ...").
+- `chain`: with `--seed`, the connection's place in the reconstruction ("hop 3 depth 1"); empty otherwise.
 - `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage and the origin has a history.
 - On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
 
