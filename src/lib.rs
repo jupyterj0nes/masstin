@@ -345,6 +345,9 @@ enum ActionType {
     /// Hunt lateral movement anomalies on a graph already loaded into Neo4j. Sister action to `graph-hunt` (which targets Memgraph MAGE); runs the same 7 detectors but calls the Neo4j Graph Data Science (GDS) library instead of MAGE for PageRank, Louvain, and betweenness. Requires the GDS plugin installed in Neo4j and `--user`. Password is read from $NEO4J_PASSWORD or prompted interactively.
     #[value(alias = "graph-hunt-neo4j")]
     GraphHuntNeo4j,
+    /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.
+    #[value(alias = "graph-hunt-csv")]
+    GraphHuntCsv,
 }
 
 // -----------------------------------------------------------------------------
@@ -559,6 +562,22 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             )
             .await;
         }
+        ActionType::GraphHuntCsv => {
+            crate::graph_hunt::graph_hunt_csv(
+                &config.file,
+                config.investigation_from.as_ref().unwrap(),
+                config.skip_detectors.as_deref(),
+                config.only_detectors.as_deref(),
+                config.alpha,
+                config.end_time.as_deref(),
+                config.output.as_deref(),
+                config.report.as_deref(),
+                config.seed.as_deref(),
+                config.seed_from.as_deref(),
+                config.seed_to.as_deref(),
+                config.sigma.as_deref(),
+            );
+        }
         ActionType::GraphHuntNeo4j => {
             let default_user = String::from("neo4j");
             crate::graph_hunt_neo4j::graph_hunt_neo4j(
@@ -745,6 +764,23 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             if config.investigation_from.is_none() {
                 return Err(String::from(
                     "For graph-hunt you must specify --investigation-from \"YYYY-MM-DD HH:MM:SS\".",
+                ));
+            }
+            if config.skip_detectors.is_some() && config.only_detectors.is_some() {
+                return Err(String::from(
+                    "--skip-detectors and --only-detectors are mutually exclusive.",
+                ));
+            }
+        }
+        ActionType::GraphHuntCsv => {
+            if config.file.is_empty() {
+                return Err(String::from(
+                    "For graph-hunt-csv you must specify at least one timeline CSV with -f.",
+                ));
+            }
+            if config.investigation_from.is_none() {
+                return Err(String::from(
+                    "For graph-hunt-csv you must specify --investigation-from \"YYYY-MM-DD HH:MM:SS\".",
                 ));
             }
             if config.skip_detectors.is_some() && config.only_detectors.is_some() {

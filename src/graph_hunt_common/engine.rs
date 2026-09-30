@@ -243,6 +243,214 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
     Ok(c)
 }
 
+// ───────────────────────────── CSV corpus ───────────────────────────────────
+
+/// Split one CSV line, honouring double quotes ("" inside a quoted field
+/// is a quote). Quoted empty fields come back empty.
+pub(crate) fn split_csv(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut inq = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if inq => {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    inq = false;
+                }
+            }
+            '"' => inq = true,
+            ',' if !inq => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+const CSV_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
+
+fn account_type(user: &str) -> String {
+    let stripped = user.split('@').next().unwrap_or(user);
+    let mut s: String = stripped.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        s = format!("u{}", s);
+    }
+    if s.is_empty() {
+        s = "NO_USER".to_string();
+    }
+    s.to_uppercase()
+}
+
+/// Build the corpus from masstin timeline CSVs (14-column layout). Two
+/// passes: the first finds short host names shared by different FQDNs and
+/// the log-file spans of every destination, the second builds the rows;
+/// pre-auth touches and unnamed failures are aggregated per day as the
+/// graph pull does.
+fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
+    use std::io::BufRead;
+    let local: HashSet<&str> = ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "-", "", " "].into_iter().collect();
+    let is_local = |v: &str| local.contains(v);
+    let mut notes = Vec::new();
+    // pass 1: FQDN ambiguity and coverage spans per (destination, family)
+    let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut span: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    let mut bad_header: Vec<String> = Vec::new();
+    for f in files {
+        let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+        let mut lines = rd.lines();
+        let header = lines.next().transpose()?.unwrap_or_default();
+        if header.trim_end_matches(['\r', '\n']) != CSV_HEADER {
+            bad_header.push(f.clone());
+            continue;
+        }
+        for line in lines {
+            let line = line?;
+            let p = split_csv(&line);
+            if p.len() < 14 {
+                continue;
+            }
+            for col in [1usize, 7, 8] {
+                let v = p[col].to_uppercase();
+                if v.contains('.') && !looks_like_ip(&v) {
+                    if let Some(short) = v.split('.').next() {
+                        fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
+                    }
+                }
+            }
+            if let Some(t) = parse_ts(&p[0]) {
+                // one span per log FILE (a missing rotation is a gap), as
+                // the loader records them
+                let t = t.and_utc().timestamp();
+                let e = span.entry((p[1].to_uppercase(), p[13].clone())).or_insert((t, t));
+                e.0 = e.0.min(t);
+                e.1 = e.1.max(t);
+            }
+        }
+    }
+    if !bad_header.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not a masstin 14-column timeline: {}", bad_header.join(", "))));
+    }
+    let ambiguous: HashSet<String> = fqdn_by_short.into_iter().filter(|(_, s)| s.len() > 1).map(|(k, _)| k).collect();
+    let short = |v: &str| -> String {
+        let u = v.to_uppercase();
+        if u.contains('.') && !looks_like_ip(&u) {
+            let s = u.split('.').next().unwrap_or("");
+            if !s.is_empty() && !ambiguous.contains(s) {
+                return s.to_string();
+            }
+        }
+        u
+    };
+    // pass 2: rows
+    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    c.lids.id("");
+    let mut agg: HashMap<(u32, u32, u32, u32, u32, i32), (u64, i64)> = HashMap::new();
+    let mut dropped = 0usize;
+    let mut total = 0usize;
+    for f in files {
+        let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+        for line in rd.lines().skip(1) {
+            let line = line?;
+            let p = split_csv(&line);
+            if p.len() < 14 {
+                continue;
+            }
+            total += 1;
+            let t = match parse_ts(&p[0]) {
+                Some(x) => x.and_utc().timestamp(),
+                None => {
+                    c.bad_ts += 1;
+                    continue;
+                }
+            };
+            let sc = p[7].trim();
+            let si = p[8].trim();
+            let origin = if !is_local(sc) && !(looks_like_ip(sc) && sc == si) {
+                short(sc)
+            } else if !is_local(si) {
+                short(si)
+            } else {
+                dropped += 1;
+                continue;
+            };
+            let dest = short(p[1].trim());
+            if dest.is_empty() || origin.eq_ignore_ascii_case(&dest) {
+                dropped += 1;
+                continue;
+            }
+            let acct = account_type(p[5].trim());
+            let et = p[2].trim();
+            let eid = p[3].trim();
+            let fam = crate::load_neo4j::log_source_family(&p[13]);
+            let cls = class_of(et, eid, &acct);
+            let o = c.nodes.id(&origin);
+            let d = c.nodes.id(&dest);
+            let a = c.accts.id(&acct);
+            let eti = c.ets.id(et);
+            let fi = c.fams.id(fam);
+            // pre-auth touches and unnamed failures: one row per day
+            if cls == PRE || (cls == FAIL && is_no_account(&acct)) {
+                let key = (o, d, a, eti, fi, day_of(t));
+                let e = agg.entry(key).or_insert((0, t));
+                e.0 += 1;
+                e.1 = e.1.min(t);
+                continue;
+            }
+            c.rows.push(RawRow {
+                t,
+                fam: fi,
+                o,
+                d,
+                a,
+                et: eti,
+                cls,
+                lt: c.lts.id(p[4].trim()),
+                cov: super::coverage_kinds(fam),
+                n: 1,
+                lid: c.lids.id(p[11].trim()),
+                logoff: et == "LOGOFF",
+            });
+        }
+    }
+    for ((o, d, a, eti, fi, _day), (n, t0)) in agg {
+        let et = c.ets.name(eti).to_string();
+        let acct = c.accts.name(a).to_string();
+        let fam = c.fams.name(fi).to_string();
+        let eid = if et == "CONNECT" { "SSH_PREAUTH" } else { "" };
+        c.rows.push(RawRow { t: t0, fam: fi, o, d, a, et: eti, cls: class_of(&et, eid, &acct), lt: c.lts.id(""), cov: super::coverage_kinds(&fam), n, lid: 0, logoff: false });
+    }
+    // coverage spans per destination node, by kind
+    let mut by_node: HashMap<String, (Vec<(i64, i64)>, Vec<(i64, i64)>)> = HashMap::new();
+    for ((dst, file), (lo, hi)) in span {
+        let name = short(&dst);
+        let (ok, fail) = super::coverage_kinds(crate::load_neo4j::log_source_family(&file));
+        let e = by_node.entry(name).or_default();
+        if ok {
+            e.0.push((lo, hi));
+        }
+        if fail {
+            e.1.push((lo, hi));
+        }
+    }
+    for (name, (ok, fail)) in by_node {
+        c.cov.insert(name, (super::merge_spans(ok), super::merge_spans(fail)));
+    }
+    notes.push(format!(
+        "{} CSV row(s): {} dropped (no usable source, or origin = destination), {} with an unparseable time; {} short name(s) shared by different FQDNs kept fully qualified",
+        total,
+        dropped,
+        c.bad_ts,
+        ambiguous.len()
+    ));
+    Ok((c, notes))
+}
+
 // ───────────────────────────── reference ────────────────────────────────────
 //
 // Leave-one-day-out. On a baseline day D a fact is "new" when it occurs on
@@ -536,6 +744,38 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
         corpus.accts.names.len(),
         clock.elapsed().as_secs_f64()
     ));
+    run_with(corpus, dialect, cfg, output, report_path, clock);
+}
+
+/// The hunt straight from masstin timeline CSVs, no graph database: the
+/// rows become the same corpus the graph pull produces, with the loader's
+/// conventions (short upper-case host names unless two FQDNs share one,
+/// local sources dropped, accounts as relationship types, log-file
+/// coverage spans per destination).
+pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>) {
+    let clock = std::time::Instant::now();
+    crate::banner::print_phase("3", "4", "Reading the timeline CSV...");
+    let (corpus, notes) = match corpus_from_csv(files) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("Masstin - Error: reading the CSV failed: {}", e);
+            return;
+        }
+    };
+    for n in &notes {
+        crate::banner::print_phase_detail("", n);
+    }
+    crate::banner::print_phase_result(&format!(
+        "{} edge rows, {} nodes, {} accounts ({:.1}s)",
+        corpus.rows.len(),
+        corpus.nodes.names.len(),
+        corpus.accts.names.len(),
+        clock.elapsed().as_secs_f64()
+    ));
+    run_with(corpus, dialect, cfg, output, report_path, clock);
+}
+
+fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, clock: std::time::Instant) {
     if corpus.bad_ts > 0 {
         crate::banner::print_phase_detail("Warning:", &format!("{} edge row(s) with an unparseable time ignored", corpus.bad_ts));
     }
@@ -2440,6 +2680,17 @@ mod tests {
         assert!(bc.evidence.contains("Sigma: 1 rule(s) fired on C while the session was open: 'PsExec Service Installation' at 1970-01-22T11:30:00Z (high): matched or exceeded by"), "{}", bc.evidence);
         assert!(bc.why.contains("'PsExec Service Installation' at 1970-01-22T11:30:00Z (high)"), "{}", bc.why);
         assert!(!bc.why.contains("Something later"), "{}", bc.why);
+    }
+
+    #[test]
+    fn csv_split_and_account_type() {
+        assert_eq!(split_csv(r#"a,"",b"#), vec!["a", "", "b"]);
+        assert_eq!(split_csv(r#"x,"one, two","he said ""hi"" ok",y"#), vec!["x", "one, two", "he said \"hi\" ok", "y"]);
+        assert_eq!(account_type("uid:1101"), "UID_1101");
+        assert_eq!(account_type("(unknown)"), "_UNKNOWN_");
+        assert_eq!(account_type("bob@corp"), "BOB");
+        assert_eq!(account_type(""), "NO_USER");
+        assert_eq!(account_type("50114229n"), "U50114229N");
     }
 
     #[test]

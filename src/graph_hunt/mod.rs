@@ -87,6 +87,35 @@ pub(crate) fn settings(
     Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, sigma })
 }
 
+/// graph-hunt-csv: the same hunt straight from timeline CSVs, no database.
+pub fn graph_hunt_csv(
+    files: &[String],
+    investigation_from: &str,
+    skip_detectors: Option<&str>,
+    only_detectors: Option<&str>,
+    alpha: f64,
+    end_time: Option<&str>,
+    output: Option<&str>,
+    report: Option<&str>,
+    seed: Option<&str>,
+    seed_from: Option<&str>,
+    seed_to: Option<&str>,
+    sigma: Option<&str>,
+) {
+    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
+        Some(s) => s,
+        None => return,
+    };
+    crate::banner::print_phase("1", "4", "Timeline CSV input");
+    for f in files {
+        crate::banner::print_phase_detail("File:", f);
+    }
+    crate::banner::print_phase_detail("Cutoff:", &settings.cutoff.to_rfc3339());
+    crate::banner::print_phase_detail("Alpha (FDR):", &format!("{}", alpha));
+    crate::banner::print_phase("2", "4", "No graph database: everything is computed in memory");
+    engine::run_csv(files, &crate::graph_hunt_common::NEO4J, &settings, output, report);
+}
+
 pub async fn graph_hunt(
     database: &str,
     user: &str,
