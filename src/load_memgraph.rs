@@ -375,27 +375,27 @@ pub async fn load_memgraph(
         // is only used to ANNOTATE the IP node (resolved_name), never to
         // merge nodes, and only when every vote agrees and the votes are
         // unlikely to be chance coincidences (graph_hunt_common::resolve).
-        let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
+        let mut cooc = crate::graph_hunt_common::resolve::CoocCollector::new();
         for line in &processed_lines {
             let parts: Vec<&str> = line.split(',').collect();
             let sc = parts[idx_src_computer];
             let si = parts[idx_src_ip];
             let side = if local_values.contains(sc) && !local_values.contains(si) && looks_like_ip(si) {
-                Some((si.to_string(), true))
+                Some((si, true))
             } else if !local_values.contains(sc) && local_values.contains(si) && !looks_like_ip(sc) {
-                Some((sc.to_string(), false))
+                Some((sc, false))
             } else { None };
             if let Some((v, is_ip)) = side {
+                // only authentication outcomes with a named account can
+                // vote (see load_neo4j)
                 let et = idx_event_type.map(|i| parts[i]).unwrap_or("");
-                let key = (parts[idx_dst].to_string(), parts[idx_target_user].to_uppercase(),
-                           parts[0].get(..19).unwrap_or(parts[0]).to_string(), et.to_string());
-                let e = cooc.entry(key).or_default();
-                let list = if is_ip { &mut e.0 } else { &mut e.1 };
-                if !list.contains(&v) { list.push(v); }
+                let user = parts[idx_target_user];
+                if (et == "SUCCESSFUL_LOGON" || et == "FAILED_LOGON") && !user.is_empty() && user != "\"\"" && user != "NO_USER" {
+                    cooc.add(parts[idx_dst], user, parts[0], et, v, is_ip);
+                }
             }
         }
-        let resolved_names: HashMap<String, (String, u32, f64)> =
-            crate::graph_hunt_common::resolve::resolve_from_cooc(&cooc, alpha);
+        let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
         drop(cooc);
 
         // ── Global IP→hostname map ──
