@@ -795,7 +795,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         }
         h
     };
-    let (rows, summary_lines, alpha, stories, seed) = analyse(&corpus, dialect, cfg, &hits);
+    let (rows, summary_lines, alpha, stories, seed) = analyse(corpus, dialect, cfg, &hits);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
@@ -943,10 +943,11 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
+fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
+    let c = &mut c;
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
-    let (ents, res) = build_entities(c, alpha);
+    let (ents, res) = build_entities(&*c, alpha);
     lines.push(format!(
         "Machines: {} graph nodes -> {} machines ({} IP(s) folded into a host name: unanimous same-login evidence, chance coincidence significant at FDR {})",
         c.nodes.names.len(),
@@ -1022,6 +1023,11 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n, fam: r.fam, lid: r.lid, logoff: r.logoff })
         .collect();
     evs.sort_by_key(|e| e.t);
+    // the raw rows are not needed any more: on tens of millions of rows
+    // keeping both copies alive doubled the peak memory
+    let fam_cov: Vec<(bool, bool)> = c.fams.names.iter().map(|f| super::coverage_kinds(f)).collect();
+    c.rows = Vec::new();
+    c.rows.shrink_to_fit();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
     let win_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| !is_base(*d)).collect();
     // window length in days: the block a baseline day is judged without
@@ -1043,14 +1049,13 @@ fn analyse(c: &Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHi
         }
     }
     if !spans_used {
-        for r in &c.rows {
-            let d = ents.of_node[r.d as usize];
-            let day = day_of(r.t);
-            if r.cov.0 {
-                cov_ok.entry(d).or_default().insert(day);
+        for e in &evs {
+            let (ok, fail) = fam_cov[e.fam as usize];
+            if ok {
+                cov_ok.entry(e.d).or_default().insert(e.day);
             }
-            if r.cov.1 {
-                cov_fail.entry(d).or_default().insert(day);
+            if fail {
+                cov_fail.entry(e.d).or_default().insert(e.day);
             }
         }
         lines.push("Coverage: graph has no log-file spans (loaded by an older masstin); using days with events".to_string());
@@ -2602,7 +2607,7 @@ mod tests {
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let c = corpus(&rows);
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, _lines, _alpha, stories, seed) = analyse(&c, &super::super::NEO4J, &cfg, &[]);
+        let (out, _lines, _alpha, stories, seed) = analyse(c, &super::super::NEO4J, &cfg, &[]);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
         let r = seed.expect("seed reconstruction");
@@ -2617,7 +2622,7 @@ mod tests {
         // seeding by the account that switched (A2, owned by X, used by B)
         // finds the B -> C login directly
         let cfg2 = Settings { seeds: vec!["a2".into()], ..cfg };
-        let (_, _, _, _, seed2) = analyse(&c, &super::super::NEO4J, &cfg2, &[]);
+        let (_, _, _, _, seed2) = analyse(corpus(&rows), &super::super::NEO4J, &cfg2, &[]);
         let r = seed2.expect("seed reconstruction");
         assert_eq!(r.hops.len(), 1);
         assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "B", "C"));
@@ -2673,7 +2678,7 @@ mod tests {
             sigma::SigmaHit { t: day21 + 13 * 3600, host: "C".into(), title: "Something later".into(), level: String::new(), tags: String::new() },
         ];
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, lines, _, _, _) = analyse(&c, &super::super::NEO4J, &cfg, &hits);
+        let (out, lines, _, _, _) = analyse(c, &super::super::NEO4J, &cfg, &hits);
         assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.why.contains("Sigma: 1 rule(s) fired on C while the session was open"), "{}", bc.why);
