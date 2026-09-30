@@ -636,10 +636,15 @@ Once the graph is loaded (with `--ungrouped`: the hunt needs per-event times), m
 
 - **`-a graph-hunt`** — reads a **Memgraph** graph.
 - **`-a graph-hunt-neo4j`** — reads a **Neo4j** graph.
+- **`-a graph-hunt-csv`** — reads the timeline **CSV** directly (`-f`), no database at all. Same engine, same results (verified on the 45-host case); the graph is only needed to explore afterwards.
 
 No server-side plugin is needed: masstin reads the edges once over bolt and computes everything — including PageRank, betweenness and Louvain — in memory.
 
 ```bash
+# No database: straight from the timeline
+masstin -a graph-hunt-csv -f timeline.csv \
+        --investigation-from "2026-03-15 00:00:00" -o findings.csv --report findings.md
+
 # Memgraph
 masstin -a graph-hunt --database bolt://localhost:7687 \
         --investigation-from "2026-03-15 00:00:00" -o findings.csv
