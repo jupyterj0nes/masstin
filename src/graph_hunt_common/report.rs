@@ -75,6 +75,48 @@ pub struct OriginStory {
     pub cypher: String,
 }
 
+/// For each class, the legitimate situations that produce the same
+/// pattern and what settles it. Text only: it changes no number.
+fn benign_causes(class: &str) -> (&'static str, &'static str) {
+    match class {
+        "credential switch with new access" | "causal path with credential switch and new access" => (
+            "the origin is a shared jump host or bastion used by several administrators with their personal accounts; an orchestration, backup or scanning account (Ansible, Rundeck, backup agent, Nessus) was pointed at new hosts or run from a new controller; a technician borrowed a colleague's workstation; the origin is a server commissioned that day.",
+            "find out who owns the origin machine (inventory, DHCP lease, reverse DNS) and whether the account's key or password was rotated or handed over that day; compare with the account's usual origins listed above; look at what the session did on the destination (Linux: sudo log, auditd USER_CMD / EXECVE, shell history; Windows: 4688 process creation, 7045 service install, 4698 scheduled task); note whether the same origin also failed or probed other hosts that day (listed above): legitimate administration rarely does.",
+        ),
+        "same origin and day as a credential switch with new access" => (
+            "the connection itself may be routine, but it comes from an origin that used someone else's account on a new host the same day; it stands or falls with that switch.",
+            "resolve the credential switch of the same origin first; if it is legitimate, these connections are too.",
+        ),
+        "account unknown to the network" => (
+            "a newly created account (onboarding, a new service or job) or an account whose earlier logins were not collected.",
+            "check the account's creation date (passwd change time, `chage -l`, AD whenCreated) and who requested it; look for it in lastlog on any host before the cutoff.",
+        ),
+        "credential switch to a known destination" => (
+            "a colleague covering for the account's usual operator, or the operator working from a new workstation.",
+            "ask the account's owner whether they used this machine; compare with the usual origins listed above.",
+        ),
+        "habitual credential on a new connection" => (
+            "a scanner, monitoring or orchestration account whose scope grew (hosts added to its inventory); an administrator reaching a new server after a change; a destination re-addressed or commissioned that day.",
+            "look for the change or ticket of that day; a fan-out to many hosts at identical intervals is a scanner or orchestrator; if the destination is new to the estate, everything reaching it will look new.",
+        ),
+        "no credential" => (
+            "monitoring probes and load-balancer health checks (exactly periodic), vulnerability scanners, a client retrying with an expired key, a mistyped host name.",
+            "check the timing (identical intervals mean automation), the sshd wording ('Did not receive identification string' is a port probe, 'Bad protocol version identification' with HEAD is an HTTP scanner, 'Failed publickey' before 'Accepted' is an agent offering keys) and who owns the source.",
+        ),
+        _ => ("", ""),
+    }
+}
+
+/// The raw events that settle a connection, by the log families that
+/// recorded it (Windows when evtx is among them, Linux otherwise).
+fn events_to_pull(logs: &[String]) -> String {
+    if logs.iter().any(|l| l.contains("evtx") || l.contains("Security") || l.contains("ual")) {
+        "on the source: 4648 (explicit credentials), 4688 (process creation); on the domain controller: 4768 / 4769 (Kerberos TGT / service ticket), 4776 (NTLM); on the destination: 4624 logon type 3 / 10 with the same LogonId as its 4634 / 4647, 4672 (privileges), 7045 (service installed), 4698 (scheduled task), 5140 (share access).".to_string()
+    } else {
+        "on the destination: /var/log/secure or auth.log (`Accepted`, `session opened` / `session closed` with the same pid as the login), wtmp (`last -F`), auditd (`USER_LOGIN` and `USER_END` with the same ses=, then `USER_CMD` / `EXECVE` for what ran), the sudo log and the account's shell history; on the origin, if collected: the outbound `ssh` in shell history and known_hosts.".to_string()
+    }
+}
+
 fn p_str(p: f64) -> String {
     if p.is_nan() {
         "n/a".into()
@@ -344,6 +386,11 @@ pub fn render_with_seed(h: &Header, stories: &[OriginStory], seed: Option<&SeedR
         if !st.campaign.is_empty() {
             s.push_str(&format!("**Moves with other origins.** {}.\n\n", st.campaign));
         }
+        let (benign, verify) = benign_causes(&st.class);
+        if !benign.is_empty() {
+            s.push_str(&format!("**Could be benign if.** {}\n\n**To rule that out.** {}\n\n", benign, verify));
+        }
+        s.push_str(&format!("**Events to pull.** {}\n\n", events_to_pull(&st.logs)));
         s.push_str(&format!(
             "**Check it.** Log families: {}. Graph query for every connection of this origin in the window:\n\n```cypher\n{}\n```\n\n",
             if st.logs.is_empty() { "n/a".to_string() } else { st.logs.join(", ") },
