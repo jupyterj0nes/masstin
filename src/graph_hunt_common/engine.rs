@@ -245,32 +245,73 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
 
 // ───────────────────────────── CSV corpus ───────────────────────────────────
 
-/// Split one CSV line, honouring double quotes ("" inside a quoted field
-/// is a quote). Quoted empty fields come back empty.
-pub(crate) fn split_csv(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut inq = false;
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if inq => {
-                if chars.peek() == Some(&'"') {
-                    cur.push('"');
-                    chars.next();
-                } else {
-                    inq = false;
+/// Split one CSV line into borrowed fields, honouring double quotes ("" inside
+/// a quoted field is a quote). Only a field with an escaped quote is copied;
+/// every other field is a slice of the line, so reading tens of millions of
+/// rows allocates nothing per field.
+pub(crate) fn split_csv_into<'a>(line: &'a str, out: &mut Vec<std::borrow::Cow<'a, str>>) {
+    use std::borrow::Cow;
+    out.clear();
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    let n = b.len();
+    loop {
+        if i < n && b[i] == b'"' {
+            // quoted field
+            let start = i + 1;
+            let mut j = start;
+            let mut escaped = false;
+            loop {
+                if j >= n {
+                    break;
                 }
+                if b[j] == b'"' {
+                    if j + 1 < n && b[j + 1] == b'"' {
+                        escaped = true;
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                j += 1;
             }
-            '"' => inq = true,
-            ',' if !inq => {
-                out.push(std::mem::take(&mut cur));
+            let raw = &line[start..j.min(n)];
+            out.push(if escaped { Cow::Owned(raw.replace("\"\"", "\"")) } else { Cow::Borrowed(raw) });
+            // skip closing quote and the comma
+            i = j + 1;
+            if i < n && b[i] == b',' {
+                i += 1;
+                if i == n {
+                    out.push(Cow::Borrowed(""));
+                    break;
+                }
+                continue;
             }
-            _ => cur.push(ch),
+            break;
+        } else {
+            let start = i;
+            while i < n && b[i] != b',' {
+                i += 1;
+            }
+            out.push(Cow::Borrowed(&line[start..i]));
+            if i < n {
+                i += 1;
+                if i == n {
+                    out.push(Cow::Borrowed(""));
+                    break;
+                }
+                continue;
+            }
+            break;
         }
     }
-    out.push(cur);
-    out
+}
+
+/// Owned variant of `split_csv_into`.
+pub(crate) fn split_csv(line: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    split_csv_into(line, &mut v);
+    v.into_iter().map(|c| c.into_owned()).collect()
 }
 
 const CSV_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
@@ -301,6 +342,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
     let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
     let mut span: HashMap<(String, String), (i64, i64)> = HashMap::new();
     let mut bad_header: Vec<String> = Vec::new();
+    let mut n_lines = 0usize;
     for f in files {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
         let mut lines = rd.lines();
@@ -311,10 +353,12 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         }
         for line in lines {
             let line = line?;
-            let p = split_csv(&line);
+            let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(16);
+            split_csv_into(&line, &mut p);
             if p.len() < 14 {
                 continue;
             }
+            n_lines += 1;
             for col in [1usize, 7, 8] {
                 let v = p[col].to_uppercase();
                 if v.contains('.') && !looks_like_ip(&v) {
@@ -327,7 +371,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
                 // one span per log FILE (a missing rotation is a gap), as
                 // the loader records them
                 let t = t.and_utc().timestamp();
-                let e = span.entry((p[1].to_uppercase(), p[13].clone())).or_insert((t, t));
+                let e = span.entry((p[1].to_uppercase(), p[13].to_string())).or_insert((t, t));
                 e.0 = e.0.min(t);
                 e.1 = e.1.max(t);
             }
@@ -348,7 +392,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         u
     };
     // pass 2: rows
-    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::with_capacity(n_lines), bad_ts: 0 };
     c.lids.id("");
     let mut agg: HashMap<(u32, u32, u32, u32, u32, i32), (u64, i64)> = HashMap::new();
     let mut dropped = 0usize;
@@ -357,7 +401,8 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
         for line in rd.lines().skip(1) {
             let line = line?;
-            let p = split_csv(&line);
+            let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(16);
+            split_csv_into(&line, &mut p);
             if p.len() < 14 {
                 continue;
             }
@@ -385,8 +430,8 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
                 continue;
             }
             let acct = account_type(p[5].trim());
-            let et = p[2].trim();
-            let eid = p[3].trim();
+            let et: &str = p[2].trim();
+            let eid: &str = p[3].trim();
             let fam = crate::load_neo4j::log_source_family(&p[13]);
             let cls = class_of(et, eid, &acct);
             let o = c.nodes.id(&origin);
@@ -482,22 +527,20 @@ struct DayCount {
     days: BTreeSet<i32>,
 }
 
-/// Past-only reference with the window's gap. A window day is new against
-/// every baseline day (all of them lie before the cutoff, up to L - 1 days
-/// before the window day, L being the window length). A baseline day d is
-/// judged against the baseline days up to d - L: the same "only the past,
-/// with the same gap" rule, so that a fact that starts mid-baseline and
-/// repeats is new on its first day only, exactly as it would be in the
-/// window. Early baseline days have less reference and therefore more
-/// novelty, which makes the null heavier than the window: conservative.
+/// Past-only reference, every day alike. A fact is new on a day when it
+/// occurred on no earlier day, whether that day is in the baseline or in
+/// the window (earlier window days count as reference too). A fact that
+/// repeats is therefore new on its first day only, wherever that day
+/// falls, and nothing depends on the length of the baseline or of the
+/// window. Early days have less reference and more novelty, which makes
+/// the null heavier than the window: conservative.
 struct DayIndex<K: std::hash::Hash + Eq> {
     m: HashMap<K, DayCount>,
-    block: i32,
 }
 
 impl<K: std::hash::Hash + Eq> DayIndex<K> {
-    fn new(block: i32) -> Self {
-        DayIndex { m: HashMap::new(), block: block.max(1) }
+    fn new() -> Self {
+        DayIndex { m: HashMap::new() }
     }
     fn add(&mut self, k: K, day: i32) {
         let c = self.m.entry(k).or_insert_with(|| DayCount { n: 0, first: day, last: day, days: BTreeSet::new() });
@@ -507,12 +550,23 @@ impl<K: std::hash::Hash + Eq> DayIndex<K> {
             c.last = c.last.max(day);
         }
     }
-    /// New on `day`: window day -> occurs on no baseline day; baseline day
-    /// -> occurs on no baseline day up to `day - block`.
-    fn is_new(&self, k: &K, day: i32, baseline: bool) -> bool {
+    /// New on `day`: no occurrence on any earlier day.
+    fn is_new(&self, k: &K, day: i32) -> bool {
         match self.m.get(k) {
             None => true,
-            Some(c) => baseline && c.days.range(..=(day - self.block)).next().is_none(),
+            Some(c) => c.days.range(..day).next().is_none(),
+        }
+    }
+    /// days before the cutoff the item occurred on, and the first and last
+    fn baseline(&self, k: &K, cutoff_day: i32) -> (u32, Option<i32>, Option<i32>) {
+        match self.m.get(k) {
+            None => (0, None, None),
+            Some(c) => {
+                let mut r = c.days.range(..cutoff_day);
+                let first = r.next().copied();
+                let last = c.days.range(..cutoff_day).next_back().copied();
+                (c.days.range(..cutoff_day).count() as u32, first, last)
+            }
         }
     }
 }
@@ -711,7 +765,6 @@ struct Conn {
     /// position in the seed reconstruction ("hop 3 depth 1"), else empty
     chain: String,
     campaign: String,
-    cypher: String,
     evaluable: bool,
     /// origin, destination and account ids and the novelty flags, for the report
     oid: u32,
@@ -795,11 +848,11 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         }
         h
     };
-    let (rows, summary_lines, alpha, stories, seed) = analyse(corpus, dialect, cfg, &hits);
+    let (rows, summary_lines, alpha, stories, seed, ents) = analyse(corpus, dialect, cfg, &hits);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
-    if let Err(e) = write_csv(&rows, alpha, output) {
+    if let Err(e) = write_csv(&rows, alpha, output, &ents, dialect) {
         eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
         return;
     }
@@ -943,7 +996,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>) {
+fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>, Entities) {
     let c = &mut c;
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
@@ -1030,8 +1083,6 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     c.rows.shrink_to_fit();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
     let win_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| !is_base(*d)).collect();
-    // window length in days: the block a baseline day is judged without
-    let block: i32 = win_days.iter().next_back().map(|d| d - cutoff_day + 1).unwrap_or(1).max(1);
 
     // ── coverage per destination machine: log-file spans from the loader,
     //    or (older graphs) the days with events ──
@@ -1072,7 +1123,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         Some(a) => a,
         None => {
             lines.push("No destination has log coverage before the cutoff: nothing can be compared. Check --investigation-from and the coverage spans written by the loader.".to_string());
-            return (Vec::new(), lines, alpha, Vec::new(), None);
+            return (Vec::new(), lines, alpha, Vec::new(), None, ents);
         }
     };
     if anchor != cutoff_day - 1 {
@@ -1121,7 +1172,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     }
     if best.0 == 0 {
         lines.push("Panel is empty: no destination is covered continuously up to the last covered baseline day. Nothing can be compared.".to_string());
-        return (Vec::new(), lines, alpha, Vec::new(), None);
+        return (Vec::new(), lines, alpha, Vec::new(), None, ents);
     }
     let s_day = best.1;
     let in_run = |m: &HashMap<u32, BTreeSet<i32>>, d: u32| -> bool {
@@ -1134,49 +1185,47 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     let panel_fail: HashSet<u32> = cov_fail.keys().copied().filter(|d| in_run(&cov_fail, *d)).collect();
     let null_days: Vec<i32> = bd.iter().copied().filter(|d| *d >= s_day).collect();
     lines.push(format!(
-        "Panel: {} destination(s) with continuous login coverage and {} with failure coverage from {} to the cutoff; {} baseline day(s) form the null; reference for novelty = all {} baseline day(s) with data, past only, with the window's gap of {} day(s)",
+        "Panel: {} destination(s) with continuous login coverage and {} with failure coverage from {} to the cutoff; {} baseline day(s) form the null; reference for novelty = every earlier day ({} baseline day(s) with data), for baseline and window days alike",
         panel_ok.len(),
         panel_fail.len(),
         day_str(s_day),
         null_days.len(),
-        base_days.len(),
-        block
+        base_days.len()
     ));
 
     // ── baseline item indexes ──
-    let mut ix_triple: DayIndex<(u32, u32, u32)> = DayIndex::new(block);
+    let mut ix_triple: DayIndex<(u32, u32, u32)> = DayIndex::new();
     // (origin, destination, account, result): the connection itself
-    let mut ix_conn: DayIndex<(u32, u32, u32, u8)> = DayIndex::new(block);
-    let mut ix_pair: DayIndex<(u32, u32)> = DayIndex::new(block);
-    let mut ix_ad: DayIndex<(u32, u32)> = DayIndex::new(block);
+    let mut ix_conn: DayIndex<(u32, u32, u32, u8)> = DayIndex::new();
+    let mut ix_pair: DayIndex<(u32, u32)> = DayIndex::new();
+    let mut ix_ad: DayIndex<(u32, u32)> = DayIndex::new();
     // (origin, account): successful use only; a refused attempt is not a
     // use, so a spray that started before the cutoff and succeeds in the
     // window is still a first use (and a credential switch)
-    let mut ix_oa: DayIndex<(u32, u32)> = DayIndex::new(block);
-    let mut ix_org: DayIndex<u32> = DayIndex::new(block);
+    let mut ix_oa: DayIndex<(u32, u32)> = DayIndex::new();
+    let mut ix_org: DayIndex<u32> = DayIndex::new();
     // named accounts with a successful login anywhere: an account seen on
     // other baseline days "has an owner"; one never seen is unknown
-    let mut ix_acct: DayIndex<u32> = DayIndex::new(block);
+    let mut ix_acct: DayIndex<u32> = DayIndex::new();
     let mut lt_base: HashMap<u32, HashMap<u32, u64>> = HashMap::new();
     let mut lt_day: HashMap<(i32, u32), HashMap<u32, u64>> = HashMap::new();
-    for e in evs.iter().filter(|e| is_base(e.day)) {
+    for e in evs.iter() {
         ix_org.add(e.o, e.day);
         if e.cls == OK || e.cls == FAIL || e.cls == PRE {
             ix_conn.add((e.o, e.d, e.a, e.cls), e.day);
         }
-        match e.cls {
-            OK => {
-                ix_triple.add((e.o, e.d, e.a), e.day);
-                ix_pair.add((e.o, e.d), e.day);
-                ix_ad.add((e.a, e.d), e.day);
-                ix_oa.add((e.o, e.a), e.day);
-                if !is_uid_account(c.accts.name(e.a)) {
-                    ix_acct.add(e.a, e.day);
-                }
+        if e.cls == OK {
+            ix_triple.add((e.o, e.d, e.a), e.day);
+            ix_pair.add((e.o, e.d), e.day);
+            ix_ad.add((e.a, e.d), e.day);
+            ix_oa.add((e.o, e.a), e.day);
+            if !is_uid_account(c.accts.name(e.a)) {
+                ix_acct.add(e.a, e.day);
+            }
+            if is_base(e.day) {
                 *lt_base.entry(e.d).or_default().entry(e.lt).or_insert(0) += e.n;
                 *lt_day.entry((e.day, e.d)).or_default().entry(e.lt).or_insert(0) += e.n;
             }
-            _ => {}
         }
     }
 
@@ -1293,27 +1342,27 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             // the connection itself (same origin, destination, account and
             // result) seen on another baseline day is habitual: nothing
             // about it is new, whatever else happens that day
-            let conn_new = ix_conn.is_new(&(o, d, a, cls), day, b);
-            if conn_new && (cls != OK || ix_triple.is_new(&(o, d, a), day, b)) {
+            let conn_new = ix_conn.is_new(&(o, d, a, cls), day);
+            if conn_new && (cls != OK || ix_triple.is_new(&(o, d, a), day)) {
                 f |= F_TRIPLE;
             }
-            if named && ix_ad.is_new(&(a, d), day, b) {
+            if named && ix_ad.is_new(&(a, d), day) {
                 f |= F_ACCT_DST;
             }
-            if ix_pair.is_new(&(o, d), day, b) {
+            if ix_pair.is_new(&(o, d), day) {
                 f |= F_DST_ORIGIN;
             }
-            if named && ix_oa.is_new(&(o, a), day, b) {
+            if named && ix_oa.is_new(&(o, a), day) {
                 f |= F_ACCT_ORIGIN;
             }
-            if ix_org.is_new(&o, day, b) {
+            if ix_org.is_new(&o, day) {
                 f |= F_NO_HISTORY;
             }
             if f & (F_DST_ORIGIN | F_ACCT_DST) != 0 {
                 f |= F_NEW_ACCESS;
             }
             if named && f & F_ACCT_ORIGIN != 0 {
-                if ix_acct.is_new(&a, day, b) {
+                if ix_acct.is_new(&a, day) {
                     f |= F_UNKNOWN_ACCT;
                 } else {
                     f |= F_SWITCH;
@@ -1329,12 +1378,12 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         for e in today {
             let od = origin_days
                 .entry((day, e.o))
-                .or_insert_with(|| OriginDay { t0: e.t, no_history: ix_org.is_new(&e.o, day, b), ..Default::default() });
+                .or_insert_with(|| OriginDay { t0: e.t, no_history: ix_org.is_new(&e.o, day), ..Default::default() });
             od.t1 = e.t;
             match e.cls {
                 OK => {
                     od.ok_dsts.insert(e.d);
-                    let pnew = ix_pair.is_new(&(e.o, e.d), day, b);
+                    let pnew = ix_pair.is_new(&(e.o, e.d), day);
                     if pnew && e.o != e.d {
                         od.new_dsts.insert(e.d);
                         if want_comm && cnodes.contains(&(e.o as usize)) && cnodes.contains(&(e.d as usize)) && cm[e.o as usize] != cm[e.d as usize] {
@@ -1344,8 +1393,8 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                     pairs_by_day.entry(day).or_default().insert((e.o, e.d));
                     let an = c.accts.name(e.a);
                     if !is_uid_account(an) {
-                        let oa_new = ix_oa.is_new(&(e.o, e.a), day, b);
-                        let ad_new = ix_ad.is_new(&(e.a, e.d), day, b);
+                        let oa_new = ix_oa.is_new(&(e.o, e.a), day);
+                        let ad_new = ix_ad.is_new(&(e.a, e.d), day);
                         if oa_new {
                             od.new_acct_uses.insert((e.a, e.d));
                             od.newacct_success.push((e.d, e.t));
@@ -1353,7 +1402,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                         if ad_new {
                             od.new_ad.insert((e.a, e.d));
                         }
-                        if oa_new && !ix_acct.is_new(&e.a, day, b) && (pnew || ad_new) {
+                        if oa_new && !ix_acct.is_new(&e.a, day) && (pnew || ad_new) {
                             od.switch_new.insert((e.a, e.d));
                         }
                     }
@@ -1431,10 +1480,9 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             if cands.is_empty() {
                 continue;
             }
-            let b = is_base(e2.day);
             let cert = 1.0 / cands.len() as f64;
             for ((a_node, a1), t1) in &cands {
-                if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), e2.day, b) {
+                if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), e2.day) {
                     if let Some(od) = origin_days.get_mut(&(e2.day, e2.o)) {
                         od.paths.push(PathFact { cert, a_node: *a_node, a1: *a1, t1: *t1, c_node: e2.d, a2: e2.a, t2: e2.t, n_cand: cands.len() });
                     }
@@ -1576,7 +1624,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         let on_panel = |t: &TripleDay| if t.cls == OK { okp(t.d) } else { failp(t.d) };
         let had_history = |t: &TripleDay| {
             let m = if t.cls == OK { &cov_ok } else { &cov_fail };
-            m.get(&t.d).map(|s| s.range(..=(t.day - block)).next().is_some()).unwrap_or(false)
+            m.get(&t.d).map(|s| s.range(..t.day).next().is_some()).unwrap_or(false)
         };
         for cls in [OK, FAIL, PRE] {
             let mut cache: HashMap<(i32, u32), [f64; 11]> = HashMap::new();
@@ -1645,7 +1693,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         let mut nod: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         let mut noa: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for ((day, o), od) in &origin_days {
-            if is_base(*day) || ix_org.m.contains_key(o) {
+            if is_base(*day) || ix_org.baseline(o, cutoff_day).0 > 0 {
                 continue;
             }
             nod.entry(*o).or_default().extend(od.new_dsts.iter().copied().filter(|d| pop_set.contains(d)));
@@ -1872,14 +1920,6 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             evidence,
             chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
-            cypher: super::browser_snippet_multi(
-                dialect,
-                &alias_list(t.o),
-                &alias_list(t.d),
-                if is_no_account(acct) { None } else { Some(acct) },
-                &ts_str(t.t0 - 1),
-                Some(&ts_str(t.t1 + 1)),
-            ),
             evaluable: true,
             oid: t.o,
             did: t.d,
@@ -1913,14 +1953,6 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             evidence: String::new(),
             chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
-            cypher: super::browser_snippet_multi(
-                dialect,
-                &alias_list(t.o),
-                &alias_list(t.d),
-                if is_no_account(acct) { None } else { Some(acct) },
-                &ts_str(t.t0 - 1),
-                Some(&ts_str(t.t1 + 1)),
-            ),
             evaluable: false,
             oid: t.o,
             did: t.d,
@@ -1964,7 +1996,8 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         let mut v: Vec<(String, u32)> = m
             .iter()
             .filter(|((a, b), _)| if key_is_first { *a == id } else { *b == id })
-            .map(|((a, b), cnt)| (name(if key_is_first { *b } else { *a }), cnt.n))
+            .map(|((a, b), cnt)| (name(if key_is_first { *b } else { *a }), cnt.days.range(..cutoff_day).count() as u32))
+            .filter(|(_, n)| *n > 0)
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
@@ -2064,9 +2097,9 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             n_sig: sig_rows.len(),
             n_rows: rows.len(),
             n_not_eval: rows.iter().filter(|cn| !cn.evaluable).count(),
-            baseline_days: ix_org.m.get(&o).map(|cnt| cnt.n).unwrap_or(0),
-            baseline_first: ix_org.m.get(&o).map(|cnt| day_str(cnt.first)).unwrap_or_default(),
-            baseline_last: ix_org.m.get(&o).map(|cnt| day_str(cnt.last)).unwrap_or_default(),
+            baseline_days: ix_org.baseline(&o, cutoff_day).0,
+            baseline_first: ix_org.baseline(&o, cutoff_day).1.map(day_str).unwrap_or_default(),
+            baseline_last: ix_org.baseline(&o, cutoff_day).2.map(day_str).unwrap_or_default(),
             data_first: base_days.iter().next().map(|d| day_str(*d)).unwrap_or_default(),
             data_last: base_days.iter().next_back().map(|d| day_str(*d)).unwrap_or_default(),
             usual_dests: top_days(&ix_pair.m, true, o, &machine_name).into_iter().take(5).collect(),
@@ -2134,7 +2167,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                 unmatched.push(raw.clone());
                 continue;
             }
-            let has_history = machines.iter().any(|m| ix_org.m.contains_key(m)) || (machines.is_empty() && accounts.iter().any(|a| ix_acct.m.contains_key(a)));
+            let has_history = machines.iter().any(|m| ix_org.baseline(m, cutoff_day).0 > 0) || (machines.is_empty() && accounts.iter().any(|a| ix_acct.baseline(a, cutoff_day).0 > 0));
             matched.push(raw.clone());
             specs.push(Spec { text: raw.clone(), machines, accounts, has_history });
         }
@@ -2433,7 +2466,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     for (i, s) in chain_set {
         out[i].chain = s;
     }
-    (out, lines, alpha, stories, seed_recon)
+    (out, lines, alpha, stories, seed_recon, ents)
 }
 
 fn nan_last(x: f64) -> f64 {
@@ -2460,7 +2493,21 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result<()> {
+fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>, ents: &Entities, dialect: &Dialect) -> std::io::Result<()> {
+    // the Browser snippet is built here, row by row, instead of being kept
+    // in memory for every connection (700 bytes each, millions of rows on
+    // a large corpus)
+    let alias_list = |id: u32| -> Vec<String> { ents.aliases[id as usize].iter().cloned().collect() };
+    let snippet = |r: &Conn| -> String {
+        super::browser_snippet_multi(
+            dialect,
+            &alias_list(r.oid),
+            &alias_list(r.did),
+            if r.account.is_empty() { None } else { Some(r.account.as_str()) },
+            &ts_str(r.first - 1),
+            Some(&ts_str(r.last + 1)),
+        )
+    };
     let mut buf = String::from(
         "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,signature,why_unusual,evidence,chain,campaign,cypher_snippet
 ",
@@ -2494,7 +2541,7 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result
             csv_escape(&r.evidence),
             csv_escape(&r.chain),
             csv_escape(&r.campaign),
-            csv_escape(&r.cypher),
+            csv_escape(&snippet(r)),
         ));
     }
     match output {
@@ -2505,6 +2552,7 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>) -> std::io::Result
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -2544,21 +2592,19 @@ mod tests {
     }
     #[test]
     fn block_reference_matches_window_length() {
-        // gap 3: a fact on baseline days 10, 11, 12 and 20 is new on day 12
-        // (only the days up to 9 count) and not on day 20 (12 <= 17)
-        let mut ix: DayIndex<u32> = DayIndex::new(3);
+        // a fact on days 10, 11, 12 and 20 is new on day 10 only; before
+        // a cutoff at day 15 it has 3 baseline days, 10 to 12
+        let mut ix: DayIndex<u32> = DayIndex::new();
         ix.add(1, 10);
         ix.add(1, 11);
         ix.add(1, 12);
         ix.add(1, 20);
-        assert!(ix.is_new(&1, 12, true));
-        assert!(!ix.is_new(&1, 20, true));
-        let mut ix2: DayIndex<u32> = DayIndex::new(3);
-        ix2.add(2, 10);
-        ix2.add(2, 11);
-        ix2.add(2, 12);
-        assert!(ix2.is_new(&2, 12, true));
-        assert!(!ix2.is_new(&2, 15, true)); // 12 is outside 15's block [13, 15]
+        assert!(ix.is_new(&1, 10));
+        assert!(!ix.is_new(&1, 12));
+        assert!(!ix.is_new(&1, 20));
+        assert!(ix.is_new(&2, 20));
+        assert_eq!(ix.baseline(&1, 15), (3, Some(10), Some(12)));
+        assert_eq!(ix.baseline(&1, 10), (0, None, None));
     }
     /// Build a corpus from (day, hour, origin, destination, account, event_type) rows.
     fn corpus(rows: &[(i32, i64, &str, &str, &str, &str)]) -> Corpus {
@@ -2607,7 +2653,7 @@ mod tests {
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let c = corpus(&rows);
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, _lines, _alpha, stories, seed) = analyse(c, &super::super::NEO4J, &cfg, &[]);
+        let (out, _lines, _alpha, stories, seed, _) = analyse(c, &super::super::NEO4J, &cfg, &[]);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
         let r = seed.expect("seed reconstruction");
@@ -2622,7 +2668,7 @@ mod tests {
         // seeding by the account that switched (A2, owned by X, used by B)
         // finds the B -> C login directly
         let cfg2 = Settings { seeds: vec!["a2".into()], ..cfg };
-        let (_, _, _, _, seed2) = analyse(corpus(&rows), &super::super::NEO4J, &cfg2, &[]);
+        let (_, _, _, _, seed2, _) = analyse(corpus(&rows), &super::super::NEO4J, &cfg2, &[]);
         let r = seed2.expect("seed reconstruction");
         assert_eq!(r.hops.len(), 1);
         assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "B", "C"));
@@ -2678,7 +2724,7 @@ mod tests {
             sigma::SigmaHit { t: day21 + 13 * 3600, host: "C".into(), title: "Something later".into(), level: String::new(), tags: String::new() },
         ];
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, lines, _, _, _) = analyse(c, &super::super::NEO4J, &cfg, &hits);
+        let (out, lines, _, _, _, _) = analyse(c, &super::super::NEO4J, &cfg, &hits);
         assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.why.contains("Sigma: 1 rule(s) fired on C while the session was open"), "{}", bc.why);
@@ -2708,14 +2754,14 @@ mod tests {
 
     #[test]
     fn dayindex_leave_one_out() {
-        let mut ix: DayIndex<u32> = DayIndex::new(1);
+        let mut ix: DayIndex<u32> = DayIndex::new();
         ix.add(7, 100);
         ix.add(8, 100);
         ix.add(8, 101);
-        assert!(ix.is_new(&7, 100, true)); // first seen on day 100
-        assert!(ix.is_new(&8, 100, true)); // first seen on day 100 too
-        assert!(!ix.is_new(&8, 101, true)); // seen the day before
-        assert!(!ix.is_new(&7, 105, false)); // window: seen in baseline
-        assert!(ix.is_new(&9, 105, false));
+        assert!(ix.is_new(&7, 100)); // first seen on day 100
+        assert!(ix.is_new(&8, 100)); // first seen on day 100 too
+        assert!(!ix.is_new(&8, 101)); // seen the day before
+        assert!(!ix.is_new(&7, 105)); // seen before
+        assert!(ix.is_new(&9, 105));
     }
 }
