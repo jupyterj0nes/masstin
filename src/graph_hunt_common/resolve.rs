@@ -138,6 +138,83 @@ pub fn resolve_ip_names<'a>(obs: impl Iterator<Item = Obs<'a>>, alpha: f64) -> H
     out
 }
 
+/// Compact collector of same-login co-occurrences for the loaders. Names
+/// are interned once and a login is keyed by small integers, so ten
+/// million rows cost tens of megabytes instead of several gigabytes (the
+/// former map of owned strings per row, fed with every pre-auth touch and
+/// session end, ran a 20 GB machine out of memory on 12 M rows). Only rows
+/// that are authentication outcomes with a named account are worth
+/// adding: pre-auth touches and session ends carry no identity to vote
+/// with.
+#[derive(Default)]
+pub struct CoocCollector {
+    names: Vec<String>,
+    ids: HashMap<String, u32>,
+    outcomes: Vec<String>,
+    /// (dst, account, second, outcome) -> (ip ids, name ids)
+    map: HashMap<(u32, u32, i64, u8), (Vec<u32>, Vec<u32>)>,
+}
+
+impl CoocCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn id(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.ids.get(s) {
+            return i;
+        }
+        let i = self.names.len() as u32;
+        self.names.push(s.to_string());
+        self.ids.insert(s.to_string(), i);
+        i
+    }
+    /// `ts` is the CSV timestamp ("YYYY-MM-DDTHH:MM:SS..." or with a space);
+    /// `source` the single IP or name recorded for the login.
+    pub fn add(&mut self, dst: &str, account: &str, ts: &str, outcome: &str, source: &str, is_ip: bool) {
+        let t = match ts.get(..19) {
+            Some(x) => x,
+            None => return,
+        };
+        let sec = match chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S"))
+        {
+            Ok(n) => n.and_utc().timestamp(),
+            Err(_) => return,
+        };
+        let oc = match self.outcomes.iter().position(|o| o == outcome) {
+            Some(i) => i as u8,
+            None => {
+                if self.outcomes.len() >= 255 {
+                    return;
+                }
+                self.outcomes.push(outcome.to_string());
+                (self.outcomes.len() - 1) as u8
+            }
+        };
+        let d = self.id(dst);
+        let a = self.id(&account.to_uppercase());
+        let s = self.id(source);
+        let e = self.map.entry((d, a, sec, oc)).or_default();
+        let list = if is_ip { &mut e.0 } else { &mut e.1 };
+        if !list.contains(&s) {
+            list.push(s);
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    /// ip -> (name, votes, chance probability), see `resolve_ip_names`.
+    pub fn resolve(&self, alpha: f64) -> HashMap<String, (String, u32, f64)> {
+        let obs = self.map.iter().flat_map(|((d, a, sec, oc), (ips, nms))| {
+            let (dst, account, outcome, sec) = (self.names[*d as usize].as_str(), self.names[*a as usize].as_str(), self.outcomes[*oc as usize].as_str(), *sec);
+            ips.iter()
+                .map(move |i| Obs { dst, account, outcome, sec, source: self.names[*i as usize].as_str(), source_is_ip: true })
+                .chain(nms.iter().map(move |i| Obs { dst, account, outcome, sec, source: self.names[*i as usize].as_str(), source_is_ip: false }))
+        });
+        resolve_ip_names(obs, alpha).into_iter().map(|(ip, r)| (ip, (r.name, r.votes, r.p_chance))).collect()
+    }
+}
+
 /// Loader entry point: the loaders already collect, per (destination,
 /// ACCOUNT, "YYYY-MM-DDTHH:MM:SS", outcome), the IPs and names recorded for
 /// that login. Returns ip -> (name, votes, chance probability).
@@ -215,5 +292,18 @@ mod tests {
         }
         let r2 = resolve_ip_names(w.into_iter(), 0.05);
         assert_eq!(r2.get("10.0.0.8").map(|x| x.name.as_str()), Some("HOSTC"));
+    }
+    #[test]
+    fn collector_matches_direct_resolution() {
+        let mut c = CoocCollector::new();
+        for i in 0..200i64 {
+            let ts = chrono::DateTime::from_timestamp(i * 300, 0).unwrap().format("%Y-%m-%dT%H:%M:%S").to_string();
+            c.add("DST2", "s", &ts, "SUCCESSFUL_LOGON", "10.0.0.8", true);
+            c.add("DST2", "S", &ts, "SUCCESSFUL_LOGON", "HOSTC", false);
+        }
+        assert_eq!(c.len(), 200);
+        let r = c.resolve(0.05);
+        assert_eq!(r.get("10.0.0.8").map(|x| x.0.as_str()), Some("HOSTC"));
+        assert_eq!(r["10.0.0.8"].1, 200);
     }
 }

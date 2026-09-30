@@ -324,7 +324,7 @@ fn streaming_pass1(
     // machine becomes two graph nodes and its history is split in half.
     // Key: (dst, user, second, event_type) -> (ips, names), single-sided
     // rows only.
-    let mut cooc: HashMap<(String, String, String, String), (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut cooc = crate::graph_hunt_common::resolve::CoocCollector::new();
     let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
 
     let file = File::open(path)?;
@@ -356,16 +356,15 @@ fn streaming_pass1(
                         Some((sc.to_string(), false))
                     } else { None };
                     if let Some((v, is_ip)) = side {
+                        // only authentication outcomes with a named
+                        // account can vote; pre-auth touches and session
+                        // ends are skipped (they were 80 % of the rows and
+                        // exhausted memory on a 12 M-row timeline)
                         let et = if idx.event_type == NONE_COL { "" } else { parts[idx.event_type].as_str() };
-                        let key = (
-                            parts[idx.dst].clone(),
-                            parts[idx.target_user].to_uppercase(),
-                            parts[0].get(..19).unwrap_or(&parts[0]).to_string(),
-                            et.to_string(),
-                        );
-                        let e = cooc.entry(key).or_default();
-                        let list = if is_ip { &mut e.0 } else { &mut e.1 };
-                        if !list.contains(&v) { list.push(v); }
+                        let user = parts[idx.target_user].as_str();
+                        if (et == "SUCCESSFUL_LOGON" || et == "FAILED_LOGON") && !user.is_empty() && user != "\"\"" && user != "NO_USER" {
+                            cooc.add(&parts[idx.dst], user, &parts[0], et, &v, is_ip);
+                        }
                     }
                 }
                 // (src_ip, src_computer) direct evidence
@@ -416,8 +415,8 @@ fn streaming_pass1(
     // login in the same second, Benjamini-Hochberg across IPs at alpha;
     // graph_hunt_common::resolve), and it is written to the IP node as
     // `resolved_name` / `resolved_votes` / `resolved_p` for the analyst.
-    let resolved_names: HashMap<String, (String, u32, f64)> =
-        crate::graph_hunt_common::resolve::resolve_from_cooc(&cooc, alpha);
+    let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
+    drop(cooc);
     // Short names shared by two or more different FQDNs stay fully
     // qualified; everything collected above is mapped to its final name.
     let ambiguous: HashSet<String> = fqdn_by_short
