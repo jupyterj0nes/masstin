@@ -706,6 +706,21 @@ Measured on a real incident: 45 Linux hosts collected with UAC, 10.5M rows (1.43
 
 The last row is the current engine. Every one of its 65 significant connections is the attacker's (the first origin's whole day: pre-auth sweep and key logins); the second attacker IP, 25 minutes later with the same account, ranks right behind (rows 69 onwards) but stays under the 5 % false discovery rate, because a never-seen machine reaching 29 hosts on its first day is something this network's own baseline does contain (new machines being commissioned). The ranking is what matters for triage: the first 65 rows are all attack, the first benign row is the 66th, and 91 of the first 100 are attack. On the incident-free window 10-09 to 19-09 the same engine marks 7 of 83 new connections significant, all the first days of the credentialed vulnerability scanner. The previous rule ("the past with the window's gap") found 108 of 125 attacker connections at the price of 112 benign ones and needed a baseline longer than the window, which the LANL benchmark below does not have.
 
+**Public benchmark: LANL.** The [Los Alamos "Comprehensive, Multi-Source Cyber-Security Events"](https://csr.lanl.gov/data/cyber1/) set (58 days of a real enterprise, 1.05 billion authentication events, 749 labelled red-team logins from 4 machines) is the reference every lateral-movement paper uses. It was converted to a masstin timeline the way a DFIR collection would look (`viconppt/graph-hunt-tests/lanl_to_masstin.py`): the logs of the 305 red-team machines plus a fixed sample of 200 others, remote logons with a user account only (machine accounts are the Kerberos chatter of every workstation with the domain controllers, 70 % of the volume, and not a person moving), days 0 to 16, cutoff at day 7. The baseline days 0 to 6 contain 50 of the 749 red-team events; the window days 7 to 15 contain 640. Run with `graph-hunt-csv`, no database, 21.3 million rows, 14 minutes, 3.3 GB.
+
+| | value |
+|---|---:|
+| rows in the window (connections) | 465,074 |
+| red-team connections among them | 444 |
+| significant at FDR 0.05 | 56, every one of them red team |
+| precision of the first 100 rows | 100 % |
+| first benign row | rank 168 |
+| red-team connections in the first 500 rows (0.1 % of the rows) | 265 of 444 (60 %) |
+| red-team sources found | the main one (610 of the 640 window events) at rank 1; the second (26 events, each a single login to a new host) first appears at rank 24,464 |
+| incident-free period (days 40 to 43, 240762 connections, 34495 of them new) | 0 significant |
+
+Reading: everything the engine marks is attack, and an analyst who reads the first 167 rows of 465 thousand sees nothing but attack. What it does not catch is the red-team machine that made one quiet login per host with a different user each time, an action this network's own baseline contains thousands of times a day; no login-graph method detects those without an inventory of who owns which machine (Hopper's own 9 misses are of that kind). For comparison, Hopper reports 94.5 % detection at about 9 alerts a day on 15 months of a 2,300-machine enterprise, with an inventory and two months of training; Argus, the best graph-neural-network result on LANL, reports an average precision of 0.32 that falls to 0.09 under fair labelling (Larroche 2026).
+
 The synthetic-corpus figures of the previous, hand-weighted detectors are in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/); they have not been re-run with the statistical engine.
 
 ### Merge graph nodes after loading
