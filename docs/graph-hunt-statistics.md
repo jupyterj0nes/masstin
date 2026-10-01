@@ -30,7 +30,7 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
    PageRank, betweenness and Louvain are computed in memory, so no GDS or MAGE plugin is needed.
 2. **Machines.** An IP and a host name become one machine when the same-login co-occurrence evidence is unanimous and the chance of coincidence is significant (see below).
 3. **Unit.** The unit of observation is the UTC day. Days before the cutoff are the baseline, the rest are the window.
-4. **Reference (the past only, every day alike).** A fact is new on a day when it occurred on no earlier day, whether that day is in the baseline or in the window: earlier window days are reference too. A fact that repeats is therefore new on its first day only, wherever that day falls, and nothing depends on the length of the baseline or of the window. Early days have less reference and more novelty, which makes the null heavier than the window: conservative. Two earlier rules were tried and dropped: leave-one-day-out (a baseline day judged against all other baseline days, before and after) made a repeating fact never new in the baseline while it was new on every window day, and on an incident-free window every new connection came out significant; "the past with the window's gap" (a baseline day *d* judged against days up to *d* − *L*) fixed that but needs a baseline longer than the window, and on LANL (7 baseline days, 9 window days) it left no null at all.
+4. **Reference (the past only, every day alike).** A fact is new on a day when it occurred on no earlier day, whether that day is in the baseline or in the window: earlier window days are reference too. A fact that repeats is therefore new on its first day only, wherever that day falls, and nothing depends on the length of the baseline or of the window. Early days have less reference and more novelty: the second day of the data has one day of reference and sees almost everything as new. On LANL the second day contributed 19,824 new connections (1,022 from never-seen origins) and the fifth 2,047 (38). Those days would fill the null with novelty that is unseen rather than unusual, while every window day has the whole baseline behind it; so **a baseline day enters the null only when at least half of the baseline days with data lie before it** (the panel start S is chosen among those days too). On a case with years of wtmp history this excludes nothing; on a 7-day baseline it keeps the last three days. Two earlier rules were tried and dropped: leave-one-day-out (a baseline day judged against all other baseline days, before and after) made a repeating fact never new in the baseline while it was new on every window day, and on an incident-free window every new connection came out significant; "the past with the window's gap" (a baseline day *d* judged against days up to *d* − *L*) fixed that but needs a baseline longer than the window, and on LANL (7 baseline days, 9 window days) it left no null at all.
 5. **Coverage.** The loaders record, for every destination, the time span of every collected log file: first to last record. Spans are merged per kind of evidence:
    - logins: every source except lastlog and btmp;
    - failures: every source except lastlog, wtmp and utmp.
@@ -85,7 +85,23 @@ both cuts false alarms eightfold against per-login anomaly detection:
   owners are the origins that used it on the reference days; a switch is
   an account with owners that this origin never used. An account with no
   owner anywhere is *unknown to the network* and is reported as such, not
-  as a switch.
+  as a switch. How strongly the account belongs elsewhere is its **home
+  share**: of its earlier successful login-days summed over the origins
+  that used it, the share that came from the most frequent one. 1 means
+  it always came from one machine (a person's own workstation); near 0
+  means it is used from everywhere (a service or administrator account).
+  This is the owner Hopper reads from an inventory, read from the logs
+  instead, and it is computed before the day in question only. The
+  `credential-switch` coordinate sums the home shares of that day's
+  switch logins, so four logins with an account that lives on one other
+  machine weigh 4 and four logins with an account used from 900 machines
+  weigh almost nothing; before, both counted 4. The connection's
+  explanation names the home: "the account belongs elsewhere: 100% of its
+  earlier login-days came from C8198 (7 day(s))". Measured on LANL
+  (baseline of 7 days): the account U3486 had 946 logins from one origin,
+  U568 628 from one origin, U1653 came from 897 origins; a quiet red-team
+  machine that logged in four times with U3486 was indistinguishable from
+  the U1653 traffic until the weight was added.
 - **new access**: the destination is new for the origin or for the account.
 
 Both are facts already measured by the leave-one-day-out reference; no
@@ -212,6 +228,9 @@ Benjamini-Hochberg runs across every (IP, NAME) candidate. An IP is resolved whe
 
 - **History plateau H\* (Mann-Kendall) → past-only reference, every day alike.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). Leave-one-day-out gives every day the same reference instead.
 - **Simes within families + Fisher across families → one joint test per origin-day.** Fisher assumes independent families, which does not hold. Testing each signal separately also multiplied the testing burden: 31 novel-edge tests for one fan-out. The joint test measures corroboration directly and stays valid under any dependence.
+
+- **Hour of day per account: measured and dropped (October 2026).** The idea was a coordinate for a login outside the account's usual hours, read from the baseline. On LANL the red team works office hours: the quiet source C22409 logs in between 13:00 and 15:00, C19932 between 8:00 and 18:00, and the red team as a whole has no login between 23:00 and 6:00 while the network has 3 % of its logins in each of those hours. On the test case the attacker entered between 15:35 and 16:10. The signal would separate nothing, and on a DFIR baseline of one to four weeks most accounts have too few logins for an hourly profile anyway; a coordinate that is almost always zero only dilutes the joint test.
+- **Accumulated homes per origin: measured and not added (October 2026).** The number of distinct single-home accounts an origin has used so far (1 for a person on a new machine, growing for an attacker rotating stolen credentials) was measured prequentially on LANL: it would put C22409 among the 1.4 % most unusual origin-days on its third day (2 homes), which under Benjamini-Hochberg over 60,000 connections is not significant; C19932 (one shared account) is invisible to it. Not worth a coordinate.
 
 ## Validation
 
