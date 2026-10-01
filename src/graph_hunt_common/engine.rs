@@ -704,6 +704,11 @@ fn day_of(t: i64) -> i32 {
     t.div_euclid(86_400) as i32
 }
 
+/// Saturday or Sunday (day 0 = 1970-01-01, a Thursday).
+fn is_weekend(day: i32) -> bool {
+    matches!((day + 4).rem_euclid(7), 0 | 6)
+}
+
 fn day_str(day: i32) -> String {
     chrono::DateTime::from_timestamp(day as i64 * 86_400, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
@@ -1736,6 +1741,16 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         qs[i] = qf[j];
     }
     let n_sig = qs.iter().filter(|q| **q <= alpha).count();
+    {
+        // weekday / weekend split, for the analyst. Matching each window
+        // day's null to the days of its kind was tried and dropped: on the
+        // test case it left the attack day with 74 null logins
+        // instead of 267 (a Sunday discovery scan held most of the new
+        // baseline logins) and the floor 1/75 could no longer pass BH
+        let we = null_days.iter().filter(|d| is_weekend(**d)).count();
+        let wwe = win_days.iter().filter(|d| is_weekend(**d)).count();
+        lines.push(format!("Day kinds: null {} weekday and {} weekend day(s); window {} weekday and {} weekend day(s)", null_days.len() - we, we, win_days.len() - wwe, wwe));
+    }
     let floor: Vec<String> = [OK, FAIL, PRE]
         .iter()
         .filter_map(|cls| tested.iter().find(|x| x.t.cls == *cls).map(|x| format!("{} 1/{}", match *cls { OK => "logins", FAIL => "failed logins", _ => "unauthenticated connections" }, x.n_null + 1)))
