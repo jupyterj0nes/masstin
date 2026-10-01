@@ -52,31 +52,69 @@ pub struct Resolution {
     pub q: f64,
 }
 
+/// The rates the chance model needs, measured over EVERY login (not only
+/// the seconds where an IP and a name coincide): a name's distinct login
+/// seconds per (destination, account, outcome), and each destination's
+/// observed span.
+#[derive(Default)]
+pub struct Rates<'a> {
+    pub n_name: HashMap<(&'a str, &'a str, &'a str, &'a str), u64>,
+    pub span: HashMap<&'a str, (i64, i64)>,
+    seen: HashSet<u64>,
+}
+
+impl<'a> Rates<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Every login counts for the span; a name-sourced login counts once
+    /// per second for its name's rate.
+    pub fn add(&mut self, dst: &'a str, account: &'a str, outcome: &'a str, sec: i64, source: &'a str, source_is_ip: bool) {
+        let e = self.span.entry(dst).or_insert((sec, sec));
+        if sec < e.0 {
+            e.0 = sec;
+        }
+        if sec > e.1 {
+            e.1 = sec;
+        }
+        if !source_is_ip {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (dst, account, outcome, source, sec).hash(&mut h);
+            if self.seen.insert(h.finish()) {
+                *self.n_name.entry((dst, account, outcome, source)).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+/// Resolution from every observation at once (the rates are taken from the
+/// same observations). For large corpora use `resolve_ip_names_with` and
+/// feed it only the seconds where an IP and a name can coincide.
 pub fn resolve_ip_names<'a>(obs: impl Iterator<Item = Obs<'a>>, alpha: f64) -> HashMap<String, Resolution> {
+    let all: Vec<Obs<'a>> = obs.collect();
+    let mut rates = Rates::new();
+    for o in &all {
+        rates.add(o.dst, o.account, o.outcome, o.sec, o.source, o.source_is_ip);
+    }
+    resolve_ip_names_with(all.into_iter(), alpha, &rates)
+}
+
+/// `obs` must contain every IP-sourced login and the name-sourced logins of
+/// the same (destination, account, outcome, second); `rates` the rates
+/// measured over all logins.
+pub fn resolve_ip_names_with<'a>(obs: impl Iterator<Item = Obs<'a>>, alpha: f64, rates: &Rates<'a>) -> HashMap<String, Resolution> {
     // (dst, account, outcome, second) -> (ips, names)
     let mut cooc: HashMap<(&str, &str, &str, i64), (Vec<&str>, Vec<&str>)> = HashMap::new();
-    let mut span: HashMap<&str, (i64, i64)> = HashMap::new();
     for o in obs {
-        let e = span.entry(o.dst).or_insert((o.sec, o.sec));
-        if o.sec < e.0 {
-            e.0 = o.sec;
-        }
-        if o.sec > e.1 {
-            e.1 = o.sec;
-        }
         let c = cooc.entry((o.dst, o.account, o.outcome, o.sec)).or_default();
         let list = if o.source_is_ip { &mut c.0 } else { &mut c.1 };
         if !list.contains(&o.source) {
             list.push(o.source);
         }
     }
-    // name login rate per (dst, account, outcome, name): distinct seconds
-    let mut n_name: HashMap<(&str, &str, &str, &str), u64> = HashMap::new();
-    for ((d, a, oc, _), (_, names)) in &cooc {
-        for nm in names {
-            *n_name.entry((d, a, oc, nm)).or_insert(0) += 1;
-        }
-    }
+    let span = &rates.span;
+    let n_name = &rates.n_name;
     // per IP: trials per context (seconds where the IP was the only IP)
     // and votes per (context, name)
     let mut trials: HashMap<&str, HashMap<(&str, &str, &str), u64>> = HashMap::new();
@@ -105,7 +143,7 @@ pub fn resolve_ip_names<'a>(obs: impl Iterator<Item = Obs<'a>>, alpha: f64) -> H
         let mut k_tot = 0u64;
         let mut p_sum = 0.0f64;
         for ((d, a, oc), &n_c) in tr {
-            let (lo, hi) = span[d];
+            let (lo, hi) = span.get(d).copied().unwrap_or((0, 0));
             let t = (hi - lo + 1).max(1) as f64;
             let lambda = n_name.get(&(d, a, oc, nm)).copied().unwrap_or(0) as f64 / t;
             let p_c = -(-lambda).exp_m1(); // 1 - e^-lambda
