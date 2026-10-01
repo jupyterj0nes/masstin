@@ -576,6 +576,35 @@ impl<K: std::hash::Hash + Eq> DayIndex<K> {
     }
 }
 
+/// How exclusively an account belongs elsewhere before `day`: the share of
+/// its earlier successful login-days (summed over the origins that used it)
+/// that came from its most frequent origin, and that origin. 1 = it always
+/// came from one machine (a person's own workstation); near 0 = it is used
+/// from everywhere (a service or administrator account). This is the owner
+/// Hopper reads from an inventory, read from the logs instead. Before
+/// `day` only: the origin being judged has no earlier day with it, so it
+/// never counts.
+fn home_share(ix_oa: &DayIndex<(u32, u32)>, origins: &[u32], a: u32, day: i32) -> (f64, Option<u32>, usize) {
+    let mut top = 0usize;
+    let mut top_o = None;
+    let mut total = 0usize;
+    for &o in origins {
+        if let Some(c) = ix_oa.m.get(&(o, a)) {
+            let k = c.days.partition_point(|d| *d < day);
+            total += k;
+            if k > top {
+                top = k;
+                top_o = Some(o);
+            }
+        }
+    }
+    if total == 0 {
+        (0.0, None, 0)
+    } else {
+        (top as f64 / total as f64, top_o, top)
+    }
+}
+
 struct TripleDay {
     day: i32,
     o: u32,
@@ -619,8 +648,11 @@ struct OriginDay {
     /// (account, destination) logins with a credential switch (account owned
     /// by other origins, never used by this one) and a new access
     /// (destination new for the origin or for the account): Hopper's two
-    /// attack properties in one login
-    switch_new: BTreeSet<(u32, u32)>,
+    /// attack properties in one login. The value is the account's home
+    /// share before that day (see `home_share`): 1 for an account that
+    /// always came from one other machine, near 0 for one used from
+    /// everywhere
+    switch_new: BTreeMap<(u32, u32), f64>,
     fail_n: u64,
     pre_n: u64,
     t0: i64,
@@ -964,7 +996,7 @@ const COORDS: [(&str, &str); 11] = [
     ("no-history", "origin has no event of any kind in the baseline"),
     ("rare-logon-type", "rarest logon type used, -ln(share of the destination's logins with a type at most this rare)"),
     ("causal-path", "causal paths through this origin with a credential switch and a new access (sum of path certainties)"),
-    ("credential-switch", "logins with a credential switch and a new access (account owned by other origins, destination new for the origin or the account)"),
+    ("credential-switch", "logins with a credential switch and a new access (account owned by other origins, destination new for the origin or the account), each weighted by the account's home share"),
 ];
 
 type Pred<'a> = &'a dyn Fn(u32) -> bool;
@@ -997,7 +1029,7 @@ fn profile(o: &OriginDay, ok: Pred, fail: Pred, enabled: &[bool; 11]) -> [f64; 1
         }
         best.values().sum()
     };
-    v[10] = o.switch_new.iter().filter(|(_, d)| ok(*d)).count() as f64;
+    v[10] = o.switch_new.iter().filter(|((_, d), _)| ok(*d)).map(|(_, w)| *w).sum();
     for (i, e) in enabled.iter().enumerate() {
         if !e {
             v[i] = 0.0;
@@ -1141,6 +1173,14 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     if anchor != cutoff_day - 1 {
         lines.push(format!("Note: the last covered baseline day is {}; the panel runs up to it", day_str(anchor)));
     }
+    // A baseline day enters the null only when at least half of the
+    // baseline days lie before it. With "reference = every earlier day"
+    // the first days see almost everything as new (the second day has one
+    // day of reference) and would fill the null with novelty that is not
+    // unusual, only unseen; the window days have the whole baseline behind
+    // them. On LANL the second day contributed 19,824 new connections
+    // (1,022 from never-seen origins) and the fifth 2,047 (38).
+    let deep = |day: i32| bd.partition_point(|d| *d < day) * 2 >= bd.len();
     let mut best = (0usize, cutoff_day);
     {
         // for each destination and kind, the first day of its last
@@ -1167,6 +1207,9 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         // failed-sweep / pre-auth / probe signals) almost entirely. A kind
         // of evidence absent from the whole graph does not veto the other.
         for (k, s) in bd.iter().enumerate() {
+            if !deep(*s) {
+                continue;
+            }
             let n_ok = rs_ok.iter().filter(|st| **st <= *s).count();
             let n_fail = rs_fail.iter().filter(|st| **st <= *s).count();
             let size = if rs_fail.is_empty() {
@@ -1176,7 +1219,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             } else {
                 n_ok.min(n_fail)
             };
-            let cells = size * (bd.len() - k);
+            let cells = size * bd[k..].iter().filter(|d| deep(**d)).count();
             if cells > best.0 {
                 best = (cells, *s);
             }
@@ -1195,9 +1238,9 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     };
     let panel_ok: HashSet<u32> = dsts.iter().copied().filter(|d| in_run(&cov_ok, *d)).collect();
     let panel_fail: HashSet<u32> = cov_fail.keys().copied().filter(|d| in_run(&cov_fail, *d)).collect();
-    let null_days: Vec<i32> = bd.iter().copied().filter(|d| *d >= s_day).collect();
+    let null_days: Vec<i32> = bd.iter().copied().filter(|d| *d >= s_day && deep(*d)).collect();
     lines.push(format!(
-        "Panel: {} destination(s) with continuous login coverage and {} with failure coverage from {} to the cutoff; {} baseline day(s) form the null; reference for novelty = every earlier day ({} baseline day(s) with data), for baseline and window days alike",
+        "Panel: {} destination(s) with continuous login coverage and {} with failure coverage from {} to the cutoff; {} baseline day(s) form the null (days with at least half the baseline before them); reference for novelty = every earlier day ({} baseline day(s) with data), for baseline and window days alike",
         panel_ok.len(),
         panel_fail.len(),
         day_str(s_day),
@@ -1245,6 +1288,13 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     //    pairs unique to it) for Louvain and centrality ──
     let want_comm = enabled[3];
     let want_central = cfg.enabled("pagerank-spike") || cfg.enabled("betweenness-spike");
+    // the origins that ever used each account, for the home share
+    let mut acct_origins: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (o, a) in ix_oa.m.keys() {
+        acct_origins.entry(*a).or_default().push(*o);
+    }
+    let no_origins: Vec<u32> = Vec::new();
+    let mut home_cache: HashMap<(i32, u32), f64> = HashMap::new();
     let base_pairs: Vec<(usize, usize)> = ix_pair.m.keys().filter(|(o, d)| o != d).map(|(o, d)| (*o as usize, *d as usize)).collect();
     let mut unique_by_day: BTreeMap<i32, HashSet<(usize, usize)>> = BTreeMap::new();
     for ((o, d), c0) in &ix_pair.m {
@@ -1415,7 +1465,8 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                             od.new_ad.insert((e.a, e.d));
                         }
                         if oa_new && !ix_acct.is_new(&e.a, day) && (pnew || ad_new) {
-                            od.switch_new.insert((e.a, e.d));
+                            let w = *home_cache.entry((day, e.a)).or_insert_with(|| home_share(&ix_oa, acct_origins.get(&e.a).unwrap_or(&no_origins), e.a, day).0);
+                            od.switch_new.insert((e.a, e.d), w);
                         }
                     }
                     if !is_uid_account(an) {
@@ -1653,7 +1704,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                 // the day's reference gap: on the first covered day of a
                 // destination every connection to it is new for lack of
                 // history, not for being unusual
-                .filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && t.flags & F_TRIPLE != 0 && on_panel(t) && had_history(t))
+                .filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && deep(t.day) && t.flags & F_TRIPLE != 0 && on_panel(t) && had_history(t))
                 .map(|t| (features(t, &okp, &failp, &mut cache, false).to_vec(), t.day))
                 .unzip();
             let jn = JointNull::new(null_rows, null_row_days, 17);
@@ -1828,6 +1879,12 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             }
             if x[3] > 0.0 {
                 why.push(("account never used by this origin before".into(), shared(3)));
+                if f & F_SWITCH != 0 {
+                    let (share, top, n) = home_share(&ix_oa, acct_origins.get(&t.a).unwrap_or(&no_origins), t.a, t.day);
+                    if let Some(top) = top {
+                        why.push((format!("the account belongs elsewhere: {:.0}% of its earlier login-days came from {} ({} day(s))", share * 100.0, ents.names.name(top), n), String::new()));
+                    }
+                }
             }
         }
         if x[1] > 0.0 {
@@ -1878,7 +1935,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             }
         }
         if x[15] > 0.0 {
-            why.push((format!("that day the origin made {} login(s) with a credential switch to a new access", x[15]), matched(15)));
+            why.push((format!("that day the origin's logins with a credential switch to a new access weigh {:.2} (each login counts by how exclusively its account belongs to other machines: 1 = one home)", x[15]), matched(15)));
         }
         if x[13] > 0.0 {
             why.push((format!("the destination's PageRank rose that day (+{:.3})", x[13]), matched(13)));
