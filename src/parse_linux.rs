@@ -686,6 +686,24 @@ fn open_plain_or_gzip(path: &Path) -> Box<dyn BufRead> {
     }
 }
 
+static REPEATED_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"^(.*?)message repeated (\d+) times: \[ ?(.*?) ?\]\s*$"#).unwrap());
+
+/// rsyslog's `message repeated N times: [ ... ]` stands for N identical
+/// lines (N failed passwords, N accepted keys); it counted as one. The
+/// inner message is put back under the line's own header, N times
+/// (capped, so a crafted line cannot allocate without bound).
+fn expand_repeated(line: String) -> Vec<String> {
+    match REPEATED_RE.captures(&line) {
+        Some(c) => {
+            let n: usize = c[2].parse().unwrap_or(1);
+            let rebuilt = format!("{}{}", &c[1], &c[3]);
+            vec![rebuilt; n.clamp(1, 10_000)]
+        }
+        None => vec![line],
+    }
+}
+
 fn parse_timestamp_syslog(fragment: &str, default_year: i32) -> Option<String> {
     // RFC3164 "Sep  6 21:39:20"
     if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(
@@ -724,7 +742,16 @@ fn parse_secure_or_messages(
     // per-directory hint comes from the CURRENT wtmp/dpkg.log and would
     // stamp a 2024 `secure-20240616` with the 2026 of its siblings.
     let rotation = rotation_date_from_name(&fname);
-    let file_year = match rotation {
+    // The current `secure` / `auth.log` has no suffix; its last-write date
+    // bounds its lines the same way (a file written in January that holds
+    // December lines). A day of slack covers the time zone.
+    let rotation = rotation.or_else(|| {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| DateTime::<Utc>::from(t).naive_utc().date() + chrono::Duration::days(1))
+    });
+    let file_year = match rotation_date_from_name(&fname) {
         Some(rot) => {
             if is_debug_mode() {
                 println!("    year {} for {} (from logrotate suffix)", rot.year(), fname);
@@ -738,7 +765,7 @@ fn parse_secure_or_messages(
         println!("    reading {} (year hint: {}) ...", path.display(), file_year);
     }
 
-    for line in open_plain_or_gzip(path).lines().flatten() {
+    for line in open_plain_or_gzip(path).lines().flatten().flat_map(expand_repeated) {
         let (when, msg) =
         // ——— RFC3164 legacy syslog: "Mar 16 08:25:22 hostname msg..." ———
         // Used by: /var/log/secure (RHEL/CentOS), /var/log/auth.log (Debian/Ubuntu),
@@ -754,6 +781,24 @@ fn parse_secure_or_messages(
                 (ts, msg.to_string())
             } else {
                 continue;
+            }
+        }
+        // ——— ISO-stamped syslog: "2026-09-25T10:11:12.123456+02:00 host msg" ———
+        // rsyslog's RSYSLOG_FileFormat (Debian 13 default; high-precision
+        // timestamps). The stamp carries its own offset: no year or
+        // time-zone guessing.
+        else if line.len() > 20 && line.as_bytes()[4] == b'-' && line.as_bytes()[10] == b'T' {
+            match line.split_once(' ') {
+                Some((stamp, rest)) => match DateTime::parse_from_rfc3339(stamp) {
+                    Ok(dt) => {
+                        let msg = rest.split_once(' ').map(|(_, m)| m).unwrap_or("");
+                        // whole seconds, like every other Linux source
+                        let ts = dt.with_timezone(&Utc).timestamp();
+                        (DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp_opt(ts, 0).unwrap_or_default(), Utc).to_rfc3339(), msg.to_string())
+                    }
+                    Err(_) => continue,
+                },
+                None => continue,
             }
         }
         // ——— RFC5424 structured syslog: "<PRI>VERSION TIMESTAMP ..." ———
@@ -2266,4 +2311,19 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
 
     // Cleanup temp extraction dir
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[cfg(test)]
+mod repeated_tests {
+    use super::expand_repeated;
+
+    #[test]
+    fn repeated_lines_are_expanded() {
+        let l = "Sep 25 10:11:12 host sshd[12]: message repeated 3 times: [ Failed password for root from 10.0.0.9 port 1 ssh2]".to_string();
+        let v = expand_repeated(l);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], "Sep 25 10:11:12 host sshd[12]: Failed password for root from 10.0.0.9 port 1 ssh2");
+        let plain = "Sep 25 10:11:12 host sshd[12]: Accepted publickey for u from 10.0.0.9 port 1 ssh2".to_string();
+        assert_eq!(expand_repeated(plain.clone()), vec![plain]);
+    }
 }

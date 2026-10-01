@@ -170,23 +170,31 @@ fn parse_indices(header: &str) -> Option<Indices> {
     }
 }
 
-fn looks_like_ip(s: &str) -> bool {
-    let ipv4 = s.chars().all(|c| c.is_ascii_digit() || c == '.');
-    let ipv6 = s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
-    ipv4 || ipv6
+/// An IPv4 address (with or without a `:port`) or an IPv6 address. The
+/// former test took any string of hex digits (`CAFE`, `BADC0DE`) for an
+/// IPv6 address and any string of digits for an IPv4 one.
+pub(crate) fn looks_like_ip(s: &str) -> bool {
+    let ipv4 = s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':');
+    ipv4 || s.split('%').next().unwrap_or(s).parse::<std::net::Ipv6Addr>().is_ok()
 }
 
-fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
-    let candidate = s
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
-        .collect::<String>();
-    if candidate.contains('.') || candidate.contains(':') {
-        Some(&s[..candidate.len()])
-    } else {
-        None
+/// The address a cell starts with: `10.0.0.1 (x)`, `10.0.0.1:3389`,
+/// `fe80::1%eth0`, `[2001:db8::1]`. The former version stopped at the
+/// first letter and cut every IPv6 address short.
+pub(crate) fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
+    let cand = s.trim_start_matches('[').split(|c: char| c == ' ' || c == '[' || c == ']' || c == '(').next().unwrap_or("");
+    if cand.is_empty() {
+        return None;
     }
+    if cand.contains('.') && cand.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ':') {
+        return Some(cand);
+    }
+    if cand.split('%').next().unwrap_or(cand).parse::<std::net::Ipv6Addr>().is_ok() {
+        return Some(cand);
+    }
+    None
 }
+
 
 /// Short host name of an FQDN (`LVRMVP03.SIR.RENFE.ES` -> `LVRMVP03`) —
 /// unless two different FQDNs in the corpus share that short name
@@ -252,11 +260,15 @@ fn clean_row(
     // the relationship TYPE is still upper-cased by sanitize_rel_type, so
     // directory accounts typed in different case stay one type, but the
     // `target_user_name` property shows what was actually logged).
-    let line = raw_line.replace("\\", "").replace("[", "").replace("]", "");
-    let fields: Vec<String> = line
-        .split(',')
+    // fields read with quotes honoured (a comma inside a quoted field can
+    // no longer shift the columns); then the same cleaning as before
+    let fields: Vec<String> = crate::graph_hunt_common::engine::csv_fields(raw_line)
+        .into_iter()
         .enumerate()
-        .map(|(i, f)| if i == idx.target_user || i == idx.subject_user { f.to_string() } else { f.to_uppercase() })
+        .map(|(i, f)| {
+            let f = f.replace("\\", "").replace("[", "").replace("]", "");
+            if i == idx.target_user || i == idx.subject_user { f } else { f.to_uppercase() }
+        })
         .collect();
     let mut row: Vec<&str> = fields.iter().map(|x| x.as_str()).collect();
     if row.len() <= idx.src_ip { return RowOutcome::Filtered; }
@@ -721,7 +733,7 @@ pub async fn load_neo4j(
             }
         };
 
-        let local_values: HashSet<&str> = ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0",
+        let local_values: HashSet<&str> = ["LOCAL", "LOCALHOST", "127.0.0.1", "::1", "::", "0.0.0.0",
             "DEFAULT_VALUE", "\"\"", "-", "", " "].iter().cloned().collect();
 
         // ── Pass 1: stream-collect counts + literal hosts ──
@@ -848,7 +860,7 @@ pub async fn load_neo4j(
                 };
                 if let Some(t) = crate::graph_hunt_common::parse_ts(&edge.time) {
                     let t = t.and_utc().timestamp();
-                    let raw_file = line.rsplit(',').next().unwrap_or("").trim_matches('"').to_string();
+                    let raw_file = crate::graph_hunt_common::engine::csv_fields(&line).pop().unwrap_or_default();
                     let e = file_spans.entry((edge.destination.clone(), raw_file)).or_insert((t, t));
                     if t < e.0 { e.0 = t; }
                     if t > e.1 { e.1 = t; }
@@ -1039,5 +1051,26 @@ pub async fn load_neo4j(
             }
         }
         crate::banner::print_load_summary("Neo4j", loaded, resolved_count, errors, start_clock);
+    }
+}
+
+#[cfg(test)]
+mod ip_tests {
+    use super::{extract_leading_ip, looks_like_ip};
+
+    #[test]
+    fn ipv6_and_hex_names() {
+        assert!(looks_like_ip("10.0.0.1"));
+        assert!(looks_like_ip("10.0.0.1:3389"));
+        assert!(looks_like_ip("fe80::1"));
+        assert!(looks_like_ip("2001:db8::10"));
+        assert!(!looks_like_ip("CAFE"));
+        assert!(!looks_like_ip("BADC0DE"));
+        assert!(!looks_like_ip("12345"));
+        assert_eq!(extract_leading_ip("10.0.0.1 (x)"), Some("10.0.0.1"));
+        assert_eq!(extract_leading_ip("fe80::1%eth0"), Some("fe80::1%eth0"));
+        assert_eq!(extract_leading_ip("[2001:db8::1]"), Some("2001:db8::1"));
+        assert_eq!(extract_leading_ip("SRV01"), None);
+        assert_eq!(extract_leading_ip("DEADBEEF"), None);
     }
 }
