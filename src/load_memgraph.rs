@@ -104,24 +104,7 @@ fn strip_timezone(ts: &str) -> String {
     ts.to_string()
 }
 
-fn looks_like_ip(s: &str) -> bool {
-    let ipv4 = s.chars().all(|c| c.is_ascii_digit() || c == '.');
-    let ipv6 = s.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
-    ipv4 || ipv6
-}
-
-fn extract_leading_ip<'a>(s: &'a str) -> Option<&'a str> {
-    let candidate = s
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ':')
-        .collect::<String>();
-
-    if candidate.contains('.') || candidate.contains(':') {
-        Some(&s[..candidate.len()])
-    } else {
-        None
-    }
-}
+use crate::load_neo4j::{extract_leading_ip, looks_like_ip};
 
 pub async fn load_memgraph(
     files: &Vec<String>,
@@ -198,7 +181,7 @@ pub async fn load_memgraph(
         let idx_log_source: usize = if is_new_format { 13 } else { 11 };
 
         let local_values: HashSet<&str> =
-                ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "\"\"", "-", ""," ",]
+                ["LOCAL", "LOCALHOST", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "\"\"", "-", ""," ",]
                 .iter().cloned().collect();
 
         let mut filtered_by_time: usize = 0;
@@ -208,7 +191,7 @@ pub async fn load_memgraph(
         let ambiguous: HashSet<String> = {
             let mut by_short: HashMap<String, HashSet<String>> = HashMap::new();
             for line in lines.iter().skip(1) {
-                let cols: Vec<&str> = line.split(',').collect();
+                let cols: Vec<String> = crate::graph_hunt_common::engine::csv_fields(line);
                 for c in [idx_dst, idx_src_computer, idx_src_ip] {
                     if let Some(v) = cols.get(c) {
                         let mut v = v.replace("\\", "").replace("[", "").replace("]", "").to_uppercase();
@@ -233,11 +216,16 @@ pub async fn load_memgraph(
         .skip(1)
         // Host / IP / type columns upper-cased for matching; the user
         // columns keep their case (the rel TYPE is upper-cased anyway).
+        // fields read with quotes honoured and commas inside them replaced
+        // (csv_fields), so the comma-joined form used below is unambiguous
         .map(|line| {
-            let l = line.replace("\\", "").replace("[", "").replace("]", "");
-            l.split(',')
+            crate::graph_hunt_common::engine::csv_fields(&line)
+                .into_iter()
                 .enumerate()
-                .map(|(i, f)| if i == idx_target_user || i == idx_subject_user { f.to_string() } else { f.to_uppercase() })
+                .map(|(i, f)| {
+                    let f = f.replace("\\", "").replace("[", "").replace("]", "");
+                    if i == idx_target_user || i == idx_subject_user { f } else { f.to_uppercase() }
+                })
                 .collect::<Vec<String>>()
                 .join(",")
         })
@@ -256,6 +244,10 @@ pub async fn load_memgraph(
             }
 
             let mut row: Vec<&str> = line.split(',').collect();
+            // a short row (a truncated last line) used to abort the load
+            if row.len() <= idx_dst.max(idx_src_computer).max(idx_src_ip).max(idx_target_user).max(idx_subject_user) {
+                return None;
+            }
             let raw_file = row.last().copied().unwrap_or("").trim_matches('"').to_string();
             let fam = crate::load_neo4j::log_source_family(row.last().copied().unwrap_or(""));
             if let Some(last) = row.last_mut() { *last = fam; }

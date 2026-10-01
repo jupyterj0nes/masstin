@@ -252,6 +252,17 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
 /// a quoted field is a quote). Only a field with an escaped quote is copied;
 /// every other field is a slice of the line, so reading tens of millions of
 /// rows allocates nothing per field.
+/// The fields of one timeline CSV line, quotes honoured, for the loaders.
+/// A comma inside a quoted field (a user name an attacker chose, a detail
+/// text) is replaced by `_`, so a loader that later splits on commas
+/// cannot be shifted one column by it: splitting the raw line on commas
+/// let a crafted account name forge the origin of an edge.
+pub(crate) fn csv_fields(line: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    split_csv_into(line, &mut v);
+    v.into_iter().map(|f| if f.contains(',') || f.contains('\n') || f.contains('\r') { f.replace([',', '\n', '\r'], "_") } else { f.into_owned() }).collect()
+}
+
 pub(crate) fn split_csv_into<'a>(line: &'a str, out: &mut Vec<std::borrow::Cow<'a, str>>) {
     use std::borrow::Cow;
     out.clear();
@@ -2851,4 +2862,14 @@ mod tests {
         assert!(!ix.is_new(&7, 105)); // seen before
         assert!(ix.is_new(&9, 105));
     }
+
+    #[test]
+    fn csv_fields_keeps_columns_aligned() {
+        let f = csv_fields("2026-09-23 15:35:00,SRV01,SUCCESSFUL_LOGON,,,\"evil,root\",,,10.0.0.1,,,123,\"a \"\"q\"\" b\",secure");
+        assert_eq!(f.len(), 14);
+        assert_eq!(f[5], "evil_root");
+        assert_eq!(f[12], "a \"q\" b");
+        assert_eq!(f[13], "secure");
+    }
+
 }
