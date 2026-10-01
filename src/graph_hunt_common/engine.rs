@@ -136,6 +136,8 @@ fn is_uid_account(a: &str) -> bool {
 
 struct RawRow {
     t: i64,
+    /// UTC day of `t`
+    day: i32,
     /// log family (secure, wtmp, audit, journal, btmp, evtx...)
     fam: u32,
     o: u32,
@@ -216,6 +218,7 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
             let cls = class_of(&et, &eid, &acct);
             let r = RawRow {
                 t,
+                day: day_of(t),
                 fam: c.fams.id(&src),
                 o: c.nodes.id(&o),
                 d: c.nodes.id(&d),
@@ -449,6 +452,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
             }
             c.rows.push(RawRow {
                 t,
+                day: day_of(t),
                 fam: fi,
                 o,
                 d,
@@ -468,7 +472,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         let acct = c.accts.name(a).to_string();
         let fam = c.fams.name(fi).to_string();
         let eid = if et == "CONNECT" { "SSH_PREAUTH" } else { "" };
-        c.rows.push(RawRow { t: t0, fam: fi, o, d, a, et: eti, cls: class_of(&et, eid, &acct), lt: c.lts.id(""), cov: super::coverage_kinds(&fam), n, lid: 0, logoff: false });
+        c.rows.push(RawRow { t: t0, day: day_of(t0), fam: fi, o, d, a, et: eti, cls: class_of(&et, eid, &acct), lt: c.lts.id(""), cov: super::coverage_kinds(&fam), n, lid: 0, logoff: false });
     }
     // coverage spans per destination node, by kind
     let mut by_node: HashMap<String, (Vec<(i64, i64)>, Vec<(i64, i64)>)> = HashMap::new();
@@ -524,7 +528,8 @@ struct DayCount {
     n: u32,
     first: i32,
     last: i32,
-    days: BTreeSet<i32>,
+    /// distinct days, ascending (events are added in time order)
+    days: Vec<i32>,
 }
 
 /// Past-only reference, every day alike. A fact is new on a day when it
@@ -543,8 +548,10 @@ impl<K: std::hash::Hash + Eq> DayIndex<K> {
         DayIndex { m: HashMap::new() }
     }
     fn add(&mut self, k: K, day: i32) {
-        let c = self.m.entry(k).or_insert_with(|| DayCount { n: 0, first: day, last: day, days: BTreeSet::new() });
-        if c.days.insert(day) {
+        let c = self.m.entry(k).or_insert_with(|| DayCount { n: 0, first: day, last: day, days: Vec::with_capacity(1) });
+        let pos = c.days.partition_point(|d| *d < day);
+        if c.days.get(pos) != Some(&day) {
+            c.days.insert(pos, day);
             c.n = c.days.len() as u32;
             c.first = c.first.min(day);
             c.last = c.last.max(day);
@@ -554,7 +561,7 @@ impl<K: std::hash::Hash + Eq> DayIndex<K> {
     fn is_new(&self, k: &K, day: i32) -> bool {
         match self.m.get(k) {
             None => true,
-            Some(c) => c.days.range(..day).next().is_none(),
+            Some(c) => c.days.first().map(|f| *f >= day).unwrap_or(true),
         }
     }
     /// days before the cutoff the item occurred on, and the first and last
@@ -562,10 +569,8 @@ impl<K: std::hash::Hash + Eq> DayIndex<K> {
         match self.m.get(k) {
             None => (0, None, None),
             Some(c) => {
-                let mut r = c.days.range(..cutoff_day);
-                let first = r.next().copied();
-                let last = c.days.range(..cutoff_day).next_back().copied();
-                (c.days.range(..cutoff_day).count() as u32, first, last)
+                let k = c.days.partition_point(|d| *d < cutoff_day);
+                (k as u32, c.days.first().copied().filter(|_| k > 0), if k > 0 { Some(c.days[k - 1]) } else { None })
             }
         }
     }
@@ -623,14 +628,13 @@ struct OriginDay {
     no_history: bool,
 }
 
+/// A successful login with a real account name (the only ones that can
+/// start or continue a causal path).
 struct OkEvent {
     t: i64,
-    day: i32,
     o: u32,
     d: u32,
     a: u32,
-    /// a real account name (not NO_USER / _UNKNOWN_ / uid:N)
-    named: bool,
     /// session end: its LOGOFF when recorded, else the end of the UTC day
     end: i64,
 }
@@ -884,18 +888,41 @@ struct Entities {
 }
 
 fn build_entities(c: &Corpus, alpha: f64) -> (Entities, HashMap<String, resolve::Resolution>) {
-    let obs = c.rows.iter().filter(|r| r.cls == OK || r.cls == FAIL).filter(|r| !is_no_account(c.accts.name(r.a))).map(|r| {
-        let src = c.nodes.name(r.o);
-        Obs {
-            dst: c.nodes.name(r.d),
-            account: c.accts.name(r.a),
-            outcome: c.ets.name(r.et),
-            sec: r.t,
-            source: src,
-            source_is_ip: looks_like_ip(src),
+    // Only the seconds where an IP-sourced login exists can hold a vote, so
+    // the co-occurrence map is built for those alone (a map with one entry
+    // per login took several GB on 21 M rows that held no IP at all); the
+    // rates of the chance model are measured over every login.
+    use std::hash::{Hash, Hasher};
+    let key_hash = |d: &str, a: &str, oc: &str, sec: i64| -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (d, a, oc, sec).hash(&mut h);
+        h.finish()
+    };
+    let named = |r: &RawRow| (r.cls == OK || r.cls == FAIL) && !is_no_account(c.accts.name(r.a));
+    let node_is_ip: Vec<bool> = c.nodes.names.iter().map(|n| looks_like_ip(n)).collect();
+    let ip_keys: HashSet<u64> = c
+        .rows
+        .iter()
+        .filter(|r| named(r) && node_is_ip[r.o as usize])
+        .map(|r| key_hash(c.nodes.name(r.d), c.accts.name(r.a), c.ets.name(r.et), r.t))
+        .collect();
+    let res = if ip_keys.is_empty() {
+        HashMap::new()
+    } else {
+        let mut rates = resolve::Rates::new();
+        for r in c.rows.iter().filter(|r| named(r)) {
+            rates.add(c.nodes.name(r.d), c.accts.name(r.a), c.ets.name(r.et), r.t, c.nodes.name(r.o), node_is_ip[r.o as usize]);
         }
-    });
-    let res = resolve::resolve_ip_names(obs, alpha);
+        let obs = c
+            .rows
+            .iter()
+            .filter(|r| named(r) && (node_is_ip[r.o as usize] || ip_keys.contains(&key_hash(c.nodes.name(r.d), c.accts.name(r.a), c.ets.name(r.et), r.t))))
+            .map(|r| {
+                let src = c.nodes.name(r.o);
+                Obs { dst: c.nodes.name(r.d), account: c.accts.name(r.a), outcome: c.ets.name(r.et), sec: r.t, source: src, source_is_ip: node_is_ip[r.o as usize] }
+            });
+        resolve::resolve_ip_names_with(obs, alpha, &rates)
+    };
     let mut names = Interner::default();
     let mut aliases: Vec<BTreeSet<String>> = Vec::new();
     let mut of_node = Vec::with_capacity(c.nodes.names.len());
@@ -1057,30 +1084,15 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         e
     };
 
-    struct Ev {
-        t: i64,
-        day: i32,
-        o: u32,
-        d: u32,
-        a: u32,
-        cls: u8,
-        lt: u32,
-        n: u64,
-        fam: u32,
-        lid: u32,
-        logoff: bool,
+    // the per-event list is the row vector itself, node ids mapped to
+    // machine ids in place: no second copy of tens of millions of events
+    let mut evs: Vec<RawRow> = std::mem::take(&mut c.rows);
+    for e in evs.iter_mut() {
+        e.o = ents.of_node[e.o as usize];
+        e.d = ents.of_node[e.d as usize];
     }
-    let mut evs: Vec<Ev> = c
-        .rows
-        .iter()
-        .map(|r| Ev { t: r.t, day: day_of(r.t), o: ents.of_node[r.o as usize], d: ents.of_node[r.d as usize], a: r.a, cls: r.cls, lt: r.lt, n: r.n, fam: r.fam, lid: r.lid, logoff: r.logoff })
-        .collect();
     evs.sort_by_key(|e| e.t);
-    // the raw rows are not needed any more: on tens of millions of rows
-    // keeping both copies alive doubled the peak memory
     let fam_cov: Vec<(bool, bool)> = c.fams.names.iter().map(|f| super::coverage_kinds(f)).collect();
-    c.rows = Vec::new();
-    c.rows.shrink_to_fit();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
     let win_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| !is_base(*d)).collect();
 
@@ -1290,7 +1302,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         }
         m
     };
-    let session_end = |e: &Ev| -> i64 {
+    let session_end = |e: &RawRow| -> i64 {
         logoff_idx
             .get(&(e.o, e.d, e.a, e.lid))
             .and_then(|v| {
@@ -1406,7 +1418,9 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                             od.switch_new.insert((e.a, e.d));
                         }
                     }
-                    ok_events.push(OkEvent { t: e.t, day, o: e.o, d: e.d, a: e.a, named: !is_uid_account(an), end: session_end(e) });
+                    if !is_uid_account(an) {
+                        ok_events.push(OkEvent { t: e.t, o: e.o, d: e.d, a: e.a, end: session_end(e) });
+                    }
                 }
                 FAIL => {
                     od.fail_dsts.insert(e.d);
@@ -1458,13 +1472,13 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         // else the end of the UTC day). With session ends the cause can
         // have entered on an earlier day.
         let mut inbound: HashMap<u32, Vec<(i64, u32, u32, i64)>> = HashMap::new();
-        for e in ok_events.iter().filter(|e| e.named && e.o != e.d) {
+        for e in ok_events.iter().filter(|e| e.o != e.d) {
             inbound.entry(e.d).or_default().push((e.t, e.o, e.a, e.end));
         }
         for v in inbound.values_mut() {
             v.sort();
         }
-        for e2 in ok_events.iter().filter(|e| e.named && e.o != e.d) {
+        for e2 in ok_events.iter().filter(|e| e.o != e.d) {
             let v = match inbound.get(&e2.o) {
                 Some(v) => v,
                 None => continue,
@@ -1482,8 +1496,8 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             }
             let cert = 1.0 / cands.len() as f64;
             for ((a_node, a1), t1) in &cands {
-                if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), e2.day) {
-                    if let Some(od) = origin_days.get_mut(&(e2.day, e2.o)) {
+                if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), day_of(e2.t)) {
+                    if let Some(od) = origin_days.get_mut(&(day_of(e2.t), e2.o)) {
                         od.paths.push(PathFact { cert, a_node: *a_node, a1: *a1, t1: *t1, c_node: e2.d, a2: e2.a, t2: e2.t, n_cand: cands.len() });
                     }
                 }
@@ -1996,7 +2010,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         let mut v: Vec<(String, u32)> = m
             .iter()
             .filter(|((a, b), _)| if key_is_first { *a == id } else { *b == id })
-            .map(|((a, b), cnt)| (name(if key_is_first { *b } else { *a }), cnt.days.range(..cutoff_day).count() as u32))
+            .map(|((a, b), cnt)| (name(if key_is_first { *b } else { *a }), cnt.days.partition_point(|d| *d < cutoff_day) as u32))
             .filter(|(_, n)| *n > 0)
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -2615,6 +2629,7 @@ mod tests {
             let cls = class_of(et, eid, a);
             c.rows.push(RawRow {
                 t: *day as i64 * 86_400 + hour * 3600,
+                day: *day,
                 fam: c.fams.id("secure"),
                 o: c.nodes.id(o),
                 d: c.nodes.id(d),
