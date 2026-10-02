@@ -1,0 +1,219 @@
+# =============================================================================
+# Masstin custom parser rule — Mordor / OTRF Security-Datasets (flat JSON)
+# =============================================================================
+#
+# Format covered:
+#   NDJSON (one JSON object per line) in the flat Mordor / HELK / nxlog schema
+#   used by the OTRF Security-Datasets project and many SIEM exports: Windows
+#   EventData fields are flattened to top-level keys (`EventID`, `Hostname`,
+#   `TargetUserName`, `SourceIp`, `DestinationPort`, ...), NOT nested under
+#   `winlog` like Winlogbeat (use `parser-elastic` for that).
+#
+#   Needs the `type: json` extractor (masstin >= the release that added it).
+#
+# Events covered (the lateral-movement-relevant ones Mordor actually carries):
+#   Sysmon Event 3  network connection, kept only on admin / LM destination
+#                   ports and only outbound (Initiated=true)
+#   4624 / 4625     logon success / failure
+#   4634 / 4647     logoff
+#   4648            logon with explicit credentials (RunAs)
+#   5140            network share access
+#
+#   Mordor/OTRF collections are Sysmon- and WFP-centric, so SMB-server/-client
+#   (1009/551/31001), WinRM (6) and WMI-Activity (5858) channels are usually
+#   absent from those datasets; add parsers for them here if your JSON has them.
+#
+# References:
+#   https://github.com/OTRF/Security-Datasets
+#   https://securitydatasets.com/
+# =============================================================================
+
+meta:
+  vendor: "OTRF / Mordor"
+  product: "Security-Datasets (flat JSON event logs)"
+  format: "NDJSON, flat Mordor/HELK/nxlog schema (EventData flattened to top level)"
+  versions_tested: ["OTRF Security-Datasets 2020-2024"]
+  description: "Windows lateral-movement events from Mordor-schema JSON datasets"
+  author: "masstin community"
+  reference_url: "https://github.com/OTRF/Security-Datasets"
+
+prefilter:
+  contains_any:
+    - '"EventID"'
+
+parsers:
+
+  # ---------------------------------------------------------------------------
+  # Sysmon Event 3 — network connection on a lateral-movement port. The
+  # destination-port regex in `match` does the port filter the YAML `map`
+  # cannot (no conditionals); it tolerates spacing/quoting variants. The host
+  # running Sysmon (`Hostname`) is the local endpoint, so the edge is drawn
+  # Hostname -> DestinationIp; `Initiated` is surfaced in `detail` because the
+  # map has no conditionals to flip the direction on inbound connections.
+  # ---------------------------------------------------------------------------
+  - name: "mordor-sysmon3-netconn-lm"
+    match:
+      contains:
+        - "Microsoft-Windows-Sysmon"
+      regex: '"DestinationPort":\s*"?(22|135|139|445|1433|3306|3389|5900|5985|5986)\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        host: "Hostname"
+        user: "User"
+        proto: "Protocol"
+        initiated: "Initiated"
+        sip: "SourceIp"
+        dip: "DestinationIp"
+        dport: "DestinationPort"
+        image: "Image"
+    map:
+      time_created:     "${ts}"
+      computer:         "${dip}"
+      event_type:       "CONNECT"
+      event_id:         "3"
+      logon_type:       "3"
+      target_user_name: "${user}"
+      workstation_name: "${host}"
+      ip_address:       "${sip}"
+      detail:           "Sysmon3 ${proto} initiated=${initiated} ${image} :${dport}"
+      filename:         "${__source_file}"
+
+  # ---------------------------------------------------------------------------
+  # 4624 — successful logon
+  # ---------------------------------------------------------------------------
+  - name: "mordor-4624-logon"
+    match:
+      regex: '"EventID":\s*4624\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        host: "Hostname"
+        user: "TargetUserName"
+        udom: "TargetDomainName"
+        subj: "SubjectUserName"
+        sdom: "SubjectDomainName"
+        lt: "LogonType"
+        ip: "IpAddress"
+        wks: "WorkstationName"
+    map:
+      time_created:        "${ts}"
+      computer:            "${host}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "4624"
+      logon_type:          "${lt}"
+      target_user_name:    "${user}"
+      target_domain_name:  "${udom}"
+      subject_user_name:   "${subj}"
+      subject_domain_name: "${sdom}"
+      workstation_name:    "${wks}"
+      ip_address:          "${ip}"
+      filename:            "${__source_file}"
+
+  # ---------------------------------------------------------------------------
+  # 4625 — failed logon
+  # ---------------------------------------------------------------------------
+  - name: "mordor-4625-logon-fail"
+    match:
+      regex: '"EventID":\s*4625\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        host: "Hostname"
+        user: "TargetUserName"
+        udom: "TargetDomainName"
+        lt: "LogonType"
+        ip: "IpAddress"
+        wks: "WorkstationName"
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "4625"
+      logon_type:         "${lt}"
+      target_user_name:   "${user}"
+      target_domain_name: "${udom}"
+      workstation_name:   "${wks}"
+      ip_address:         "${ip}"
+      filename:           "${__source_file}"
+
+  # ---------------------------------------------------------------------------
+  # 4648 — logon with explicit credentials (RunAs); destination = TargetServerName
+  # ---------------------------------------------------------------------------
+  - name: "mordor-4648-explicit-creds"
+    match:
+      regex: '"EventID":\s*4648\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        tsn: "TargetServerName"
+        user: "TargetUserName"
+        subj: "SubjectUserName"
+        sdom: "SubjectDomainName"
+        ip: "IpAddress"
+    map:
+      time_created:        "${ts}"
+      computer:            "${tsn}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "4648"
+      logon_type:          "3"
+      target_user_name:    "${user}"
+      subject_user_name:   "${subj}"
+      subject_domain_name: "${sdom}"
+      ip_address:          "${ip}"
+      filename:            "${__source_file}"
+
+  # ---------------------------------------------------------------------------
+  # 4634 / 4647 — logoff
+  # ---------------------------------------------------------------------------
+  - name: "mordor-4634-4647-logoff"
+    match:
+      regex: '"EventID":\s*46(34|47)\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        host: "Hostname"
+        user: "TargetUserName"
+        udom: "TargetDomainName"
+        eid: "EventID"
+    map:
+      time_created:       "${ts}"
+      computer:           "${host}"
+      event_type:         "LOGOFF"
+      event_id:           "${eid}"
+      target_user_name:   "${user}"
+      target_domain_name: "${udom}"
+      filename:           "${__source_file}"
+
+  # ---------------------------------------------------------------------------
+  # 5140 — network share accessed
+  # ---------------------------------------------------------------------------
+  - name: "mordor-5140-share"
+    match:
+      regex: '"EventID":\s*5140\b'
+    extract:
+      type: json
+      fields:
+        ts: "@timestamp"
+        host: "Hostname"
+        user: "SubjectUserName"
+        sdom: "SubjectDomainName"
+        ip: "IpAddress"
+        share: "ShareName"
+    map:
+      time_created:        "${ts}"
+      computer:            "${host}"
+      event_type:          "SUCCESSFUL_LOGON"
+      event_id:            "5140"
+      logon_type:          "3"
+      target_user_name:    "${user}"
+      subject_user_name:   "${user}"
+      subject_domain_name: "${sdom}"
+      ip_address:          "${ip}"
+      detail:              "${share}"
+      filename:            "${__source_file}"

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::parse::LogData;
 
@@ -97,6 +98,18 @@ pub enum Extract {
         kv_separator: String,
         #[serde(default)]
         trim: bool,
+    },
+    /// Parse the line as one JSON object (NDJSON: one object per line) and pull
+    /// scalar fields by dot-path into named context variables. Handles both flat
+    /// schemas (Mordor / nxlog / HELK: `EventID`, `TargetUserName`, `SourceIp`...)
+    /// and nested ones (Winlogbeat: `winlog.event_id`, `winlog.event_data.X`).
+    /// Example:
+    ///   fields:
+    ///     user: "TargetUserName"       # flat
+    ///     eid:  "winlog.event_id"      # nested
+    Json {
+        #[serde(default)]
+        fields: HashMap<String, String>,
     },
 }
 
@@ -501,6 +514,18 @@ fn apply_extract(
             }
             false
         }
+        Extract::Json { fields } => {
+            let parsed: JsonValue = match serde_json::from_str(input.trim()) {
+                Ok(v) => v,
+                Err(_) => return false, // not a JSON line: let another parser try
+            };
+            for (var, path) in fields {
+                if let Some(s) = json_path_get(&parsed, path).and_then(json_scalar) {
+                    ctx.insert(var.clone(), s);
+                }
+            }
+            true
+        }
         Extract::Keyvalue { pair_separator, kv_separator, trim } => {
             for pair in input.split(pair_separator.as_str()) {
                 let pair = if *trim { pair.trim() } else { pair };
@@ -515,6 +540,25 @@ fn apply_extract(
             }
             true
         }
+    }
+}
+
+/// Walk a dot-path (`a.b.c`) into a JSON value, returning the node at the end.
+fn json_path_get<'a>(v: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    let mut cur = v;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Render a scalar JSON value as a string (objects / arrays / null → None).
+fn json_scalar(v: &JsonValue) -> Option<String> {
+    match v {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::Bool(b) => Some(b.to_string()),
+        _ => None,
     }
 }
 
