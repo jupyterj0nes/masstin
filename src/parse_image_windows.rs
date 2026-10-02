@@ -71,6 +71,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     let base_temp = std::env::temp_dir().join("masstin_image_extract");
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
+    // Temp dirs where parse-massive extracts forensic images found INSIDE zip
+    // archives. Removed at the end of the run.
+    let mut zip_img_temps: Vec<PathBuf> = Vec::new();
 
     // Extract from mounted volumes: filesystem scan for live + raw I/O for VSS
     for vol in &volumes {
@@ -165,6 +168,37 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
             // Add discovered images to the processing list
             all_image_files.extend(filtered);
+        }
+    }
+
+    // MASSIVE mode only: forensic images (E01/VMDK/dd...) packed INSIDE a zip
+    // are invisible to the filesystem image scan above, and the EVTX zip
+    // walker only pulls `.evtx` entries. parse-massive is meant to process
+    // EVERYTHING, so here we dig images out of the zips too: find every zip
+    // under the evidence dirs, and for the ones that carry image segments,
+    // pre-check free space and extract the image set to a temp dir on the
+    // SAME volume as the archive (never the system temp, which may be a
+    // nearly-full C:). The extracted images then flow through the normal
+    // image pipeline; the temp dirs are removed at the end of the run.
+    if include_loose_artifacts && !real_dirs.is_empty() {
+        let mut zips: Vec<PathBuf> = Vec::new();
+        for dir in &real_dirs {
+            scan_for_zips(Path::new(dir), &mut zips, 0);
+        }
+        for zip in &zips {
+            let zip_name = Path::new(zip).file_name().and_then(|n| n.to_str()).unwrap_or("");
+            match extract_images_from_zip(Path::new(zip), &mut zip_img_temps) {
+                Ok(imgs) if !imgs.is_empty() => {
+                    crate::banner::print_phase_result(&format!(
+                        "{} forensic image(s) recovered from archive {}", imgs.len(), zip_name
+                    ));
+                    all_image_files.extend(imgs);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    crate::banner::print_warning(&format!("Archive {}: {}", zip_name, e));
+                }
+            }
         }
     }
 
@@ -449,6 +483,12 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Cleanup temp directories
     let _ = fs::remove_dir_all(&base_temp);
+    // Cleanup any temp dirs where images were extracted out of zips (massive mode)
+    zip_img_temps.sort();
+    zip_img_temps.dedup();
+    for t in &zip_img_temps {
+        let _ = fs::remove_dir_all(t);
+    }
 }
 
 /// Extract hostname from extracted EVTX files by reading the Computer field from the first record.
@@ -562,6 +602,181 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
             }
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+//  parse-massive: forensic images nested inside zip archives
+// -----------------------------------------------------------------------------
+
+/// Name of the per-archive temp subdir where images get extracted. Also skipped
+/// by the zip walker so an extraction is never re-scanned.
+const MASSIVE_IMG_TMP: &str = ".masstin_massive_img";
+
+/// Recursively collect `.zip` files under a directory (parse-massive).
+fn scan_for_zips(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 10 { return; }
+    let entries = match fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == MASSIVE_IMG_TMP || name.starts_with('$') || name == "System Volume Information" {
+                continue;
+            }
+            scan_for_zips(&p, out, depth + 1);
+        } else if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("zip")).unwrap_or(false) {
+            out.push(p);
+        }
+    }
+}
+
+/// An EWF segment extension: `e01`..`e99` / `ex01`. (Post-`e99` `eaa` rollover
+/// is rare in practice and not matched; those cases should be extracted on disk.)
+fn is_ewf_segment_ext(ext: &str) -> bool {
+    let b = ext.as_bytes();
+    (b.len() == 3 && b[0] == b'e' && b[1].is_ascii_digit() && b[2].is_ascii_alphanumeric())
+        || (b.len() == 4 && b[0] == b'e' && b[1] == b'x' && b[2].is_ascii_alphanumeric() && b[3].is_ascii_alphanumeric())
+}
+
+/// Does a zip entry name look like a forensic image file or image segment?
+fn entry_is_image(name: &str) -> bool {
+    let fname = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
+    let ext = match fname.rsplit_once('.') { Some((_, e)) => e.to_ascii_lowercase(), None => return false };
+    matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "dd" | "raw" | "img")
+        || is_ewf_segment_ext(&ext)
+        || (ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit())) // split raw .001/.002/...
+}
+
+/// Is this extracted file the FIRST segment of an image (the one to feed the
+/// pipeline)? Mirrors the dedup rules of the filesystem image scan: keep `.E01`
+/// / vmdk descriptor / `.001`, skip secondary EWF segments, vmdk extents and
+/// split-raw continuations.
+fn is_first_image_segment(p: &Path) -> bool {
+    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let lower = fname.to_lowercase();
+    if lower.ends_with(".e01") || lower.ends_with(".ex01") { return true; }
+    if let Some((_, ext)) = lower.rsplit_once('.') {
+        if is_ewf_segment_ext(ext) { return false; } // .e02.. / .ex02..
+    }
+    if lower.ends_with(".vmdk") {
+        let stem = &lower[..lower.len() - 5];
+        if stem.ends_with("-flat") || stem.ends_with("-ctk") { return false; }
+        if let Some(pos) = stem.rfind("-s") {
+            let a = &stem[pos + 2..];
+            if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) { return false; }
+        }
+        if let Some(pos) = stem.rfind("-0") {
+            let a = &stem[pos + 1..];
+            if a.len() >= 6 && a[..6].chars().all(|c| c.is_ascii_digit()) { return false; }
+        }
+        return true;
+    }
+    if lower.ends_with(".dd") || lower.ends_with(".raw") || lower.ends_with(".img") || lower.ends_with(".001") {
+        return true;
+    }
+    // split-raw secondary piece (.002, .003, ...)
+    if let Some((_, ext)) = lower.rsplit_once('.') {
+        if ext.len() == 3 && ext != "001" && ext.bytes().all(|b| b.is_ascii_digit()) { return false; }
+    }
+    false
+}
+
+/// Free bytes available to the caller on the volume containing `path`
+/// (the directory must exist). `None` when it cannot be determined.
+#[cfg(windows)]
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut avail: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if ok != 0 { Some(avail) } else { None }
+}
+
+#[cfg(not(windows))]
+fn free_space_bytes(_path: &Path) -> Option<u64> { None }
+
+/// Extract every forensic-image entry (and all its segments) out of a zip into
+/// a temp dir on the SAME volume as the archive, after checking there is room.
+/// Returns the first-segment image paths to feed the pipeline. The temp base is
+/// pushed onto `temps` for cleanup. `Err` means the whole archive was skipped
+/// (unreadable, or not enough free space) — nothing is left half-written beyond
+/// best effort.
+fn extract_images_from_zip(zip_path: &Path, temps: &mut Vec<PathBuf>) -> Result<Vec<String>, String> {
+    let file = File::open(zip_path).map_err(|e| format!("cannot open ({})", e))?;
+    let mut archive = ::zip::ZipArchive::new(file).map_err(|e| format!("not a readable zip ({})", e))?;
+
+    // Which entries are images, and how much uncompressed space they need.
+    let mut img_idx: Vec<usize> = Vec::new();
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        if let Ok(e) = archive.by_index(i) {
+            if e.is_file() && entry_is_image(e.name()) {
+                img_idx.push(i);
+                total += e.size();
+            }
+        }
+    }
+    if img_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tmp_base = zip_path.parent().unwrap_or(Path::new(".")).join(MASSIVE_IMG_TMP);
+    let dest = tmp_base.join(zip_path.file_stem().and_then(|s| s.to_str()).unwrap_or("archive"));
+    fs::create_dir_all(&dest).map_err(|e| format!("cannot create temp dir ({})", e))?;
+    temps.push(tmp_base);
+
+    // Pre-flight: need the uncompressed total plus a 5% margin.
+    let need = total + total / 20;
+    if let Some(free) = free_space_bytes(&dest) {
+        if free < need {
+            return Err(format!(
+                "skipped — extracting {} image file(s) needs ~{:.1} GB but only {:.1} GB free on this drive",
+                img_idx.len(),
+                need as f64 / 1_073_741_824.0,
+                free as f64 / 1_073_741_824.0
+            ));
+        }
+    }
+
+    crate::banner::print_info(&format!(
+        "  Extracting {} image file(s) (~{:.1} GB) from {} to a temp dir on the same drive...",
+        img_idx.len(),
+        total as f64 / 1_073_741_824.0,
+        zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+    ));
+
+    let mut extracted: Vec<PathBuf> = Vec::new();
+    for &i in &img_idx {
+        let mut e = archive.by_index(i).map_err(|er| format!("read entry ({})", er))?;
+        let rel = e
+            .enclosed_name()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(e.name().rsplit(|c| c == '/' || c == '\\').next().unwrap_or("image")));
+        let out_path = dest.join(&rel);
+        if let Some(parent) = out_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut out_file = File::create(&out_path).map_err(|er| format!("create {} ({})", out_path.display(), er))?;
+        std::io::copy(&mut e, &mut out_file).map_err(|er| format!("extract {} ({})", out_path.display(), er))?;
+        extracted.push(out_path);
+    }
+
+    // Feed only the first segment of each image set to the pipeline; EWF/VMDK
+    // sibling segments are discovered on disk (they sit next to it).
+    let firsts: Vec<String> = extracted
+        .iter()
+        .filter(|p| is_first_image_segment(p))
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    Ok(firsts)
 }
 
 /// Describe partition types found in an image (for error messages when NTFS/ext4 not found)

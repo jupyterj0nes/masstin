@@ -95,6 +95,14 @@ const RDPLOCALSESSION_EVENT_IDS: &[&str] = &["21","22","24","25"];
 const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 const WINRM_EVENT_IDS: &[&str] = &["6"];
 const WMI_EVENT_IDS: &[&str] = &["5858"];
+// Sysmon Operational. Only Event ID 3 (network connection) is lateral-movement
+// relevant; process/pipe/file/registry events are tool-attribution territory,
+// out of masstin's scope.
+const SYSMON_EVENT_IDS: &[&str] = &["3"];
+// Admin / lateral-movement service ports. Sysmon logs EVERY connection, so the
+// parser keeps only connections whose SERVICE port is one of these — same port
+// set parse-cortex uses with --admin-ports — to control volume.
+const SYSMON_LM_PORTS: &[&str] = &["22", "135", "139", "445", "1433", "3306", "3389", "5900", "5985", "5986"];
 
 pub mod parse {}
 
@@ -1441,6 +1449,124 @@ pub fn parse_wmi(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
 }
 
 // ---------------------------------------------------------------------------------------
+// SYSMON PARSER (Microsoft-Windows-Sysmon/Operational)
+// Event ID 3: network connection detected. The host where Sysmon runs is the
+// LOCAL endpoint (Source*); the peer is Destination*. `Initiated` says whether
+// the local process opened the connection (outbound) or accepted it (inbound):
+//   Initiated=true  -> local -> remote, service port = DestinationPort
+//   Initiated=false -> remote -> local, service port = SourcePort
+// Only connections on a lateral-movement service port are kept, mapped to a
+// CONNECT edge origin -> destination, with the process + protocol in `detail`.
+// ---------------------------------------------------------------------------------------
+pub fn parse_sysmon(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing Sysmon {}", file);
+    }
+
+    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+        Ok((parser, log_data)) => (parser, log_data),
+        Err(_) => return vec![],
+    };
+
+    for record in parser.records() {
+        let r = match record { Ok(r) => r, Err(_) => continue };
+        let event: Event = match from_str(r.data.as_str()) { Ok(e) => e, Err(_) => continue };
+        let event_id = match event.System.EventID {
+            Some(ref id) if lateral_event_ids.contains(&id.as_str()) => id.clone(),
+            _ => continue,
+        };
+
+        let mut dv: HashMap<String, String> = [
+            "Image", "User", "Protocol", "Initiated",
+            "SourceIp", "SourceHostname", "SourcePort",
+            "DestinationIp", "DestinationHostname", "DestinationPort",
+        ].iter().map(|k| (k.to_string(), String::new())).collect();
+
+        match event.EventData {
+            Some(ed) => {
+                for d in ed.Datas {
+                    if let Some(name) = d.Name {
+                        if let Some(slot) = dv.get_mut(&name) {
+                            *slot = d.body.unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            None => continue,
+        }
+
+        let computer = event.System.Computer.clone().unwrap_or_default();
+        let v = |k: &str| dv.get(k).cloned().unwrap_or_default();
+        let initiated = v("Initiated").eq_ignore_ascii_case("true");
+
+        // (origin hostname, origin ip, dest hostname, dest ip, service port)
+        let (origin_host, origin_ip, dest_host, dest_ip, port) = if initiated {
+            (computer.clone(), v("SourceIp"), v("DestinationHostname"), v("DestinationIp"), v("DestinationPort"))
+        } else {
+            (v("DestinationHostname"), v("DestinationIp"), computer.clone(), v("SourceIp"), v("SourcePort"))
+        };
+
+        if !SYSMON_LM_PORTS.contains(&port.as_str()) {
+            continue;
+        }
+
+        let dest_ip = strip_ipv4_mapped(&dest_ip);
+        let origin_ip = strip_ipv4_mapped(&origin_ip);
+        let dst_computer = if !dest_host.is_empty() && dest_host != "-" { dest_host } else { dest_ip };
+        if dst_computer.is_empty() {
+            continue;
+        }
+        // origin: a hostname when we have one, otherwise the bare IP
+        let origin_is_ip = origin_host.is_empty() || origin_host == "-";
+        let (src_computer, src_ip) = if origin_is_ip { (String::new(), origin_ip) } else { (origin_host, origin_ip) };
+
+        // drop loopback / empty / self-connections (volume + noise control)
+        let is_local = |s: &str| {
+            s.is_empty() || s == "-" || s == "127.0.0.1" || s == "::1" || s == "0.0.0.0" || s.eq_ignore_ascii_case("localhost")
+        };
+        if is_local(&src_ip) && is_local(&src_computer) {
+            continue;
+        }
+        if (!src_computer.is_empty() && src_computer.eq_ignore_ascii_case(&dst_computer))
+            || (!src_ip.is_empty() && src_ip == dst_computer)
+        {
+            continue;
+        }
+
+        let (domain, user) = match v("User").split_once('\\') {
+            Some((d, u)) => (d.to_string(), u.to_string()),
+            None => (String::new(), v("User")),
+        };
+        let logon_type = match port.as_str() {
+            "3389" | "5900" => "10",
+            "22" => "SSH",
+            _ => "3",
+        }.to_string();
+        let proto = v("Protocol");
+        let image = v("Image");
+
+        log_data.push(LogData {
+            time_created: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+            computer: dst_computer,
+            event_type: "CONNECT".to_string(),
+            event_id: event_id.clone(),
+            subject_user_name: String::new(),
+            subject_domain_name: String::new(),
+            target_user_name: user,
+            target_domain_name: domain,
+            logon_type,
+            workstation_name: src_computer,
+            ip_address: src_ip,
+            logon_id: String::new(),
+            filename: file.to_string(),
+            detail: format!("Sysmon3 {} {} :{}", proto, image, port),
+        });
+    }
+
+    log_data
+}
+
+// ---------------------------------------------------------------------------------------
 // UNKNOWN PARSER (AUTODETECT PROVIDER)
 // ---------------------------------------------------------------------------------------
 pub fn parse_unknown(file: &str) -> Vec<LogData> {
@@ -1489,6 +1615,9 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         },
         "Microsoft-Windows-WMI-Activity" => {
             log_data = parse_wmi(file, WMI_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-Sysmon" => {
+            log_data = parse_sysmon(file, SYSMON_EVENT_IDS.to_vec())
         },
         _ => (),
     }
@@ -2076,6 +2205,9 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
         },
         "Microsoft-Windows-WMI-Activity%4Operational.evtx" => {
             parse_wmi(&file_origin, WMI_EVENT_IDS.to_vec())
+        },
+        "Microsoft-Windows-Sysmon%4Operational.evtx" => {
+            parse_sysmon(&file_origin, SYSMON_EVENT_IDS.to_vec())
         },
         _ => {
             // Unknown filename (archived EVTX such as Security-YYYY-MM-DD-HH-MM-SS.evtx
