@@ -54,12 +54,12 @@ parsers:           # ordered list of sub-parsers
       contains_any: [...]   # any one of these substrings must be present
       regex: "..."          # optional regex that must match
     extract:       # how to pull fields out of the matched line
-      type: csv | regex | keyvalue
+      type: csv | regex | keyvalue | json
       ...
     sub_extract:   # optional second-pass extraction on a field extracted above
       field: "..."
       strip_before: "..."   # optional, drop prefix up to first occurrence
-      type: csv | regex | keyvalue
+      type: csv | regex | keyvalue | json
       ...
     map:           # fill masstin's 14 LogData columns using ${variable} substitution
       time_created: "${...}"
@@ -173,6 +173,22 @@ extract:
 ```
 
 Each parsed key becomes a context variable. Values are stripped of surrounding `"` and `'` quotes.
+
+#### `type: json`
+
+Parses the line as one JSON object (NDJSON — one object per line) and pulls scalar fields into named variables by dot-path. Handles both **flat** schemas (Mordor / nxlog / HELK / many SIEM exports, where Windows EventData is flattened to top-level keys) and **nested** ones (`winlog.event_id`, `winlog.event_data.TargetUserName`).
+
+```yaml
+extract:
+  type: json
+  fields:
+    eid:  "EventID"                       # flat key
+    user: "TargetUserName"                # flat key
+    ip:   "SourceIp"                       # flat key
+    nested_eid: "winlog.event_id"          # dot-path into nested objects
+```
+
+Each key under `fields` is the context variable to create; its value is the dot-path to read. Only scalar values (string, number, bool) are captured; objects, arrays and null are skipped. A line that is not valid JSON does not match this parser (the next parser is tried). Use the regex in `match` to route by event id when the `map` needs a per-event `event_type`, e.g. `match.regex: '"EventID":\s*4624\b'`. See [`rules/json/mordor.yaml`](../rules/json/mordor.yaml) for a worked example over the OTRF Security-Datasets.
 
 ### `sub_extract` block (optional)
 
@@ -309,7 +325,7 @@ masstin -a parse-custom --rules my-rule.yaml -f big.log -o out.csv --debug
 
 ## Limits of v1
 
-- **No JSON extractor.** Planned for v2. For now, JSON logs need a regex extractor.
+- **JSON extractor (`type: json`)** reads one JSON object per line (NDJSON) and pulls scalar fields by dot-path (flat `EventID` or nested `winlog.event_id`). It does not iterate JSON arrays or a single multi-line object — one object per line.
 - **No lookaround in regex.** Rust's `regex` crate is linear-time by design and doesn't support `(?=...)` or `(?<=...)`. Use capture groups with `?P<name>` and do splitting in the extractor.
 - **No chained sub-extracts.** Exactly one `sub_extract` per parser. If you need two-level nesting, write two parsers or split your input differently.
 - **No conditional mapping.** The `map` block is pure text substitution. If you need event_type to depend on a captured field's value (e.g. `action=success` → `SUCCESSFUL_LOGON`, `action=fail` → `FAILED_LOGON`), write two parsers with different `match` blocks.

@@ -22,8 +22,9 @@ This directory holds community-contributed YAML rule files for masstin's `parse-
 | Firewall | [`firewall/cisco-asa.yaml`](firewall/cisco-asa.yaml) | ✅ complete | 6 | ASA syslog (113004/113005/605004/605005/716001/716002) |
 | Firewall | [`firewall/fortinet-fortigate.yaml`](firewall/fortinet-fortigate.yaml) | ✅ complete | 4 | FortiGate `type=event subtype=system\|user` (admin login, user auth) |
 | Proxy | [`proxy/squid.yaml`](proxy/squid.yaml) | ✅ complete | 3 | Squid access.log native (CONNECT tunnel, HTTP, TCP_DENIED) |
+| JSON/SIEM | [`json/mordor.yaml`](json/mordor.yaml) | ✅ complete | 6 | Mordor / OTRF Security-Datasets flat NDJSON (EventData flattened to top level) |
 
-**Totals:** 8 rules, 31 parsers, all researched against vendor documentation and validated against sample log lines in [`*/samples/`](./).
+**Totals:** 9 rules, 37 parsers, all researched against vendor documentation and validated against sample log lines in [`*/samples/`](./).
 
 ## References
 
