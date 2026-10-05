@@ -51,7 +51,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 | **Unified cross-OS image parsing** | Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS + registry), ext4 partitions get Linux parsing (auth.log, wtmp, secure, audit, **systemd-journald binary logs**) — all merged into one chronological timeline. Zero manual mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively walks it, finds every E01/VMDK/dd image, auto-detects OS, extracts all artifacts from live + VSS, and produces a single unified timeline. Per-image artifact grouping in the summary tells you exactly which image produced which events. One command, entire incident. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **Unified 14-column timeline** | All sources merged into a single chronological CSV with a canonical 14-column schema. Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons. `logon_id` carried through for session correlation. | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy logs via YAML rule files with three extractor types (csv, regex, keyvalue) and nested sub-extract with `strip_before` preprocessing. Ships with **8 researched rules / 31 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
+| **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy / JSON logs via YAML rule files with four extractor types (csv, regex, keyvalue, json) and nested sub-extract with `strip_before` preprocessing. Ships with **9 researched rules / 37 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid, and Mordor / OTRF Security-Datasets flat JSON. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
 | **Noise filtering** | Four opt-in flags to cut output down to signal only: `--ignore-local` drops records with no usable source (loopback IPs, LOCAL markers, service/interactive logons without src, MSTSC/default_value placeholders); `--exclude-users`, `--exclude-hosts`, `--exclude-ips` accept comma-separated lists, glob wildcards (`svc_*`, `*$`) and `@file.txt` imports; `--exclude-ips` also accepts CIDR ranges (`10.0.0.0/8`). Combine with `--dry-run` for a pre-flight stats report showing exactly what would be filtered. | [Noise filtering](https://weinvestigateanything.com/en/tools/masstin-noise-filtering/) |
 | **Triage-aware discovery** | When the directory walker hits an archive, masstin lists its entries and matches against four known triage tool layouts: **KAPE** (`_kape.cli` / `Console/KAPE.log` / `<host>/C/Windows/System32/winevt/Logs/`), **Velociraptor Offline Collector** (`client_info.json` + `collection_context.json` / `uploads.json`), **Cortex XDR Offline Collector** (`output/cortex-xdr-payload.log`) and **UAC — Unix-like Artifacts Collector** (`uac.log` + `[root]/`, tar.gz). Detected packages surface as `=> Triage found: <type> [host: ...]` lines in phase 1 with hostname extracted from the archive filename when possible. | [Triage detection](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
 | **Per-source breakdown** | The phase-2 summary groups every parsed artifact by its source — forensic image, triage zip, plain archive, or loose folder — instead of by its leaf directory name. Each group shows the total event count plus the per-EVTX list underneath. Lets the analyst tell at a glance how many events came from `HRServer.e01` vs from a Cortex XDR triage of `WIN-DC01` vs from a folder of loose EVTX dropped in `D:\evidence\`. | [Per-source breakdown](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
@@ -71,7 +71,7 @@ Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff)
 
 | Feature | Description | Details |
 |---------|-------------|---------|
-| **Multi-source Windows EVTX** | 32+ Windows Event IDs across 11 EVTX providers: Security, TerminalServices-LocalSessionManager + RemoteConnectionManager, RDPClient, RDPCoreTS, SMBServer, SMBClient + Connectivity, WinRM, WMI-Activity, plus Scheduled Tasks XML. | [Artifacts](#supported-artifacts) |
+| **Multi-source Windows EVTX** | 33+ Windows Event IDs across 12 EVTX providers: Security, TerminalServices-LocalSessionManager + RemoteConnectionManager, RDPClient, RDPCoreTS, SMBServer, SMBClient + Connectivity, WinRM, WMI-Activity, Sysmon (Event 3 network connections on lateral-movement ports), plus Scheduled Tasks XML. | [Artifacts](#supported-artifacts) |
 | **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs an attacker deleted from the live volume. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
 | **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Implements **Tier 1** (full 64 KB chunks) and **Tier 2** (orphan record detection); Tier 3 (template matching) is planned. Hardened via thread isolation + `catch_unwind` + per-file timeout; corrupted chunks can be skipped with `--skip-offsets`. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
 | **UAL (User Access Logging)** | Auto-detect and parse SUM/UAL ESE databases — 3-year server logon history that survives Security event log clearing. Essential for Windows Server forensics where attackers wipe EVTX but forget UAL. | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
@@ -322,7 +322,7 @@ artifacts.
 
 ### Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
 
-For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 8 researched rules in [`rules/`](rules/) that you can use out of the box.
+For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, flat JSON event exports, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 9 researched rules in [`rules/`](rules/) that you can use out of the box.
 
 ```bash
 # Run a single rule against a log file
@@ -350,6 +350,7 @@ The library currently covers:
 | `firewall/cisco-asa.yaml` | 6 | ASA `113004/113005/605004/605005/716001/716002` |
 | `firewall/fortinet-fortigate.yaml` | 4 | FortiGate `subtype=system\|user` admin login, user auth |
 | `proxy/squid.yaml` | 3 | Squid access.log CONNECT tunnel, HTTP, TCP_DENIED |
+| `json/mordor.yaml` | 6 | Mordor / OTRF Security-Datasets flat NDJSON (Sysmon 3 on LM ports, 4624/4625/4634/4647/4648/5140) |
 
 Every rule is researched against vendor official documentation and validated against realistic sample log lines committed under each category's `samples/` directory. See [`rules/README.md`](rules/README.md) for the full references table and [`docs/custom-parsers.md`](docs/custom-parsers.md) for the schema specification.
 
@@ -873,7 +874,7 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
 | `-o, --output` | Output file path |
@@ -894,12 +895,24 @@ For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resou
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
 | `--stdout` | Print output to stdout only |
-| `--debug` | Print debug information |
+| `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and rejected lines in `parse-custom`) |
 | `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
+| `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](rules/)) |
+| `--dry-run` | `parse-custom`: show first matches and rejected lines, write no CSV. With any filter flag on a parser action: print the filter stats and write only the CSV header |
+| `--ignore-local`, `--exclude-users`, `--exclude-hosts`, `--exclude-ips` | Noise filtering on every parser action and `merge` (see [Noise filtering](#noise-filtering---ignore-local-and---exclude-)) |
+| `--carve-unalloc` | `carve-image`: scan unallocated space only (planned; currently scans the whole image) |
+| `--skip-offsets LIST` | `carve-image`: comma-separated hex offsets to skip (32 MB window each) on a pathological E01 |
+| `--investigation-from "YYYY-MM-DD HH:MM:SS"` | `graph-hunt*`: cutoff (UTC). Days before it are the baseline, the rest the window. Required |
+| `--alpha` | `graph-hunt*` and loaders: false discovery rate for Benjamini-Hochberg (default 0.05), the only chosen number |
+| `--only-detectors` / `--skip-detectors` | `graph-hunt*`: comma-separated signal names to run exclusively or to drop (mutually exclusive) |
+| `--report FILE.md` | `graph-hunt*`: also write the analyst report, one story per origin with a significant connection |
+| `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account`; the report opens with the reconstructed chain. Requires `--report` |
+| `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
+| `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |
 
 ## Supported Artifacts
 
-Masstin parses **32+ Windows Event IDs** across **11 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
+Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
 
 ### Windows EVTX
 
@@ -915,6 +928,7 @@ Masstin parses **32+ Windows Event IDs** across **11 EVTX sources**, plus Linux 
 | **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
 | **WinRM/Operational** | 6 | PowerShell Remoting session init — destination host from connection field (source system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **WMI-Activity/Operational** | 5858 | Remote WMI execution — source machine from ClientMachine field (destination system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
+| **Sysmon/Operational** | 3 | Network connections on lateral-movement service ports (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986); direction from `Initiated`, initiating process in `detail` | |
 | **Scheduled Tasks XML** | — | Remotely registered tasks detected via Author field (MACHINE\user) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **MountPoints2 (NTUSER.DAT)** | — | Remote share connections from each user's registry (##SERVER#SHARE with LastWriteTime) | [Read more →](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
 
@@ -977,10 +991,11 @@ Full documentation at **[We Investigate Anything](https://weinvestigateanything.
 - [x] ~~Event reconstruction from cleared logs (EVTX record carving)~~ — **done (Tier 1 + Tier 2 detection)**
 - [x] ~~MountPoints2 registry hive parsing for lateral movement traces~~ — **done**
 - [x] ~~Custom parser framework for VPN/firewall/proxy logs (YAML rules)~~ — **done (v1: csv/regex/keyvalue + sub-extract + strip_before)**
-- [x] ~~Initial community rule library~~ — **done (8 rules, 31 parsers: Palo Alto GP + TRAFFIC, Cisco AnyConnect + ASA, Fortinet SSL VPN + FortiGate, OpenVPN, Squid)**
+- [x] ~~Initial community rule library~~ — **done (9 rules, 37 parsers: Palo Alto GP + TRAFFIC, Cisco AnyConnect + ASA, Fortinet SSL VPN + FortiGate, OpenVPN, Squid, Mordor / OTRF JSON)**
 - [ ] EVTX carving Tier 3: template matching for orphan records (reconstruct XML from records whose parent chunks are gone)
 - [ ] Unallocated-only carving scan (`--carve-unalloc`) — currently scans the whole image
-- [ ] Custom parsers v2: JSON extractor, conditional map, per-rule `--validate` command
+- [x] ~~Custom parsers v2: JSON extractor~~ — **done (`type: json`, flat and nested dot-paths)**
+- [ ] Custom parsers v2: conditional map, per-rule `--validate` command
 - [ ] More community parser rules: Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall
 - [ ] **EVTX header tampering detection** — flag chunks whose record numbers, timestamps or CRCs have been edited (Event Log Edit / similar tooling)
 - [x] ~~**systemd-journald binary log parsing** — pure-Rust reader for `/var/log/journal/*.journal[~]` (compact mode + zstd), essential on Ubuntu 22 / RHEL 8+ with SSSD + AD~~ — **done**

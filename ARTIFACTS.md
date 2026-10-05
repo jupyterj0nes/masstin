@@ -64,6 +64,12 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | WinRM/Operational | 6 | WSMan session initiation on the source host (destination in `connection` field) |
 | WMI-Activity/Operational | 5858 | WMI client failure with `ClientMachine` field identifying remote origin |
 
+### Sysmon
+
+| Log Source | Event ID | Description |
+|------------|----------|-------------|
+| Sysmon/Operational | 3 | Network connection on a lateral-movement service port (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986). The Sysmon host is the local endpoint; `Initiated` sets the direction. One `CONNECT` edge origin → destination with the process and protocol in `detail`. Other Sysmon events (process, pipe, file, registry) are out of scope |
+
 ## Linux Artifacts
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/)
@@ -79,6 +85,9 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | `wtmp` | Binary | Historical login/logout/boot records |
 | `btmp` | Binary | Failed login attempts |
 | `lastlog` | Binary | Last login per user |
+| `uac-<host>-<os>-<stamp>.tar.gz` | Archive | UAC (Unix-like Artifacts Collector) triages, streamed selectively; nested zip / tar.gz combinations walked |
+
+What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, journald, auditd `USER_LOGIN`), `LOGIN` / `FAILED_LOGIN` (wtmp / btmp), `LASTLOG`, `SSH_PREAUTH` (`CONNECT` rows for connections that ended before authenticating) and `LOGOUT` (`LOGOFF` rows paired with their login). `logon_id` carries the sshd process id on every row that has one, the same on a login and on its LOGOFF. RFC3164 syslog timestamps are converted from the host's local zone to UTC; auditd records of a connection already in the sshd log are dropped, paired by pid.
 
 > **Domain-joined Linux (SSSD / Active Directory):** on Ubuntu 22 + SSSD hosts, `/var/log/auth.log` is often nearly empty because PAM routes auth through the systemd journal. Masstin reads `.journal` / `.journal~` files directly and applies the same `Accepted (password|publickey)` / `Failed password` regexes as on text logs, so SSH logins from AD users surface in the timeline with no extra configuration. Combined with the audit.log `USER_LOGIN` path, this recovers the full lateral-movement picture on modern enterprise Linux.
 
@@ -112,4 +121,4 @@ Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR f
 
 ---
 
-**Total:** 32 Windows Event IDs across 10 EVTX sources + 7 Linux artifact types + Winlogbeat JSON + Cortex XDR
+**Total:** 33 Windows Event IDs across 12 EVTX sources + 9 Linux artifact types + Winlogbeat JSON + Cortex XDR + YAML custom parsers (VPN, firewall, proxy, JSON)

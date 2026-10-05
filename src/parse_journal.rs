@@ -13,13 +13,15 @@
 //   regexes used by parse_linux::parse_secure_or_messages() so a journal
 //   entry yields the exact same RawEvt struct as an auth.log line.
 //
-//   Handled today:
-//     - _COMM=sshd  MESSAGE="Accepted (password|publickey) for USER from IP"
-//     - _COMM=sshd  MESSAGE="Failed password for USER from IP"
+//   Handled today (_COMM or SYSLOG_IDENTIFIER = sshd / sshd-session):
+//     - "Accepted <method> for USER from SRC"
+//     - "Failed <method> for [invalid user] USER from SRC"
+//     - pre-authentication touches (no ident string, bad protocol, [preauth] closes)
+//     - session ends (pam "session closed" paired by pid, else "Disconnected from user")
 //
-//   Not yet handled (on roadmap): sudo COMMAND entries, invalid-user,
-//   pam_sss auth failures, LZ4/XZ-compressed journals (crate only does
-//   zstd — fine for Ubuntu 20+/RHEL 8+).
+//   Not yet handled (on roadmap): sudo COMMAND entries, pam_sss auth
+//   failures, LZ4/XZ-compressed journals (crate only does zstd — fine for
+//   Ubuntu 20+/RHEL 8+).
 // =============================================================================
 
 use std::fs::File;

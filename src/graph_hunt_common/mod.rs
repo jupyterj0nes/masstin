@@ -1,5 +1,7 @@
-// Shared pieces of graph-hunt used by both backends (Neo4j + GDS in
-// `graph_hunt_neo4j`, Memgraph + MAGE in `graph_hunt`).
+// Shared pieces of graph-hunt used by every backend (Neo4j in
+// `graph_hunt_neo4j`, Memgraph and timeline CSVs in `graph_hunt`). No
+// server-side plugin (GDS, MAGE) is used: edges are read once and every
+// statistic is computed in memory.
 //
 // Everything here speaks plain Cypher through neo4rs; the only dialect
 // difference that matters is the temporal constructor (`datetime()` on
