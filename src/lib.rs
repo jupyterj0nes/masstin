@@ -253,7 +253,8 @@ pub struct Cli {
     /// For `graph-hunt`: comma-separated list of detector names to skip.
     /// Available: novel-edge, community-bridge, origin-fanout, cred-rotation,
     /// pagerank-spike, betweenness-spike, failed-sweep, preauth-sweep,
-    /// probe-then-success, rare-logon-type, causal-path, credential-switch.
+    /// probe-then-success, rare-logon-type, causal-path, credential-switch,
+    /// sigma.
     /// Example: --skip-detectors pagerank-spike,betweenness-spike
     #[arg(long)]
     skip_detectors: Option<String>,
@@ -339,10 +340,10 @@ enum ActionType {
     MergeNeo4jNodes,
     /// Merge two :host nodes in a Memgraph graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Same as `merge-neo4j-nodes` but for Memgraph.
     MergeMemgraphNodes,
-    /// Hunt lateral movement anomalies on a graph already loaded into Memgraph. Uses native graph algorithms (PageRank, Louvain, betweenness) plus structural detectors (novel edges, chain motifs, credential rotation) to surface pivots. Requires --database and --investigation-from. Best results with --ungrouped loads.
+    /// Statistical lateral-movement hunt on a graph loaded into Memgraph with --ungrouped. Every signal is a probability measured against the network's own baseline (conformal p-values, Benjamini-Hochberg at --alpha); no MAGE plugin needed. Requires --database and --investigation-from. Options: --report, --seed, --sigma, --only/--skip-detectors.
     #[value(alias = "graph-hunt")]
     GraphHunt,
-    /// Hunt lateral movement anomalies on a graph already loaded into Neo4j. Sister action to `graph-hunt` (which targets Memgraph MAGE); runs the same 7 detectors but calls the Neo4j Graph Data Science (GDS) library instead of MAGE for PageRank, Louvain, and betweenness. Requires the GDS plugin installed in Neo4j and `--user`. Password is read from $NEO4J_PASSWORD or prompted interactively.
+    /// Same statistical hunt on a graph loaded into Neo4j with --ungrouped. Edges are read once over bolt and every statistic (PageRank, betweenness, Louvain included) is computed in memory; no GDS plugin needed. Requires --database, --user and --investigation-from; --db selects the database. Password from $NEO4J_PASSWORD or a prompt.
     #[value(alias = "graph-hunt-neo4j")]
     GraphHuntNeo4j,
     /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.

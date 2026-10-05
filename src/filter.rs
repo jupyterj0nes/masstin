@@ -256,7 +256,7 @@ pub enum LocalReason {
 /// on whether src_ip OR src_computer carries meaningful lateral-movement
 /// signal; if EITHER is useful the record is kept regardless of the other.
 ///
-/// See the blog post and docs/ignore-local.md for the full rule rationale.
+/// See the README "Noise filtering" section for the full rule table.
 pub fn classify_local(r: &LogData) -> Option<LocalReason> {
     let src_ip_noise = is_src_ip_noise(&r.ip_address);
     let src_computer_noise = is_src_computer_noise(&r.workstation_name, &r.computer);
