@@ -595,6 +595,8 @@ The same physical host often appears as both an IP and a hostname depending on w
 
 When the loader can't tie an IP to a hostname (for example an external attacker IP with no matching session), the IP stays as its own node.
 
+> **Known limit.** The frequency map takes the most frequent name for an IP, so a machine that was renamed (a DC that was `WIN-E0PO207ERMD` before becoming `CITADEL-DC01`) can end up as two nodes, with its history split between them. `graph-hunt-csv` does not use the loader: it keeps nodes as recorded and only reports an IP and a name as one machine when the same-login co-occurrence test is significant (see [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md#ip--host-name-loaders-and-graph-hunt)). The two paths can therefore disagree on machine identity for renamed hosts; the loaders' annotation `resolved_name` carries the test's answer either way. Verified on the Szechuan case (2026-10-05): same chain, same classes, same verdict on both backends, with the DC split in two nodes on the loaded graph.
+
 #### Loader internals: why it is fast and never loses an edge
 
 The loader is built so that **every CSV row that makes it past the filters lands as exactly one edge in the graph** — no silent drops, no retries hiding failures. Five design choices add up to that guarantee while keeping the load near-linear in edge count:
