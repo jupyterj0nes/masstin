@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 — 2026-10-05
+
+### The statistical graph-hunt
+
+`graph-hunt` is no longer a scorer with hand-picked weights: every signal is a probability measured against the network's own baseline, and `--alpha` is the only number you choose. The same hunt runs on Neo4j, on Memgraph and straight from the timeline CSV (`graph-hunt-csv`), with Hopper's classes, causal paths, `--seed` reconstruction and an analyst `--report`. On the public Los Alamos set (21 M rows) the first 100 rows are 99 % red team and an incident-free period yields nothing. Around it: Linux session ends and `logon_id`, UAC triages, Sysmon Event 3, a JSON extractor for custom rules, images inside zips for `parse-massive`, and a long list of parser fixes validated on real EVTX.
 
 - `parse-windows` / `parser-elastic` / `parse-cortex-evtx-forensics`: **4778 and 4779 carry logon_type 10.** Session reconnect / disconnect are Terminal Services events; the column was empty (Cortex gave them 3). Validated on the EVTX-to-MITRE-Attack samples.
 - `parse-custom`: **`type: json` extractor**. A rule can now parse NDJSON logs (one JSON object per line) and pull scalar fields by dot-path, both flat (`EventID`, `TargetUserName`, `SourceIp` — the Mordor / nxlog / HELK / SIEM-export shape) and nested (`winlog.event_id`). This closes the JSON gap in the custom-parser framework and lets masstin ingest JSON event logs it could not before. Ships with a new library rule **`rules/json/mordor.yaml`** for the OTRF Security-Datasets (Sysmon Event 3 on lateral-movement ports, 4624/4625/4634/4647/4648/5140); validated end-to-end against real OTRF data.
