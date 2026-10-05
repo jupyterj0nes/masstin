@@ -200,6 +200,8 @@ A vote can also be a coincidence: an unrelated login from that name in the same 
 
 Benjamini-Hochberg runs across every (IP, NAME) candidate. An IP is resolved when exactly one NAME is significant for it; two significant names are a conflict and the IP stays unresolved. The loaders write `resolved_name`, `resolved_votes` and `resolved_p` on the IP node and never merge nodes.
 
+Two rules of machine identity coexist today. The loaders also build the graph with a frequency map (src_ip, src_computer) weighted by 4778/4779 and machine-account hints, and that map picks the node name an IP gets at load time; the engine run over a loaded graph inherits it. `graph-hunt-csv` skips the loader and folds IP and name only by the test above. On a renamed host (Szechuan: the DC was `WIN-E0PO207ERMD` before `CITADEL-DC01`) the map keeps the old name alive as a second node and the DC's history is split between the two; the CSV path shows one machine. The chain, the classes and the verdict were the same on both paths in that case (October 2026); making the loaders use the test instead of the map is the pending unification.
+
 ## Parser changes (parse-linux; they change the CSV, approved)
 
 1. **SSH pre-authentication touches** become CONNECT rows with event_id `SSH_PREAUTH` and detail `ssh/preauth-no-ident`, `ssh/preauth-bad-proto` or `ssh/preauth-closed [user=…]`. Only lines that are pre-authentication by definition are taken:
