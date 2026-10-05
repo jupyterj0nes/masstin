@@ -179,7 +179,7 @@ pub async fn parse_cortex_evtx_forensics_data(
                     | alter lt = if(
                         event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión|Anmeldetyp|Type d.ouverture de session|Tipo di accesso):\s*(\d+)"), 0),
                         event_id = 4648, "runas",
-                        event_id in (21,22,24,25,1024,1102,1149,131), "10",
+                        event_id in (21,22,24,25,1024,1102,1149,131,4778,4779), "10",
                         event_id in (6,5858), "",
                         "3")
                     | alter srcip = if(

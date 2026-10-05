@@ -98,6 +98,7 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
     };
 
     let share_name = ed.and_then(|d| d.get("ShareName")).and_then(|s| s.as_str()).unwrap_or("");
+    let logon_type = crate::parse::infer_logon_type(&event_id_str, ed.and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or(""));
 
     let detail = match event_id_str.as_str() {
         "4624" | "4648" => process_name.to_string(),
@@ -115,7 +116,7 @@ fn parse_security_event(json: &Value, file_path: &str) -> LogData {
         subject_domain_name: ed.and_then(|d| d.get("SubjectDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         target_user_name: ed.and_then(|d| d.get("TargetUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         target_domain_name: ed.and_then(|d| d.get("TargetDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        logon_type: ed.and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or("").to_string(),
+        logon_type,
         workstation_name: ed.and_then(|d| d.get("WorkstationName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         ip_address: ed.and_then(|d| d.get("IpAddress")).and_then(|ip| ip.as_str()).unwrap_or("").to_string(),
         logon_id: target_logon_id.to_string(),
