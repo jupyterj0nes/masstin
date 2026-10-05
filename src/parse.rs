@@ -31,13 +31,16 @@ pub fn is_debug_mode() -> bool {
 /// Infer logon_type for events that lack one natively.
 /// Kerberos (4768/4769/4770/4771), NTLM (4776), share access (5140),
 /// explicit creds (4648), and WinRM (6) are all network-based in a
-/// lateral movement context → type 3.
-fn infer_logon_type(event_id: &str, raw: &str) -> String {
+/// lateral movement context → type 3. 4778 / 4779 (session reconnected /
+/// disconnected) are Terminal Services sessions → type 10, like the
+/// LocalSessionManager 21-25 events they go with.
+pub(crate) fn infer_logon_type(event_id: &str, raw: &str) -> String {
     if !raw.is_empty() {
         return raw.to_string();
     }
     match event_id {
         "4768" | "4769" | "4770" | "4771" | "4776" | "5140" | "4648" | "6" => "3".to_string(),
+        "4778" | "4779" => "10".to_string(),
         _ => String::new(),
     }
 }
