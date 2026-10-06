@@ -76,9 +76,9 @@ The full artifact list with the fields taken from each event is in [ARTIFACTS.md
 A connection is one origin logging in to one destination with one account on one day. Connections that already happened on another baseline day are habitual and never reported. For the new ones, ten facts are measured against the baseline (first-time destination, account the origin never used, account that belongs to another machine, failed sweeps, pre-auth touches, logon type, graph centrality, community crossing, chain speed, Sigma hits from Hayabusa / Chainsaw when given) and combined into one empirical p-value per origin-day. Benjamini-Hochberg across all of them controls the false discovery rate you asked for.
 
 <div align="center">
-  <img src="resources/demo-hunt.gif" alt="graph-hunt-csv on the Szechuan timeline: the run, then the ranked connections with their Hopper class and their place in the chain from the seed"/>
+  <img src="resources/demo-hunt.gif" alt="graph-hunt-csv on the LANL authentication set: 21 million rows, 204 significant connections at FDR 5 %, the red-team machine at rank 1"/>
   <br>
-  <em>graph-hunt-csv on the Szechuan timeline with the attacker's IP as seed: what the engine measured, then the ranked connections. Each row says why it is there (a credential switch with a new access, a causal path) and where it sits in the chain.</em>
+  <em>graph-hunt-csv on the public Los Alamos set, no seed, no hint: 21 million logins read, every new connection measured against the baseline, 204 survive the 5 % false discovery rate, and the first rows are the red-team machine switching credentials on hosts it had never reached. The 22-minute run is cut in the recording.</em>
 </div>
 
 Measured on a real test incident and on the public Los Alamos (LANL) authentication set:
