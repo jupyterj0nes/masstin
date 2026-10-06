@@ -16,9 +16,9 @@
 </div>
 
 <div align="center">
-  <img src="resources/demo-graph.gif" alt="Memgraph Lab on a masstin timeline: the hour of the intrusion, then the temporal path query between the attacker's IP and the workstation"/>
+  <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples: banner, discovery, per-folder breakdown and the 14-column CSV"/>
   <br>
-  <em>A masstin timeline in Memgraph Lab: every login of the hour the attacker came in, then one Cypher query from the catalogue returns the chronologically valid path from the attacker's IP to the workstation it reached. DFIR Madness "Szechuan sauce" case.</em>
+  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the 14-column timeline at the end.</em>
 </div>
 
 ## What it does
@@ -29,6 +29,11 @@ An incident leaves logins in a dozen places: Security.evtx on fifty Windows host
 - **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
 - **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
 
+<div align="center">
+  <img src="resources/demo-graph.gif" alt="Memgraph Lab on a masstin timeline: the hour of the intrusion, then the temporal path query between the attacker's IP and the workstation"/>
+  <br>
+  <em>The same timeline in Memgraph Lab: every login of the hour the attacker came in, then one Cypher query from the catalogue returns the chronologically valid path from the attacker's IP to the workstation it reached. DFIR Madness "Szechuan sauce" case.</em>
+</div>
 
 ## Quick start
 
@@ -49,12 +54,6 @@ masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00
 # 4. Optional: load the graph and look at it
 masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungrouped
 ```
-
-<div align="center">
-  <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples"/>
-  <br>
-  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the 14-column CSV at the end.</em>
-</div>
 
 > **macOS first run:** if Gatekeeper blocks the binary, run `xattr -d com.apple.quarantine masstin-*` once.
 
