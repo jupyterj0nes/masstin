@@ -1,1014 +1,124 @@
-# Masstin - Lateral movement tracker for anything!
+# Masstin
 
 <div align="center">
-  <img src="resources/masstin_logo.png" alt="Masstin Logo" width="600"/>
+  <img src="resources/masstin_logo.png" alt="Masstin logo" width="420"/>
   <br><br>
-  <strong>Lateral movement tracker for anything!</strong>
-  <br><br>
-
-  [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-  [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-  [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
-
-</div>
-
----
-
-**Masstin** is a high-speed DFIR tool written in Rust that parses forensic artifacts and unifies lateral movement data into a single chronological timeline. It supports Windows EVTX, Linux logs, Winlogbeat JSON, and EDR APIs — all merged into one CSV, ready for analysis or graph database visualization (Neo4j, Memgraph).
-
-Named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff) — the guardian dog from the mountains of León, Spain. Like its namesake, Masstin watches over your network and tracks every movement.
-
-> Evolved from [Sabonis](https://github.com/jupyterj0nes/sabonis) (Python), rewritten in Rust for ~90% faster performance.
-
-> **[We Investigate Anything](https://weinvestigateanything.com)** — Masstin is part of the WIA project, a DFIR knowledge base where you'll find detailed documentation for every artifact masstin parses, investigation guides, and real-world case studies — all in English and Spanish.
-
-<div align="center">
-  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction — attacker's chronologically-valid route through the network, rendered in Memgraph"/>
+  <strong>Lateral movement tracker for anything.</strong>
   <br>
-  <em>Temporal path reconstruction — the attacker's chronologically-valid route between two hosts, rendered from a masstin timeline in Memgraph. Each hop is validated as happening strictly after the previous one.</em>
+  One timeline from every log you have. One statistical hunt over it. No SIEM, no plugins, one binary.
+  <br><br>
+
+  [![Release](https://img.shields.io/github/v/release/jupyterj0nes/masstin?label=release)](https://github.com/jupyterj0nes/masstin/releases/latest)
+  [![crates.io](https://img.shields.io/crates/v/masstin.svg)](https://crates.io/crates/masstin)
+  [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+  [![Platform](https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](https://github.com/jupyterj0nes/masstin/releases/latest)
+
 </div>
 
-## Table of Contents
+<div align="center">
+  <img src="resources/demo-hunt.gif" alt="masstin graph-hunt-csv reconstructing an attacker's chain from a seed IP on the DFIR Madness Szechuan case"/>
+  <br>
+  <em>graph-hunt-csv on the DFIR Madness "Szechuan sauce" case: from one known-bad IP to the whole chain, with the certainty of every hop, in 0.2 s.</em>
+</div>
 
-- [Key Features](#key-features)
-- [Install](#install)
-- [Usage](#usage)
-- [Output Format](#output-format)
-- [Graph Visualization](#graph-visualization-neo4j--memgraph)
-- [All Options](#all-options)
-- [Supported Artifacts](#supported-artifacts)
-- [Documentation](#documentation)
-- [Roadmap](#roadmap)
-- [License](#license)
-- [Contact](#contact)
+## What it does
 
-## Key Features
+An incident leaves logins in a dozen places: Security.evtx on fifty Windows hosts, `wtmp` and `auth.log` on the Linux side, UAL databases nobody remembers, EDR exports, a VPN concentrator. Masstin reads all of them and answers one question: **who logged in where, with what, and when.**
 
-### Core capabilities
+- **Parse anything into one timeline.** Forensic images (E01, VMDK, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same 14-column CSV. [Parsing →](docs/parsing.md)
+- **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
+- **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
 
-| Feature | Description | Details |
-|---------|-------------|---------|
-| **Unified cross-OS image parsing** | Single `parse-image` command auto-detects OS per partition — NTFS partitions get Windows parsing (EVTX + UAL + VSS + registry), ext4 partitions get Linux parsing (auth.log, wtmp, secure, audit, **systemd-journald binary logs**) — all merged into one chronological timeline. Zero manual mounting. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Bulk evidence processing** | Point `-d` at an evidence folder and masstin recursively walks it, finds every E01/VMDK/dd image, auto-detects OS, extracts all artifacts from live + VSS, and produces a single unified timeline. Per-image artifact grouping in the summary tells you exactly which image produced which events. One command, entire incident. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Unified 14-column timeline** | All sources merged into a single chronological CSV with a canonical 14-column schema. Every event classified as `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF` or `CONNECT` with human-readable failure reasons. `logon_id` carried through for session correlation. | [CSV format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| **Custom parsers (YAML)** | `parse-custom` parses arbitrary VPN / firewall / proxy / JSON logs via YAML rule files with four extractor types (csv, regex, keyvalue, json) and nested sub-extract with `strip_before` preprocessing. Ships with **9 researched rules / 37 sub-parsers** out of the box: Palo Alto GlobalProtect, Palo Alto TRAFFIC (with User-ID filter), Cisco AnyConnect, Cisco ASA, Fortinet SSL VPN, FortiGate, OpenVPN, Squid, and Mordor / OTRF Security-Datasets flat JSON. Every rule backed by vendor documentation — see [`rules/README.md#references`](rules/README.md#references). Full schema in [`docs/custom-parsers.md`](docs/custom-parsers.md). | [Custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/) |
-| **Noise filtering** | Four opt-in flags to cut output down to signal only: `--ignore-local` drops records with no usable source (loopback IPs, LOCAL markers, service/interactive logons without src, MSTSC/default_value placeholders); `--exclude-users`, `--exclude-hosts`, `--exclude-ips` accept comma-separated lists, glob wildcards (`svc_*`, `*$`) and `@file.txt` imports; `--exclude-ips` also accepts CIDR ranges (`10.0.0.0/8`). Combine with `--dry-run` for a pre-flight stats report showing exactly what would be filtered. | [Noise filtering](https://weinvestigateanything.com/en/tools/masstin-noise-filtering/) |
-| **Triage-aware discovery** | When the directory walker hits an archive, masstin lists its entries and matches against four known triage tool layouts: **KAPE** (`_kape.cli` / `Console/KAPE.log` / `<host>/C/Windows/System32/winevt/Logs/`), **Velociraptor Offline Collector** (`client_info.json` + `collection_context.json` / `uploads.json`), **Cortex XDR Offline Collector** (`output/cortex-xdr-payload.log`) and **UAC — Unix-like Artifacts Collector** (`uac.log` + `[root]/`, tar.gz). Detected packages surface as `=> Triage found: <type> [host: ...]` lines in phase 1 with hostname extracted from the archive filename when possible. | [Triage detection](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
-| **Per-source breakdown** | The phase-2 summary groups every parsed artifact by its source — forensic image, triage zip, plain archive, or loose folder — instead of by its leaf directory name. Each group shows the total event count plus the per-EVTX list underneath. Lets the analyst tell at a glance how many events came from `HRServer.e01` vs from a Cortex XDR triage of `WIN-DC01` vs from a folder of loose EVTX dropped in `D:\evidence\`. | [Per-source breakdown](https://weinvestigateanything.com/en/tools/masstin-triage-detection/) |
-| **Graph visualization** | Direct upload to [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) or [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) with connection grouping and IP-to-hostname resolution. Ships with a Cypher query for **temporal path reconstruction** — find the chronologically coherent attacker route between any two nodes. | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
-| **Automation-ready** | `--silent` for Velociraptor / SOAR pipelines, single cross-platform binary for Windows / Linux / macOS, no runtime dependencies. | |
+<div align="center">
+  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction: the attacker's chronologically valid route between two hosts, rendered from a masstin timeline in Memgraph"/>
+  <br>
+  <em>Temporal path reconstruction in Memgraph Lab: the attacker's route between two hosts where every hop happens strictly after the previous one. One Cypher query from the catalogue.</em>
+</div>
 
-### Input format support
+## Quick start
 
-| Feature | Description | Details |
-|---------|-------------|---------|
-| **Forensic images** | E01 (ewf), VMDK (flat + sparse + streamOptimized with zlib-compressed grains), raw dd, multi-part images. Handles OVA exports, cloud templates, vSphere backups, and incomplete SFTP uploads via `.filepart` fallback. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Mounted volumes** | Point `-d D:` at a mounted drive or pass `--all-volumes` to scan every NTFS disk on the host — live EVTX + VSS recovery without imaging first. | |
-| **BitLocker detection** | Automatically detects BitLocker-encrypted partitions via the `-FVE-FS-` VBR signature, warns with the exact offset, and skips encrypted volumes instead of crashing on unreadable data. | [Forensic images](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **Compressed triage** | Recursive ZIP extraction with auto-detection of standard forensic passwords (`infected`, `kape`, etc.). `parse-linux` also streams `.tar` / `.tar.gz` / `.tgz` (nested in zips or in each other) and unpacks only the log files it needs. | |
-
-### Artifact coverage
-
-| Feature | Description | Details |
-|---------|-------------|---------|
-| **Multi-source Windows EVTX** | 33+ Windows Event IDs across 12 EVTX providers: Security, TerminalServices-LocalSessionManager + RemoteConnectionManager, RDPClient, RDPCoreTS, SMBServer, SMBClient + Connectivity, WinRM, WMI-Activity, Sysmon (Event 3 network connections on lateral-movement ports), plus Scheduled Tasks XML. | [Artifacts](#supported-artifacts) |
-| **VSS snapshot recovery** | Detect and extract EVTX from Volume Shadow Copies — recover event logs an attacker deleted from the live volume. Uses [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). | [VSS recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| **EVTX carving** | `carve-image` scans raw disk data for EVTX chunks (`ElfChnk`) in unallocated space — recovers lateral movement events even after logs AND VSS are deleted. Implements **Tier 1** (full 64 KB chunks) and **Tier 2** (orphan record detection); Tier 3 (template matching) is planned. Hardened via thread isolation + `catch_unwind` + per-file timeout; corrupted chunks can be skipped with `--skip-offsets`. | [EVTX carving](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/) |
-| **UAL (User Access Logging)** | Auto-detect and parse SUM/UAL ESE databases — 3-year server logon history that survives Security event log clearing. Essential for Windows Server forensics where attackers wipe EVTX but forget UAL. | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-| **MountPoints2 registry** | Extract NTUSER.DAT from every user profile and parse MountPoints2 registry keys — reveals which user connected to which remote share (`\\SERVER\SHARE`) with timestamps. Survives event log clearing. Supports dirty hives with transaction log recovery (`.LOG1` / `.LOG2`). | [MountPoints2](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
-| **Linux logs** | `auth.log`, `secure`, `wtmp`, `audit.log` with smart inference: auto-detects hostname, infers year from `dpkg.log`, supports Debian and RHEL, RFC3164 and RFC5424 formats. **Plus pure-Rust systemd-journald binary reader** that walks `/var/log/journal/<machine-id>/*.journal[~]` (compact mode + zstd) and extracts sshd `Accepted`/`Failed` events — essential on Ubuntu 22 / RHEL 8+ with SSSD + Active Directory, where `/var/log/auth.log` is nearly empty because PAM routes auth through the journal. Works on Windows analyst hosts without libsystemd. | [Linux artifacts](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| **EDR & SIEM feeds** | Winlogbeat JSON export (`parser-elastic`), Cortex XDR legacy export (`parse-cortex`), Cortex XDR forensics EVTX export (`parse-cortex-evtx-forensics`). All feeds normalized to the same 14-column schema so they merge cleanly with host-side artifacts. | |
-
-> **Build note.** Masstin builds on **stable Rust** with a plain `cargo build --release`. No nightly, no feature flags, no opt-ins. The pre-built release binaries on the [Releases page](https://github.com/jupyterj0nes/masstin/releases) are compiled from the same stable build path as a local `cargo build`.
-
-## Install
-
-### Download pre-built binary (recommended)
-
-> **No Rust toolchain needed.** Just download and run.
-
-| Platform | Download |
-|----------|----------|
-| Windows | [`masstin-windows.exe`](https://github.com/jupyterj0nes/masstin/releases/latest) |
-| Linux | [`masstin-linux`](https://github.com/jupyterj0nes/masstin/releases/latest) |
-| macOS (Apple Silicon, M1+) | [`masstin-macos-arm64`](https://github.com/jupyterj0nes/masstin/releases/latest) |
-| macOS (Intel) | [`masstin-macos-x86_64`](https://github.com/jupyterj0nes/masstin/releases/latest) |
-
-Go to [**Releases**](https://github.com/jupyterj0nes/masstin/releases) and download the binary for your platform. That's it.
-
-> **macOS first run:** if Gatekeeper blocks the binary ("Apple cannot check it for malicious software"), clear the quarantine attribute once and run normally:
-> ```bash
-> chmod +x masstin-*-macos-*
-> xattr -d com.apple.quarantine masstin-*-macos-*
-> ```
-
-### Install from crates.io
+Download the binary for your platform from the [Releases page](https://github.com/jupyterj0nes/masstin/releases/latest), or `cargo install masstin`. No runtime dependencies.
 
 ```bash
-cargo install masstin
-```
+# 1. Everything under the evidence folder (images, zips, triages, loose files) -> one timeline
+masstin -a parse-massive -d /evidence/case-2026-03 -o timeline.csv
 
-### Build from source
+# 2. Hunt: what happened after the cutoff that this network had never done before?
+masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00:00" \
+        --report hunt.md -o hunt.csv
 
-```bash
-git clone https://github.com/jupyterj0nes/masstin.git
-cd masstin
-cargo build --release
-# Binary at ./target/release/masstin
-```
+# 3. Known-bad host or account? Reconstruct the chain from it
+masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00:00" \
+        --seed 10.10.1.50 --report hunt.md -o hunt.csv
 
-## Usage
-
-### Choosing the right action — what each one actually processes
-
-Quick reference. The three Windows actions differ by **what you feed them**, not by the parser underneath — EVTX dispatch is the same in all of them (Provider.Name routing, unknown providers silently skipped).
-
-| Source | `parse-windows` | `parse-image` | `parse-massive` |
-|---|:---:|:---:|:---:|
-| Loose EVTX files and directories | ✅ | ❌ | ✅ |
-| Recursive ZIP walk (unlimited nesting) | ✅ | ❌ | ✅ |
-| `Provider.Name` fallback for archived / renamed EVTX | ✅ | ✅ | ✅ |
-| Forensic disk images (E01, VMDK, raw, dd, img) | ❌ | ✅ | ✅ |
-| NTFS walker → `winevt/Logs` + VSS recovery | ❌ | ✅ | ✅ |
-| UAL databases (`LogFiles/Sum/*.mdb`) | ❌ | ✅ | ✅ |
-| Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
-| MountPoints2 (NTUSER.DAT registry hive) | ❌ | ✅ | ✅ |
-| Triage detection (KAPE / Velociraptor / Cortex XDR) with per-source labels | ❌ | ❌ | ✅ |
-| Loose-artifact promotion of `-d` directories into the pipeline | ❌ | ❌ | ✅ |
-
-Rule of thumb:
-
-- **Folder / ZIP / single EVTX** → `parse-windows`
-- **Forensic image** (`.e01`, `.vmdk`, `.raw`) → `parse-image`
-- **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
-
-In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
-
-### Parse Windows: Generate a lateral movement timeline
-
-Parses Windows EVTX files and UAL databases from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
-
-EVTX dispatch happens by `Provider.Name` read from the XML, not by filename, so files that do not follow the canonical Windows naming scheme — `Security-<YYYY-MM-DD-HH-MM-SS>.evtx` produced by the "Archive the log when full" retention policy, operator-renamed files, extracts from third-party tooling — are still routed to the right parser. If you want strict canonical-only matching for speed on a huge noisy tree, point `-d` directly at the `winevt/Logs` folder and the walker only opens `.evtx` and `.zip` anyway.
-
-> **Note:** The legacy command `parse` is still supported as an alias for backwards compatibility.
-
-```bash
-# Single directory (or compressed triage package)
-masstin -a parse-windows -d /evidence/logs/ -o timeline.csv
-
-# Multiple machines
-masstin -a parse-windows -d /machine1/logs -d /machine2/logs -o timeline.csv --overwrite
-
-# Individual EVTX files
-masstin -a parse-windows -f Security.evtx -f System.evtx -o timeline.csv
+# 4. Optional: load the graph and look at it
+masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungrouped
 ```
 
 <div align="center">
-  <img src="resources/masstin_cli_output.png" alt="Masstin CLI output — parse-windows"/>
+  <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples"/>
+  <br>
+  <em>parse-windows over 293 EVTX samples: artifact discovery, per-folder breakdown, duplicates removed, 14-column CSV.</em>
 </div>
 
-### Parse Linux logs
+> **macOS first run:** if Gatekeeper blocks the binary, run `xattr -d com.apple.quarantine masstin-*` once.
 
-Parses Linux system logs and accounting entries to extract SSH sessions and authentication events. Supports both Debian/Ubuntu (`auth.log`) and RHEL/CentOS (`secure`) log formats, with both RFC3164 (legacy syslog) and RFC5424 (structured) timestamp formats.
+## What it reads
 
-```bash
-masstin -a parse-linux -d /evidence/var/log/ -o linux-timeline.csv
+| Source | What masstin extracts |
+|---|---|
+| **Windows EVTX** | 33+ Event IDs across 12 providers: Security (4624/4625/4634/4647/4648/4768/4769/4771/4776/4778/4779/5140…), Terminal Services, RDP client and core, SMB server and client, WinRM, WMI-Activity, Sysmon Event 3, Scheduled Tasks. Archived and renamed EVTX are routed by provider name. |
+| **Windows beyond EVTX** | UAL (User Access Logging) ESE databases, MountPoints2 from NTUSER.DAT, Volume Shadow Copies, EVTX chunks carved from unallocated space. |
+| **Forensic images** | E01 (multi-segment), VMDK (flat, sparse, streamOptimized), dd/raw, mounted volumes, images packed inside zips. OS detected per partition; NTFS and ext4 both walked. BitLocker detected and reported. |
+| **Linux** | `auth.log`, `secure`, `messages`, `wtmp`/`btmp`/`lastlog`, `audit.log`, binary journald. Session ends paired to their login, syslog times converted to UTC, OpenSSH 9.8 `sshd-session` understood. |
+| **Triage packages** | KAPE, Velociraptor offline collector, UAC, Cortex XDR, plain zips and tarballs, nested in each other. |
+| **Feeds** | Winlogbeat JSON, Cortex XDR network connections and forensic EVTX, Mordor / OTRF Security-Datasets. |
+| **Anything else** | `parse-custom` with a YAML rule: csv, regex, key=value and JSON extractors. Ships with rules for Palo Alto, Cisco, Fortinet, OpenVPN, Squid and Mordor. [Custom parsers →](docs/custom-parsers.md) |
 
-# A folder of UAC (Unix-like Artifacts Collector) triages — every tar.gz is
-# detected, streamed and labelled [TRIAGE: UAC] in the per-source breakdown
-masstin -a parse-linux -d /evidence/uac-collections/ -o linux-timeline.csv
-```
+The full artifact list with the fields taken from each event is in [ARTIFACTS.md](ARTIFACTS.md). The 14 columns are described in [docs/csv-format.md](docs/csv-format.md).
 
-Rotated logs are handled the way logrotate leaves them: `secure-20240616`, `messages-20260830.gz`, `wtmp-20231119`, `btmp-20260901.gz`. The `-YYYYMMDD` suffix also fixes the year of RFC3164 timestamps (which carry none), so a 2024 rotation is not stamped with the year of its 2026 siblings.
+## How graph-hunt decides
 
-**What comes out, per source**
+A connection is one origin logging in to one destination with one account on one day. Connections that already happened on another baseline day are habitual and never reported. For the new ones, ten facts are measured against the baseline (first-time destination, account the origin never used, account that belongs to another machine, failed sweeps, pre-auth touches, logon type, graph centrality, community crossing, chain speed, Sigma hits from Hayabusa / Chainsaw when given) and combined into one empirical p-value per origin-day. Benjamini-Hochberg across all of them controls the false discovery rate you asked for.
 
-| Source | Events | Notes |
-|---|---|---|
-| `secure` / `auth.log` / `messages` (+ rotations, `.gz`) | `SSH_SUCCESS` for every `Accepted <method>` (password, publickey, keyboard-interactive/pam, gssapi-with-mic…), `SSH_FAILED` for every `Failed <method>` including `invalid user` guesses and `not allowed because` policy denials | `detail` carries the method (`ssh/publickey`, `ssh/password invalid-user`, `ssh/not-allowed`). Sources are kept whether sshd logged an IP or a resolved hostname (`UseDNS yes`). `pam_unix(sshd:auth)` failures are only used when sshd logged no outcome lines at all — on SSSD/LDAP hosts pam_unix fails for every directory user before pam_sss succeeds |
-| `audit.log*` | `USER_LOGIN` / `USER_AUTH` with `addr=` → `SSH_SUCCESS` / `SSH_FAILED` | epoch timestamps; `detail` = `audit` |
-| `wtmp*` / `utmp` | `LOGIN` / `LOGOUT` per session with a remote source (IP or hostname) | console sessions and boot/runlevel records are dropped |
-| `btmp*` | `FAILED_LOGIN` | rotated and gzipped files included |
-| `lastlog` | `LASTLOG`: last login per account with its source | uid → name via the collected `/etc/passwd`; the only trace left of accounts whose activity predates every surviving rotation |
-| `/var/log/journal`, `/run/log/journal` | same sshd events as above, from journald | de-duplicated against `secure` when rsyslog's imjournal copied them there |
+Measured on a real test incident and on the public Los Alamos (LANL) authentication set:
 
-**Timestamps are made absolute.** RFC3164 lines are the host's local wall-clock time; masstin resolves the zone from the collected filesystem (`/etc/timezone`, `/etc/sysconfig/clock`, the `/etc/localtime` symlink target or the TZif file itself, or `timedatectl` output on a live UAC run) and converts them to UTC, so they line up with wtmp, audit and journald instead of sitting hours apart. If no zone can be found the run says so and leaves them as-is. If an archive ends early (interrupted transfer), the run prints a loud truncation warning naming the file — everything tar wrote after that point is missing.
+| | test corpus | LANL (21.3 M rows) |
+|---|---:|---:|
+| Significant connections at FDR 5 % | 65, all the attacker's | 204, 185 red team |
+| Precision of the first 100 rows | 100 % | 99 % |
+| Incident-free period | – | 0 significant |
 
-<div align="center">
-  <img src="resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
-</div>
-
-### Parse forensic images — auto-detect Windows and Linux
-
-**One command. Any OS. Any image format.** Masstin opens forensic disk images directly, auto-detects every partition type (NTFS or ext4), and applies the right parser to each — all without mounting, external tools, or manual OS identification.
-
-- **NTFS partitions** → Windows parsing: EVTX + UAL from live volume + VSS snapshot recovery
-- **ext4 partitions** → Linux parsing: auth.log, secure, messages, audit.log, wtmp, btmp, lastlog, and `/var/log/journal/` systemd-journald binary logs
-
-All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
-
-Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi). Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
-
-```bash
-# Single image — auto-detects OS
-masstin -a parse-image -f HRServer.e01 -o timeline.csv
-
-# Mix Windows E01 + Linux VMDK — single merged timeline
-masstin -a parse-image -f DC01.e01 -f "kali-linux.vmdk" -o timeline.csv
-
-# Multiple images of any OS
-masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o incident.csv
-```
-
-<div align="center">
-  <img src="resources/masstin_cli_parse_image.png" alt="Masstin parse-image with cross-OS auto-detection"/>
-</div>
-
-### Bulk evidence processing — one command, entire incident
-
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files. Each image is opened, partitions are auto-detected (NTFS or ext4), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
-
-```bash
-# Scan an entire evidence folder — finds all images, any OS
-masstin -a parse-image -d /evidence/all_machines/ -o full_timeline.csv
-
-# Mix: evidence folder + individual images + mounted volume
-masstin -a parse-image -d /evidence/ -f extra.e01 -d F: -o timeline.csv
-```
-
-Masstin automatically filters VMDK split extents (`-s001.vmdk`), snapshots (`-000001.vmdk`), flat data files (`-flat.vmdk`) and change tracking blocks (`-ctk.vmdk`), keeping only the base descriptor. For E01, only the first segment (`.E01`) is processed — subsequent segments (`.E02`, `.E03`) are loaded automatically.
-
-### Parse massive — images + triage + loose artifacts in one pass
-
-When you have a mix of forensic images **and** loose EVTX/log files in the same evidence folder, `parse-massive` processes everything together. It combines `parse-image` (for E01/VMDK/dd) with directory scanning (for extracted triage packages and individual EVTX files), producing a single unified timeline.
-
-```bash
-# Process all images AND loose artifacts from evidence directories
-masstin -a parse-massive -d /evidence/ -o everything.csv
-```
-
-> **Difference from `parse-image`:** `parse-image` only processes forensic images found in `-d` directories. `parse-massive` also includes any loose EVTX and log files in those directories — useful when evidence arrives as a mix of disk images and extracted triage packages.
-
-> **Backward compatibility:** The legacy commands `parse-image-windows` and `parse-image-linux` are still accepted as aliases for `parse-image`.
-
-### Parse from mounted volumes (live disk / write-blocker)
-
-Point masstin at a drive letter and it reads the raw volume directly — extracting all EVTX from the live filesystem and from every VSS snapshot found on the disk. No need to image the disk first. Ideal for triage or when working with a write-blocker.
-
-```bash
-# Single volume (requires Administrator on Windows)
-masstin -a parse-image -d D: -o timeline.csv
-
-# Multiple volumes
-masstin -a parse-image -d D: -d E: -o timeline.csv
-
-# Scan all NTFS volumes on the system
-masstin -a parse-image --all-volumes -o timeline.csv
-```
-
-> **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
-
-> **PowerShell users:** Do not end paths with `\` inside single quotes — PowerShell interprets `\` before the closing quote as an escape character, corrupting the command arguments. Masstin detects this and warns you, but the safest approach is to omit the trailing `\` or use double quotes: `-d "C:\evidence\image.vmdk"`.
-
-### User Access Logging (UAL)
-
-Masstin auto-detects UAL databases (`.mdb` files from `C:\Windows\System32\LogFiles\Sum`) and extracts server access records going back **up to 3 years** — surviving event log clearing and rollover. UAL records include username, source IP, role (File Server/SMB, Remote Access/RDP, etc.), access count, and first/last seen timestamps.
-
-```bash
-# Automatic: UAL is detected when scanning directories or forensic images
-masstin -a parse-windows -d /evidence/Windows/System32/LogFiles/Sum/ -o timeline.csv
-
-# Direct: point at individual .mdb files
-masstin -a parse-windows -f Current.mdb -f SystemIdentity.mdb -o timeline.csv
-
-# From forensic images: UAL databases are extracted and parsed automatically
-masstin -a parse-image -f DC01.e01 -o timeline.csv
-```
-
-Each UAL record generates two timeline entries (first seen + last seen). Server hostname is resolved from `SystemIdentity.mdb`. Roles are mapped to protocols: File Server → `SMB`, Remote Access → `RDP`, Web Server → `HTTP`, etc. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-ual/)
-
-### Parse Winlogbeat JSON
-
-Parses Winlogbeat JSON logs forwarded to Elasticsearch. Extracts the same lateral movement data from JSON format when EVTX files are unavailable.
-
-```bash
-masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
-```
-
-### Parse Cortex XDR
-
-Queries the Cortex XDR API directly to retrieve network connection data or EVTX forensic artifacts collected by Cortex agents.
-
-```bash
-# Network connection data
-masstin -a parse-cortex --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
-  --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
-  -o cortex-network.csv
-
-# EVTX forensics collected by Cortex agents
-masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
-  --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
-  -o cortex-evtx.csv
-```
-
-`parse-cortex-evtx-forensics` queries the Cortex XDR `forensics_event_log` dataset —
-the backing store for Cortex's forensic triage feature, where the XDR forensic
-agent collects Windows Event Logs from endpoints on demand. The same dataset also
-receives logs uploaded by the Cortex XDR offline collector, so triage packages
-gathered from air-gapped or unreachable hosts and pushed into the tenant are
-queried through the exact same path. masstin mirrors the event IDs and extraction
-logic of `parse-windows`, so output from this action merges cleanly with host-side
-artifacts.
-
-### Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
-
-For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, flat JSON event exports, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 9 researched rules in [`rules/`](rules/) that you can use out of the box.
-
-```bash
-# Run a single rule against a log file
-masstin -a parse-custom --rules rules/vpn/palo-alto-globalprotect.yaml -f vpn.log -o timeline.csv
-
-# Run the ENTIRE library — every log file is tried against every rule
-masstin -a parse-custom --rules rules/ -f vpn.log -f firewall.log -f proxy.log -o timeline.csv
-
-# Dry-run: show first matches + rejected samples, no CSV written
-masstin -a parse-custom --rules rules/vpn/palo-alto-globalprotect.yaml -f vpn.log --dry-run
-
-# Debug: preserve rejected lines sample alongside the output
-masstin -a parse-custom --rules rules/ -f vpn.log -o timeline.csv --debug
-```
-
-The library currently covers:
-
-| Rule | Parsers | Format |
-|------|---------|--------|
-| `vpn/palo-alto-globalprotect.yaml` | 5 | Palo Alto SYSTEM log subtype=globalprotect (legacy CSV syslog) |
-| `vpn/cisco-anyconnect.yaml` | 4 | Cisco ASA `%ASA-6-113039/722022/722023` + `%ASA-4-113019` |
-| `vpn/fortinet-ssl-vpn.yaml` | 3 | FortiGate `type=event subtype=vpn` (tunnel-up/down/ssl-login-fail) |
-| `vpn/openvpn.yaml` | 4 | OpenVPN free-form syslog (Peer Connection / AUTH_FAILED / SIGTERM) |
-| `firewall/palo-alto-traffic.yaml` | 2 | PAN-OS TRAFFIC log CSV — authenticated sessions (User-ID) only |
-| `firewall/cisco-asa.yaml` | 6 | ASA `113004/113005/605004/605005/716001/716002` |
-| `firewall/fortinet-fortigate.yaml` | 4 | FortiGate `subtype=system\|user` admin login, user auth |
-| `proxy/squid.yaml` | 3 | Squid access.log CONNECT tunnel, HTTP, TCP_DENIED |
-| `json/mordor.yaml` | 6 | Mordor / OTRF Security-Datasets flat NDJSON (Sysmon 3 on LM ports, 4624/4625/4634/4647/4648/5140) |
-
-Every rule is researched against vendor official documentation and validated against realistic sample log lines committed under each category's `samples/` directory. See [`rules/README.md`](rules/README.md) for the full references table and [`docs/custom-parsers.md`](docs/custom-parsers.md) for the schema specification.
-
-### Noise filtering: `--ignore-local` and `--exclude-*`
-
-Real forensic cases often generate CSVs with 50%+ of rows that carry no useful lateral movement signal — service logons from LOCAL SYSTEM, RDP failures where the source IP was never captured, brute force attempts from noisy internal jumpboxes, and so on. Masstin ships with four opt-in flags that let you cut the output down to just the records that matter. All four are off by default, so existing workflows are not affected.
-
-```bash
-# Drop records with no usable source (loopback, service/interactive logons
-# without src, LOCAL markers, MSTSC/default_value placeholders)
-masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local
-
-# Exclude known noisy service accounts and machine accounts
-masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
-    --exclude-users 'svc_*,*$,@corpsvc.txt'
-
-# Exclude known jumpbox hostnames
-masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
-    --exclude-hosts 'JUMP01,JUMP02,*-MON,@jumpboxes.txt'
-
-# Exclude internal subnets via CIDR
-masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
-    --exclude-ips '10.0.0.0/8,172.16.0.0/12,fe80::/10'
-
-# Pre-flight: --dry-run with any filter shows a stats breakdown without
-# writing the CSV — validate the filter composition before committing
-masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local --dry-run
-
-# Re-filter an existing CSV via merge (no re-parsing of images)
-masstin -a merge -f old-timeline.csv --ignore-local --exclude-users @svc.txt \
-    -o filtered.csv
-```
-
-**Filter rules**
-
-| Flag | Drops records where... | Applies to |
-|---|---|---|
-| `--ignore-local` | Neither src_ip nor src_computer carries a useful value. IP useful = valid, non-loopback, non-link-local. Computer useful = non-empty, non-`-`, non-`LOCAL`, non-`MSTSC`, non-`default_value`, non-self-reference. | All parser actions |
-| `--exclude-users LIST` | `subject_user_name` OR `target_user_name` matches any glob in the list (case-insensitive). | All parser actions + `merge` |
-| `--exclude-hosts LIST` | `dst_computer` OR `src_computer` matches any glob. | All parser actions + `merge` |
-| `--exclude-ips LIST` | `src_ip` matches any individual IP or CIDR range in the list. | All parser actions + `merge` |
-
-**List syntax** (same for all three `--exclude-*` flags):
-
-- **Inline CSV:** `svc_backup,svc_monitor,svc_sql`
-- **File import:** `@users.txt` — one entry per line, `#` for comments
-- **Mix:** `svc_foo,@bigfile.txt,admin*`
-- **Glob wildcards:** `svc_*` (prefix), `*$` (suffix, matches machine accounts), `*admin*` (contains), `exact_match` (exact)
-- **CIDR (ips only):** `10.0.0.0/24`, `fe80::/10`, individual IPs
-
-**Filter summary**
-
-After every run with any filter flag active, masstin prints a breakdown:
-
-```
-  🧹 Filter summary:
-     Total records seen: 178,274
-     Total kept:         110,070 (61.7%)
-     Total filtered:     68,204 (38.3%)
-
-     --ignore-local:     68,204 (38.3%)
-        both_noise             67,703
-        self_reference            134
-        service_logon             306
-        interactive_logon          21
-        literal_LOCAL              39
-        loopback_ip                 1
-     --exclude-users:       523 (0.3%)   [3 patterns]
-     --exclude-hosts:       245 (0.1%)   [2 patterns]
-     --exclude-ips:          12 (0.0%)   [1 ranges]
-```
-
-The stats always attribute each filtered record to exactly one cause (the first filter layer that matched), so the numbers add up. Use `--dry-run` to see this report without writing the CSV.
-
-**Safety guarantee:** records with a valid routable public `src_ip` are never filtered by `--ignore-local`, regardless of what `src_computer` contains. This preserves brute force and external attack signal even when Windows couldn't resolve a workstation name — the most common missing-metadata case in real forensics.
-
-### Triage detection and per-source breakdown
-
-When the directory walker encounters a ZIP archive (or, in `parse-linux`, a `.tar` / `.tar.gz` / `.tgz`), masstin reads its entry list and runs pattern matching against four known triage tool layouts. Detected packages surface as `=> Triage found:` lines in phase 1 and drive the per-source grouping in phase 2 — so the analyst can tell at a glance which events came from which source.
-
-Archives nest freely: a zip wrapping two UAC tarballs, or a tar.gz wrapping another tar.gz, is walked all the way down and every level is labelled with its full chain (`outer.tar.gz -> inner/uac-host-linux-20260924230926.tar.gz`). Tar archives are streamed and only the files masstin can use are unpacked, so a multi-GB UAC collection costs seconds and a few MB of temp space, not a full extraction.
-
-**Detection signatures**
-
-| Triage tool | Marker (any of) | Hostname extracted from |
-|---|---|---|
-| **KAPE** | `_kape.cli` at any level, `Console/KAPE.log`, or 5+ entries matching `<host>/C/Windows/System32/winevt/Logs/*.evtx` | Filename pattern `<host>_<digits>...zip` (only when the shape is unambiguous; KAPE has no enforced filename) |
-| **Velociraptor Offline Collector** | Top-level `client_info.json` + (`collection_context.json` OR `uploads.json`); encrypted variant uses `metadata.json` + `data.zip` | Filename pattern `Collection-<host>-<YYYY-MM-DD>T...Z.zip` |
-| **Cortex XDR Offline Collector** | Any entry ending in `cortex-xdr-payload.log` (this filename is unique to the XDR collector) | Filename pattern `offline_collector_output_<host>_<YYYY-MM-DD>_<HH-MM-SS>.zip` |
-| **UAC (Unix-like Artifacts Collector)** | `uac.log` at the archive root plus the `[root]/` or `live_response/` layout directory (tar.gz by default, zip with `-f zip`); or the enforced filename `uac-<host>-<os>-<YYYYMMDDhhmmss>` | Filename pattern `uac-<host>-<os>-<YYYYMMDDhhmmss>.tar.gz`. UAC writes `unknown` when it was run against a mounted image, so masstin then falls back to `[root]/etc/hostname`, `/etc/sysconfig/network`, `uac.log`, `/etc/hosts` and the syslog header of the collected logs |
-
-**Phase 1 output** (folder containing 2 triages plus a forensic image with NTUSER.DAT hives). Notice that every counter — triages, EVTX inside compressed archives, MountPoints2 from registry, Scheduled Tasks from XML — appears as `=>` lines INSIDE the same `[1/3]` block, not scattered before/after the phase header:
-
-```
-[1/3] Searching for artifacts...
-        => Triage found: Velociraptor Offline Collector [host: WIN-DC01]
-           source: K:/CEN26-1164N-B/SFTP/triages/Collection-WIN-DC01-2026-04-13T15_30_00Z.zip
-           entries inside: 247 (EVTX or other matched files)
-        => Triage found: Cortex XDR Offline Collector [host: TESTHOST01]
-           source: K:/CEN26-1164N-B/SFTP/triages/offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip
-           entries inside: 173 (EVTX or other matched files)
-        420 EVTX artifacts found inside 2 of 2 compressed archives
-        => 432 EVTX artifacts found total
-        => 12 MountPoints2 remote share events found
-        => 13 remote Scheduled Task events found
-```
-
-The `source:` line under each triage shows the **full path** to the zip — critical because real cases often have duplicate copies of the same host's triage in different folders (e.g. one in `SFTP/...` and another in `To-Unit42/...`). Showing only the filename would make them look identical even though they're physically different files.
-
-**Phase 2 output** — every artifact is grouped by SOURCE (image, triage, archive, or loose folder), each group showing the total event count plus the per-EVTX list. **VSS-recovered events are tagged inline** so the analyst can tell at a glance which logs came from a shadow copy vs which came from the live partition:
-
-```
-[+] Lateral movement events grouped by source (4 sources):
-
-        => [IMAGE]  HRServer_Disk0.e01  (4521 events total)
-           - Security.evtx (3220)
-           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (134)
-           - Security.evtx (1095)  [VSS]
-           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (72)  [VSS]
-
-        => [TRIAGE: Cortex XDR]  triages/offline_collector_output_TESTHOST01_2026-04-13_15-30-00.zip  [host: TESTHOST01]  (834 events total)
-           - Security.evtx (612)
-           - Microsoft-Windows-WinRM%4Operational.evtx (89)
-           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (133)
-
-        => [TRIAGE: Velociraptor]  triages/Collection-WIN-DC01-2026-04-13T15_30_00Z.zip  [host: WIN-DC01]  (4521 events total)
-           - Security.evtx (4380)
-           - Microsoft-Windows-WinRM%4Operational.evtx (141)
-
-        => [FOLDER]  D:/evidence/loose/extracted_evtx  (131 events total)
-           - Security.evtx (120)
-           - Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx (11)
-```
-
-**VSS tagging** is automatic — the helper detects `partition_<N>_vss_<M>/` paths in the temp extraction tree and labels matching entries with a `[VSS]` suffix (or `[VSS-0]`, `[VSS-1]` when multiple snapshots from the same image coexist, so each one stays visually distinct). Live entries carry no annotation. Within each source group, items are sorted **live-first then by VSS index**, so the analyst reads "what the system has now" at the top and "what masstin recovered from snapshots" underneath as a clearly demarcated bonus section. This is exactly the forensic story masstin's VSS recovery feature is supposed to tell.
-
-**Triage source labels** include the **immediate parent directory** of the zip (`triages/<filename>` above) so two physical copies of the same host's triage living in different folders (e.g. `SFTP/host.zip` vs `To-Unit42/host.zip`) appear as DIFFERENT source groups instead of collapsing into one bucket with duplicated entries inside.
-
-**Source tags** are ASCII only — no emoji — so they render correctly in conhost legacy on Windows Server 2016/2019, RDP sessions, mosh/tmux, and any analyst environment regardless of fonts or terminal capabilities. Each tag is colour-coded for visual distinction:
-
-- `[IMAGE]` — cyan — forensic image extract (works for E01, VMDK, dd, all formats)
-- `[TRIAGE: <type>]` — yellow — detected triage package, with hostname and parent-directory hint
-- `[ARCHIVE]` — white — ZIP that doesn't match any known triage layout
-- `[FOLDER]` — dim — loose artifacts in a regular directory, identified by their full parent path (not just the leaf name)
-- `[VSS]` / `[VSS-N]` suffix — yellow — appended to individual EVTX entries within an `[IMAGE]` group when they were recovered from a Volume Shadow Copy
-
-This applies to **every parser action** that walks directories: `parse-windows`, `parse-image`, `parse-massive`, `parse-linux`. The same source labels show up regardless of which action you ran, so the breakdown format is consistent across the whole tool.
-
-After the summary, the action prints a **load-into-graph hint** with both Memgraph and Neo4j commands ready to copy-paste, with the output path canonicalised to the long form (no 8.3 short names like `C00PR~1.DES` leaking into the suggestion):
-
-```
-        Load into graph (pick one):
-          Memgraph:  masstin -a load-memgraph -f C:/Users/c00pr/.../timeline.csv --database localhost:7687
-          Neo4j:     masstin -a load-neo4j   -f C:/Users/c00pr/.../timeline.csv --database bolt://localhost:7687 --user neo4j
-```
-
-### EVTX carving: last-resort recovery from unallocated space
-
-When the attacker cleared the logs, wiped VSS, and deleted the UAL databases, there's still one place where event data can survive: the unallocated space of the disk itself. `carve-image` scans the raw image looking for 64 KB EVTX chunks (`ElfChnk\x00` magic), validates them, groups them by provider, builds synthetic EVTX files, and feeds them through the normal masstin pipeline.
-
-```bash
-# Carve a single image
-masstin -a carve-image -f server.e01 -o carved.csv
-
-# Carve multiple images at once
-masstin -a carve-image -f DC01.e01 -f SRV-FILE.vmdk -o carved.csv
-
-# Skip known-bad offsets on a pathological E01 (corrupted EWF chunks)
-masstin -a carve-image -f broken.e01 --skip-offsets 0x6478b6000 -o carved.csv
-
-# Keep rejected synthetic EVTX files for post-mortem / upstream bug reports
-masstin -a carve-image -f image.e01 -o carved.csv --debug
-```
-
-**What it implements today:**
-- **Tier 1 — full chunk recovery**: complete 64 KB chunks recovered from unallocated space, parsed with full fidelity through the regular pipeline. Events are indistinguishable from live ones in the output.
-- **Tier 2 — orphan record detection**: individual records outside recoverable chunks are counted and reported (header metadata only; full XML reconstruction is Tier 3).
-- **Tier 3 — template matching**: planned. Will reconstruct XML from orphan records using templates harvested from Tier 1 chunks plus a common Windows template library.
-
-**Hardened against a hostile ecosystem**: the upstream `evtx` crate was designed to parse well-formed live logs, not arbitrary corrupted 64 KB buffers from unallocated space. We found three classes of bugs during development (infinite loop on malformed BinXML and two unbounded multi-GB allocations that aborted the whole process), [reported them upstream](https://github.com/omerbenamram/evtx/issues/290), and they were fixed in evtx 0.11.2. A fourth path — a `Vec::with_capacity(~16 GiB)` inside `read_template_values_cursor` driven by a corrupt BinXML template-values count — still aborts the process on evtx 0.11.2 because the Rust allocator resolves OOM with `abort()` (not a panic), so `catch_unwind` and thread isolation cannot contain it.
-
-To survive that without blocking on an upstream fix, the phase-2 validator spawns a **child process per synthetic EVTX** via `MASSTIN_VALIDATE_EVTX=<path>`, which runs `masstin::validate_evtx_file` and exits 0 on success. If the child aborts by OOM the parent sees a non-zero exit code (Windows `0xC0000409`, Linux signal), rejects the offending file, and keeps carving. Verified end-to-end on a 50 GB `ws01-wipe-novss.raw`: one pathological chunk used to kill the entire run; now it gets quarantined as `masstin_rejected_evtx/panic_oom__Security.evtx` while the remaining 107 synthetic files parse cleanly.
-
-Defenses kept on top of the subprocess boundary:
-
-- `std::panic::catch_unwind` inside the child for any ordinary panic path in malformed BinXML
-- 60-second wall-clock poll deadline on the child; hangs are killed and the file is rejected
-- `--skip-offsets` lets you tell masstin to jump over a 32 MB window around a problematic E01 offset on re-runs
-- `--debug` preserves rejected synthetic EVTX files to `<output_dir>/masstin_rejected_evtx/` for post-mortem
-
-Full technical breakdown: [EVTX carving article](https://weinvestigateanything.com/en/tools/evtx-carving-unallocated/).
-
-### Merge: Combine multiple timelines
-
-```bash
-masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
-```
-
-### Load into graph database
-
-```bash
-# Neo4j
-masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
-
-# Memgraph
-masstin -a load-memgraph -f timeline.csv --database localhost:7687
-```
-
-#### Grouped vs ungrouped: two modes for two questions
-
-The loader supports two modes depending on what you are investigating:
-
-**Grouped (default)** — one edge per unique `(destination, user, logon_type)` combination. The edge carries a `count` property (how many events collapsed into it) and a `time` property (earliest event). This produces a clean, readable graph that answers **"who talks to whom and how"** — the global picture. Ideal for understanding network topology, mapping trust boundaries, and presenting findings.
-
-**Ungrouped (`--ungrouped`)** — one edge per CSV row with its real timestamp. This preserves full temporal granularity so you can query for **chronologically coherent paths**: "the attacker logged in from A to B at 10:00, then from B to C at 10:05". This is the mode for active hunting. Always pair it with `--start-time` / `--end-time` to scope the window — loading an ungrouped 250k-row timeline without a time filter will create an unusable graph.
-
-| Mode | Edges | Best for |
-|------|-------|----------|
-| Grouped (default) | ~100-200 | Global overview, topology, presentations |
-| `--ungrouped` | 1 per CSV row | Temporal path hunting, incident timeline |
-
-#### Load options
-
-| Flag | Effect |
-|------|--------|
-| `--ungrouped` | One edge per CSV row (`CREATE`) instead of grouping. Preserves real timestamps for temporal path queries. Pair with `--start-time` / `--end-time`. |
-| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this. |
-| `--end-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is later than this. |
-
-```bash
-# Global overview — who talks to whom (default, grouped)
-masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j
-
-# Temporal hunting — every individual event in a 30-minute window
-masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j \
-        --ungrouped --start-time "2026-03-15 14:00:00" --end-time "2026-03-15 14:30:00"
-```
-
-#### IP ↔ hostname unification
-
-The same physical host often appears as both an IP and a hostname depending on which event populated each row. Both loaders build an internal `ip → hostname` map and resolve them to a single graph node automatically. Events `4778` (Session Reconnected) and `4779` (Session Disconnected) get an **x1000 weight** in the frequency map because Windows always populates both fields reliably for those events, so a single 4778/4779 outweighs hundreds of conflicting normal events.
-
-When the loader can't tie an IP to a hostname (for example an external attacker IP with no matching session), the IP stays as its own node.
-
-> **Known limit.** The frequency map takes the most frequent name for an IP, so a machine that was renamed (a DC that was `WIN-E0PO207ERMD` before becoming `CITADEL-DC01`) can end up as two nodes, with its history split between them. `graph-hunt-csv` does not use the loader: it keeps nodes as recorded and only reports an IP and a name as one machine when the same-login co-occurrence test is significant (see [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md#ip--host-name-loaders-and-graph-hunt)). The two paths can therefore disagree on machine identity for renamed hosts; the loaders' annotation `resolved_name` carries the test's answer either way. Verified on the Szechuan case (2026-10-05): same chain, same classes, same verdict on both backends, with the DC split in two nodes on the loaded graph.
-
-#### Loader internals: why it is fast and never loses an edge
-
-The loader is built so that **every CSV row that makes it past the filters lands as exactly one edge in the graph** — no silent drops, no retries hiding failures. Five design choices add up to that guarantee while keeping the load near-linear in edge count:
-
-1. **`CREATE INDEX :host(name)` at connect time** (idempotent). Without it, every per-edge `MERGE (h:host {name: ...})` does a full label scan, turning the load into O(V·E) — super-linear and effectively unusable past a few hundred thousand edges. With it, each MERGE is an indexed lookup.
-2. **One-pass resolution in Rust.** IP→hostname unification, self-loop filtering and relationship-type sanitization all happen client-side once, before anything touches Bolt. The database phase is a pure write — no logic to retry.
-3. **`UNWIND` batches of 5000 edges per round-trip**, bucketed by relationship type (Cypher cannot parametrize a relationship type, and masstin's schema uses the sanitized username as the rel type). One Bolt round-trip per 5000 edges instead of one per edge.
-4. **One-shot host-node pre-create**, then `MATCH` (not `MERGE`) for the endpoints inside each edge batch. With the index already in place, MATCH is the cheapest possible lookup, and the edge batches no longer reason about node existence.
-5. **Strictly serial execution.** An opt-in concurrent path was tried and reverted: Memgraph 3.9.x SIGSEGVs under concurrent writes (timing-dependent race), Neo4j tolerated concurrency but the deadlock-retry-backoff overhead actually made it slower than serial on the test corpus, and any retry policy admitted the theoretical risk of silently dropping edges. Serial = no contention = zero retries needed = zero loss by construction.
-
-**Measured impact** (cumulative load of a 1 M-edge test corpus on the same Memgraph 3.9 host):
-
-| | Time | Throughput | Load curve |
-|--|-----:|----------:|-----------|
-| Before this optimization | 50.9 min | 327 edges/s | super-linear (exp ≈ 1.20) |
-| After (current default) | 23.0 min | 726 edges/s | near-linear (exp ≈ 1.09) |
-
-On Neo4j 4.2 the same loader hits ~12 000 edges/s on the same corpus — Neo4j is about an order of magnitude faster per write than Memgraph for this workload, so a 4 GB / ~27 M-edge CSV that takes ~13 h on Memgraph extrapolates to ~37 min on Neo4j.
-
-#### Driving load-neo4j without a password prompt
-
-By default `load-neo4j` prompts for the password interactively (`rpassword`), which is fine on the desk but breaks scripts and CI. Set the **`NEO4J_PASSWORD` environment variable** before invoking masstin to skip the prompt:
-
-```bash
-# Linux / macOS
-NEO4J_PASSWORD='your-pass' masstin -a load-neo4j -f timeline.csv \
-    --database bolt://localhost:7687 --user neo4j
-
-# PowerShell
-$env:NEO4J_PASSWORD = 'your-pass'
-masstin.exe -a load-neo4j -f timeline.csv `
-    --database bolt://localhost:7687 --user neo4j
-```
-
-When the variable is unset or empty the loader falls back to the interactive prompt. The password lives in the process environment — do not export it from a shared shell or a logged dotfile.
-
-### Detect lateral movement: graph-hunt
-
-Once the graph is loaded (with `--ungrouped`: the hunt needs per-event times), masstin looks for lateral-movement anomalies and reports them with **probabilities measured in the network itself** — no hand-picked weights, windows or thresholds. Two flavors, same engine:
-
-- **`-a graph-hunt`** — reads a **Memgraph** graph.
-- **`-a graph-hunt-neo4j`** — reads a **Neo4j** graph.
-- **`-a graph-hunt-csv`** — reads the timeline **CSV** directly (`-f`), no database at all. Same engine, same results (verified on the test case); the graph is only needed to explore afterwards.
-
-No server-side plugin is needed: masstin reads the edges once over bolt and computes everything — including PageRank, betweenness and Louvain — in memory.
-
-```bash
-# No database: straight from the timeline
-masstin -a graph-hunt-csv -f timeline.csv \
-        --investigation-from "2026-03-15 00:00:00" -o findings.csv --report findings.md
-
-# Memgraph
-masstin -a graph-hunt --database bolt://localhost:7687 \
-        --investigation-from "2026-03-15 00:00:00" -o findings.csv
-
-# Neo4j (password from $NEO4J_PASSWORD or prompt; --db for a named database)
-NEO4J_PASSWORD='your-pass' masstin -a graph-hunt-neo4j \
-        --database bolt://localhost:7687 --user neo4j --db mycase \
-        --investigation-from "2026-03-15 00:00:00" -o findings.csv
-```
-
-Days before `--investigation-from` are the **baseline**, the rest the **window**. `--alpha` (default 0.05) is the false discovery rate and the only number the analyst chooses.
-
-#### How it decides
-
-The full design, with the reasons behind each choice, is in [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md). In short:
-
-- **The past only, every day alike.** A fact is *new* on a day if it happened on no earlier day, whether that day is in the baseline or in the window, so a fact is new on the first day it appears and nothing depends on how long the baseline or the window is. Baseline days are then a fair yardstick for window days: same rule, same statistics.
-- **Coverage from the log files.** The loaders record on every host node the time span of each collected log file (`cov_ok` for sources that show logins, `cov_fail` for sources that show failures). Counts are only compared over a **panel** of destinations watched continuously; its start day is the one that maximises panel size × baseline days. Window activity on hosts outside the panel is listed as *not evaluable* instead of being ranked.
-- **The unit is the connection**: (origin, destination, account, result) on one day. A connection seen on another baseline day is habitual and scores zero. A new one is described by what is new about it and by its origin's day: destinations reached for the first time (`origin-fanout`), new accounts for the origin (`cred-rotation`), never-seen account/destination pairs (`novel-edge`), new destinations outside the origin's Louvain community (`community-bridge`), destinations with failures (`failed-sweep`), SSH pre-auth touches (`preauth-sweep`), refused named attempts followed by a login with a new account (`probe-then-success`), origin without any history, rarest logon type (`rare-logon-type`), causal paths with a credential switch (`causal-path`), logins with a credential switch and a new access (`credential-switch`), and the destination's PageRank / betweenness change (`pagerank-spike`, `betweenness-spike`). One joint test combines them; its calibration against the baseline connections gives a p-value that stays valid however the signals depend on each other.
-- **Decision.** Benjamini-Hochberg across the new connections at `--alpha` (habitual ones have p = 1 and are not tests). Significant connections first; the rest stay in the CSV, marked. Every count in an explanation also says on how many baseline days it occurred.
-- **Hopper's signature orders the rows.** Following Hopper (Ho et al., USENIX Security 2021), a connection that combines a **credential switch** (an account owned by other origins, never used by this one) with a **new access** (destination new for the origin or the account) comes before one that reaches a new destination with its habitual credential (scanners, orchestration, administrators on their own account). Hopper reads the owner of each account from an inventory; masstin reads it from the logs: the share of the account's earlier login-days that came from its most frequent origin (1 = it always came from one machine, near 0 = used from everywhere), and a switch weighs that much. The explanation names the home: "the account belongs elsewhere: 100% of its earlier login-days came from C8198". The class is the first clause of `why_unusual`; the p-value is untouched. A **causal path** is the same signature across two hops: A entered B as a1, B went on to C as a2 ≠ a1, and a1 had never reached C.
-- **Origins without history** are judged by their own novelty even on destinations without comparable coverage, so their connections are never left out as *not evaluable*.
-- **Campaigns.** Origins with no history that share a new account and hit overlapping destinations beyond chance (exact hypergeometric test) are grouped in one row. Nodes are not merged.
-- **Machines, not nodes.** An IP and a host name are reported as one machine when the same logins appear once with each (sshd IP vs wtmp reverse-DNS) far more often than chance allows (binomial test over the IP's logins, false discovery rate across candidates, one unambiguous name). The loaders store this on the IP node as `resolved_name` / `resolved_votes` / `resolved_p`; nodes are never merged.
-
-`--only-detectors` / `--skip-detectors` take the signal names above (mutually exclusive).
-
-#### Output
-
-One row per connection, most unusual first:
-
-`rank, significant, p_value, q_value, day, first_seen_utc, last_seen_utc, origin, destination, account, result, events, logs, signature, why_unusual, evidence, chain, campaign, cypher_snippet`
-
-- `result`: login OK, login FAILED, or connection without authentication (SSH pre-auth).
-- `logs`: the log families that recorded it (secure, wtmp, audit, btmp, journal, evtx...).
-- `signature`: the Hopper class ("credential switch with new access", "account unknown to the network", "habitual credential on a new connection", "no credential", "habitual connection"), one value per row, made to filter on.
-- `why_unusual`: what is new about the connection and its context, in short phrases without numbers ("origin never seen before; that day the origin reached 29 destination(s) for the first time").
-- `evidence`: the same reasons with the baseline count behind each one ("origin never seen before: shared by 56 of 1280 new baseline logins, on 19 of 28 days; ...").
-- `chain`: with `--seed`, the connection's place in the reconstruction ("hop 3 depth 1"); empty otherwise.
-- `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage and the origin has a history.
-- On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
-
-**Reconstruction from seeds.** Add `--seed 10.0.0.5,alice` (host names, IPs or accounts you already know to be bad) and the report opens with the chain: every login the seeds made in the window, then every login that left the entered machine while that session was open and was either a new connection or used an account the chain already used, with a certainty of 1 over the sessions open on that machine at the moment; what was open on a seed machine when it first acted; the failed attempts and unauthenticated touches of the chain machines; and one Cypher query that draws the whole chain, plus one that returns everything between the chain machines in that time span. A seed that already existed in the baseline starts the chain only with its new connections (a shared jump host's routine is listed, not followed); a never-seen seed with everything it did. `host:account` names both at once, and `--seed-from` / `--seed-to` bound the logins that start the chain.
-
-**Corroboration with Sigma tools.** Add `--sigma hayabusa.jsonl,chainsaw/` (Hayabusa or Chainsaw JSON output). A rule that fired on a machine while a login session was open on it becomes one more measured signal of that connection, and the explanation says which rule, when and at what level: "Sigma: 2 rule(s) fired on SRV01 while the session was open: 'PsExec Service Installation' at 15:36:02 (high), ...". masstin does not detect PsExec, WMI or service installs itself; it joins what those tools found to the login that made it possible.
-
-**Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, what legitimate situation produces the same pattern and how to rule it out, which raw events to pull, and a Browser query to check everything. The CSV is unchanged.
-
-#### Detection quality
-
-Measured on a test corpus: a Linux estate, 10.5M rows (1.43M logins, 657k failures, 8.4M SSH pre-auth touches), 28 baseline days, a 6-day window with N events. Ground truth from the raw logs, from the raw logs: two never-seen origins that probe an account, sweep 29 hosts without authenticating and then log in with a key on 32 hosts, plus the pre-auth sweep of the machine whose key was stolen. Everything else in the window (a credentialed vulnerability scanner, orchestration, monitoring probes, administrators, the response team) counts as a false alarm.
-
-| engine | significant connections | attacker connections found | attacker's first row | first benign row | P@10 | P@50 | P@100 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| connection-level test (Sept 26) | 338 | 112 / 125 | rank 3 | rank 1 | 80% | 72% | 76% |
-| + Hopper signature, causal paths, no-history rule (Sept 28) | 362 | 123 / 125 | rank 1 | rank 3 | 80% | 90% | 91% |
-| + statistical review: past-only reference with the window's gap, null = new connections, BH over new connections (Sept 28) | 220 | 108 / 125 | rank 1 | rank 66 | 100% | 100% | 86% |
-| **+ reference = every earlier day, baseline and window alike (Oct 1)** | **65** | 65 / 125 | **rank 1** | **rank 66** | **100%** | **100%** | 91% |
-
-The last row is the current engine. Every one of its 65 significant connections is the attacker's (the first origin's whole day: pre-auth sweep and key logins); the second attacker IP, 25 minutes later with the same account, ranks right behind (rows 69 onwards) but stays under the 5 % false discovery rate, because a never-seen machine reaching 29 hosts on its first day is something this network's own baseline does contain (new machines being commissioned). The ranking is what matters for triage: the first 65 rows are all attack, the first benign row is the 66th, and 91 of the first 100 are attack. On the incident-free window 10-09 to 19-09 the same engine marks 7 of 83 new connections significant, all the first days of the credentialed vulnerability scanner. The previous rule ("the past with the window's gap") found 108 of 125 attacker connections at the price of 112 benign ones and needed a baseline longer than the window, which the LANL benchmark below does not have.
-
-**Public benchmark: LANL.** The [Los Alamos "Comprehensive, Multi-Source Cyber-Security Events"](https://csr.lanl.gov/data/cyber1/) set (58 days of a real enterprise, 1.05 billion authentication events, 749 labelled red-team logins from 4 machines) is the reference every lateral-movement paper uses. It was converted to a masstin timeline the way a DFIR collection would look (`viconppt/graph-hunt-tests/lanl_to_masstin.py`): the logs of the 305 red-team machines plus a fixed sample of 200 others, remote logons with a user account only (machine accounts are the Kerberos chatter of every workstation with the domain controllers, 70 % of the volume, and not a person moving), days 0 to 16, cutoff at day 7. The baseline days 0 to 6 contain 50 of the 749 red-team events; the window days 7 to 15 contain 640. Run with `graph-hunt-csv`, no database, 21.3 million rows, 14 minutes, 3.3 GB.
-
-| | value |
-|---|---:|
-| rows in the window (connections) | 465,074 |
-| red-team connections among them | 444 |
-| significant at FDR 0.05 | 204: 185 red team (42 % of the 444) and 19 from one unlabelled machine that failed on 47 hosts and then logged in with 7 accounts new to it |
-| precision of the first 100 rows | 99 % |
-| first row that is not red team | rank 84 (that same machine) |
-| red-team connections in the first 500 rows (0.1 % of the rows) | 286 of 444 (64 %) |
-| red-team sources found | the main one (610 of the 640 window events) at rank 1; the second (26 events, each a single login to a new host) first appears at rank 23,301 |
-| incident-free period (days 40 to 43, 241,423 connections, 34,587 of them new) | 0 significant |
-
-Before the null skipped the shallow baseline days (October 2026), the same run gave 56 significant connections, all red team, first non-red-team row at rank 168 and 13 % of the red-team connections: the first baseline days, with one or two days of reference behind them, were filling the null with "new" connections that were merely unseen. The owner weight of the credential switch, added at the same time, does not change the count here (203 without it): on this network a person's own account from a never-seen machine is an everyday event, so the weight tells the analyst whose account it is without making the login rarer.
-
-Reading: an analyst who reads the first 83 rows of 465 thousand sees nothing but attack, and the 19 rows that are not labelled red team are one machine spraying 47 hosts and succeeding with seven accounts it had never used, which no analyst would want hidden. What it does not catch is the red-team machine that made one quiet login per host with a different user each time, an action this network's own baseline contains thousands of times a day (people using their own account from a machine never seen before); no login-graph method detects those without an inventory of who owns which machine (Hopper's own 9 misses are of that kind). For comparison, Hopper reports 94.5 % detection at about 9 alerts a day on 15 months of a 2,300-machine enterprise, with an inventory and two months of training; Argus, the best graph-neural-network result on LANL, reports an average precision of 0.32 that falls to 0.09 under fair labelling (Larroche 2026).
-
-The synthetic-corpus figures of the previous, hand-weighted detectors are in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/); they have not been re-run with the statistical engine.
-
-### Merge graph nodes after loading
-
-If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
-
-```bash
-# Neo4j
-masstin -a merge-neo4j-nodes \
-        --database bolt://localhost:7687 --user neo4j \
-        --old-node "10.0.0.10" --new-node "WORKSTATION-A"
-
-# Memgraph
-masstin -a merge-memgraph-nodes \
-        --database localhost:7687 \
-        --old-node "10.0.0.10" --new-node "WORKSTATION-A"
-```
-
-## Output Format
-
-All actions produce a unified CSV with 14 columns:
-
-| Column | Description |
-|--------|-------------|
-| `time_created` | Event timestamp |
-| `dst_computer` | Destination hostname |
-| `event_type` | Event classification: `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
-| `event_id` | Original Event ID (e.g., `4624`, `SSH_SUCCESS`, `SMB`, `RDP`) |
-| `logon_type` | Windows logon type (e.g., `2`, `3`, `10`) |
-| `target_user_name` | Target user account |
-| `target_domain_name` | Target domain |
-| `src_computer` | Source hostname |
-| `src_ip` | Source IP address |
-| `subject_user_name` | Subject user account |
-| `subject_domain_name` | Subject domain |
-| `logon_id` | Logon ID for session correlation |
-| `detail` | Additional context: SubStatus, process name, SSH auth method, UAL role |
-| `log_filename` | Source file (e.g., `HRServer.e01:vss_0:Security.evtx`) |
-
-For the complete Event ID mapping, see [CSV Format and Event Classification](https://weinvestigateanything.com/en/tools/masstin-csv-format/).
-
-## Graph Visualization (Neo4j / Memgraph)
-
-Masstin supports two graph databases. Both use the Cypher query language and the same queries work on both with minor differences.
-
-### Neo4j
-
-| Step | Windows | Linux | macOS | Docker (all platforms) |
-|------|---------|-------|-------|------------------------|
-| **Install** | Download [Neo4j Desktop](https://neo4j.com/download/) and install | `sudo apt install neo4j` or [download](https://neo4j.com/download/) | `brew install neo4j` or [download](https://neo4j.com/download/) | `docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j` |
-| **Start** | Open Neo4j Desktop, create a database, click Start | `sudo systemctl start neo4j` | `neo4j start` | Runs automatically |
-| **Browser** | `http://localhost:7474` | `http://localhost:7474` | `http://localhost:7474` | `http://localhost:7474` |
-| **Load data** | `masstin.exe -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j` | `masstin -a load-neo4j -f timeline.csv --database localhost:7687 --user neo4j` | Same as Linux | Same as Linux |
-
-### Memgraph
-
-| Step | Windows | Linux | macOS | Docker (all platforms) |
-|------|---------|-------|-------|------------------------|
-| **Install** | Via Docker — requires WSL 2 + Docker Desktop (see below) | `sudo apt install memgraph` or [download](https://memgraph.com/download/) | Use Docker (recommended) | `docker compose` with `memgraph/memgraph-mage` + `memgraph/lab` |
-| **Start** | `iwr https://windows.memgraph.com \| iex` (starts DB + Lab via docker compose) | `sudo systemctl start memgraph` | — | Runs automatically |
-| **Browser** | `http://localhost:3000` (Memgraph Lab) | `http://localhost:3000` | `http://localhost:3000` | `http://localhost:3000` |
-| **Load data** | `masstin.exe -a load-memgraph -f timeline.csv --database localhost:7687` | `masstin -a load-memgraph -f timeline.csv --database localhost:7687` | Same as Linux | Same as Linux |
-
-> **Note:** Memgraph runs in-memory. Data is lost on restart unless [snapshots are configured](https://memgraph.com/docs/fundamentals/data-durability).
-
-> **Graph style:** A ready-to-use GSS style for Memgraph Lab is available at [`memgraph-resources/style.gss`](memgraph-resources/style.gss). Copy its contents into the Graph Style editor in Memgraph Lab, click Apply, then click **Save style** with name `masstin` and enable **Default Graph Style** to apply it automatically to all future queries.
->
-> <div align="center"><img src="memgraph-resources/memgraph_save_style.png" alt="Save masstin style as default in Memgraph Lab" width="600"/></div>
-
-<details>
-<summary><strong>Windows prerequisites for Memgraph (WSL 2 + Docker)</strong></summary>
-
-On Windows, Memgraph runs inside a Docker container, and Docker Desktop requires WSL 2. The dependency chain is: **WSL 2 → Docker Desktop → Memgraph container**.
-
-**1. Enable WSL 2** — Open PowerShell as Administrator:
-
-```powershell
-dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
-dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
-```
-
-Restart your PC, then:
-
-```powershell
-wsl --update
-wsl --set-default-version 2
-wsl --install
-```
-
-**2. Install Docker Desktop** — Download from [docker.com](https://www.docker.com/products/docker-desktop/). Select "Use WSL 2 instead of Hyper-V" during installation. Restart if prompted.
-
-**3. Install and run Memgraph:**
-
-```powershell
-iwr https://windows.memgraph.com | iex
-```
-
-This downloads a `docker-compose.yml` and starts the database (`memgraph/memgraph-mage`) and the web interface (`memgraph/lab`). Open `http://localhost:3000` — Memgraph Lab is ready.
-
-</details>
-
-### Querying the graph
-
-After loading data, use Cypher queries to explore lateral movement.
-
-**Neo4j** — filter by time range:
-
-```cypher
-MATCH (h1:host)-[r]->(h2:host)
-WHERE datetime(r.time) >= datetime("2024-08-12T00:00:00Z")
-  AND datetime(r.time) <= datetime("2024-08-13T00:00:00Z")
-RETURN h1, r, h2
-```
-
-<div align="center">
-  <img src="neo4j-resources/neo4j_output1.png" alt="Lateral movement graph in Neo4j"/>
-</div>
-
-**Memgraph** — view all lateral movement:
-
-```cypher
-MATCH (h1:host)-[r]->(h2:host)
-RETURN h1, r, h2
-```
-
-<div align="center">
-  <img src="memgraph-resources/memgraph_output1.png" alt="Lateral movement graph in Memgraph"/>
-</div>
-
-**Temporal path reconstruction** (from `10_99_88_77` to `SRV_BACKUP`):
-
-```cypher
-MATCH path = (start:host {name:'10_99_88_77'})-[*]->(end:host {name:'SRV_BACKUP'})
-WHERE ALL(i IN range(0, size(relationships(path))-2)
-  WHERE localDateTime(relationships(path)[i].time) < localDateTime(relationships(path)[i+1].time))
-RETURN path
-ORDER BY length(path)
-LIMIT 5
-```
-
-<div align="center">
-  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction in Memgraph"/>
-</div>
-
-For the full query catalog (10+ queries), see the [Cypher Resources](neo4j-resources/cypher_queries.md).
-
-## All Options
-
-| Option | Description |
-|--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` |
-| `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
-| `-f, --file` | Individual files: EVTX, .mdb, E01, VMDK, dd/raw (repeatable) |
-| `-o, --output` | Output file path |
-| `--database` | Graph database URL (e.g., `localhost:7687`) |
-| `-u, --user` | Database user (Neo4j) |
-| `--db` | Target database name on the graph server (default `neo4j` for Neo4j actions, `memgraph` for Memgraph). Useful in multi-database Neo4j 5.x/2026.x setups. |
-| `--cortex-url` | Cortex XDR API base URL |
-| `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` (Cortex actions, `merge`, `load-neo4j` / `load-memgraph`) |
-| `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` (same scope as `--start-time`) |
-| `--ungrouped` | For `load-neo4j` / `load-memgraph`: emit one edge per CSV row instead of grouping |
-| `--old-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node to remove (its edges are transferred to `--new-node`) |
-| `--new-node` | For `merge-neo4j-nodes` / `merge-memgraph-nodes`: name of the `:host` node that survives the merge |
-| `--filter-cortex-ip` | Filter by IP in Cortex queries |
-| `--admin-ports` | `parse-cortex`: widen network port list to full admin set (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986). Default is RDP/SMB/SSH + WinRM. |
-| `--cortex-event-ids` | `parse-cortex-evtx-forensics`: comma-separated override of the default Windows Event ID set |
-| `--cortex-min-window-secs` | Auto-pagination floor for both Cortex actions when a time window saturates the API 1M cap (default 300) |
-| `--cortex-max-passes` | Hard cap on auto-pagination passes for both Cortex actions (default 200) |
-| `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
-| `--overwrite` | Overwrite output file if it exists |
-| `--stdout` | Print output to stdout only |
-| `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and rejected lines in `parse-custom`) |
-| `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
-| `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](rules/)) |
-| `--dry-run` | `parse-custom`: show first matches and rejected lines, write no CSV. With any filter flag on a parser action: print the filter stats and write only the CSV header |
-| `--ignore-local`, `--exclude-users`, `--exclude-hosts`, `--exclude-ips` | Noise filtering on every parser action and `merge` (see [Noise filtering](#noise-filtering---ignore-local-and---exclude-)) |
-| `--carve-unalloc` | `carve-image`: scan unallocated space only (planned; currently scans the whole image) |
-| `--skip-offsets LIST` | `carve-image`: comma-separated hex offsets to skip (32 MB window each) on a pathological E01 |
-| `--investigation-from "YYYY-MM-DD HH:MM:SS"` | `graph-hunt*`: cutoff (UTC). Days before it are the baseline, the rest the window. Required |
-| `--alpha` | `graph-hunt*` and loaders: false discovery rate for Benjamini-Hochberg (default 0.05), the only chosen number |
-| `--only-detectors` / `--skip-detectors` | `graph-hunt*`: comma-separated signal names to run exclusively or to drop (mutually exclusive) |
-| `--report FILE.md` | `graph-hunt*`: also write the analyst report, one story per origin with a significant connection |
-| `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account`; the report opens with the reconstructed chain. Requires `--report` |
-| `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
-| `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |
-
-## Supported Artifacts
-
-Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](ARTIFACTS.md).
-
-### Windows EVTX
-
-| Source | Event IDs | What it tracks | Article |
-|--------|-----------|---------------|---------|
-| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140 | Logons, logoffs, Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
-| **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **RdpCoreTS** | 131 | RDP transport negotiation | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| **WinRM/Operational** | 6 | PowerShell Remoting session init — destination host from connection field (source system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
-| **WMI-Activity/Operational** | 5858 | Remote WMI execution — source machine from ClientMachine field (destination system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
-| **Sysmon/Operational** | 3 | Network connections on lateral-movement service ports (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986); direction from `Initiated`, initiating process in `detail` | |
-| **Scheduled Tasks XML** | — | Remotely registered tasks detected via Author field (MACHINE\user) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
-| **MountPoints2 (NTUSER.DAT)** | — | Remote share connections from each user's registry (##SERVER#SHARE with LastWriteTime) | [Read more →](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
-
-### UAL (User Access Logging)
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| `SystemIdentity.mdb` | Server hostname, role mappings | [Read more →](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-| `Current.mdb` + `{GUID}.mdb` | Username, source IP, role, access count, first/last seen (up to 3 years) | [Read more →](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-
-### Linux
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| `/var/log/auth.log` (Debian/Ubuntu) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/secure` (RHEL/CentOS) | SSH success, failure, PAM authentication | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/messages` | SSH events via syslog | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/audit/audit.log` | `USER_LOGIN` / `USER_AUTH` from auditd — primary SSH signal on Ubuntu + SSSD | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `/var/log/journal/<machine-id>/*.journal[~]` | systemd-journald binary logs — sshd `Accepted`/`Failed` events on modern SSSD / AD hosts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| `utmp` / `wtmp` / `btmp` / `lastlog` | Login sessions, failed attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-
-### Winlogbeat & Cortex XDR
-
-| Source | What it tracks | Article |
-|--------|---------------|---------|
-| Winlogbeat JSON | All Windows Event IDs in JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
-| Cortex XDR Network | RDP, SMB, SSH connections via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
-| Cortex XDR EVTX Forensics | Forensic event logs from agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md). The hunt runs straight from the CSV (`graph-hunt-csv`), on Memgraph (`graph-hunt`) or on Neo4j (`graph-hunt-neo4j`), with no server-side plugin.
 
 ## Documentation
 
-Full documentation at **[We Investigate Anything](https://weinvestigateanything.com)** — bilingual DFIR knowledge base (English/Spanish).
+| Topic | Where |
+|---|---|
+| Every `parse-*` action, noise filtering, triage detection, carving, merge | [docs/parsing.md](docs/parsing.md) |
+| graph-hunt: options, output columns, report, seeds, Sigma corroboration, detection quality | [docs/graph-hunt.md](docs/graph-hunt.md) |
+| Statistics behind the hunt | [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md) |
+| Loading into Neo4j / Memgraph, visualisation, query catalogue | [docs/graph-databases.md](docs/graph-databases.md) · [Cypher queries](neo4j-resources/cypher_queries.md) |
+| Custom parsers (YAML rules) | [docs/custom-parsers.md](docs/custom-parsers.md) |
+| Every command-line option | [docs/cli-options.md](docs/cli-options.md) |
+| Artifacts and fields | [ARTIFACTS.md](ARTIFACTS.md) |
+| Articles, in English and Spanish | [weinvestigateanything.com](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/) |
 
-### Tools
-
-| Topic | Article |
-|-------|---------|
-| Masstin main page | [weinvestigateanything.com — masstin](https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/) |
-| CSV format and event classification | [CSV Format](https://weinvestigateanything.com/en/tools/masstin-csv-format/) |
-| Forensic images and VSS recovery | [VSS Recovery](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/) |
-| User Access Logging (UAL) | [UAL](https://weinvestigateanything.com/en/tools/masstin-ual/) |
-| vshadow-rs — pure Rust VSS parser | [vshadow-rs](https://weinvestigateanything.com/en/tools/vshadow-rs/) |
-| Neo4j and Cypher guide | [Neo4j](https://weinvestigateanything.com/en/tools/neo4j-cypher-visualization/) |
-| Memgraph guide | [Memgraph](https://weinvestigateanything.com/en/tools/memgraph-visualization/) |
-
-### Artifacts
-
-| Artifact | Article |
-|----------|---------|
-| Security.evtx (14 Event IDs) | [Security.evtx](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
-| Terminal Services EVTX (RDP) | [Terminal Services](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| SMB EVTX (Server + Client) | [SMB Events](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
-| Linux forensic artifacts | [Linux](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
-| Winlogbeat JSON | [Winlogbeat](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
-| Cortex XDR | [Cortex](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
+`masstin --help` lists every action and flag.
 
 ## Roadmap
 
-- [ ] VHD/VHDX image support
-- [x] ~~Event reconstruction from cleared logs (EVTX record carving)~~ — **done (Tier 1 + Tier 2 detection)**
-- [x] ~~MountPoints2 registry hive parsing for lateral movement traces~~ — **done**
-- [x] ~~Custom parser framework for VPN/firewall/proxy logs (YAML rules)~~ — **done (v1: csv/regex/keyvalue + sub-extract + strip_before)**
-- [x] ~~Initial community rule library~~ — **done (9 rules, 37 parsers: Palo Alto GP + TRAFFIC, Cisco AnyConnect + ASA, Fortinet SSL VPN + FortiGate, OpenVPN, Squid, Mordor / OTRF JSON)**
-- [ ] EVTX carving Tier 3: template matching for orphan records (reconstruct XML from records whose parent chunks are gone)
-- [ ] Unallocated-only carving scan (`--carve-unalloc`) — currently scans the whole image
-- [x] ~~Custom parsers v2: JSON extractor~~ — **done (`type: json`, flat and nested dot-paths)**
-- [ ] Custom parsers v2: conditional map, per-rule `--validate` command
-- [ ] More community parser rules: Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall
-- [ ] **EVTX header tampering detection** — flag chunks whose record numbers, timestamps or CRCs have been edited (Event Log Edit / similar tooling)
-- [x] ~~**systemd-journald binary log parsing** — pure-Rust reader for `/var/log/journal/*.journal[~]` (compact mode + zstd), essential on Ubuntu 22 / RHEL 8+ with SSSD + AD~~ — **done**
-- [ ] **Linux event recovery / carving** — recover deleted entries from `auth.log`, `wtmp`, `btmp`, `journald` after rotation or attacker cleanup
-- [ ] **macOS support** — `parse-mac` (live `/var/log` and unified logs) and `parse-image-mac` (HFS+/APFS forensic images), bringing Mac to feature parity with Windows and Linux
-- [ ] **Official Velociraptor plugin** — package masstin so analysts can run it from a Velociraptor artifact and get a unified timeline back without leaving the platform
+- Loaders unify IP and hostname with the same binomial test graph-hunt uses (today: frequency map, see [docs/graph-databases.md](docs/graph-databases.md#ip--hostname-unification))
+- VHD/VHDX images; macOS (`parse-mac`, APFS images)
+- EVTX carving Tier 3 (template matching) and unallocated-only scan
+- EVTX header tampering detection; Linux log carving
+- More custom-parser rules (Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall); conditional map and per-rule `--validate`
+- Official Velociraptor plugin
 
-## License
+## About
 
-GNU Affero General Public License v3.0 — see [LICENSE](LICENSE) for details.
+Masstin is the Rust rewrite of [Sabonis](https://github.com/jupyterj0nes/sabonis), named after the [Mastín Leonés](https://en.wikipedia.org/wiki/Spanish_Mastiff), the guardian dog of the mountains of León. It builds on stable Rust with a plain `cargo build --release`. If you use it in research, [CITATION.cff](CITATION.cff) has the reference.
 
-## Contact
+Licensed under the GNU Affero General Public License v3.0 ([LICENSE](LICENSE)).
 
 **Toño Díaz** ([@jupyterj0nes](https://github.com/jupyterj0nes)) · [LinkedIn](https://www.linkedin.com/in/antoniodiazcastano/) · [weinvestigateanything.com](https://weinvestigateanything.com)

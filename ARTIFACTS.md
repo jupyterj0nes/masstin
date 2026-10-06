@@ -95,7 +95,7 @@ What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, jo
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
 
-Parses all 32 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
+Parses all 33 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
 
 ## Cortex XDR
 

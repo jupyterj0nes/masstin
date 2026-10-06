@@ -8,3 +8,4 @@ desktop-carved.csv
 masstin_rejected_evtx/
 test_all_carve.sh
 test_zip_recursion/
+/target-linux
