@@ -387,8 +387,8 @@ After the summary, the action prints a **load-into-graph hint** with both Memgra
 
 ```
         Load into graph (pick one):
-          Memgraph:  masstin -a load-memgraph -f C:/Users/c00pr/.../timeline.csv --database localhost:7687
-          Neo4j:     masstin -a load-neo4j   -f C:/Users/c00pr/.../timeline.csv --database bolt://localhost:7687 --user neo4j
+          Memgraph:  masstin -a load-memgraph -f C:/cases/.../timeline.csv --database localhost:7687
+          Neo4j:     masstin -a load-neo4j   -f C:/cases/.../timeline.csv --database bolt://localhost:7687 --user neo4j
 ```
 
 ## EVTX carving: last-resort recovery from unallocated space
