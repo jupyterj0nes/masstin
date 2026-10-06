@@ -16,9 +16,9 @@
 </div>
 
 <div align="center">
-  <img src="resources/demo-hunt.gif" alt="masstin graph-hunt-csv reconstructing an attacker's chain from a seed IP on the DFIR Madness Szechuan case"/>
+  <img src="resources/demo-graph.gif" alt="Memgraph Lab on a masstin timeline: the hour of the intrusion, then the temporal path query between the attacker's IP and the workstation"/>
   <br>
-  <em>graph-hunt-csv on the DFIR Madness "Szechuan sauce" case: from one known-bad IP to the whole chain, with the certainty of every hop, in 0.2 s.</em>
+  <em>A masstin timeline in Memgraph Lab: every login of the hour the attacker came in, then one Cypher query from the catalogue returns the chronologically valid path from the attacker's IP to the workstation it reached. DFIR Madness "Szechuan sauce" case.</em>
 </div>
 
 ## What it does
@@ -29,11 +29,6 @@ An incident leaves logins in a dozen places: Security.evtx on fifty Windows host
 - **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
 - **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
 
-<div align="center">
-  <img src="memgraph-resources/memgraph_temporal_path.png" alt="Temporal path reconstruction: the attacker's chronologically valid route between two hosts, rendered from a masstin timeline in Memgraph"/>
-  <br>
-  <em>Temporal path reconstruction in Memgraph Lab: the attacker's route between two hosts where every hop happens strictly after the previous one. One Cypher query from the catalogue.</em>
-</div>
 
 ## Quick start
 
@@ -58,7 +53,7 @@ masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungr
 <div align="center">
   <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples"/>
   <br>
-  <em>parse-windows over 293 EVTX samples: artifact discovery, per-folder breakdown, duplicates removed, 14-column CSV.</em>
+  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the 14-column CSV at the end.</em>
 </div>
 
 > **macOS first run:** if Gatekeeper blocks the binary, run `xattr -d com.apple.quarantine masstin-*` once.
@@ -80,6 +75,12 @@ The full artifact list with the fields taken from each event is in [ARTIFACTS.md
 ## How graph-hunt decides
 
 A connection is one origin logging in to one destination with one account on one day. Connections that already happened on another baseline day are habitual and never reported. For the new ones, ten facts are measured against the baseline (first-time destination, account the origin never used, account that belongs to another machine, failed sweeps, pre-auth touches, logon type, graph centrality, community crossing, chain speed, Sigma hits from Hayabusa / Chainsaw when given) and combined into one empirical p-value per origin-day. Benjamini-Hochberg across all of them controls the false discovery rate you asked for.
+
+<div align="center">
+  <img src="resources/demo-hunt.gif" alt="graph-hunt-csv on the Szechuan timeline: the run, then the ranked connections with their Hopper class and their place in the chain from the seed"/>
+  <br>
+  <em>graph-hunt-csv on the Szechuan timeline with the attacker's IP as seed: what the engine measured, then the ranked connections. Each row says why it is there (a credential switch with a new access, a causal path) and where it sits in the chain.</em>
+</div>
 
 Measured on a real test incident and on the public Los Alamos (LANL) authentication set:
 
