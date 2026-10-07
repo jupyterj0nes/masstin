@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Build:** polars is gone. The Windows and Winlogbeat parsers built a DataFrame only to write it as CSV; they now write the rows directly with the same quoting (`src/csv_out.rs`), byte-identical output on the EVTX sample sets, a build that no longer carries polars-plan's future-incompatibility warnings, and a Windows binary of 16 MB instead of 27.
+- **Build:** quick-xml 0.20 -> 0.42 (the other crate flagged as incompatible with a future Rust). Attributes and text in the event structs use the `@name` / `$text` names of the new serde layer, and whitespace-only element text is trimmed as before, so `<Param2>` with a line break stays an empty field.
+- **CI:** `ci.yml` builds and tests on Linux and Windows with stable Rust on every push and pull request, and prints the future-incompatibility report, so a dependency that stops compiling on a new toolchain is caught before a tag is cut (the v1.1.0 release failed that way on `ethnum`).
+
 ## v1.1.0 — 2026-10-05
 
 ### The statistical graph-hunt

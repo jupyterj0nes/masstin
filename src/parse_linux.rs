@@ -6,7 +6,6 @@
 // -----------------------------------------------------------------------------
 use flate2::read::GzDecoder;
 use once_cell::sync::Lazy;
-use polars::prelude::*;
 use regex::Regex;
 use std::{
     collections::HashMap,

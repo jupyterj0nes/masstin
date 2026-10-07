@@ -3,12 +3,19 @@ use evtx::EvtxParser;
 extern crate serde;
 extern crate quick_xml;
 use serde::{Serialize, Deserialize};
-use quick_xml::de::from_str;
+
+/// Deserialise one event record with whitespace-only text trimmed, as the
+/// quick-xml 0.20 deserializer did: a Param element holding only a line
+/// break and spaces is an empty value, not a run of spaces.
+fn from_str<'a, T: serde::Deserialize<'a>>(s: &'a str) -> Result<T, quick_xml::DeError> {
+    let mut reader = quick_xml::NsReader::from_str(s);
+    reader.config_mut().trim_text(true);
+    let mut de = quick_xml::de::Deserializer::borrowing(reader);
+    serde::Deserialize::deserialize(&mut de)
+}
 use std::{error::Error, collections::HashMap};
-use polars::prelude::*;
 use walkdir::WalkDir;
 use std::path::Path;
-use std::io::{self, Write};
 use ::zip::read::ZipArchive;
 use std::io::{Read, Cursor, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1822,7 +1829,7 @@ fn time_sort_key(raw: &str) -> Option<chrono::NaiveDateTime> {
     None
 }
 
-fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
+fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {
     // Deduplicate events (e.g., same event from live volume and VSS snapshot)
     // Key: (time_created, dst_computer, event_id, event_type, target_user_name, src_ip)
     // Prefer live volume events over VSS (shorter filename = no "vss_" in path)
@@ -1862,86 +1869,12 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) -> usize {
     let mut log_data = log_data;
     log_data.sort_by_cached_key(|x| (time_sort_key(&x.time_created), x.time_created.clone()));
 
-    let time_created_vec: Vec<String> = log_data.iter().map(|x| x.time_created.to_string()).collect();
-    let time_created = Series::new("time_created", time_created_vec);
-
-    let computer_vec: Vec<String> = log_data.iter().map(|x| x.computer.to_string()).collect();
-    let computer = Series::new("dst_computer", computer_vec);
-
-    let event_type_vec: Vec<String> = log_data.iter().map(|x| x.event_type.to_string()).collect();
-    let event_type = Series::new("event_type", event_type_vec);
-
-    let event_id_vec: Vec<String> = log_data.iter().map(|x| x.event_id.to_string()).collect();
-    let event_id = Series::new("event_id", event_id_vec);
-
-    let logon_type_vec: Vec<String> = log_data.iter().map(|x| x.logon_type.to_string()).collect();
-    let logon_type = Series::new("logon_type", logon_type_vec);
-
-    let target_user_name_vec: Vec<String> = log_data.iter().map(|x| x.target_user_name.to_string()).collect();
-    let target_user_name = Series::new("target_user_name", target_user_name_vec);
-
-    let target_domain_name_vec: Vec<String> = log_data.iter().map(|x| x.target_domain_name.to_string()).collect();
-    let target_domain_name = Series::new("target_domain_name", target_domain_name_vec);
-
-    let workstation_name_vec: Vec<String> = log_data.iter().map(|x| x.workstation_name.to_string()).collect();
-    let workstation_name = Series::new("src_computer", workstation_name_vec);
-
-    let ip_address_vec: Vec<String> = log_data.iter().map(|x| x.ip_address.to_string()).collect();
-    let ip_address = Series::new("src_ip", ip_address_vec);
-
-    let subject_user_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_user_name.to_string()).collect();
-    let subject_user_name = Series::new("subject_user_name", subject_user_name_vec);
-
-    let subject_domain_name_vec: Vec<String> = log_data.iter().map(|x| x.subject_domain_name.to_string()).collect();
-    let subject_domain_name = Series::new("subject_domain_name", subject_domain_name_vec);
-
-    let logon_id_vec: Vec<String> = log_data.iter().map(|x| x.logon_id.to_string()).collect();
-    let logon_id = Series::new("logon_id", logon_id_vec);
-
-    let detail_vec: Vec<String> = log_data.iter().map(|x| x.detail.to_string()).collect();
-    let detail = Series::new("detail", detail_vec);
-
-    let filename_vec: Vec<String> = log_data.iter().map(|x| x.filename.to_string()).collect();
-    let filename = Series::new("log_filename", filename_vec);
-
-    let df = DataFrame::new(vec![
-        time_created,
-        computer,
-        event_type,
-        event_id,
-        logon_type,
-        target_user_name,
-        target_domain_name,
-        workstation_name,
-        ip_address,
-        subject_user_name,
-        subject_domain_name,
-        logon_id,
-        detail,
-        filename
-    ]);
-    // already sorted by instant above (df stays a Result for the writers below)
-
-    match output {
-        Some(output_path) => {
-            let mut output_file = match File::create(output_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[ERROR] Cannot create output file {}: {}", output_path, e);
-                    return 0;
-                }
-            };
-            CsvWriter::new(&mut output_file)
-                .has_header(true)
-                .finish(&mut df.unwrap())
-                .unwrap();
-        },
-        None => {
-            CsvWriter::new(io::stdout())
-                .has_header(true)
-                .finish(&mut df.unwrap())
-                .unwrap();
-        },
+    if let Err(e) = crate::csv_out::write_timeline(&log_data, output) {
+        match output {
+            Some(p) => eprintln!("[ERROR] Cannot write output file {}: {}", p, e),
+            None => eprintln!("[ERROR] Cannot write output: {}", e),
+        }
+        return 0;
     }
 
     deduped_count
@@ -2471,7 +2404,7 @@ pub fn parse_events_ex(
     // Phase 3: Generate output
     crate::banner::print_output_start();
     let total_before_dedup = log_data.len();
-    let total_after_dedup = vector_to_polars(log_data, output);
+    let total_after_dedup = write_rows(log_data, output);
     let deduped = total_before_dedup - total_after_dedup;
     if deduped > 0 {
         crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
@@ -2506,11 +2439,13 @@ struct System {
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct TimeCreated {
+    #[serde(rename = "@SystemTime")]
     SystemTime: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct Provider {
+    #[serde(rename = "@Name")]
     Name: Option<String>,
 }
 
@@ -2522,8 +2457,9 @@ struct EventData {
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct Data {
+    #[serde(rename = "@Name")]
     Name: Option<String>,
-    #[serde(rename = "$value")]
+    #[serde(rename = "$text")]
     pub body: Option<String>,
 }
 
@@ -2535,6 +2471,7 @@ struct UserData {
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct Security {
+    #[serde(rename = "@UserID")]
     UserID: Option<String>,
 }
 

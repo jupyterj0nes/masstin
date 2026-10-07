@@ -19,6 +19,7 @@ mod merge;
 pub use crate::merge::*;
 use serde_json::Value;
 mod parse_elastic;
+mod csv_out;
 pub use crate::parse_elastic::*;
 mod parse_cortex;
 pub use crate::parse_cortex::*;
