@@ -1820,8 +1820,18 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         for e in evs.iter().filter(|e| !is_base(e.day) && e.cls == OK && nod.contains_key(&e.o)) {
             ev_of.entry(e.o).or_default().insert((e.d, e.a, e.t));
         }
-        let pop = pop_set.len() as u64;
-        let mut pairs: Vec<(u32, u32, f64, usize, BTreeSet<u32>)> = Vec::new();
+        // The population of the overlap test is the shared account's own
+        // footprint: every panel destination that account reached in the
+        // window, from any origin. Two newcomers that use the same account
+        // go where that account goes (a person's two machines, a service
+        // account from two new hosts), so an overlap inside the footprint
+        // is the expectation, not a coincidence; drawing from the whole
+        // panel instead called 96 % of the LANL candidate pairs campaigns.
+        let mut acct_dsts: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+        for e in evs.iter().filter(|e| !is_base(e.day) && e.cls == OK && pop_set.contains(&e.d)) {
+            acct_dsts.entry(e.a).or_default().insert(e.d);
+        }
+        let mut pairs: Vec<(u32, u32, f64, usize, BTreeSet<u32>, usize, usize, usize)> = Vec::new();
         for x in 0..cand.len() {
             for y in x + 1..cand.len() {
                 let (a, b) = (cand[x], cand[y]);
@@ -1834,9 +1844,15 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                         continue;
                     }
                 }
-                let (da, db) = (&nod[&a], &nod[&b]);
-                let k = da.intersection(db).count();
-                pairs.push((a, b, stats::hypergeom_upper(pop, da.len() as u64, db.len() as u64, k as u64), k, shared));
+                let footprint: BTreeSet<u32> = shared.iter().filter_map(|s| acct_dsts.get(s)).flat_map(|d| d.iter().copied()).collect();
+                let da: BTreeSet<u32> = nod[&a].intersection(&footprint).copied().collect();
+                let db: BTreeSet<u32> = nod[&b].intersection(&footprint).copied().collect();
+                if da.is_empty() || db.is_empty() || footprint.len() < 2 {
+                    continue;
+                }
+                let k = da.intersection(&db).count();
+                let p = stats::hypergeom_upper(footprint.len() as u64, da.len() as u64, db.len() as u64, k as u64);
+                pairs.push((a, b, p, k, shared, da.len(), db.len(), footprint.len()));
             }
         }
         let pq = stats::benjamini_hochberg(&pairs.iter().map(|p| p.2).collect::<Vec<_>>());
@@ -1847,13 +1863,14 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             }
             n_camp += 1;
             let acc = pr.4.iter().map(|a| c.accts.name(*a)).collect::<Vec<_>>().join(" ");
-            for (me, other, mine) in [(pr.0, pr.1, &nod[&pr.0]), (pr.1, pr.0, &nod[&pr.1])] {
+            for (me, other, mine) in [(pr.0, pr.1, pr.5), (pr.1, pr.0, pr.6)] {
                 let txt = format!(
-                    "with {}: both never seen before, same new account {}, {} of its {} new destinations shared (exact test p = {:.1e}, q = {:.1e})",
+                    "with {}: both never seen before, same new account {}, {} of its {} new destinations shared among the {} that account reaches (exact test p = {:.1e}, q = {:.1e})",
                     entity_label(&ents, other),
                     acc,
                     pr.3,
-                    mine.len(),
+                    mine,
+                    pr.7,
                     pr.2,
                     pq[k]
                 );
@@ -1864,7 +1881,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
                 e.push_str(&txt);
             }
         }
-        lines.push(format!("Campaigns: {} candidate pair(s) sharing a new account, {} significant", pairs.len(), n_camp));
+        lines.push(format!("Campaigns: {} candidate pair(s) sharing a new account, {} overlap beyond the account's own footprint", pairs.len(), n_camp));
     }
 
     // ── report rows ──
@@ -2749,6 +2766,49 @@ mod tests {
             });
         }
         c
+    }
+
+    #[test]
+    fn campaign_overlap_is_judged_within_the_accounts_footprint() {
+        // baseline: twenty days of routine so the null is not empty
+        let zs: Vec<String> = (1..=20).map(|k| format!("Z{}", k)).collect();
+        let ss: Vec<String> = (1..=12).map(|k| format!("S{}", k)).collect();
+        let mut rows: Vec<(i32, i64, &str, &str, &str, &str)> = Vec::new();
+        for day in 1..=20 {
+            for s in &ss {
+                rows.push((day, 9, "ADM", s.as_str(), "ADM1", "SUCCESSFUL_LOGON"));
+            }
+            rows.push((day, 12, zs[(day - 1) as usize].as_str(), "S1", "ADM1", "SUCCESSFUL_LOGON"));
+        }
+        // window day 21: account U is used by six machines with history,
+        // each to its own two servers (U's footprint = S1..S12); newcomers
+        // A and B both use U and hit the same six servers: far beyond what
+        // two independent users of U would share
+        for i in 0..6 {
+            let o = format!("P{}", i + 1);
+            rows.push((21, 8, Box::leak(o.clone().into_boxed_str()), ss[2 * i].as_str(), "U", "SUCCESSFUL_LOGON"));
+            rows.push((21, 8, Box::leak(o.into_boxed_str()), ss[2 * i + 1].as_str(), "U", "SUCCESSFUL_LOGON"));
+            rows.push((1, 8, Box::leak(format!("P{}", i + 1).into_boxed_str()), "S1", "U", "SUCCESSFUL_LOGON"));
+        }
+        for i in 0..6 {
+            rows.push((21, 10, "A", ss[i].as_str(), "U", "SUCCESSFUL_LOGON"));
+            rows.push((21, 11, "B", ss[i].as_str(), "U", "SUCCESSFUL_LOGON"));
+        }
+        // newcomers C and D share account V, whose footprint is exactly
+        // what the two of them reach: the overlap is the account's routine
+        for s in &ss[..4] {
+            rows.push((21, 13, "C", s.as_str(), "V", "SUCCESSFUL_LOGON"));
+            rows.push((21, 14, "D", s.as_str(), "V", "SUCCESSFUL_LOGON"));
+        }
+        let c = corpus(&rows);
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let (out, lines, _alpha, _stories, _seed, _) = analyse(c, &super::super::NEO4J, &cfg, &[]);
+        let camp = |o: &str| out.iter().find(|r| r.origin == o).map(|r| r.campaign.clone()).unwrap_or_default();
+        assert!(camp("A").contains("with B"), "A: {:?}", camp("A"));
+        assert!(camp("B").contains("with A"), "B: {:?}", camp("B"));
+        assert!(camp("C").is_empty(), "C: {:?}", camp("C"));
+        assert!(camp("D").is_empty(), "D: {:?}", camp("D"));
+        assert!(lines.iter().any(|l| l.starts_with("Campaigns: 2 candidate pair(s)") && l.contains("1 overlap")), "{:?}", lines);
     }
 
     #[test]
