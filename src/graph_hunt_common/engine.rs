@@ -1754,10 +1754,10 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
     let n_sig = qs.iter().filter(|q| **q <= alpha).count();
     {
         // weekday / weekend split, for the analyst. Matching each window
-        // day's null to the days of its kind was tried and dropped: on the
-        // test case it left the attack day with 74 null logins
-        // instead of 267 (a Sunday discovery scan held most of the new
-        // baseline logins) and the floor 1/75 could no longer pass BH
+        // day's null to the days of its kind was tried and dropped: it
+        // halves the null for a weekday (a weekend scan can hold most of
+        // the new baseline logins) and the raised floor could no longer
+        // pass BH
         let we = null_days.iter().filter(|d| is_weekend(**d)).count();
         let wwe = win_days.iter().filter(|d| is_weekend(**d)).count();
         lines.push(format!("Day kinds: null {} weekday and {} weekend day(s); window {} weekday and {} weekend day(s)", null_days.len() - we, we, win_days.len() - wwe, wwe));

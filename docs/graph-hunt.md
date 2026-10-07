@@ -1,13 +1,13 @@
 # graph-hunt: statistical lateral-movement detection
 
-How the hunt decides, what it writes and how well it does on a test corpus and on the public LANL set. The maths are in [graph-hunt-statistics.md](graph-hunt-statistics.md). Back to the [README](../README.md).
+How the hunt decides, what it writes and how well it does on the public LANL set. The maths are in [graph-hunt-statistics.md](graph-hunt-statistics.md). Back to the [README](../README.md).
 
 
 Once the graph is loaded (with `--ungrouped`: the hunt needs per-event times), masstin looks for lateral-movement anomalies and reports them with **probabilities measured in the network itself** — no hand-picked weights, windows or thresholds. Two flavors, same engine:
 
 - **`-a graph-hunt`** — reads a **Memgraph** graph.
 - **`-a graph-hunt-neo4j`** — reads a **Neo4j** graph.
-- **`-a graph-hunt-csv`** — reads the timeline **CSV** directly (`-f`), no database at all. Same engine, same results (verified on the test case); the graph is only needed to explore afterwards.
+- **`-a graph-hunt-csv`** — reads the timeline **CSV** directly (`-f`), no database at all. Same engine, same results; the graph is only needed to explore afterwards.
 
 No server-side plugin is needed: masstin reads the edges once over bolt and computes everything — including PageRank, betweenness and Louvain — in memory.
 
@@ -58,24 +58,13 @@ One row per connection, most unusual first:
 - `significant`: yes / no at the chosen false discovery rate; `not evaluated` when the destination lacks comparable log coverage and the origin has a history.
 - On Neo4j the snippet returns an APOC virtual graph of that connection for Browser.
 
-**Reconstruction from seeds.** Add `--seed 10.0.0.5,alice` (host names, IPs or accounts you already know to be bad) and the report opens with the chain: every login the seeds made in the window, then every login that left the entered machine while that session was open and was either a new connection or used an account the chain already used, with a certainty of 1 over the sessions open on that machine at the moment; what was open on a seed machine when it first acted; the failed attempts and unauthenticated touches of the chain machines; and one Cypher query that draws the whole chain, plus one that returns everything between the chain machines in that time span. A seed that already existed in the baseline starts the chain only with its new connections (a shared jump host's routine is listed, not followed); a never-seen seed with everything it did. `host:account` names both at once, and `--seed-from` / `--seed-to` bound the logins that start the chain.
+**Reconstruction from seeds.** Add `--seed 10.0.0.5,svc-backup` (host names, IPs or accounts you already know to be bad) and the report opens with the chain: every login the seeds made in the window, then every login that left the entered machine while that session was open and was either a new connection or used an account the chain already used, with a certainty of 1 over the sessions open on that machine at the moment; what was open on a seed machine when it first acted; the failed attempts and unauthenticated touches of the chain machines; and one Cypher query that draws the whole chain, plus one that returns everything between the chain machines in that time span. A seed that already existed in the baseline starts the chain only with its new connections (a shared jump host's routine is listed, not followed); a never-seen seed with everything it did. `host:account` names both at once, and `--seed-from` / `--seed-to` bound the logins that start the chain.
 
 **Corroboration with Sigma tools.** Add `--sigma hayabusa.jsonl,chainsaw/` (Hayabusa or Chainsaw JSON output). A rule that fired on a machine while a login session was open on it becomes one more measured signal of that connection, and the explanation says which rule, when and at what level: "Sigma: 2 rule(s) fired on SRV01 while the session was open: 'PsExec Service Installation' at 15:36:02 (high), ...". masstin does not detect PsExec, WMI or service installs itself; it joins what those tools found to the login that made it possible.
 
 **Analyst report.** Add `--report findings.md` to also get one story per origin, most unusual first, in words: whether it existed in the baseline and what it usually did, what it did in the window in chronological phases, why that is unusual with the baseline count behind every statement, who owns the accounts it used for the first time, its causal paths, the origins it moves with, what legitimate situation produces the same pattern and how to rule it out, which raw events to pull, and a Browser query to check everything. The CSV is unchanged.
 
 ### Detection quality
-
-Measured on a test corpus: a Linux estate, 10.5M rows (1.43M logins, 657k failures, 8.4M SSH pre-auth touches), 28 baseline days, a 6-day window with N events. Ground truth from the raw logs, from the raw logs: two never-seen origins that probe an account, sweep 29 hosts without authenticating and then log in with a key on 32 hosts, plus the pre-auth sweep of the machine whose key was stolen. Everything else in the window (a credentialed vulnerability scanner, orchestration, monitoring probes, administrators, the response team) counts as a false alarm.
-
-| engine | significant connections | attacker connections found | attacker's first row | first benign row | P@10 | P@50 | P@100 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| connection-level test (Sept 26) | 338 | 112 / 125 | rank 3 | rank 1 | 80% | 72% | 76% |
-| + Hopper signature, causal paths, no-history rule (Sept 28) | 362 | 123 / 125 | rank 1 | rank 3 | 80% | 90% | 91% |
-| + statistical review: past-only reference with the window's gap, null = new connections, BH over new connections (Sept 28) | 220 | 108 / 125 | rank 1 | rank 66 | 100% | 100% | 86% |
-| **+ reference = every earlier day, baseline and window alike (Oct 1)** | **65** | 65 / 125 | **rank 1** | **rank 66** | **100%** | **100%** | 91% |
-
-The last row is the current engine. Every one of its 65 significant connections is the attacker's (the first origin's whole day: pre-auth sweep and key logins); the second attacker IP, 25 minutes later with the same account, ranks right behind (rows 69 onwards) but stays under the 5 % false discovery rate, because a never-seen machine reaching 29 hosts on its first day is something this network's own baseline does contain (new machines being commissioned). The ranking is what matters for triage: the first 65 rows are all attack, the first benign row is the 66th, and 91 of the first 100 are attack. On the incident-free window 10-09 to 19-09 the same engine marks 7 of 83 new connections significant, all the first days of the credentialed vulnerability scanner. The previous rule ("the past with the window's gap") found 108 of 125 attacker connections at the price of 112 benign ones and needed a baseline longer than the window, which the LANL benchmark below does not have.
 
 **Public benchmark: LANL.** The [Los Alamos "Comprehensive, Multi-Source Cyber-Security Events"](https://csr.lanl.gov/data/cyber1/) set (58 days of a real enterprise, 1.05 billion authentication events, 749 labelled red-team logins from 4 machines) is the reference every lateral-movement paper uses. It was converted to a masstin timeline the way a DFIR collection would look (`viconppt/graph-hunt-tests/lanl_to_masstin.py`): the logs of the 305 red-team machines plus a fixed sample of 200 others, remote logons with a user account only (machine accounts are the Kerberos chatter of every workstation with the domain controllers, 70 % of the volume, and not a person moving), days 0 to 16, cutoff at day 7. The baseline days 0 to 6 contain 50 of the 749 red-team events; the window days 7 to 15 contain 640. Run with `graph-hunt-csv`, no database, 21.3 million rows, 14 minutes, 3.3 GB.
 
