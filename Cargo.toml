@@ -13,10 +13,9 @@ license = "AGPL-3.0-only"
 clap = { version = "4.0.32", features = ["derive"] }
 evtx = "0.11.2"
 chrono = "0.4.23"
-quick-xml = { version = "0.20", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 serde = { version = "1.0", features = [ "derive" ] }
 serde_json = "1.0"
-polars = { version = "0.26.1", features = ["lazy", "serde"] }
 walkdir = "2.3.2"
 neo4rs = "0.6.0"
 futures = "0.3.28"

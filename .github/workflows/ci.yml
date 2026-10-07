@@ -1,0 +1,47 @@
+name: CI
+
+# Build and test on every push and pull request, on the same stable
+# toolchain the release workflow uses, so a dependency that stops
+# compiling on a new Rust is caught before a tag is cut.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'resources/**'
+      - 'neo4j-resources/**'
+      - 'memgraph-resources/**'
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked --lib
+
+      - name: Future-incompatibility report
+        if: runner.os == 'Linux'
+        run: cargo report future-incompatibilities || true

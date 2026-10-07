@@ -2,9 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use serde_json::Value;
 use std::{collections::HashMap, error::Error};
-use polars::prelude::*;
 use std::path::Path;
-use std::io::Write;
 
 static DEBUG_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -280,8 +278,8 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
     }
 }
 
-/// **Converts extracted events into a Polars DataFrame and saves CSV**
-fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
+/// **Filters, sorts and writes the extracted events as CSV**
+fn write_rows(log_data: Vec<LogData>, output: Option<&String>) {
     // Apply noise filter (--ignore-local / --exclude-*).
     let log_data: Vec<LogData> = log_data
         .into_iter()
@@ -292,58 +290,17 @@ fn vector_to_polars(log_data: Vec<LogData>, output: Option<&String>) {
         return;
     }
 
-    let df = df_from_logdata(&log_data);
-    if let Some(output_path) = output {
-        let mut output_file = File::create(output_path).unwrap();
-        CsvWriter::new(&mut output_file)
-            .has_header(true)
-            .finish(&mut df.clone())
-            .unwrap();
-        println!("[INFO] CSV file generated: {}", output_path);
-    } else {
-        CsvWriter::new(std::io::stdout())
-            .has_header(true)
-            .finish(&mut df.clone())
-            .unwrap();
+    // Same order polars gave: ascending on the time_created text.
+    let mut log_data = log_data;
+    log_data.sort_by(|a, b| a.time_created.cmp(&b.time_created));
+    match crate::csv_out::write_timeline(&log_data, output) {
+        Ok(()) => {
+            if let Some(output_path) = output {
+                println!("[INFO] CSV file generated: {}", output_path);
+            }
+        }
+        Err(e) => eprintln!("[ERROR] Cannot write output: {}", e),
     }
-}
-
-/// **Converts `Vec<LogData>` to a Polars DataFrame**
-fn df_from_logdata(log_data: &[LogData]) -> DataFrame {
-    let time_created = Series::new("time_created", log_data.iter().map(|x| x.time_created.clone()).collect::<Vec<String>>());
-    let computer = Series::new("dst_computer", log_data.iter().map(|x| x.computer.clone()).collect::<Vec<String>>());
-    let event_type = Series::new("event_type", log_data.iter().map(|x| x.event_type.clone()).collect::<Vec<String>>());
-    let event_id = Series::new("event_id", log_data.iter().map(|x| x.event_id.clone()).collect::<Vec<String>>());
-    let logon_type = Series::new("logon_type", log_data.iter().map(|x| x.logon_type.clone()).collect::<Vec<String>>());
-    let target_user_name = Series::new("target_user_name", log_data.iter().map(|x| x.target_user_name.clone()).collect::<Vec<String>>());
-    let target_domain_name = Series::new("target_domain_name", log_data.iter().map(|x| x.target_domain_name.clone()).collect::<Vec<String>>());
-    let workstation_name = Series::new("src_computer", log_data.iter().map(|x| x.workstation_name.clone()).collect::<Vec<String>>());
-    let ip_address = Series::new("src_ip", log_data.iter().map(|x| x.ip_address.clone()).collect::<Vec<String>>());
-    let subject_user_name = Series::new("subject_user_name", log_data.iter().map(|x| x.subject_user_name.clone()).collect::<Vec<String>>());
-    let subject_domain_name = Series::new("subject_domain_name", log_data.iter().map(|x| x.subject_domain_name.clone()).collect::<Vec<String>>());
-    let logon_id = Series::new("logon_id", log_data.iter().map(|x| x.logon_id.clone()).collect::<Vec<String>>());
-    let detail = Series::new("detail", log_data.iter().map(|x| x.detail.clone()).collect::<Vec<String>>());
-    let filename = Series::new("log_filename", log_data.iter().map(|x| x.filename.clone()).collect::<Vec<String>>());
-
-    let df = DataFrame::new(vec![
-        time_created,
-        computer,
-        event_type,
-        event_id,
-        logon_type,
-        target_user_name,
-        target_domain_name,
-        workstation_name,
-        ip_address,
-        subject_user_name,
-        subject_domain_name,
-        logon_id,
-        detail,
-        filename,
-    ])
-    .unwrap();
-
-    df.sort(["time_created"], false).unwrap()
 }
 
 /// **Main function called from `lib.rs` to parse Winlogbeat events**
@@ -406,7 +363,7 @@ pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, outp
     // Phase 3: Generate output
     crate::banner::print_output_start();
     let total_events = log_data.len();
-    vector_to_polars(log_data, output);
+    write_rows(log_data, output);
 
     crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
 }
