@@ -25,6 +25,7 @@ Rule of thumb:
 - **Folder / ZIP / single EVTX** → `parse-windows`
 - **Forensic image** (`.e01`, `.vmdk`, `.vhd`, `.vhdx`, `.raw`) → `parse-image`
 - **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
+- **Linux logs / UAC triage** → `parse-linux`; **macOS `.logarchive` or `log show` JSON** → `parse-mac`; **any other text / JSON log** → `parse-custom` with a YAML rule
 
 In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
 
@@ -81,6 +82,37 @@ Rotated logs are handled the way logrotate leaves them: `secure-20240616`, `mess
 <div align="center">
   <img src="../resources/masstin_cli_linux.png" alt="Masstin CLI output — parse-linux"/>
 </div>
+
+## Parse macOS logs
+
+Reads the macOS Unified Log and extracts the two confirmed remote-access vectors on macOS — SSH and Screen Sharing / Apple Remote Desktop (ARD). Both carriers below feed one classifier, so the output is identical whichever you give it.
+
+```bash
+# A .logarchive bundle (sudo log collect, or exported from Console.app).
+# Read directly from the binary tracev3 files — works on Windows and Linux too,
+# no Mac needed.
+masstin -a parse-mac -d /evidence/MACBOOK-01.logarchive -o mac-timeline.csv
+
+# A folder that holds one or more .logarchive bundles (e.g. an unpacked triage)
+masstin -a parse-mac -d /evidence/mac-triage/ -o mac-timeline.csv
+
+# A `log show` export, for when the analyst carried the triage off as text
+log show --style ndjson --info --last 30d > mac.ndjson   # run on the Mac
+masstin -a parse-mac -f mac.ndjson -o mac-timeline.csv    # run anywhere
+```
+
+A `.logarchive` is a bundle of binary `tracev3` records with `dsc` / `uuidtext` string catalogues and `timesync` files. masstin parses them directly with the pure-Rust [`macos-unifiedlogs`](https://crates.io/crates/macos-unifiedlogs) crate, so an archive acquired from a Mac is parsed on any OS. A `log show --style ndjson` export (one JSON object per line) or `--style json` (a single array) needs no catalogues — the message is already resolved — and is the dependency-free path off the host.
+
+**What comes out, per source**
+
+| Process | Events | Notes |
+|---|---|---|
+| `sshd` / `sshd-session` | `SUCCESSFUL_LOGON` for `Accepted <method>`, `FAILED_LOGON` for `Failed <method>` (including `invalid user` and `not allowed because` policy denials), `LOGOFF` for `Disconnected from user`, `CONNECT` for pre-authentication touches (banner grabs, early disconnects) | The OpenSSH message text is the same masstin reads on Linux; `logon_type` is `SSH`, `detail` names the method. The source address goes to `src_ip` (or `src_computer` if sshd logged a name) |
+| `screensharingd` / `ScreensharingAgent` | `SUCCESSFUL_LOGON` / `FAILED_LOGON` for `Authentication: SUCCEEDED/FAILED :: User Name: <u> :: Viewer Address: <ip>` | Covers both Screen Sharing.app and ARD screen-control sessions, which authenticate through screensharingd; `logon_type` is `ScreenSharing`, `detail` carries the auth `Type` (DH, VNC…) |
+
+The destination of every row is the Mac being analysed; its name is taken from the `.logarchive` bundle name (a `log collect` archive is conventionally named after the host). Console logins (`loginwindow`), `sudo` and `su` are host-local, not lateral movement, and are dropped — as on every other masstin parser.
+
+Not yet read (see the roadmap): `smbd` share connections (the Unified Log message format is not documented reliably enough to parse without guessing), `/var/log/system.log` / ASL text, the `utmpx` / `wtmpx` login databases, and APFS disk images.
 
 ## Parse forensic images — auto-detect Windows and Linux
 
@@ -472,6 +504,13 @@ Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux 
 | `/var/log/audit/audit.log` | `USER_LOGIN` / `USER_AUTH` from auditd — primary SSH signal on Ubuntu + SSSD | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `/var/log/journal/<machine-id>/*.journal[~]` | systemd-journald binary logs — sshd `Accepted`/`Failed` events on modern SSSD / AD hosts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
 | `utmp` / `wtmp` / `btmp` / `lastlog` | Login sessions, failed attempts | [Read more →](https://weinvestigateanything.com/en/artifacts/linux-forensic-artifacts/) |
+
+## macOS
+
+| Source | What it tracks | Notes |
+|--------|---------------|-------|
+| `.logarchive` (Unified Log, binary `tracev3`) | `sshd` SSH logons and `screensharingd` Screen Sharing / ARD logons — success, failure, policy denial, pre-auth contact, disconnect | Read directly on any OS via `macos-unifiedlogs`; `sudo log collect` output or a Console.app export |
+| `log show --style ndjson` / `json` export | Same `sshd` and `screensharingd` events | Dependency-free text carrier, resolved off the host |
 
 ## Winlogbeat & Cortex XDR
 

@@ -26,7 +26,9 @@ pub use crate::parse_cortex::*;
 mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;
 mod parse_linux;
+mod parse_mac;
 pub use crate::parse_linux::*;
+pub use crate::parse_mac::parse_mac;
 mod parse_journal;
 pub(crate) mod linux_tz;
 mod parse_image_windows;
@@ -330,6 +332,9 @@ enum ActionType {
     ParseCortexEvtxForensics,
     /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
+    /// Parse macOS logs: a .logarchive bundle (binary Unified Log) or a `log show` JSON/NDJSON export. Extracts SSH and Screen Sharing / ARD remote logons.
+    #[value(alias = "parse-macos")]
+    ParseMac,
     /// Parse from forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
@@ -484,6 +489,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseLinux => {
             parse_linux(&config.file, &config.directory, config.output.as_ref());
         }
+        ActionType::ParseMac => {
+            parse_mac(&config.file, &config.directory, config.output.as_ref());
+        }
         ActionType::ParseImage => {
             parse_image(&config.file, &config.directory, config.all_volumes, config.output.as_ref(), false);
         }
@@ -616,7 +624,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 fn validate_folders(config: &Cli) -> Result<(), String> {
     // Check the action
     match config.action {
-        ActionType::ParseWindows | ActionType::ParserElastic | ActionType::ParseLinux => {
+        ActionType::ParseWindows | ActionType::ParserElastic | ActionType::ParseLinux | ActionType::ParseMac => {
             // For these actions, at least one file or directory is required
             if config.directory.is_empty() && config.file.is_empty() {
                 return Err(String::from(

@@ -85,6 +85,33 @@ jobs:
           python3 .github/scripts/normalize_timeline.py out/samples.csv EVTX-ATTACK-SAMPLES | tee -a out/hashes.txt
           echo "hunt rows: $(wc -l < out/hunt.csv)" | tee -a out/hashes.txt
 
+      - name: parse-mac on a log show export (all three OSes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/masstin
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/masstin.exe
+          mkdir -p out
+          cat > out/logshow.ndjson <<'JSON'
+          {"timestamp":"2026-03-15 09:12:30.250000+0200","processImagePath":"/usr/sbin/sshd","eventMessage":"Accepted publickey for alice from 10.0.0.5 port 50022 ssh2: ED25519 SHA256:abc"}
+          {"timestamp":"2026-03-15 09:15:00.000000+0200","processImagePath":"/usr/sbin/sshd","eventMessage":"Failed password for invalid user root from 203.0.113.7 port 40510 ssh2"}
+          {"timestamp":"2026-03-15 09:20:45.900000+0200","process":"screensharingd","eventMessage":"Authentication: SUCCEEDED :: User Name: deanwinchester :: Viewer Address: 192.168.1.10 :: Type: DH"}
+          {"timestamp":"2026-03-15 09:21:00.000000+0200","process":"screensharingd","eventMessage":"Authentication: FAILED :: User Name: guest :: Viewer Address: 192.168.1.99 :: Type: DH"}
+          {"timestamp":"2026-03-15 09:40:00.000000+0200","processImagePath":"/usr/sbin/sshd","eventMessage":"Disconnected from user alice 10.0.0.5 port 50022"}
+          {"timestamp":"2026-03-15 09:00:00.000000+0200","processImagePath":"/usr/sbin/sshd","eventMessage":"Server listening on 0.0.0.0 port 22."}
+          {"timestamp":"2026-03-15 10:00:00.000000+0200","process":"loginwindow","eventMessage":"USER_PROCESS: console login"}
+          {"timestamp":"2026-03-15 10:05:00.000000+0200","process":"sudo","eventMessage":"alice : TTY=ttys000 ; PWD=/ ; USER=root ; COMMAND=/bin/ls"}
+          JSON
+          "$BIN" -a parse-mac -f out/logshow.ndjson -o out/mac.csv --overwrite
+          n=$(( $(wc -l < out/mac.csv) - 1 ))
+          echo "parse-mac rows: $n" | tee -a out/hashes.txt
+          # Five lateral-movement rows; the three noise lines (listening, console
+          # login, sudo) must be dropped.
+          [ "$n" -eq 5 ] || { echo "::error::parse-mac expected 5 rows, got $n"; exit 1; }
+          grep -q MAC-SCREENSHARE-OK out/mac.csv || { echo "::error::screensharingd success not classified"; exit 1; }
+          grep -q MAC-SSHD-OK out/mac.csv || { echo "::error::sshd success not classified"; exit 1; }
+          ! grep -q loginwindow out/mac.csv || { echo "::error::console login was not dropped"; exit 1; }
+
       - name: Build NTFS disk images from the samples and parse them (Windows only)
         if: runner.os == 'Windows'
         shell: pwsh

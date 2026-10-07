@@ -91,6 +91,19 @@ What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, jo
 
 > **Domain-joined Linux (SSSD / Active Directory):** on Ubuntu 22 + SSSD hosts, `/var/log/auth.log` is often nearly empty because PAM routes auth through the systemd journal. Masstin reads `.journal` / `.journal~` files directly and applies the same `Accepted (password|publickey)` / `Failed password` regexes as on text logs, so SSH logins from AD users surface in the timeline with no extra configuration. Combined with the audit.log `USER_LOGIN` path, this recovers the full lateral-movement picture on modern enterprise Linux.
 
+## macOS Artifacts
+
+The macOS Unified Log, read by `parse-mac`. A `.logarchive` bundle (`sudo log collect` or a Console.app export) is the binary `tracev3` store; masstin decodes it directly with the pure-Rust `macos-unifiedlogs` crate, so an archive acquired from a Mac is parsed on a Windows or Linux analyst host with no Mac in the loop. A `log show --style ndjson` / `json` export carries the same events already resolved to text.
+
+| Source | Type | What it captures |
+|--------|------|-----------------|
+| `*.logarchive` (`Persist/*.tracev3` + `dsc` / `uuidtext` + `timesync`) | Binary (Unified Log) | `sshd` / `sshd-session` SSH logons and `screensharingd` Screen Sharing / Apple Remote Desktop logons |
+| `log show --style ndjson` / `json` export | Text (JSON) | The same `sshd` and `screensharingd` events, resolved off the host |
+
+What `parse-mac` writes, per row: `SUCCESSFUL_LOGON` (sshd `Accepted`, screensharingd `Authentication: SUCCEEDED`), `FAILED_LOGON` (sshd `Failed` including `invalid user` and `not allowed because`, screensharingd `Authentication: FAILED`), `LOGOFF` (sshd `Disconnected from user`) and `CONNECT` (sshd pre-authentication touches). `logon_type` is `SSH` or `ScreenSharing`; the destination is the Mac being analysed, the source address goes to `src_ip` (or `src_computer` for a resolved name). Unified Log timestamps (nanoseconds since the epoch) and `log show` timestamps are converted to ISO UTC. Console logins (`loginwindow`), `sudo` and `su` are host-local, not lateral movement, and are dropped.
+
+> **Not yet read:** `smbd` share connections (the Unified Log message format is not documented reliably enough to parse without guessing), `/var/log/system.log` / ASL text, the `utmpx` / `wtmpx` login databases, and APFS disk images — these are the documented roadmap for `parse-mac`.
+
 ## Winlogbeat JSON
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
@@ -121,4 +134,4 @@ Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR f
 
 ---
 
-**Total:** 33 Windows Event IDs across 12 EVTX sources + 9 Linux artifact types + Winlogbeat JSON + Cortex XDR + YAML custom parsers (VPN, firewall, proxy, JSON)
+**Total:** 33 Windows Event IDs across 12 EVTX sources + 9 Linux artifact types + macOS Unified Log (`.logarchive` and `log show` JSON) + Winlogbeat JSON + Cortex XDR + YAML custom parsers (VPN, firewall, proxy, JSON)

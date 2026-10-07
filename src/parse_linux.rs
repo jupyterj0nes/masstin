@@ -78,7 +78,7 @@ pub(crate) static SSH_FAIL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"Failed (\S+) for (?:(invalid user) )?(\S+) from (\S+)"#).unwrap());
 // Policy denial after successful authentication — still a failed logon
 // from the network's point of view, and the source is usually a hostname.
-static SSH_NOTALLOWED_RE: Lazy<Regex> =
+pub(crate) static SSH_NOTALLOWED_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"User (\S+) from (\S+) not allowed because"#).unwrap());
 // SSH connections that ended before any authentication attempt. They are
 // not logons, but they are contact: a scanner, a banner grab, a client
