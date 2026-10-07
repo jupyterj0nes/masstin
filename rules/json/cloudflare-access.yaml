@@ -1,0 +1,136 @@
+# =============================================================================
+# Masstin custom parser rule — Cloudflare Access (Zero Trust) login logs
+# =============================================================================
+#
+# Format covered:
+#   NDJSON from Cloudflare Logpush, dataset `access_requests` (one object per
+#   line), the login and logout records Cloudflare Access writes when a user
+#   reaches an application protected by Access:
+#
+#     {"Action":"login","Allowed":true,"AppDomain":"intranet.corp.example",
+#      "AppUUID":"123e4567-e89b-12d3-a456-426614174000","Connection":"onetimepin","Country":"us",
+#      "CreatedAt":"2023-05-24T02:48:33+09:30","Email":"jane.doe@corp.example","IPAddress":"203.0.113.9",
+#      "RayID":"00c0ffeeabc12345","UserUID":"5e1d4a2f-...", ...}
+#
+#   `CreatedAt` is RFC 3339 with the default Logpush settings; jobs configured
+#   with `timestamps: unix` or `unixnano` write an epoch, which masstin reads
+#   too.
+#
+# Events covered:
+#   Action login,  Allowed true    (SUCCESSFUL_LOGON)
+#   Action login,  Allowed false   (FAILED_LOGON)
+#   Action logout                  (LOGOFF)
+#
+#   The application (`AppDomain`) is the destination, the client's address
+#   the source; the identity provider (`Connection`), the country and the
+#   user id go to `detail`.
+#
+# References:
+#   https://developers.cloudflare.com/logs/reference/log-fields/account/access_requests/
+#   Sample lines: Elastic integrations test fixtures (packages/cloudflare_logpush), synthetic
+# =============================================================================
+
+meta:
+  vendor: "Cloudflare"
+  product: "Access (Zero Trust) — Logpush access_requests"
+  format: "NDJSON, Logpush dataset access_requests"
+  versions_tested: ["Logpush access_requests 2023-2024 (sample lines)"]
+  description: "Cloudflare Access application logins, denied logins and logouts"
+  author: "masstin community"
+  reference_url: "https://developers.cloudflare.com/logs/reference/log-fields/account/access_requests/"
+
+prefilter:
+  contains_any:
+    - '"AppDomain"'
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Login denied
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cloudflare-access-login-denied"
+    match:
+      regex: '"Action":\s*"login".*"Allowed":\s*false|"Allowed":\s*false.*"Action":\s*"login"'
+    extract:
+      type: json
+      fields:
+        ts: "CreatedAt"
+        user: "Email"
+        ip: "IPAddress"
+        app: "AppDomain"
+        idp: "Connection"
+        country: "Country"
+        uid: "UserUID"
+        ray: "RayID"
+    map:
+      time_created:       "${ts}"
+      computer:           "${app}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "CF-ACCESS-DENIED"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   ""
+      ip_address:         "${ip}"
+      logon_type:         "ZTNA"
+      filename:           "${__source_file}"
+      detail:             "Cloudflare Access login denied | idp=${idp} country=${country} user_uid=${uid} ray=${ray}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Login allowed
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cloudflare-access-login"
+    match:
+      regex: '"Action":\s*"login".*"Allowed":\s*true|"Allowed":\s*true.*"Action":\s*"login"'
+    extract:
+      type: json
+      fields:
+        ts: "CreatedAt"
+        user: "Email"
+        ip: "IPAddress"
+        app: "AppDomain"
+        idp: "Connection"
+        country: "Country"
+        uid: "UserUID"
+        ray: "RayID"
+    map:
+      time_created:       "${ts}"
+      computer:           "${app}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "CF-ACCESS-LOGIN"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   ""
+      ip_address:         "${ip}"
+      logon_type:         "ZTNA"
+      filename:           "${__source_file}"
+      detail:             "Cloudflare Access login | idp=${idp} country=${country} user_uid=${uid} ray=${ray}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Logout
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "cloudflare-access-logout"
+    match:
+      regex: '"Action":\s*"logout"'
+    extract:
+      type: json
+      fields:
+        ts: "CreatedAt"
+        user: "Email"
+        ip: "IPAddress"
+        app: "AppDomain"
+        uid: "UserUID"
+    map:
+      time_created:       "${ts}"
+      computer:           "${app}"
+      event_type:         "LOGOFF"
+      event_id:           "CF-ACCESS-LOGOUT"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   ""
+      ip_address:         "${ip}"
+      logon_type:         "ZTNA"
+      filename:           "${__source_file}"
+      detail:             "Cloudflare Access logout | user_uid=${uid}"

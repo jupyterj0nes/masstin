@@ -532,7 +532,9 @@ fn apply_extract(
                 if let Some(pos) = pair.find(kv_separator.as_str()) {
                     let key = pair[..pos].trim().to_string();
                     let val = pair[pos + kv_separator.len()..].trim();
-                    let val = val.trim_matches('"').trim_matches('\'').to_string();
+                    // quotes first, then the padding some vendors keep inside
+                    // them (Check Point writes user:" Jane Doe ")
+                    let val = val.trim_matches('"').trim_matches('\'').trim().to_string();
                     if !key.is_empty() {
                         ctx.insert(key, val);
                     }
@@ -634,7 +636,10 @@ fn build_log_data(
     ld
 }
 
-/// Substitute ${var} references in a template using ctx.
+/// Substitute ${var} references in a template using ctx. `${a|b|c}` takes
+/// the first of the alternatives that has a non-empty value, so a rule can
+/// cover a vendor that names the same thing two ways (Check Point writes
+/// the account as `user` on some records and `src_user_name` on others).
 /// Unknown variables are left as empty string.
 fn substitute(template: &str, ctx: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(template.len());
@@ -645,7 +650,7 @@ fn substitute(template: &str, ctx: &HashMap<String, String>) -> String {
             if let Some(end_rel) = template[i + 2..].find('}') {
                 let end = i + 2 + end_rel;
                 let name = &template[i + 2..end];
-                if let Some(val) = ctx.get(name) {
+                if let Some(val) = name.split('|').map(|n| n.trim()).filter_map(|n| ctx.get(n)).find(|v| !v.is_empty()) {
                     out.push_str(val);
                 }
                 i = end + 1;
@@ -688,4 +693,22 @@ fn write_csv(path: &str, records: &[LogData]) -> Result<(), String> {
     }
     wtr.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::substitute;
+    use std::collections::HashMap;
+
+    #[test]
+    fn substitute_takes_the_first_non_empty_alternative() {
+        let mut ctx = HashMap::new();
+        ctx.insert("user".to_string(), String::new());
+        ctx.insert("src_user_name".to_string(), "jdoe".to_string());
+        ctx.insert("host".to_string(), "gw1".to_string());
+        assert_eq!(substitute("${user|src_user_name}@${host}", &ctx), "jdoe@gw1");
+        assert_eq!(substitute("${host|src_user_name}", &ctx), "gw1");
+        assert_eq!(substitute("${nope|also_nope}-", &ctx), "-");
+        assert_eq!(substitute("${host}", &ctx), "gw1");
+    }
 }

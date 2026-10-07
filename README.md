@@ -67,7 +67,7 @@ masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungr
 | **Linux** | `auth.log`, `secure`, `messages`, `wtmp`/`btmp`/`lastlog`, `audit.log`, binary journald. Session ends paired to their login, syslog times converted to UTC, OpenSSH 9.8 `sshd-session` understood. |
 | **Triage packages** | KAPE, Velociraptor offline collector, UAC, Cortex XDR, plain zips and tarballs, nested in each other. |
 | **Feeds** | Winlogbeat JSON, Cortex XDR network connections and forensic EVTX, Mordor / OTRF Security-Datasets. |
-| **Anything else** | `parse-custom` with a YAML rule: csv, regex, key=value and JSON extractors. Ships with rules for Palo Alto, Cisco, Fortinet, OpenVPN, Squid and Mordor. [Custom parsers →](docs/custom-parsers.md) |
+| **Anything else** | `parse-custom` with a YAML rule: csv, regex, key=value and JSON extractors. Ships with rules for Palo Alto, Cisco, Fortinet, Check Point, OpenVPN, Squid, Zscaler ZPA, Cloudflare Access and Mordor. [Custom parsers →](docs/custom-parsers.md) |
 
 The full artifact list with the fields taken from each event is in [ARTIFACTS.md](ARTIFACTS.md). The 14 columns are described in [docs/csv-format.md](docs/csv-format.md).
 
@@ -110,7 +110,7 @@ The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md
 - macOS (`parse-mac`, APFS images)
 - EVTX carving Tier 3 (template matching) and unallocated-only scan
 - EVTX header tampering detection; Linux log carving
-- More custom-parser rules (Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall); conditional map and per-rule `--validate`
+- More custom-parser rules (Juniper, SonicWall, Okta); per-rule `--validate`
 - Official Velociraptor plugin
 
 ## About

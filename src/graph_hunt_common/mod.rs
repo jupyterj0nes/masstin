@@ -108,7 +108,7 @@ pub fn parse_ts(s: &str) -> Option<NaiveDateTime> {
             return Some(dt);
         }
     }
-    None
+    crate::timefmt::parse_fallback(s)
 }
 
 

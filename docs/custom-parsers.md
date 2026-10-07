@@ -218,7 +218,7 @@ Variables produced by `sub_extract` live in the same context as those produced b
 
 ### `map` block
 
-Fills the 14 columns of masstin's `LogData` struct using `${variable}` substitution. Any key in the map that corresponds to a real `LogData` field is kept; unknown keys are ignored.
+Fills the 14 columns of masstin's `LogData` struct using `${variable}` substitution. `${a|b|c}` takes the first alternative with a non-empty value, for vendors that name the same thing two ways (`${user|src_user_name}`). Any key in the map that corresponds to a real `LogData` field is kept; unknown keys are ignored.
 
 ```yaml
 map:
@@ -259,7 +259,7 @@ These are the columns of masstin's unified `LogData` schema — the same ones yo
 
 | Field | Typical use |
 |---|---|
-| `time_created` | Event timestamp, ideally in the vendor's own format (masstin preserves it as-is) |
+| `time_created` | Event timestamp, ideally in the vendor's own format (masstin preserves it as-is). Everything downstream reads ISO / RFC 3339 (`2026-03-15T10:00:00Z`, `2026-03-15 10:00:00`), C asctime (`Fri May 31 17:35:42 2019`, Zscaler) and Unix epochs in seconds, ms, µs or ns (Cloudflare) |
 | `computer` | Destination machine / device the event happened on (e.g. firewall name, gateway name) |
 | `event_type` | One of `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
 | `event_id` | Short identifier of the event flavour (e.g. `GP-GW-AUTH-SUCC`) |

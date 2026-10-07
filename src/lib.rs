@@ -49,6 +49,7 @@ pub mod parse_custom;
 pub mod filter;
 pub mod vmdk;
 pub mod vhd;
+pub mod timefmt;
 pub use crate::vmdk::*;
 mod graph_hunt;
 mod graph_hunt_common;

@@ -1907,7 +1907,7 @@ fn time_sort_key(raw: &str) -> Option<chrono::NaiveDateTime> {
             return Some(n);
         }
     }
-    None
+    crate::timefmt::parse_fallback(t)
 }
 
 fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {

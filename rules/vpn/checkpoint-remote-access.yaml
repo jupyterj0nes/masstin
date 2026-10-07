@@ -1,0 +1,144 @@
+# =============================================================================
+# Masstin custom parser rule — Check Point Remote Access VPN (Log Exporter)
+# =============================================================================
+#
+# Format covered:
+#   Check Point Log Exporter in its "syslog" (semi-unified) format, as sent by
+#   a Management Server or a Log Server to a SIEM:
+#
+#     <134>1 2025-02-18T10:01:41Z GW-NAME CheckPoint 10038 - [action:"Log In";
+#       flags:"18688"; ifdir:"inbound"; ...; time:"1739872901"; auth_method:"Password";
+#       client_name:"Check Point Mobile"; cvpn_category:"Session"; domain_name:"CORP";
+#       event_type:"Login"; hostname:"GW-NAME"; office_mode_ip:"10.9.0.12";
+#       os_name:"Windows"; product:"Mobile Access"; src:"203.0.113.7"; status:"Success";
+#       tunnel_protocol:"IPSec"; user:" Jane Doe (jdoe) "; user_dn:"CN=..."; user_group:"Users"]
+#
+#   One `key:"value"` pair per field, separated by `; `, inside brackets after
+#   the RFC 5424 header. The timestamp of the record is the header's (ISO,
+#   UTC); the epoch in `time:` is the same instant.
+#
+# Events covered:
+#   Remote access / Mobile Access session login, success   (SUCCESSFUL_LOGON)
+#   Remote access / Mobile Access session login, failure   (FAILED_LOGON)
+#   Remote access session logout                           (LOGOFF)
+#
+#   The gateway that terminated the tunnel (`hostname`) is the destination;
+#   the client's public address (`src`) the source. `office_mode_ip`, the
+#   address the client gets inside the network, goes to `detail`: that is the
+#   address that will show up as the origin of the user's next logins.
+#
+# Administrator logins to the management server are in
+# firewall/checkpoint-admin.yaml (same format, different fields).
+#
+# References:
+#   https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_LoggingAndMonitoring_AdminGuide/Topics-LMG/Log-Exporter.htm
+#   https://community.checkpoint.com/t5/Logging-and-Reporting/Log-Exporter-CEF-Field-Mappings/td-p/41060
+#   Sample lines: Elastic integrations test fixtures (packages/checkpoint), synthetic
+# =============================================================================
+
+meta:
+  vendor: "Check Point"
+  product: "Remote Access VPN / Mobile Access (Log Exporter syslog format)"
+  format: "RFC 5424 header + [key:\"value\"; key:\"value\"; ...]"
+  versions_tested: ["R81.x Log Exporter syslog format (sample lines)"]
+  description: "Remote access VPN session login, login failure and logout on the gateway"
+  author: "masstin community"
+  reference_url: "https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_LoggingAndMonitoring_AdminGuide/Topics-LMG/Log-Exporter.htm"
+
+prefilter:
+  contains_any:
+    - 'cvpn_category:"Session"'
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Remote access login failed (first, so a failed login never falls into
+  #    the success parser: parsers are tried in order)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-ra-login-failed"
+    match:
+      contains: ['cvpn_category:"Session"', 'event_type:"Login"']
+      contains_any: ['status:"Failure"', 'status:"Failed"', 'status:"Fail"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${hostname}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "CP-RA-LOGIN-FAIL"
+      subject_user_name:  ""
+      target_user_name:   "${user|src_user_name}"
+      target_domain_name: "${domain_name}"
+      workstation_name:   ""
+      ip_address:         "${src}"
+      logon_type:         "VPN"
+      filename:           "${__source_file}"
+      detail:             "Check Point remote access login failed | client=${client_name} os=${os_name} auth=${auth_method} tunnel=${tunnel_protocol} reason=${reason}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Remote access login succeeded
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-ra-login"
+    match:
+      contains: ['cvpn_category:"Session"', 'event_type:"Login"', 'status:"Success"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${hostname}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "CP-RA-LOGIN"
+      subject_user_name:  ""
+      target_user_name:   "${user|src_user_name}"
+      target_domain_name: "${domain_name}"
+      workstation_name:   ""
+      ip_address:         "${src}"
+      logon_type:         "VPN"
+      logon_id:           "${session_uid}"
+      filename:           "${__source_file}"
+      detail:             "Check Point remote access login | client=${client_name} os=${os_name} auth=${auth_method} tunnel=${tunnel_protocol} office_mode_ip=${office_mode_ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Remote access session ended
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-ra-logout"
+    match:
+      contains: ['cvpn_category:"Session"']
+      contains_any: ['action:"Log Out"', 'event_type:"Logout"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${hostname}"
+      event_type:         "LOGOFF"
+      event_id:           "CP-RA-LOGOUT"
+      subject_user_name:  ""
+      target_user_name:   "${user|src_user_name}"
+      target_domain_name: "${domain_name}"
+      workstation_name:   ""
+      ip_address:         "${src}"
+      logon_type:         "VPN"
+      logon_id:           "${session_uid}"
+      filename:           "${__source_file}"
+      detail:             "Check Point remote access logout | client=${client_name} tunnel=${tunnel_protocol}"

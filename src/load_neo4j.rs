@@ -62,7 +62,7 @@ fn parse_csv_time(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Some(Utc.from_utc_datetime(&dt));
     }
-    None
+    crate::timefmt::parse_fallback(s).map(|dt| Utc.from_utc_datetime(&dt))
 }
 
 pub mod load {
