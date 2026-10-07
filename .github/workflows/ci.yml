@@ -26,12 +26,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
@@ -41,6 +43,10 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked --lib
+
+      - name: Build the Intel target (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --target x86_64-apple-darwin
 
       - name: Future-incompatibility report
         if: runner.os == 'Linux'

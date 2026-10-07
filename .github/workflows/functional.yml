@@ -1,0 +1,128 @@
+name: Functional (real data, three OSes)
+
+# Parses two public EVTX sample sets and runs the hunt on the result, on
+# Linux, Windows and macOS (Apple Silicon natively, and the Intel binary
+# under Rosetta on the same runner), then checks that every OS produced
+# the same timeline byte for byte once the artifact paths are normalised.
+# This is the test the unit tests cannot give: the whole pipeline on real
+# event logs, on the platforms the release ships for.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'resources/**'
+      - 'neo4j-resources/**'
+      - 'memgraph-resources/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays, catches toolchain drift between pushes
+
+permissions:
+  contents: read
+
+env:
+  MITRE_REPO: https://github.com/mdecrevoisier/EVTX-to-MITRE-Attack
+  SAMPLES_REPO: https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES
+
+jobs:
+  run:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (native)
+        run: cargo build --release --locked
+
+      - name: Build (x86_64, macOS only)
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Cache the sample sets
+        id: samples
+        uses: actions/cache@v4
+        with:
+          path: samples
+          key: evtx-samples-v1
+
+      - name: Fetch the sample sets
+        if: steps.samples.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p samples
+          git clone -q --depth 1 "$MITRE_REPO" samples/EVTX-to-MITRE-Attack
+          git clone -q --depth 1 "$SAMPLES_REPO" samples/EVTX-ATTACK-SAMPLES
+          rm -rf samples/*/.git
+
+      - name: Parse and hunt (native binary)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/masstin
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/masstin.exe
+          mkdir -p out
+          "$BIN" -a parse-windows -d samples/EVTX-to-MITRE-Attack -o out/mitre.csv --overwrite
+          "$BIN" -a parse-windows -d samples/EVTX-ATTACK-SAMPLES -o out/samples.csv --overwrite
+          "$BIN" -a graph-hunt-csv -f out/mitre.csv --investigation-from "2021-01-01 00:00:00" -o out/hunt.csv --report out/hunt.md --overwrite
+          python3 .github/scripts/normalize_timeline.py out/mitre.csv EVTX-to-MITRE-Attack | tee -a out/hashes.txt
+          python3 .github/scripts/normalize_timeline.py out/samples.csv EVTX-ATTACK-SAMPLES | tee -a out/hashes.txt
+          echo "hunt rows: $(wc -l < out/hunt.csv)" | tee -a out/hashes.txt
+
+      - name: Parse with the Intel binary under Rosetta (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-apple-darwin/release/masstin
+          file "$BIN"
+          "$BIN" -a parse-windows -d samples/EVTX-to-MITRE-Attack -o out/mitre-x86_64.csv --overwrite
+          python3 .github/scripts/normalize_timeline.py out/mitre-x86_64.csv EVTX-to-MITRE-Attack | tee -a out/hashes.txt
+          cmp out/mitre.csv.norm out/mitre-x86_64.csv.norm && echo "Intel and Apple Silicon binaries agree"
+
+      - name: Upload normalised timelines
+        uses: actions/upload-artifact@v4
+        with:
+          name: timelines-${{ matrix.os }}
+          path: |
+            out/*.norm
+            out/hashes.txt
+            out/hunt.md
+
+  compare:
+    name: Same output on every OS
+    needs: run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+
+      - name: Compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in mitre.csv.norm samples.csv.norm; do
+            echo "== $f"
+            sha256sum all/*/"$f"
+            n=$(sha256sum all/*/"$f" | awk '{print $1}' | sort -u | wc -l)
+            [ "$n" -eq 1 ] || { echo "::error::$f differs between operating systems"; exit 1; }
+          done
+          cat all/*/hashes.txt
+          echo "All three operating systems produced the same timelines."
