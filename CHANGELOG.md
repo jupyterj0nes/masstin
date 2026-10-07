@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **CI:** the functional workflow now exercises `parse-image` on the three operating systems. The Windows runner builds a raw NTFS disk image with diskpart (a fixed VHD formatted by Windows, the public EVTX samples copied under `Windows\System32\winevt\Logs`, the 512-byte VHD footer stripped), parses it, and hands it to the Linux and macOS runners as an artifact; the compare job requires the same timeline from every OS and the same events from the image as from the loose files. No multi-GB download: public Windows 10 images weigh tens of GB and the small public ones are XP with `.evt` logs.
+
 ## v1.2.0 — 2026-10-07
 
 ### One rule of identity, and a build that is tested where it ships
