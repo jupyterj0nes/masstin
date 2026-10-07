@@ -117,11 +117,7 @@ constant is involved. They enter the engine in two ways:
    or no credential (failures, pre-auth); habitual connection.
 
    The class is the `signature` column of the CSV (and the first clause of
-   `why_unusual` in versions before 2026-09-30). On the test case it
-   separates the attacker (every one of its logins in the first class) from
-   the vulnerability scanner, the orchestration account and the
-   administrators on their own accounts, all of which reach new destinations
-   with their habitual credential and stay significant but rank behind.
+   `why_unusual` in versions before 2026-09-30). On real data it separates the attacker (every one of its logins in the first class) from scanners, orchestration accounts and administrators on their own account.
 
 ### Causal paths
 
@@ -209,14 +205,14 @@ Two rules of machine identity coexist today. The loaders also build the graph wi
    - "Bad protocol version identification";
    - closed, reset or disconnect lines carrying `[preauth]`.
 
-   Ordinary session ends are excluded, and the user column stays empty. This was validated against the raw logs: 171 lines from 10.0.0.5 on 29 hosts, matched exactly on three re-parsed hosts.
+   Ordinary session ends are excluded, and the user column stays empty. This was validated against raw logs, matched exactly on re-parsed hosts.
 2. **auditd ↔ sshd pairing by identifier.**
    - A successful audit connection is one (pid, `ses`) pair: its further USER_LOGIN records are channels of the same connection, collapsed per host across rotated files.
    - A failed USER_LOGIN is one connection and is never collapsed.
    - An audit record is dropped when an sshd line of the same host, pid, source and outcome exists in a log file whose span covers it. The pairing is one-to-one, closest first. Pre-auth closes pair with audit failures.
    - For files without USER_LOGIN, only USER_AUTH `op=success` records (one per successful connection) and `op=PAM:authentication` failures are used.
 
-   This replaces the 600 s window and the ±1 s same-user match. It was validated row for row against an independent reference on host-a, host-b and host-c. That reference found Nessus sessions whose audit record trails sshd by up to 40 minutes; a time window would have missed them.
+   This replaces the 600 s window and the ±1 s same-user match. It was validated row for row against an independent reference on three hosts. That reference found scanner sessions whose audit record trails sshd by up to 40 minutes; a time window would have missed them.
 
 ## Declared decisions (not derived from data)
 
@@ -231,13 +227,13 @@ Two rules of machine identity coexist today. The loaders also build the graph wi
 - **History plateau H\* (Mann-Kendall) → past-only reference, every day alike.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). Leave-one-day-out gives every day the same reference instead.
 - **Simes within families + Fisher across families → one joint test per origin-day.** Fisher assumes independent families, which does not hold. Testing each signal separately also multiplied the testing burden: 31 novel-edge tests for one fan-out. The joint test measures corroboration directly and stays valid under any dependence.
 
-- **Null matched to the window day's kind (weekday / weekend): measured and dropped (October 2026).** Each window day was compared only with the null days of its kind. On the test case the attack day was left with 74 null logins instead of 267, because a weekend scan held most of the new baseline logins; the floor rose from 1/268 to 1/75 and none of the 65 attacker connections could pass Benjamini-Hochberg over 365 tests, although the order did not change. The mixed null is the conservative choice for a weekday (the weekend novelty makes it heavier) and the calibration window, which contains a weekend, showed no weekend alarm. The run prints the split ("Day kinds: null 20 weekday and 8 weekend day(s); window 5 weekday and 1 weekend day(s)") so the analyst can see it. A depth rule relative to the panel span instead of the days with data was tried at the same time and dropped too: it discarded that Sunday, which has two years of secure-log reference behind it, and left 35 null logins.
-- **Hour of day per account: measured and dropped (October 2026).** The idea was a coordinate for a login outside the account's usual hours, read from the baseline. On LANL the red team works office hours: the quiet source C22409 logs in between 13:00 and 15:00, C19932 between 8:00 and 18:00, and the red team as a whole has no login between 23:00 and 6:00 while the network has 3 % of its logins in each of those hours. On the test case the attacker entered between 15:35 and 16:10. The signal would separate nothing, and on a DFIR baseline of one to four weeks most accounts have too few logins for an hourly profile anyway; a coordinate that is almost always zero only dilutes the joint test.
+- **Null matched to the window day's kind (weekday / weekend): measured and dropped (October 2026).** Each window day was compared only with the null days of its kind. It halves the null for a weekday and raises the floor of the reachable p-values enough that findings which pass with the mixed null no longer pass Benjamini-Hochberg, without changing the order: a weekend scan can hold most of the new baseline logins. The mixed null is the conservative choice for a weekday (the weekend novelty makes it heavier) and a calibration window containing a weekend showed no weekend alarm. The run prints the split ("Day kinds: null 20 weekday and 8 weekend day(s); window 5 weekday and 1 weekend day(s)") so the analyst can see it. A depth rule relative to the panel span instead of the days with data was tried at the same time and dropped too: it discarded a weekend day with years of secure-log reference behind it.
+- **Hour of day per account: measured and dropped (October 2026).** The idea was a coordinate for a login outside the account's usual hours, read from the baseline. On LANL the red team works office hours: the quiet source C22409 logs in between 13:00 and 15:00, C19932 between 8:00 and 18:00, and the red team as a whole has no login between 23:00 and 6:00 while the network has 3 % of its logins in each of those hours. On real data the attacker entered in the middle of the working afternoon. The signal would separate nothing, and on a DFIR baseline of one to four weeks most accounts have too few logins for an hourly profile anyway; a coordinate that is almost always zero only dilutes the joint test.
 - **Accumulated homes per origin: measured and not added (October 2026).** The number of distinct single-home accounts an origin has used so far (1 for a person on a new machine, growing for an attacker rotating stolen credentials) was measured prequentially on LANL: it would put C22409 among the 1.4 % most unusual origin-days on its third day (2 homes), which under Benjamini-Hochberg over 60,000 connections is not significant; C19932 (one shared account) is invisible to it. Not worth a coordinate.
 
 ## Validation
 
 - **Parser:** row-for-row against counts computed independently from the raw logs.
-- **Statistics:** each p-value states its counts, which are recomputed independently from the CSV for selected machines (10.0.0.5/.87, appliance, scanners).
+- **Statistics:** each p-value states its counts, which are recomputed independently from the CSV for selected machines.
 - **Calibration:** a hunt over a period without the incident should give few significant machines, consistent with the controlled false discovery rate.
 - **Synthetic corpus** with ground truth (5M edges, Neo4j database `neo4j`): precision and recall.

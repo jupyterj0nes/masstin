@@ -1109,7 +1109,7 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         //     that sshd opened; every further USER_LOGIN of the same
         //     connection (one per channel: scp, sftp, ansible modules, a
         //     second shell) repeats the same (pid, ses). Verified on
-        //     host-a: 780 success records = 667 distinct (pid, ses) =
+        //     one host: 780 success records = 667 distinct (pid, ses) =
         //     667 `USER_AUTH op=success` records. The repeats are collapsed
         //     per host after all files are read (a session can straddle an
         //     audit.log rotation), see `conn`.
