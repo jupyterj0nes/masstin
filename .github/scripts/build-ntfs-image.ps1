@@ -1,22 +1,27 @@
-# Builds a raw NTFS disk image that carries EVTX files under
+# Builds an NTFS disk image that carries EVTX files under
 # Windows\System32\winevt\Logs, the way a system drive does, so parse-image
-# can be exercised in CI on all three operating systems without a multi-GB
-# download. Needs an elevated Windows session (GitHub's Windows runners
-# are): a fixed-size VHD is created with diskpart, formatted by Windows,
-# filled, detached, and the raw disk is the VHD minus its 512-byte footer.
+# can be exercised in CI without a multi-GB download. Needs an elevated
+# Windows session (GitHub's Windows runners are).
+#
+#   -Format raw   fixed VHD created by diskpart, footer stripped (a raw disk)
+#   -Format vhd   VHD, -Type fixed or expandable (dynamic)
+#   -Format vhdx  VHDX, -Type fixed or expandable (dynamic)
 param(
     [Parameter(Mandatory = $true)][string]$Samples,
     [Parameter(Mandatory = $true)][string]$Out,
+    [ValidateSet('raw', 'vhd', 'vhdx')][string]$Format = 'raw',
+    [ValidateSet('fixed', 'expandable')][string]$Type = 'fixed',
     [int]$SizeMB = 160
 )
 $ErrorActionPreference = 'Stop'
 $Out = [System.IO.Path]::GetFullPath($Out)
-$vhd = [System.IO.Path]::ChangeExtension($Out, '.vhd')
-Remove-Item $vhd, $Out -ErrorAction SilentlyContinue
+$disk = if ($Format -eq 'raw') { [System.IO.Path]::ChangeExtension($Out, '.vhd') } else { $Out }
+if ($Format -eq 'raw') { $Type = 'fixed' }
+Remove-Item $disk, $Out -ErrorAction SilentlyContinue
 $letter = 'X'
 @"
-create vdisk file="$vhd" maximum=$SizeMB type=fixed
-select vdisk file="$vhd"
+create vdisk file="$disk" maximum=$SizeMB type=$Type
+select vdisk file="$disk"
 attach vdisk
 create partition primary
 format fs=ntfs label="MASSTIN" quick
@@ -36,16 +41,18 @@ Get-ChildItem -Path $Samples -Recurse -Filter *.evtx | ForEach-Object {
     $n++
 }
 Write-Host "copied $n EVTX files into $logs"
-Get-Volume -DriveLetter $letter | Select-Object FileSystem, Size, SizeRemaining | Format-Table | Out-String | Write-Host
 @"
-select vdisk file="$vhd"
+select vdisk file="$disk"
 detach vdisk
 "@ | Out-File -Encoding ascii "$env:TEMP\masstin-diskpart2.txt"
 diskpart /s "$env:TEMP\masstin-diskpart2.txt" | Out-Null
-$len = (Get-Item $vhd).Length
-$fs = [System.IO.File]::OpenRead($vhd); $fo = [System.IO.File]::Create($Out)
-$buf = New-Object byte[] (1MB); $left = $len - 512
-while ($left -gt 0) { $r = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left)); $fo.Write($buf, 0, $r); $left -= $r }
-$fo.Close(); $fs.Close()
-Remove-Item $vhd
-Write-Host "raw image: $Out ($((Get-Item $Out).Length) bytes)"
+if ($Format -eq 'raw') {
+    # a fixed VHD is the raw disk followed by a 512-byte footer
+    $len = (Get-Item $disk).Length
+    $fs = [System.IO.File]::OpenRead($disk); $fo = [System.IO.File]::Create($Out)
+    $buf = New-Object byte[] (1MB); $left = $len - 512
+    while ($left -gt 0) { $r = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left)); $fo.Write($buf, 0, $r); $left -= $r }
+    $fo.Close(); $fs.Close()
+    Remove-Item $disk
+}
+Write-Host "$Format ($Type): $Out ($((Get-Item $Out).Length) bytes)"

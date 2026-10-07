@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `parse-image` / `parse-massive` / `carve-image`: **VHD and VHDX images** (Hyper-V, Azure, Windows Backup): fixed and dynamic in both formats, read through the same walkers as E01 and VMDK (`src/vhd.rs`). Differencing disks with a parent are refused with a message instead of silently reading holes. Validated on disks created by diskpart with the public EVTX samples inside (fixed and dynamic VHD, fixed and dynamic VHDX): same 848 rows as the loose files; the functional CI now builds a dynamic VHD and a dynamic VHDX on the Windows runner and parses the VHD on Linux and macOS too.
 - **CI:** the functional workflow now exercises `parse-image` on the three operating systems. The Windows runner builds a raw NTFS disk image with diskpart (a fixed VHD formatted by Windows, the public EVTX samples copied under `Windows\System32\winevt\Logs`, the 512-byte VHD footer stripped), parses it, and hands it to the Linux and macOS runners as an artifact; the compare job requires the same timeline from every OS and the same events from the image as from the loose files. No multi-GB download: public Windows 10 images weigh tens of GB and the small public ones are XP with `.evt` logs.
 
 ## v1.2.0 — 2026-10-07

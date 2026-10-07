@@ -25,7 +25,7 @@
 
 An incident leaves logins in a dozen places: Security.evtx on fifty Windows hosts, `wtmp` and `auth.log` on the Linux side, UAL databases nobody remembers, EDR exports, a VPN concentrator. Masstin reads all of them and answers one question: **who logged in where, with what, and when.**
 
-- **Parse anything into one timeline.** Forensic images (E01, VMDK, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same 14-column CSV. [Parsing →](docs/parsing.md)
+- **Parse anything into one timeline.** Forensic images (E01, VMDK, VHD/VHDX, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same 14-column CSV. [Parsing →](docs/parsing.md)
 - **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
 - **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
 
@@ -63,7 +63,7 @@ masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungr
 |---|---|
 | **Windows EVTX** | 33+ Event IDs across 12 providers: Security (4624/4625/4634/4647/4648/4768/4769/4771/4776/4778/4779/5140…), Terminal Services, RDP client and core, SMB server and client, WinRM, WMI-Activity, Sysmon Event 3, Scheduled Tasks. Archived and renamed EVTX are routed by provider name. |
 | **Windows beyond EVTX** | UAL (User Access Logging) ESE databases, MountPoints2 from NTUSER.DAT, Volume Shadow Copies, EVTX chunks carved from unallocated space. |
-| **Forensic images** | E01 (multi-segment), VMDK (flat, sparse, streamOptimized), dd/raw, mounted volumes, images packed inside zips. OS detected per partition; NTFS and ext4 both walked. BitLocker detected and reported. |
+| **Forensic images** | E01 (multi-segment), VMDK (flat, sparse, streamOptimized), VHD and VHDX (fixed and dynamic, the Hyper-V and Azure formats), dd/raw, mounted volumes, images packed inside zips. OS detected per partition; NTFS and ext4 both walked. BitLocker detected and reported. |
 | **Linux** | `auth.log`, `secure`, `messages`, `wtmp`/`btmp`/`lastlog`, `audit.log`, binary journald. Session ends paired to their login, syslog times converted to UTC, OpenSSH 9.8 `sshd-session` understood. |
 | **Triage packages** | KAPE, Velociraptor offline collector, UAC, Cortex XDR, plain zips and tarballs, nested in each other. |
 | **Feeds** | Winlogbeat JSON, Cortex XDR network connections and forensic EVTX, Mordor / OTRF Security-Datasets. |
@@ -107,7 +107,7 @@ The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md
 
 ## Roadmap
 
-- VHD/VHDX images; macOS (`parse-mac`, APFS images)
+- macOS (`parse-mac`, APFS images)
 - EVTX carving Tier 3 (template matching) and unallocated-only scan
 - EVTX header tampering detection; Linux log carving
 - More custom-parser rules (Checkpoint, ZScaler, Cloudflare Access, Juniper, SonicWall); conditional map and per-rule `--validate`
