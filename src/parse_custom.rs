@@ -614,7 +614,10 @@ fn build_log_data(
     };
 
     let mut ld = LogData {
-        time_created: get("time_created"),
+        // vendor timestamps the fallback reads (asctime, epoch) are written
+        // as ISO UTC so the CSV stays homogeneous; masstin's own shapes
+        // are kept as they come
+        time_created: crate::timefmt::normalise_for_csv(&get("time_created")),
         computer: get("computer"),
         event_type: get("event_type"),
         event_id: get("event_id"),
