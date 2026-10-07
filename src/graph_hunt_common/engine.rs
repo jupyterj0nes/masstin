@@ -157,6 +157,9 @@ struct RawRow {
 struct Corpus {
     /// node name -> (cov_ok, cov_fail) log-file spans written by the loader
     cov: HashMap<String, (Vec<i64>, Vec<i64>)>,
+    /// node name -> IPs the loader folded into it (`aliases` on the host
+    /// node), so a hunt on a loaded graph labels machines as the CSV path does
+    aliases: HashMap<String, Vec<String>>,
     fams: Interner,
     nodes: Interner,
     accts: Interner,
@@ -169,7 +172,7 @@ struct Corpus {
 }
 
 async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
-    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
     c.lids.id("");
     let aggregated = format!(
         "(coalesce(r.event_id, '') = 'SSH_PREAUTH' OR (coalesce(r.event_type, '') = 'FAILED_LOGON' AND type(r) IN {na}))",
@@ -235,12 +238,16 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
         }
     }
     let mut s = graph
-        .execute(query("MATCH (h:host) RETURN h.name AS n, coalesce(h.cov_ok, []) AS ok, coalesce(h.cov_fail, []) AS fail"))
+        .execute(query("MATCH (h:host) RETURN h.name AS n, coalesce(h.cov_ok, []) AS ok, coalesce(h.cov_fail, []) AS fail, coalesce(h.aliases, []) AS al"))
         .await?;
     while let Some(row) = s.next().await? {
         let n: String = row.get("n").unwrap_or_default();
         let ok: Vec<i64> = row.get("ok").unwrap_or_default();
         let fail: Vec<i64> = row.get("fail").unwrap_or_default();
+        let al: Vec<String> = row.get("al").unwrap_or_default();
+        if !al.is_empty() {
+            c.aliases.insert(n.clone(), al);
+        }
         c.cov.insert(n, (ok, fail));
     }
     Ok(c)
@@ -406,7 +413,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         u
     };
     // pass 2: rows
-    let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::with_capacity(n_lines), bad_ts: 0 };
+    let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::with_capacity(n_lines), bad_ts: 0 };
     c.lids.id("");
     let mut agg: HashMap<(u32, u32, u32, u32, u32, i32), (u64, i64)> = HashMap::new();
     let mut dropped = 0usize;
@@ -986,6 +993,16 @@ fn build_entities(c: &Corpus, alpha: f64) -> (Entities, HashMap<String, resolve:
         aliases[id as usize].insert(n.clone());
         of_node.push(id);
     }
+    // IPs the loader already folded into a host node are not nodes here;
+    // they are still part of the machine's label
+    for (n, al) in &c.aliases {
+        if let Some(&nid) = c.nodes.map.get(n) {
+            let id = of_node[nid as usize] as usize;
+            for a in al {
+                aliases[id].insert(a.clone());
+            }
+        }
+    }
     (Entities { names, aliases, of_node }, res)
 }
 
@@ -1139,6 +1156,11 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
         e.o = ents.of_node[e.o as usize];
         e.d = ents.of_node[e.d as usize];
     }
+    // a login from a machine to itself under another name (its own IP
+    // folded into its host name) is not a connection; the loaders drop
+    // the same rows when they fold an IP, so a hunt on a loaded graph and
+    // on the CSV see the same rows
+    evs.retain(|e| e.o != e.d);
     evs.sort_by_key(|e| e.t);
     let fam_cov: Vec<(bool, bool)> = c.fams.names.iter().map(|f| super::coverage_kinds(f)).collect();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
@@ -2705,7 +2727,7 @@ mod tests {
     }
     /// Build a corpus from (day, hour, origin, destination, account, event_type) rows.
     fn corpus(rows: &[(i32, i64, &str, &str, &str, &str)]) -> Corpus {
-        let mut c = Corpus { cov: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+        let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
         c.lids.id("");
         for (day, hour, o, d, a, et) in rows {
             let eid = if *et == "CONNECT" { "SSH_PREAUTH" } else { "" };

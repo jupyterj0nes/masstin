@@ -107,7 +107,6 @@ The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md
 
 ## Roadmap
 
-- Loaders unify IP and hostname with the same binomial test graph-hunt uses (today: frequency map, see [docs/graph-databases.md](docs/graph-databases.md#ip--hostname-unification))
 - VHD/VHDX images; macOS (`parse-mac`, APFS images)
 - EVTX carving Tier 3 (template matching) and unallocated-only scan
 - EVTX header tampering detection; Linux log carving

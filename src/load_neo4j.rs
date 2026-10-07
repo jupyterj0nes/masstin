@@ -2,7 +2,6 @@
 //
 // MEMORY MODEL (post-streaming refactor):
 //   Pass 1 walks the CSV line-by-line collecting only:
-//     - `counts`: weighted (src_ip → src_computer) evidence for IP↔host
 //       unification. Bounded by distinct (ip, host) pairs (~thousands).
 //     - `literal_hosts`: non-IP non-local hostnames seen as src or dst.
 //       Bounded by total distinct hosts (~hundreds to a few thousand).
@@ -311,8 +310,8 @@ fn clean_row(
     RowOutcome::Cleaned(row.into_iter().map(|s| s.to_string()).collect())
 }
 
-/// Pass-1 streaming aggregation. Returns (counts, literal_hosts,
-/// filtered_by_time, kept_rows). The counts map drives IP→hostname
+/// Pass-1 streaming aggregation. Returns (literal_hosts, filtered_by_time,
+/// kept_rows, resolved_names, ambiguous). The resolved names drive IP→hostname
 /// resolution; literal_hosts seeds the pre-create-nodes phase so the
 /// edge batches downstream can MATCH instead of MERGE.
 fn streaming_pass1(
@@ -322,8 +321,7 @@ fn streaming_pass1(
     start_dt: Option<DateTime<Utc>>,
     end_dt: Option<DateTime<Utc>>,
     alpha: f64,
-) -> std::io::Result<(HashMap<(String, String), u32>, HashSet<String>, usize, usize, HashMap<String, (String, u32, f64)>, HashSet<String>)> {
-    let mut counts: HashMap<(String, String), u32> = HashMap::new();
+) -> std::io::Result<(HashSet<String>, usize, usize, HashMap<String, (String, u32, f64)>, HashSet<String>)> {
     let mut literal_hosts: HashSet<String> = HashSet::new();
     let mut filtered_by_time: usize = 0;
     let mut kept_rows: usize = 0;
@@ -379,33 +377,6 @@ fn streaming_pass1(
                         }
                     }
                 }
-                // (src_ip, src_computer) direct evidence
-                if !local_values.contains(parts[idx.src_computer].as_str())
-                    && !local_values.contains(parts[idx.src_ip].as_str())
-                    && parts[idx.src_computer] != parts[idx.src_ip]
-                {
-                    let weight: u32 =
-                        if parts[idx.event_id] == "4778" || parts[idx.event_id] == "4779" {
-                            1000
-                        } else { 1 };
-                    *counts
-                        .entry((parts[idx.src_ip].clone(), parts[idx.src_computer].clone()))
-                        .or_insert(0) += weight;
-                }
-                // Machine-account hint (target_user = MACHINE$ → IP)
-                if local_values.contains(parts[idx.src_computer].as_str())
-                    && !local_values.contains(parts[idx.src_ip].as_str())
-                {
-                    let target_user = parts[idx.target_user].as_str();
-                    if target_user.ends_with('$') && target_user.len() > 1 {
-                        let machine = &target_user[..target_user.len() - 1];
-                        if !looks_like_ip(machine) && !machine.contains('.') && !machine.is_empty() {
-                            *counts
-                                .entry((parts[idx.src_ip].clone(), machine.to_uppercase()))
-                                .or_insert(0) += 100;
-                        }
-                    }
-                }
                 // literal hosts: non-IP non-local src/dst names that will appear
                 // as graph nodes after resolution (anything matching an IP will
                 // be resolved through ip_to_host downstream).
@@ -419,14 +390,17 @@ fn streaming_pass1(
         }
     }
     // One vote per unambiguous same-login pair (exactly one IP and one
-    // name recorded for that login). The mapping is NOT used to merge
-    // nodes: the name is only what the destination's sshd resolved by
-    // reverse DNS at that moment (stale PTR, DHCP reuse, NAT and aliases
-    // all break it). It is kept only when every vote agrees and there are
-    // unlikely to be chance coincidences (Poisson model of an unrelated
-    // login in the same second, Benjamini-Hochberg across IPs at alpha;
-    // graph_hunt_common::resolve), and it is written to the IP node as
-    // `resolved_name` / `resolved_votes` / `resolved_p` for the analyst.
+    // name recorded for that login). A name is accepted for an IP only
+    // when its votes exceed what chance coincidences would give (Poisson
+    // model of an unrelated login in the same second, binomial upper tail,
+    // Benjamini-Hochberg across every (IP, name) candidate at alpha) and
+    // no second name is significant too; graph_hunt_common::resolve. That
+    // is the rule graph-hunt applies, and since October 2026 it is also
+    // what merges an IP into a name node at load time (a frequency map of
+    // (src_ip, src_computer) pairs did it before and kept a renamed
+    // machine's old name alive as a second node). The IP node that is
+    // folded still carries `resolved_name` / `resolved_votes` /
+    // `resolved_p` so the analyst can see why.
     let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
     drop(cooc);
     // Short names shared by two or more different FQDNs stay fully
@@ -445,33 +419,12 @@ fn streaming_pass1(
                      ambiguous.len(), list.iter().take(8).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
         );
     }
-    let counts: HashMap<(String, String), u32> = counts
-        .into_iter()
-        .fold(HashMap::new(), |mut m, ((ip, host), w)| {
-            *m.entry((short_name(&ip, &ambiguous), short_name(&host, &ambiguous))).or_insert(0) += w;
-            m
-        });
     let literal_hosts: HashSet<String> = literal_hosts.into_iter().map(|h| short_name(&h, &ambiguous)).collect();
     let resolved_names: HashMap<String, (String, u32, f64)> = resolved_names
         .into_iter()
         .map(|(ip, (name, v, p))| (ip, (short_name(&name, &ambiguous), v, p)))
         .collect();
-    Ok((counts, literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous))
-}
-
-fn derive_ip_to_host(counts: &HashMap<(String, String), u32>) -> HashMap<String, String> {
-    let mut best: HashMap<String, (String, u32)> = HashMap::new();
-    for ((ip, host), weight) in counts {
-        let entry = best.entry(ip.clone()).or_insert((host.clone(), 0));
-        if *weight > entry.1 {
-            *entry = (host.clone(), *weight);
-        }
-    }
-    let mut out: HashMap<String, String> = HashMap::new();
-    for (ip, (host, _)) in best {
-        out.insert(ip, host);
-    }
-    out
+    Ok((literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous))
 }
 
 /// Sanitize a username into a valid Cypher relationship-type identifier:
@@ -736,8 +689,8 @@ pub async fn load_neo4j(
         let local_values: HashSet<&str> = ["LOCAL", "LOCALHOST", "127.0.0.1", "::1", "::", "0.0.0.0",
             "DEFAULT_VALUE", "\"\"", "-", "", " "].iter().cloned().collect();
 
-        // ── Pass 1: stream-collect counts + literal hosts ──
-        let (counts, mut literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous) =
+        // ── Pass 1: stream-collect literal hosts and the IP ↔ name votes ──
+        let (mut literal_hosts, filtered_by_time, kept_rows, resolved_names, ambiguous) =
             match streaming_pass1(file, &idx, &local_values, start_dt, end_dt, alpha) {
                 Ok(t) => t,
                 Err(e) => {
@@ -753,12 +706,16 @@ pub async fn load_neo4j(
         }
         crate::banner::print_phase_detail(
             "Pass 1:",
-            &format!("{} kept rows; {} (ip,host) evidence pairs; {} literal hosts",
-                     kept_rows, counts.len(), literal_hosts.len()),
+            &format!("{} kept rows; {} IP(s) resolved to a name by the same-login test; {} literal hosts",
+                     kept_rows, resolved_names.len(), literal_hosts.len()),
         );
 
-        let ip_to_host = derive_ip_to_host(&counts);
-        drop(counts);  // free the (ip,host)→weight map; ip_to_host is what we keep
+        // The IP → host map is the binomial test's answer and nothing else
+        // (the rule graph-hunt applies); see streaming_pass1.
+        let ip_to_host: HashMap<String, String> = resolved_names
+            .iter()
+            .map(|(ip, (name, _, _))| (ip.clone(), name.clone()))
+            .collect();
 
         // All graph host names = literal hosts ∪ resolved targets ∪ unresolved
         // IPs that will appear as nodes. Capture the latter from ip_to_host
@@ -1022,15 +979,18 @@ pub async fn load_neo4j(
             }
         }
 
-        // IP nodes: annotate (never merge) with the unanimous sshd name.
+        // Host nodes: list the IPs the same-login test folded into them,
+        // with the votes and the chance probability behind each one.
         if !resolved_names.is_empty() {
             let ips: Vec<String> = resolved_names.keys().cloned().collect();
             let names: Vec<String> = ips.iter().map(|i| resolved_names[i].0.clone()).collect();
             let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
             let pch: Vec<f64> = ips.iter().map(|i| resolved_names[i].2).collect();
             let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
-                           MATCH (h:host {name: $ips[i]}) \
-                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i], h.resolved_p = $pch[i] \
+                           MATCH (h:host {name: $names[i]}) \
+                           SET h.aliases = coalesce(h.aliases, []) + [$ips[i]], \
+                               h.alias_votes = coalesce(h.alias_votes, []) + [$votes[i]], \
+                               h.alias_p = coalesce(h.alias_p, []) + [$pch[i]] \
                            RETURN count(h) AS n";
             match graph
                 .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts).param("pch", pch))
@@ -1040,12 +1000,12 @@ pub async fn load_neo4j(
                     let n: i64 = match r.next().await { Ok(Some(row)) => row.get("n").unwrap_or(0), _ => 0 };
                     crate::banner::print_phase_detail(
                         "IP nodes:",
-                        &format!("{} annotated with resolved_name (unanimous same-login evidence, chance coincidence significant at FDR {}; nodes not merged)", n, alpha),
+                        &format!("{} IP(s) folded into a host name by the same-login test (chance coincidence significant at FDR {}); the host node lists them in `aliases`", n, alpha),
                     );
                 }
                 Err(e) => {
                     if crate::parse::is_debug_mode() {
-                        eprintln!("[ERROR] resolved_name annotation failed: {:?}", e);
+                        eprintln!("[ERROR] aliases annotation failed: {:?}", e);
                     }
                 }
             }
