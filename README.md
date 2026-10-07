@@ -78,16 +78,16 @@ A connection is one origin logging in to one destination with one account on one
 <div align="center">
   <img src="resources/demo-hunt.gif" alt="graph-hunt-csv on the LANL authentication set: 21 million rows, 204 significant connections at FDR 5 %, the red-team machine at rank 1"/>
   <br>
-  <em>graph-hunt-csv on the public Los Alamos set, no seed, no hint: 21 million logins read, every new connection measured against the baseline, 204 survive the 5 % false discovery rate, and the first rows are the red-team machine switching credentials on hosts it had never reached. The 22-minute run is cut in the recording.</em>
+  <em>graph-hunt-csv on the public Los Alamos set, no seed, no hint: 21 million logins read, every new connection measured against the baseline, 204 survive the 5 % false discovery rate, and the first rows are the red-team machine switching credentials on hosts it had never reached. The 22 minutes of computation are cut out of the recording.</em>
 </div>
 
-Measured on a real test incident and on the public Los Alamos (LANL) authentication set:
+Three cases where the truth is known beforehand, and what the hunt reports on each with no seed and no hint:
 
-| | test corpus | LANL (21.3 M rows) |
-|---|---:|---:|
-| Significant connections at FDR 5 % | 65, all the attacker's | 204, 185 red team |
-| Precision of the first 100 rows | 100 % | 99 % |
-| Incident-free period | – | 0 significant |
+| Case | What is known | What graph-hunt reports |
+|---|---|---|
+| **DFIR Madness "Szechuan sauce"**: 2 disk images, 5,916 rows, 2 days of logs | One external IP enters the DC over RDP and goes on to the workstation | 0 significant: with one baseline day there is no null to test against, and it says so instead of inventing a threshold. With that IP as `--seed`, the 4-hop chain with its certainties (the recording at the top of this section's docs). |
+| **Test corpus, a Linux estate**: 10.5 M rows, 28 baseline days, 6-day window | From the raw logs: two never-seen origins probe an account, sweep 29 hosts and log in with a key on 32 | 65 significant at FDR 5 %, every one of them the attacker's; rank 1 is the attacker, the first benign row is 66th; 7 of 83 on an incident-free window, all a credentialed scanner's first days |
+| **LANL authentication set** (public): 21.3 M rows, 749 labelled red-team logins | Four red-team machines; 444 red-team connections in the window | 204 significant: 185 red team plus one unlabelled machine that failed on 47 hosts and then logged in with 7 new accounts; the first 83 rows are all red team, 99 % of the first 100; 0 significant on an incident-free period |
 
 The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md). The hunt runs straight from the CSV (`graph-hunt-csv`), on Memgraph (`graph-hunt`) or on Neo4j (`graph-hunt-neo4j`), with no server-side plugin.
 
