@@ -45,14 +45,14 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 | Log Source | Event ID | Description |
 |------------|----------|-------------|
-| SMBServer/Security | 1009 | Server denied anonymous access to the client (FAILED_LOGON) |
-| SMBServer/Security | 551 | SMB session authentication failure (FAILED_LOGON) |
-| SMBClient/Security | 31001 | Client failed to authenticate to the server (FAILED_LOGON) |
-| SMBClient/Connectivity | 30803 | SMB connectivity event |
-| SMBClient/Connectivity | 30804 | SMB connectivity event |
-| SMBClient/Connectivity | 30805 | SMB connectivity event |
-| SMBClient/Connectivity | 30806 | SMB connectivity event |
-| SMBClient/Connectivity | 30807 | SMB connectivity event |
+| SMBServer/Security | 1009 | Server denied anonymous access to the client (FAILED_LOGON); client from `ClientName` (UNC stripped) or the `ClientAddress` socket dump |
+| SMBServer/Security | 551 | SMB session authentication failure (FAILED_LOGON); client as above, `UserName` split into user and domain, NT status in `detail` (`Status 0xc000006d` = wrong password, `0xc000006e` = account restriction, `0xc0000022` = access denied) |
+| SMBClient/Security | 31001 | Client failed to authenticate to the server (FAILED_LOGON); written on the client: the local computer is the source, `ServerName` (UNC stripped) the destination, the share in `detail` |
+| SMBClient/Connectivity | 30803 | Failed to establish a network connection to the server (CONNECT, client side) |
+| SMBClient/Connectivity | 30804 | A network connection was disconnected (CONNECT, client side) |
+| SMBClient/Connectivity | 30805 | The client lost its session to the server (CONNECT, client side) |
+| SMBClient/Connectivity | 30806 | The client re-established its session to the server (CONNECT, client side) |
+| SMBClient/Connectivity | 30807 | The connection to the share was lost (CONNECT, client side; `ServerName` carries `\server\share`, the share goes to `detail`) |
 | SMBClient/Connectivity | 30808 | SMB share access |
 
 ### PowerShell Remoting & WMI

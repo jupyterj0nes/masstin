@@ -52,6 +52,64 @@ pub(crate) fn infer_logon_type(event_id: &str, raw: &str) -> String {
     }
 }
 
+/// Split a UNC-style server reference as the SMB channels write it
+/// (`\\192.0.2.31`, `\192.0.2.31\C$`, `\\srv01\ADMIN$`) into the
+/// server and the share path. Returns (server, share); share is empty when
+/// the value names the server alone.
+pub(crate) fn split_unc(v: &str) -> (String, String) {
+    let t = v.trim().trim_start_matches(|c| c == '\\' || c == '/');
+    match t.find(|c| c == '\\' || c == '/') {
+        Some(i) => (t[..i].to_string(), t[i + 1..].trim_matches(|c| c == '\\' || c == '/').to_string()),
+        None => (t.to_string(), String::new()),
+    }
+}
+
+/// Decode the hex dump of a Windows SOCKADDR_STORAGE as the SMB channels
+/// write it (`ClientAddress`, `RemoteAddress`, `Address`): family in the
+/// first two bytes (little-endian, 2 = AF_INET, 23 = AF_INET6), the port,
+/// then the address. Returns the IP as text, or None when the dump is not
+/// an address (unset, zero, or another family).
+pub(crate) fn sockaddr_hex_ip(hex: &str) -> Option<String> {
+    let h = hex.trim();
+    if h.len() < 16 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let b: Vec<u8> = (0..h.len() / 2).filter_map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()).collect();
+    let family = u16::from_le_bytes([b[0], b[1]]);
+    match family {
+        2 if b.len() >= 8 => {
+            let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+            if ip.is_unspecified() { None } else { Some(ip.to_string()) }
+        }
+        23 if b.len() >= 24 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&b[8..24]);
+            let ip = std::net::Ipv6Addr::from(o);
+            if ip.is_unspecified() { None } else { Some(strip_ipv4_mapped(&ip.to_string())) }
+        }
+        _ => None,
+    }
+}
+
+/// `DOMAIN\user` or `user@domain` into (user, domain).
+pub(crate) fn split_account(v: &str) -> (String, String) {
+    let v = v.trim();
+    if let Some(i) = v.find('\\') {
+        return (v[i + 1..].to_string(), v[..i].to_string());
+    }
+    if let Some(i) = v.find('@') {
+        return (v[..i].to_string(), v[i + 1..].to_string());
+    }
+    (v.to_string(), String::new())
+}
+
+/// Source columns for a host name recorded by a client-side channel: the
+/// name goes to src_computer, an address to src_ip, never both.
+fn source_columns(host: &str) -> (String, String) {
+    let h = host.trim().to_string();
+    if h.parse::<std::net::IpAddr>().is_ok() { (String::new(), h) } else { (h, String::new()) }
+}
+
 fn strip_ipv4_mapped(ip: &str) -> String {
     if let Some(v4) = ip.strip_prefix("::ffff:") {
         return v4.to_string();
@@ -811,9 +869,19 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                         // no <UserData><EventData>: never unwrap, a record
                         // of another shape used to abort the whole run.
                         let ed = event.UserData.as_ref().and_then(|u| u.EventData.as_ref());
-                        let user = ed.and_then(|e| e.UserName.clone()).unwrap_or_default();
-                        let client = strip_ipv4_mapped(&ed.and_then(|e| e.ClientName.clone()).unwrap_or_default());
-                        let client_is_ip = client.parse::<std::net::IpAddr>().is_ok();
+                        let (user, domain) = split_account(&ed.and_then(|e| e.UserName.clone()).unwrap_or_default());
+                        // ClientName is written as a UNC reference
+                        // (`\\192.0.2.76`); the raw value was landing in
+                        // src_computer with its backslashes and the address
+                        // was never recognised. ClientAddress (a SOCKADDR
+                        // hex dump) is the fallback when the name is empty.
+                        let mut client = strip_ipv4_mapped(&split_unc(&ed.and_then(|e| e.ClientName.clone()).unwrap_or_default()).0);
+                        if client.is_empty() {
+                            client = ed.and_then(|e| e.ClientAddress.as_deref()).and_then(sockaddr_hex_ip).unwrap_or_default();
+                        }
+                        let (workstation_name, ip_address) = source_columns(&client);
+                        let status = ed.and_then(|e| e.Status.clone()).unwrap_or_default();
+                        let detail = if status.is_empty() { String::new() } else { format!("Status {}", status) };
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
                             computer: event.System.Computer.unwrap_or_default(),
@@ -822,13 +890,13 @@ pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             subject_user_name: event.System.Security.as_ref().and_then(|s| s.UserID.as_ref()).cloned().unwrap_or_default(),
                             subject_domain_name: String::from(""),
                             target_user_name: user,
-                            target_domain_name: String::from(""),
+                            target_domain_name: domain,
                             logon_type: String::from("3"),
-                            workstation_name: if client_is_ip { String::new() } else { client.clone() },
-                            ip_address: if client_is_ip { client } else { String::new() },
+                            workstation_name,
+                            ip_address,
                             logon_id: String::from(""),
                             filename: file.to_string(),
-                            detail: String::from(""),
+                            detail,
                         });
                     }
                 }
@@ -877,23 +945,33 @@ pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData
                             }
                         } else { continue; }
 
+                        let (server, share_in_name) = split_unc(data_values.get("ServerName").map(|s| s.as_str()).unwrap_or(""));
+                        let share = {
+                            let s = split_unc(data_values.get("ShareName").map(|s| s.as_str()).unwrap_or("")).1;
+                            if s.is_empty() { share_in_name } else { s }
+                        };
+                        let (user, domain) = split_account(data_values.get("UserName").map(|s| s.as_str()).unwrap_or(""));
+                        // written on the CLIENT: the local Computer is the
+                        // source (a name, not an address), the server the
+                        // destination
+                        let (workstation_name, ip_address) = source_columns(event.System.Computer.as_deref().unwrap_or(""));
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: data_values.get("ServerName").unwrap_or(&String::new()).to_string(),
+                            computer: strip_ipv4_mapped(&server),
                             // 31001 (level Error): the client failed to
                             // authenticate to the server.
                             event_type: "FAILED_LOGON".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
-                            target_user_name: data_values.get("UserName").unwrap_or(&String::new()).to_string(),
-                            target_domain_name: String::from(""),
+                            target_user_name: user,
+                            target_domain_name: domain,
                             logon_type: String::from("3"),
-                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
-                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
+                            workstation_name,
+                            ip_address,
                             logon_id: String::from(""),
                             filename: file.to_string(),
-                            detail: data_values.get("ShareName").unwrap_or(&String::new()).to_string(),
+                            detail: share,
                         });
                     }
                 }
@@ -928,9 +1006,10 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                     if lateral_event_ids.contains(&event_id.as_str()) {
                         let mut data_values: HashMap<String, String> = [
                             ("UserName".to_string(), String::from("")),
-                            ("ServerName".to_string(), String::from(""))
+                            ("ServerName".to_string(), String::from("")),
+                            ("RemoteAddress".to_string(), String::from("")),
+                            ("Address".to_string(), String::from("")),
                         ].iter().cloned().collect();
-
                         let event_data = match event.EventData { Some(ed) => ed, None => continue };
                         for data in event_data.Datas {
                             if let Some(name) = data.Name {
@@ -939,22 +1018,37 @@ pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -
                                 }
                             }
                         }
-
+                        // ServerName is a UNC reference (`\192.0.2.31`,
+                        // and `\192.0.2.31\C$` on 30807, the share
+                        // lost); the SOCKADDR dumps are the fallback when
+                        // it is empty
+                        let (mut server, share) = split_unc(data_values.get("ServerName").map(|s| s.as_str()).unwrap_or(""));
+                        if server.is_empty() {
+                            server = ["RemoteAddress", "Address"].iter()
+                                .filter_map(|k| data_values.get(*k).map(|v| v.as_str()))
+                                .find_map(sockaddr_hex_ip)
+                                .unwrap_or_default();
+                        }
+                        if server.is_empty() { continue; }
+                        let (user, domain) = split_account(data_values.get("UserName").map(|s| s.as_str()).unwrap_or(""));
+                        // written on the CLIENT: the local Computer is the
+                        // source, a name, never an address
+                        let (workstation_name, ip_address) = source_columns(event.System.Computer.as_deref().unwrap_or(""));
                         log_data.push(LogData {
                             time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: data_values.get("ServerName").unwrap_or(&String::new()).to_string(),
+                            computer: strip_ipv4_mapped(&server),
                             event_type: "CONNECT".to_string(),
                             event_id,
                             subject_user_name: String::from(""),
                             subject_domain_name: String::from(""),
-                            target_user_name: data_values.get("UserName").unwrap_or(&String::new()).to_string(),
-                            target_domain_name: String::from(""),
+                            target_user_name: user,
+                            target_domain_name: domain,
                             logon_type: String::from("3"),
-                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
-                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
+                            workstation_name,
+                            ip_address,
                             logon_id: String::from(""),
                             filename: file.to_string(),
-                            detail: String::from(""),
+                            detail: share,
                         });
                     }
                 }
@@ -1390,72 +1484,59 @@ pub fn parse_wmi(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
     };
 
     for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                // WMI uses UserData with Operation_ClientFailure, but serde can handle
-                // it via the generic Event struct if we extract fields manually from XML
-                let event: EventWMI = match from_str(&data) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                if let Some(ref event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let (client_machine, user, operation) = match event.UserData {
-                            Some(ref ud) => {
-                                let cm = ud.client_machine().unwrap_or_default();
-                                let u = ud.user().unwrap_or_default();
-                                let op = ud.operation().unwrap_or_default();
-                                (cm, u, op)
-                            }
-                            None => continue,
-                        };
-
-                        let computer = event.System.Computer.clone().unwrap_or_default();
-
-                        // Only include remote WMI: ClientMachine must differ from Computer
-                        // Compare short names to handle FQDN vs NetBIOS (e.g., "SRV01" vs "SRV01.domain.local")
-                        let cm_short = client_machine.split('.').next().unwrap_or(&client_machine);
-                        let comp_short = computer.split('.').next().unwrap_or(&computer);
-                        if client_machine.is_empty() || cm_short.eq_ignore_ascii_case(comp_short) {
-                            continue;
-                        }
-
-                        // Parse user: may be "DOMAIN\user" or just "user"
-                        let (domain, username) = if let Some(pos) = user.find('\\') {
-                            (user[..pos].to_string(), user[pos + 1..].to_string())
-                        } else {
-                            (String::new(), user.clone())
-                        };
-
-                        // Skip SYSTEM/LOCAL SERVICE noise
-                        if username == "SYSTEM" || username == "LOCAL SERVICE" || username == "NETWORK SERVICE" {
-                            continue;
-                        }
-
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer,
-                            event_type: "CONNECT".to_string(),
-                            event_id: event_id.clone(),
-                            subject_user_name: String::new(),
-                            subject_domain_name: String::new(),
-                            target_user_name: username,
-                            target_domain_name: domain,
-                            logon_type: String::new(),
-                            workstation_name: client_machine.clone(),
-                            ip_address: client_machine,
-                            logon_id: String::new(),
-                            filename: file.to_string(),
-                            detail: if operation.len() > 100 { format!("WMI: {}...", &operation[..100]) } else { format!("WMI: {}", operation) },
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
+        if let Ok(r) = record {
+            if let Some(row) = wmi_row(r.data.as_str(), file, &lateral_event_ids) {
+                log_data.push(row);
+            }
         }
     }
     log_data
+}
+
+/// One WMI-Activity record (XML) to a row: 5858 written on the SERVER whose
+/// WMI service refused an operation, with the client in `ClientMachine`.
+/// Local clients (the machine itself, by short name) and service accounts
+/// are not lateral movement and give None.
+pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Option<LogData> {
+    let event: EventWMI = from_str(xml).ok()?;
+    let event_id = event.System.EventID.as_ref()?;
+    if !lateral_event_ids.contains(&event_id.as_str()) {
+        return None;
+    }
+    let ud = event.UserData.as_ref()?;
+    let client_machine = ud.client_machine().unwrap_or_default();
+    let user = ud.user().unwrap_or_default();
+    let operation = ud.operation().unwrap_or_default();
+    let computer = event.System.Computer.clone().unwrap_or_default();
+
+    // Only remote WMI: ClientMachine must differ from Computer, compared by
+    // short name (FQDN vs NetBIOS)
+    let cm_short = client_machine.split('.').next().unwrap_or(&client_machine);
+    let comp_short = computer.split('.').next().unwrap_or(&computer);
+    if client_machine.is_empty() || cm_short.eq_ignore_ascii_case(comp_short) {
+        return None;
+    }
+    let (username, domain) = split_account(&user);
+    if username == "SYSTEM" || username == "LOCAL SERVICE" || username == "NETWORK SERVICE" {
+        return None;
+    }
+    let (workstation_name, ip_address) = source_columns(&client_machine);
+    Some(LogData {
+        time_created: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+        computer,
+        event_type: "CONNECT".to_string(),
+        event_id: event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: username,
+        target_domain_name: domain,
+        logon_type: String::new(),
+        workstation_name,
+        ip_address,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: if operation.len() > 100 { format!("WMI: {}...", &operation[..100]) } else { format!("WMI: {}", operation) },
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2479,6 +2560,8 @@ struct Security {
 struct EventDataSMBServer {
     ClientName: Option<String>,
     UserName: Option<String>,
+    ClientAddress: Option<String>,
+    Status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -2520,4 +2603,63 @@ struct WMIClientFailure {
     ClientMachine: Option<String>,
     User: Option<String>,
     Operation: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unc_server_and_share() {
+        assert_eq!(split_unc(r"\\192.0.2.76"), ("192.0.2.76".to_string(), String::new()));
+        assert_eq!(split_unc(r"\192.0.2.31\C$"), ("192.0.2.31".to_string(), "C$".to_string()));
+        assert_eq!(split_unc(r"\\srv01\ADMIN$\"), ("srv01".to_string(), "ADMIN$".to_string()));
+        assert_eq!(split_unc("srv01"), ("srv01".to_string(), String::new()));
+        assert_eq!(split_unc(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn sockaddr_dumps() {
+        // AF_INET, port 0x7DB3, 127.0.0.1 (as SMBServer 551 writes ClientAddress)
+        assert_eq!(sockaddr_hex_ip("02007DB37F0000010000000000000000"), Some("127.0.0.1".to_string()));
+        // AF_INET, port 445, 192.168.1.43 (SmbClient 30803 RemoteAddress)
+        assert_eq!(sockaddr_hex_ip("020001BDC0A8012B0000000000000000"), Some("192.168.1.43".to_string()));
+        // unset
+        assert_eq!(sockaddr_hex_ip("00000000000000000000000000000000"), None);
+        assert_eq!(sockaddr_hex_ip(""), None);
+        // AF_INET6, port 445, ::1
+        assert_eq!(sockaddr_hex_ip(&format!("170001BD00000000{}01", "00".repeat(15))), Some("::1".to_string()));
+    }
+
+    #[test]
+    fn accounts_split() {
+        assert_eq!(split_account(r"NT AUTHORITY\ANONYMOUS LOGON"), ("ANONYMOUS LOGON".to_string(), "NT AUTHORITY".to_string()));
+        assert_eq!(split_account("alice@corp.example"), ("alice".to_string(), "corp.example".to_string()));
+        assert_eq!(split_account("bob"), ("bob".to_string(), String::new()));
+    }
+
+    /// A 5858 as Windows writes it (fields from a real record, names
+    /// replaced), with the client on another machine.
+    const WMI_5858: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-WMI-Activity' Guid='{1418ef04-b0b4-4623-bf7e-d74ab47bbdaa}'/><EventID>5858</EventID><Version>0</Version><Level>2</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime='2026-10-07T14:28:11.1517614Z'/><EventRecordID>128870</EventRecordID><Correlation/><Execution ProcessID='4304' ThreadID='4728'/><Channel>Microsoft-Windows-WMI-Activity/Operational</Channel><Computer>SRV01.corp.example</Computer><Security UserID='S-1-5-18'/></System><UserData><Operation_ClientFailure xmlns='http://manifests.microsoft.com/win/2006/windows/WMI'><Id>{0736B5DE-549D-0007-CE8C-51079D54DD01}</Id><ClientMachine>WS-ADMIN01</ClientMachine><User>CORP\alice</User><ClientProcessId>13300</ClientProcessId><Component>Unknown</Component><Operation>Start IWbemServices::ExecQuery - root\cimv2 : select * from Win32_Process</Operation><ResultCode>0x80041010</ResultCode><PossibleCause>Unknown</PossibleCause></Operation_ClientFailure></UserData></Event>"#;
+
+    #[test]
+    fn wmi_5858_remote_client_is_a_connect_row() {
+        let row = wmi_row(WMI_5858, "f.evtx", &["5858"]).expect("remote 5858 gives a row");
+        assert_eq!(row.event_type, "CONNECT");
+        assert_eq!(row.computer, "SRV01.corp.example");
+        assert_eq!(row.workstation_name, "WS-ADMIN01");
+        assert_eq!(row.ip_address, "");
+        assert_eq!(row.target_user_name, "alice");
+        assert_eq!(row.target_domain_name, "CORP");
+        assert_eq!(row.time_created, "2026-10-07T14:28:11.1517614Z");
+        assert!(row.detail.starts_with("WMI: Start IWbemServices::ExecQuery"));
+    }
+
+    #[test]
+    fn wmi_5858_local_client_is_dropped() {
+        let local = WMI_5858.replace("<ClientMachine>WS-ADMIN01</ClientMachine>", "<ClientMachine>SRV01</ClientMachine>");
+        assert!(wmi_row(&local, "f.evtx", &["5858"]).is_none());
+        let svc = WMI_5858.replace(r"CORP\alice", r"NT AUTHORITY\SYSTEM");
+        assert!(wmi_row(&svc, "f.evtx", &["5858"]).is_none());
+    }
 }
