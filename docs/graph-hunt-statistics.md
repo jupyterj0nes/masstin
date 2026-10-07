@@ -171,7 +171,7 @@ the engine already measured; the report computes nothing.
 - **Origins without history** are evaluated on off-panel destinations with every destination-side fact switched off (account on the destination, community, logon type, centrality): only what is known about the origin counts.
 - **Centrality.** PageRank is iterated to floating-point stationarity, and a change smaller than twice the difference between two starting points (the convergence noise of that graph) is no change. Betweenness is exact.
 - **Causal paths.** A path's certainty is 1 / #candidate causes; the pivot's coordinate sums, over its distinct (destination, account) connections of the day, the best certainty of each, so it is a count of connections weighted by certainty, not of sessions.
-- **Campaigns** are a grouping, not a detection: the hypergeometric test assumes destinations drawn uniformly from the panel, and real destinations are not uniform, so the p is indicative. Two origins whose window logins coincide in destination, account and second are one machine recorded twice and are never paired.
+- **Campaigns** are a grouping, not a detection. The overlap test draws from the shared account's own footprint (every panel destination that account reached in the window, from any origin), not from the whole panel: two newcomers using the same account go where the account goes, and that overlap is the expectation. Drawing from the panel called 96 % of the candidate pairs on LANL campaigns (172,719 of 180,707); within the footprint a pair stands out only when the two overlap more than two independent users of that account would. Two origins whose window logins coincide in destination, account and second are one machine recorded twice and are never paired.
 - **Logon-type rarity** is weighted by events, so double-logged logins weigh twice; on Linux the type is the same for every row and the coordinate is inert.
 - **Conformal detail.** Each null point's surprise is computed leaving itself out; the exact full-conformal construction would also add the observation to the reference. The difference is ln((N + 1) / N) per positive coordinate and goes in the conservative direction for observations above the null.
 
@@ -179,7 +179,7 @@ the engine already measured; the report computes nothing.
 
 Columns: `section, rank, machine, machine_p, machine_q, significant, detector, role, p_value, day, hosts, account, events, time_window, summary, cypher_snippet`.
 
-- **`section = campaign`.** Origins with no baseline event that share a new account and reach overlapping destinations beyond chance. Overlap is tested with the exact hypergeometric test over the panel, with Benjamini-Hochberg across candidate pairs. This is a grouping only: nodes are not merged and scores are unchanged.
+- **`section = campaign`.** Origins with no baseline event that share a new account and reach overlapping destinations beyond chance. Overlap is tested with the exact hypergeometric test over the shared account's footprint in the window, with Benjamini-Hochberg across candidate pairs. This is a grouping only: nodes are not merged and scores are unchanged.
 - **`section = finding`.**
   - `role = decision` rows (`origin-profile`, `centrality-profile`) carry the joint p that counts for the machine.
   - `role = component` rows show each coordinate with its univariate tail, for explanation.
