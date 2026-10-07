@@ -32,7 +32,7 @@ fn parse_time(raw: &str) -> Option<NaiveDateTime> {
             return Some(n);
         }
     }
-    None
+    crate::timefmt::parse_fallback(t)
 }
 
 const MASSTIN_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";

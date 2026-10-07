@@ -109,6 +109,23 @@ jobs:
             out/evtx-samples.vhd
           retention-days: 3
 
+      - name: Custom-parser rule library on its sample lines (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          for rule in rules/*/*.yaml; do
+            dir=$(dirname "$rule"); name=$(basename "$rule" .yaml)
+            sample="$dir/samples/$name.sample.log"
+            [ -f "$sample" ] || { echo "::warning::$rule has no sample"; continue; }
+            target/release/masstin -a parse-custom --rules "$rule" -f "$sample" -o "out/rule-$name.csv" --overwrite --silent >/dev/null 2>&1 || true
+            n=$(( $(wc -l < "out/rule-$name.csv" 2>/dev/null || echo 1) - 1 ))
+            echo "$rule: $n row(s) from $(wc -l < "$sample") sample line(s)"
+            [ "$n" -gt 0 ] || { echo "::error::$rule produced no rows from its sample"; fail=1; }
+          done
+          [ $fail -eq 0 ]
+
       - name: Parse with the Intel binary under Rosetta (macOS only)
         if: runner.os == 'macOS'
         shell: bash

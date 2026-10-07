@@ -1,0 +1,191 @@
+# =============================================================================
+# Masstin custom parser rule — Zscaler Private Access (ZPA) LSS logs, JSON
+# =============================================================================
+#
+# Format covered:
+#   NDJSON written by the ZPA Log Streaming Service (LSS) with the default
+#   JSON templates, one object per line:
+#
+#   User Status (the ZTNA session of a device):
+#     {"LogTimestamp":"Fri May 31 17:34:48 2019","Customer":"...","Username":"jane.doe@corp.example",
+#      "SessionID":"vkczUERSLl88Y+ytH8v5","SessionStatus":"ZPN_STATUS_AUTHENTICATED","ZEN":"broker2b.pdx",
+#      "PrivateIP":"10.0.0.5","PublicIP":"203.0.113.9","TimestampAuthentication":"2019-05-29T21:18:38.000Z",
+#      "TimestampUnAuthentication":"","Idp":"IDP Config","Hostname":"DESKTOP-99HCSJ1","Platform":"windows", ...}
+#
+#   User Activity (one application connection through ZPA):
+#     {"LogTimestamp": "Fri May 31 17:35:42 2019","SessionID": "...","ConnectionStatus": "active",
+#      "Username": "jane.doe@corp.example","ClientPublicIP": "203.0.113.9","ClientPrivateIP": "10.0.0.5",
+#      "Policy": "ABC Lab Apps","Connector": "...","Host": "intranet.corp.example","Application": "...",
+#      "ServerIP": "10.20.0.7","ServerPort": 443,"ServicePort": 443, ...}
+#
+#   `LogTimestamp` is C asctime; masstin reads it. `TimestampAuthentication`
+#   is ISO and dates the login itself, so the status parsers use it.
+#
+# Events covered:
+#   ZPN_STATUS_AUTHENTICATED   user's device authenticated to ZPA     (SUCCESSFUL_LOGON)
+#   ZPN_STATUS_AUTH_FAILED     authentication failed                  (FAILED_LOGON)
+#   ZPN_STATUS_DISCONNECTED    session ended                          (LOGOFF)
+#   User Activity              connection to an application host      (CONNECT)
+#
+#   For the session events the destination is the ZPA broker (`ZEN`), the
+#   source the device (`Hostname`, `PublicIP`). For activity rows the
+#   destination is the application host (`Host`, falling back on `ServerIP`
+#   when `Host` is itself an address) and the source the client's public
+#   address; the private address and the connector go to `detail`.
+#   `SessionID` is written to `logon_id` so logins pair with their LOGOFF.
+#
+# References:
+#   https://help.zscaler.com/zpa/about-user-status-log-fields
+#   https://help.zscaler.com/zpa/about-user-activity-log-fields
+#   Sample lines: Elastic integrations test fixtures (packages/zscaler_zpa), synthetic
+# =============================================================================
+
+meta:
+  vendor: "Zscaler"
+  product: "Private Access (ZPA) — Log Streaming Service JSON"
+  format: "NDJSON, LSS default JSON templates (User Status, User Activity)"
+  versions_tested: ["LSS JSON templates 2019-2024 (sample lines)"]
+  description: "ZPA device sessions (authenticated / failed / disconnected) and application connections"
+  author: "masstin community"
+  reference_url: "https://help.zscaler.com/zpa/about-user-status-log-fields"
+
+prefilter:
+  contains_any:
+    - '"SessionStatus"'
+    - '"ConnectionStatus"'
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Device session authenticated
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "zpa-session-authenticated"
+    match:
+      regex: '"SessionStatus":\s*"ZPN_STATUS_AUTHENTICATED"'
+    extract:
+      type: json
+      fields:
+        ts_auth: "TimestampAuthentication"
+        ts_log: "LogTimestamp"
+        user: "Username"
+        host: "Hostname"
+        pub_ip: "PublicIP"
+        priv_ip: "PrivateIP"
+        zen: "ZEN"
+        idp: "Idp"
+        platform: "Platform"
+        client: "ClientType"
+        session: "SessionID"
+    map:
+      time_created:       "${ts_auth}"
+      computer:           "${zen}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "ZPA-AUTH"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   "${host}"
+      ip_address:         "${pub_ip}"
+      logon_type:         "ZTNA"
+      logon_id:           "${session}"
+      filename:           "${__source_file}"
+      detail:             "ZPA session authenticated | idp=${idp} platform=${platform} client=${client} private_ip=${priv_ip}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Device authentication failed
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "zpa-session-auth-failed"
+    match:
+      regex: '"SessionStatus":\s*"ZPN_STATUS_AUTH_FAILED"'
+    extract:
+      type: json
+      fields:
+        ts_log: "LogTimestamp"
+        user: "Username"
+        host: "Hostname"
+        pub_ip: "PublicIP"
+        zen: "ZEN"
+        idp: "Idp"
+        platform: "Platform"
+        session: "SessionID"
+    map:
+      time_created:       "${ts_log}"
+      computer:           "${zen}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "ZPA-AUTH-FAIL"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   "${host}"
+      ip_address:         "${pub_ip}"
+      logon_type:         "ZTNA"
+      logon_id:           "${session}"
+      filename:           "${__source_file}"
+      detail:             "ZPA authentication failed | idp=${idp} platform=${platform}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Device session ended
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "zpa-session-disconnected"
+    match:
+      regex: '"SessionStatus":\s*"ZPN_STATUS_DISCONNECTED"'
+    extract:
+      type: json
+      fields:
+        ts_log: "LogTimestamp"
+        user: "Username"
+        host: "Hostname"
+        pub_ip: "PublicIP"
+        zen: "ZEN"
+        session: "SessionID"
+    map:
+      time_created:       "${ts_log}"
+      computer:           "${zen}"
+      event_type:         "LOGOFF"
+      event_id:           "ZPA-DISCONNECT"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   "${host}"
+      ip_address:         "${pub_ip}"
+      logon_type:         "ZTNA"
+      logon_id:           "${session}"
+      filename:           "${__source_file}"
+      detail:             "ZPA session disconnected"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Application connection (User Activity)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "zpa-app-connection"
+    match:
+      contains: ['"ConnectionStatus"', '"ClientPublicIP"']
+    extract:
+      type: json
+      fields:
+        ts_log: "LogTimestamp"
+        user: "Username"
+        pub_ip: "ClientPublicIP"
+        priv_ip: "ClientPrivateIP"
+        host: "Host"
+        server_ip: "ServerIP"
+        server_port: "ServerPort"
+        app: "Application"
+        policy: "Policy"
+        status: "ConnectionStatus"
+        reason: "InternalReason"
+        connector: "Connector"
+        session: "SessionID"
+    map:
+      time_created:       "${ts_log}"
+      computer:           "${host|server_ip}"
+      event_type:         "CONNECT"
+      event_id:           "ZPA-CONNECT"
+      subject_user_name:  ""
+      target_user_name:   "${user}"
+      target_domain_name: ""
+      workstation_name:   ""
+      ip_address:         "${pub_ip}"
+      logon_type:         "ZTNA"
+      logon_id:           "${session}"
+      filename:           "${__source_file}"
+      detail:             "ZPA ${status} ${app} server=${server_ip}:${server_port} policy=${policy} connector=${connector} private_ip=${priv_ip} ${reason}"

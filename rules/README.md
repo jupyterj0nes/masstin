@@ -23,8 +23,12 @@ This directory holds community-contributed YAML rule files for masstin's `parse-
 | Firewall | [`firewall/fortinet-fortigate.yaml`](firewall/fortinet-fortigate.yaml) | ✅ complete | 4 | FortiGate `type=event subtype=system\|user` (admin login, user auth) |
 | Proxy | [`proxy/squid.yaml`](proxy/squid.yaml) | ✅ complete | 3 | Squid access.log native (CONNECT tunnel, HTTP, TCP_DENIED) |
 | JSON/SIEM | [`json/mordor.yaml`](json/mordor.yaml) | ✅ complete | 6 | Mordor / OTRF Security-Datasets flat NDJSON (EventData flattened to top level) |
+| VPN | [`vpn/checkpoint-remote-access.yaml`](vpn/checkpoint-remote-access.yaml) | ✅ complete | 3 | Check Point Log Exporter syslog `[key:"value"; ...]` — remote access / Mobile Access session login, failure, logout |
+| Firewall | [`firewall/checkpoint-admin.yaml`](firewall/checkpoint-admin.yaml) | ✅ complete | 3 | Check Point Log Exporter syslog — administrator logins to the management, failures, Expert Shell SSH logins |
+| JSON/ZTNA | [`json/zscaler-zpa.yaml`](json/zscaler-zpa.yaml) | ✅ complete | 4 | Zscaler ZPA LSS JSON — device session authenticated / failed / disconnected, application connections |
+| JSON/ZTNA | [`json/cloudflare-access.yaml`](json/cloudflare-access.yaml) | ✅ complete | 3 | Cloudflare Access Logpush `access_requests` NDJSON — login allowed / denied, logout |
 
-**Totals:** 9 rules, 37 parsers, all researched against vendor documentation and validated against sample log lines in [`*/samples/`](./).
+**Totals:** 13 rules, 50 parsers, all researched against vendor documentation and validated against sample log lines in [`*/samples/`](./). The Check Point, Zscaler and Cloudflare samples are the public test fixtures of the Elastic integrations repository (synthetic data).
 
 ## References
 
@@ -39,6 +43,9 @@ Every rule in this library was written from the vendor's official log format doc
 | `firewall/palo-alto-traffic.yaml` | [Traffic Log Fields (PAN-OS 11.0)](https://docs.paloaltonetworks.com/pan-os/11-0/pan-os-admin/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields) · [Syslog Field Descriptions index](https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions) |
 | `firewall/cisco-asa.yaml` | [ASA Syslog Messages 101001–199021](https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog/syslogs1.html) · [ASA Syslog Messages 715001–721019](https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/asa-syslog/syslog-messages-715001-to-721019.html) · [Messages by Severity Level](https://www.cisco.com/c/en/us/td/docs/security/asa/syslog/b_syslog/syslogs-sev-level.html) |
 | `firewall/fortinet-fortigate.yaml` | [FortiOS Log Message Reference](https://docs.fortinet.com/document/fortigate/latest/fortios-log-message-reference) |
+| `vpn/checkpoint-remote-access.yaml`, `firewall/checkpoint-admin.yaml` | [Log Exporter (R81 Logging and Monitoring Guide)](https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_LoggingAndMonitoring_AdminGuide/Topics-LMG/Log-Exporter.htm) · [Log Exporter CEF field mappings (CheckMates)](https://community.checkpoint.com/t5/Logging-and-Reporting/Log-Exporter-CEF-Field-Mappings/td-p/41060) · [Sample lines (Elastic integrations, packages/checkpoint)](https://github.com/elastic/integrations/tree/main/packages/checkpoint/data_stream/firewall/_dev/test/pipeline) |
+| `json/zscaler-zpa.yaml` | [ZPA User Status log fields](https://help.zscaler.com/zpa/about-user-status-log-fields) · [ZPA User Activity log fields](https://help.zscaler.com/zpa/about-user-activity-log-fields) · [Sample lines (Elastic integrations, packages/zscaler_zpa)](https://github.com/elastic/integrations/tree/main/packages/zscaler_zpa/data_stream) |
+| `json/cloudflare-access.yaml` | [Logpush dataset access_requests (Cloudflare)](https://developers.cloudflare.com/logs/reference/log-fields/account/access_requests/) · [Sample lines (Elastic integrations, packages/cloudflare_logpush)](https://github.com/elastic/integrations/tree/main/packages/cloudflare_logpush/data_stream/access_request/_dev/test/pipeline) |
 | `proxy/squid.yaml` | [Squid LogFormat feature reference](https://wiki.squid-cache.org/Features/LogFormat) · [Squid FAQ — Log Files](https://wiki.squid-cache.org/SquidFaq/SquidLogs) · [logformat directive](https://www.squid-cache.org/Doc/config/logformat/) |
 
 If you're writing a new rule or updating an existing one, add your primary sources to this table in the same PR.

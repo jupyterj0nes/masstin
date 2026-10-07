@@ -1,0 +1,136 @@
+# =============================================================================
+# Masstin custom parser rule — Check Point administrator logins (Log Exporter)
+# =============================================================================
+#
+# Format covered:
+#   Check Point Log Exporter "syslog" (semi-unified) format, the audit records
+#   a Management Server writes when an administrator signs in:
+#
+#     <134>1 2023-12-29T08:42:55Z CP-Manager CheckPoint 10547 - [action:"Accept"; ...;
+#       additional_info:"Authentication method: radius"; administrator:"mario.rossi@example.org";
+#       client_ip:"10.16.10.27"; machine:"desktop0001.example.local"; operation:"Log In";
+#       operation_number:"10"; product:"SmartConsole"; subject:"Administrator Login"]
+#
+#   A failed attempt carries `audit_status:"Failure"` and the reason in
+#   `additional_info` ("Administrator failed to log in: Wrong Password").
+#   An SSH login to the Expert Shell on a gateway is a separate record:
+#       [alert:"Expert_Alert"; ...; administrator:"admin"; client_ip:"10.16.109.244";
+#        device_name:"CPFW-0001"; device_type:"GW"; operation:"Log In"; product:"Expert Shell";
+#        subject:"Administrator Expert Shell login"]
+#
+# Events covered:
+#   Administrator login to the management (SmartConsole, Web UI, WEB_API)   (SUCCESSFUL_LOGON)
+#   Administrator login failed                                             (FAILED_LOGON)
+#   Expert Shell (SSH) login on a gateway                                  (SUCCESSFUL_LOGON)
+#
+#   The management server (syslog host) or the gateway (`device_name`) is the
+#   destination; `client_ip` / `machine` the source.
+#
+# Remote access VPN sessions are in vpn/checkpoint-remote-access.yaml.
+#
+# References:
+#   https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_LoggingAndMonitoring_AdminGuide/Topics-LMG/Log-Exporter.htm
+#   Sample lines: Elastic integrations test fixtures (packages/checkpoint), synthetic
+# =============================================================================
+
+meta:
+  vendor: "Check Point"
+  product: "Management Server audit (Log Exporter syslog format)"
+  format: "RFC 5424 header + [key:\"value\"; key:\"value\"; ...]"
+  versions_tested: ["R81.x Log Exporter syslog format (sample lines)"]
+  description: "Administrator logins to the management server and Expert Shell logins on gateways"
+  author: "masstin community"
+  reference_url: "https://sc1.checkpoint.com/documents/R81/WebAdminGuides/EN/CP_R81_LoggingAndMonitoring_AdminGuide/Topics-LMG/Log-Exporter.htm"
+
+prefilter:
+  contains_any:
+    - 'operation:"Log In"'
+
+parsers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Administrator login failed (first: parsers are tried in order)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-admin-login-failed"
+    match:
+      contains: ['operation:"Log In"', 'subject:"Administrator Login"', 'audit_status:"Failure"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${syslog_host}"
+      event_type:         "FAILED_LOGON"
+      event_id:           "CP-ADMIN-LOGIN-FAIL"
+      subject_user_name:  ""
+      target_user_name:   "${administrator}"
+      target_domain_name: ""
+      workstation_name:   "${machine}"
+      ip_address:         "${client_ip}"
+      logon_type:         "MGMT"
+      filename:           "${__source_file}"
+      detail:             "Check Point admin login failed | product=${product} ${additional_info}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Administrator login to the management server
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-admin-login"
+    match:
+      contains: ['operation:"Log In"', 'subject:"Administrator Login"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${syslog_host}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "CP-ADMIN-LOGIN"
+      subject_user_name:  ""
+      target_user_name:   "${administrator}"
+      target_domain_name: ""
+      workstation_name:   "${machine}"
+      ip_address:         "${client_ip}"
+      logon_type:         "MGMT"
+      filename:           "${__source_file}"
+      detail:             "Check Point admin login | product=${product} ${additional_info}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Expert Shell login on a gateway (SSH)
+  # ─────────────────────────────────────────────────────────────────────────
+  - name: "checkpoint-expert-shell-login"
+    match:
+      contains: ['operation:"Log In"', 'product:"Expert Shell"']
+    extract:
+      type: regex
+      pattern: '^<\d+>\d+\s+(?P<ts>\S+)\s+(?P<syslog_host>\S+)\s+CheckPoint\s+\d+\s+-\s+\[(?P<body>.*)\]\s*$'
+    sub_extract:
+      field: "body"
+      type: keyvalue
+      pair_separator: "; "
+      kv_separator: ":"
+      trim: true
+    map:
+      time_created:       "${ts}"
+      computer:           "${device_name}"
+      event_type:         "SUCCESSFUL_LOGON"
+      event_id:           "CP-EXPERT-LOGIN"
+      subject_user_name:  ""
+      target_user_name:   "${administrator}"
+      target_domain_name: ""
+      workstation_name:   ""
+      ip_address:         "${client_ip}"
+      logon_type:         "SSH"
+      filename:           "${__source_file}"
+      detail:             "Check Point Expert Shell login | ${additional_info}"
