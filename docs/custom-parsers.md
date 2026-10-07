@@ -259,7 +259,7 @@ These are the columns of masstin's unified `LogData` schema — the same ones yo
 
 | Field | Typical use |
 |---|---|
-| `time_created` | Event timestamp, ideally in the vendor's own format (masstin preserves it as-is). Everything downstream reads ISO / RFC 3339 (`2026-03-15T10:00:00Z`, `2026-03-15 10:00:00`), C asctime (`Fri May 31 17:35:42 2019`, Zscaler) and Unix epochs in seconds, ms, µs or ns (Cloudflare) |
+| `time_created` | Event timestamp. ISO / RFC 3339 values (`2026-03-15T10:00:00Z`, `2026-03-15 10:00:00`, with or without fraction and offset) are written as they come. C asctime (`Fri May 31 17:35:42 2019`, Zscaler) and Unix epochs in seconds, ms, µs or ns (Cloudflare) are rewritten as ISO UTC (`2019-05-31T17:35:42Z`) so the CSV stays homogeneous. Anything else is written as it came and reported as unparseable by the loaders |
 | `computer` | Destination machine / device the event happened on (e.g. firewall name, gateway name) |
 | `event_type` | One of `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
 | `event_id` | Short identifier of the event flavour (e.g. `GP-GW-AUTH-SUCC`) |

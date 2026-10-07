@@ -40,9 +40,52 @@ pub fn parse_fallback(raw: &str) -> Option<NaiveDateTime> {
     None
 }
 
+/// What a parser writes into `time_created`: a value already in one of
+/// masstin's own shapes (RFC 3339, `YYYY-MM-DDTHH:MM:SS[.f][Z]`,
+/// `YYYY-MM-DD HH:MM:SS[.f]`) is kept exactly as it came; a value only the
+/// fallback understands (asctime, epoch) is rewritten as ISO UTC so the
+/// CSV stays homogeneous; anything else is kept as it came and will be
+/// reported as unparseable downstream.
+pub fn normalise_for_csv(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if chrono::DateTime::parse_from_rfc3339(t).is_ok() || chrono::DateTime::parse_from_rfc3339(&t.replacen(' ', "T", 1)).is_ok() {
+        return t.to_string();
+    }
+    let bare = t.trim_end_matches('Z').replacen(' ', "T", 1);
+    for f in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if NaiveDateTime::parse_from_str(&bare, f).is_ok() {
+            return t.to_string();
+        }
+    }
+    match parse_fallback(t) {
+        Some(dt) => {
+            if dt.and_utc().timestamp_subsec_nanos() == 0 {
+                dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+            } else {
+                dt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()
+            }
+        }
+        None => t.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_fallback;
+    use super::{normalise_for_csv, parse_fallback};
+
+    #[test]
+    fn csv_values_come_out_iso() {
+        assert_eq!(normalise_for_csv("Fri May 31 17:35:42 2019"), "2019-05-31T17:35:42Z");
+        assert_eq!(normalise_for_csv("1684862313"), "2023-05-23T17:18:33Z");
+        assert_eq!(normalise_for_csv("1684862313500"), "2023-05-23T17:18:33.500Z");
+        assert_eq!(normalise_for_csv("2023-05-24T02:48:33+09:30"), "2023-05-24T02:48:33+09:30", "masstin's own shapes are kept as they come");
+        assert_eq!(normalise_for_csv("2020-09-19T03:21:47.000Z"), "2020-09-19T03:21:47.000Z");
+        assert_eq!(normalise_for_csv("2020-09-19 03:21:47"), "2020-09-19 03:21:47");
+        assert_eq!(normalise_for_csv("not a date"), "not a date");
+    }
 
     #[test]
     fn asctime_and_epoch() {
