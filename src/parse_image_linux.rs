@@ -67,7 +67,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     let mut all_image_files: Vec<String> = files.to_vec();
 
     // Scan directories for forensic images
-    let image_extensions = ["e01", "ex01", "vmdk", "dd", "raw", "img", "001"];
+    let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "dd", "raw", "img", "001"];
     for dir in directories {
         crate::banner::print_info(&format!("Scanning {} for forensic images...", dir));
         scan_for_images(Path::new(dir), &image_extensions, &mut all_image_files, 0);
@@ -145,6 +145,10 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
                 crate::banner::print_info(&format!("Image format: VMDK ({})", image_path));
                 extract_logs_from_image_vmdk(image_path, &temp_dir)
             }
+            "vhd" | "vhdx" => {
+                crate::banner::print_info(&format!("Image format: {} ({})", ext.to_uppercase(), image_path));
+                extract_logs_from_image_vhd(image_path, &temp_dir)
+            }
             "dd" | "raw" | "img" | "001" => {
                 crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
                 extract_logs_from_image_raw(image_path, &temp_dir)
@@ -207,6 +211,14 @@ fn extract_logs_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Pat
     let image_size = reader.total_size();
     crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
 
+    let mut buf_reader = BufReader::new(reader);
+    extract_logs_from_seekable(&mut buf_reader, image_size, image_path, temp_dir)
+}
+
+fn extract_logs_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
+    let (reader, image_size) = crate::vhd::open_virtual_disk(image_path)
+        .map_err(|e| format!("Cannot open virtual disk: {}", e))?;
+    crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
     let mut buf_reader = BufReader::new(reader);
     extract_logs_from_seekable(&mut buf_reader, image_size, image_path, temp_dir)
 }

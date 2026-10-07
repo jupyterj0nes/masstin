@@ -85,20 +85,28 @@ jobs:
           python3 .github/scripts/normalize_timeline.py out/samples.csv EVTX-ATTACK-SAMPLES | tee -a out/hashes.txt
           echo "hunt rows: $(wc -l < out/hunt.csv)" | tee -a out/hashes.txt
 
-      - name: Build an NTFS disk image from the samples and parse it (Windows only)
+      - name: Build NTFS disk images from the samples and parse them (Windows only)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          .github/scripts/build-ntfs-image.ps1 -Samples samples/EVTX-to-MITRE-Attack -Out out/evtx-samples.raw
+          .github/scripts/build-ntfs-image.ps1 -Samples samples/EVTX-to-MITRE-Attack -Out out/evtx-samples.raw -Format raw
+          .github/scripts/build-ntfs-image.ps1 -Samples samples/EVTX-to-MITRE-Attack -Out out/evtx-samples.vhd -Format vhd -Type expandable
+          .github/scripts/build-ntfs-image.ps1 -Samples samples/EVTX-to-MITRE-Attack -Out out/evtx-samples.vhdx -Format vhdx -Type expandable
           target/release/masstin.exe -a parse-image -f out/evtx-samples.raw -o out/image.csv --overwrite
+          target/release/masstin.exe -a parse-image -f out/evtx-samples.vhd -o out/vhd.csv --overwrite
+          target/release/masstin.exe -a parse-image -f out/evtx-samples.vhdx -o out/vhdx.csv --overwrite
           python .github/scripts/normalize_timeline.py out/image.csv evtx-samples.raw | Tee-Object -Append out/hashes.txt
+          python .github/scripts/normalize_timeline.py out/vhd.csv evtx-samples.vhd | Tee-Object -Append out/hashes.txt
+          python .github/scripts/normalize_timeline.py out/vhdx.csv evtx-samples.vhdx | Tee-Object -Append out/hashes.txt
 
-      - name: Upload the disk image for the other operating systems
+      - name: Upload the disk images for the other operating systems
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ntfs-image
-          path: out/evtx-samples.raw
+          path: |
+            out/evtx-samples.raw
+            out/evtx-samples.vhd
           retention-days: 3
 
       - name: Parse with the Intel binary under Rosetta (macOS only)
@@ -148,13 +156,16 @@ jobs:
           set -euo pipefail
           mkdir -p out
           target/release/masstin -a parse-image -f img/evtx-samples.raw -o out/image.csv --overwrite
+          target/release/masstin -a parse-image -f img/evtx-samples.vhd -o out/vhd.csv --overwrite
           python3 .github/scripts/normalize_timeline.py out/image.csv evtx-samples.raw | tee out/hashes.txt
+          python3 .github/scripts/normalize_timeline.py out/vhd.csv evtx-samples.vhd | tee -a out/hashes.txt
       - name: Upload normalised timeline
         uses: actions/upload-artifact@v4
         with:
           name: image-${{ matrix.os }}
           path: |
             out/image.csv.norm
+            out/vhd.csv.norm
             out/hashes.txt
 
   compare:
@@ -170,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in mitre.csv.norm samples.csv.norm image.csv.norm; do
+          for f in mitre.csv.norm samples.csv.norm image.csv.norm vhd.csv.norm; do
             echo "== $f"
             sha256sum all/*/"$f"
             n=$(sha256sum all/*/"$f" | awk '{print $1}' | sort -u | wc -l)
@@ -186,10 +197,11 @@ jobs:
               i = r[0].index('log_filename')
               return [tuple(x[:i] + x[i+1:]) for x in r[1:]]
           a = rows(glob.glob('all/timelines-ubuntu-latest/mitre.csv.norm')[0])
-          b = rows(glob.glob('all/image-ubuntu-latest/image.csv.norm')[0])
-          print(f'loose files: {len(a)} rows; disk image: {len(b)} rows')
-          if a != b:
-              print('::error::parse-image and parse-windows disagree on the same EVTX set'); sys.exit(1)
+          for name, pat in [('raw image', 'all/image-ubuntu-latest/image.csv.norm'), ('dynamic VHD', 'all/image-ubuntu-latest/vhd.csv.norm'), ('dynamic VHDX', 'all/timelines-windows-latest/vhdx.csv.norm')]:
+              b = rows(glob.glob(pat)[0])
+              print(f'loose files: {len(a)} rows; {name}: {len(b)} rows')
+              if a != b:
+                  print(f'::error::parse-image on the {name} and parse-windows disagree on the same EVTX set'); sys.exit(1)
           PY
           cat all/*/hashes.txt
           echo "All three operating systems produced the same timelines."

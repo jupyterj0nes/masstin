@@ -110,7 +110,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Scan real directories for forensic images (E01, VMDK, dd, raw)
     if !real_dirs.is_empty() {
-        let image_extensions = ["e01", "ex01", "vmdk", "dd", "raw", "img", "001"];
+        let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "dd", "raw", "img", "001"];
         let mut discovered: Vec<String> = Vec::new();
 
         let sp = crate::banner::create_spinner("Scanning for forensic images...");
@@ -236,6 +236,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let size_bytes: Option<u64> = if ext == "vmdk" {
             crate::vmdk::VmdkReader::probe_size(image_path)
                 .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+        } else if ext == "vhd" {
+            // a dynamic VHD's file size says nothing about the disk
+            crate::vhd::VhdReader::probe_size(image_path)
+                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+        } else if ext == "vhdx" {
+            crate::vhd::VhdxReader::probe_size(image_path)
+                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
         } else {
             fs::metadata(image_path).ok().map(|m| m.len())
         };
@@ -260,6 +267,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let result = match ext.as_str() {
             "e01" | "ex01" => extract_evtx_from_image_ewf(image_path, &temp_dir),
             "vmdk" => extract_evtx_from_image_vmdk(image_path, &temp_dir),
+            "vhd" | "vhdx" => extract_evtx_from_image_vhd(image_path, &temp_dir),
             "dd" | "raw" | "img" | "001" => extract_evtx_from_image_raw(image_path, &temp_dir),
             _ => extract_evtx_from_image_raw(image_path, &temp_dir)
                     .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
@@ -642,7 +650,7 @@ fn is_ewf_segment_ext(ext: &str) -> bool {
 fn entry_is_image(name: &str) -> bool {
     let fname = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
     let ext = match fname.rsplit_once('.') { Some((_, e)) => e.to_ascii_lowercase(), None => return false };
-    matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "dd" | "raw" | "img")
+    matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img")
         || is_ewf_segment_ext(&ext)
         || (ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit())) // split raw .001/.002/...
 }
@@ -1256,6 +1264,17 @@ fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Ext
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
     }
 
+    let mut buf_reader = BufReader::new(reader);
+    extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
+}
+
+/// Extract EVTX from a VHD (fixed or dynamic) or VHDX (fixed or dynamic)
+fn extract_evtx_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
+    let (reader, image_size) = crate::vhd::open_virtual_disk(image_path)
+        .map_err(|e| format!("Cannot open virtual disk: {}", e))?;
+    if is_debug_mode() {
+        eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
+    }
     let mut buf_reader = BufReader::new(reader);
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }

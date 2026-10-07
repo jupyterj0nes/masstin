@@ -12,7 +12,7 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 | Loose EVTX files and directories | ✅ | ❌ | ✅ |
 | Recursive ZIP walk (unlimited nesting) | ✅ | ❌ | ✅ |
 | `Provider.Name` fallback for archived / renamed EVTX | ✅ | ✅ | ✅ |
-| Forensic disk images (E01, VMDK, raw, dd, img) | ❌ | ✅ | ✅ |
+| Forensic disk images (E01, VMDK, VHD/VHDX, raw, dd, img) | ❌ | ✅ | ✅ |
 | NTFS walker → `winevt/Logs` + VSS recovery | ❌ | ✅ | ✅ |
 | UAL databases (`LogFiles/Sum/*.mdb`) | ❌ | ✅ | ✅ |
 | Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
@@ -23,7 +23,7 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 Rule of thumb:
 
 - **Folder / ZIP / single EVTX** → `parse-windows`
-- **Forensic image** (`.e01`, `.vmdk`, `.raw`) → `parse-image`
+- **Forensic image** (`.e01`, `.vmdk`, `.vhd`, `.vhdx`, `.raw`) → `parse-image`
 - **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
 
 In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
@@ -91,7 +91,7 @@ Rotated logs are handled the way logrotate leaves them: `secure-20240616`, `mess
 
 All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
 
-Supports **E01**, **dd/raw**, and **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi). Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+Supports **E01**, **dd/raw**, **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi) and **VHD / VHDX** (fixed and dynamic; differencing disks with a parent must be merged first). Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ```bash
 # Single image — auto-detects OS
@@ -110,7 +110,7 @@ masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o inci
 
 ## Bulk evidence processing — one command, entire incident
 
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, and dd/raw files. Each image is opened, partitions are auto-detected (NTFS or ext4), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files. Each image is opened, partitions are auto-detected (NTFS or ext4), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
 
 ```bash
 # Scan an entire evidence folder — finds all images, any OS

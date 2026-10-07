@@ -48,6 +48,7 @@ pub use crate::parse_carve::validate_evtx_file;
 pub mod parse_custom;
 pub mod filter;
 pub mod vmdk;
+pub mod vhd;
 pub use crate::vmdk::*;
 mod graph_hunt;
 mod graph_hunt_common;
@@ -67,7 +68,7 @@ pub struct Cli {
     #[arg(short, long)]
     directory: Vec<String>,
 
-    /// Individual files to process (EVTX, JSON, .mdb, E01, dd/raw)
+    /// Individual files to process (EVTX, JSON, .mdb, E01, VMDK, VHD/VHDX, dd/raw)
     #[arg(short, long)]
     file: Vec<String>,
 
@@ -328,7 +329,7 @@ enum ActionType {
     ParseCortexEvtxForensics,
     /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
-    /// Parse from forensic images (E01/dd/VMDK), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
+    /// Parse from forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
     /// MASSIVE mode: process EVERYTHING — forensic images + triage packages + loose EVTX/logs. Point at evidence folder, get a timeline. No mercy.
@@ -705,7 +706,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
         ActionType::CarveImage => {
             if config.file.is_empty() {
                 return Err(String::from(
-                    "For carve-image, specify forensic image files with -f (E01/VMDK/dd).",
+                    "For carve-image, specify forensic image files with -f (E01/VMDK/VHD/VHDX/dd).",
                 ));
             }
         }

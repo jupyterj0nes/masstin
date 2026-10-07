@@ -118,6 +118,7 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
         let result = match ext.as_str() {
             "e01" | "ex01" => carve_from_ewf(image_path, image_name, &temp_dir, unalloc_only, skip_offsets),
             "vmdk" => carve_from_vmdk(image_path, image_name, &temp_dir, unalloc_only),
+            "vhd" | "vhdx" => carve_from_vhd(image_path, image_name, &temp_dir, unalloc_only),
             _ => carve_from_raw(image_path, image_name, &temp_dir, unalloc_only),
         };
 
@@ -603,6 +604,13 @@ fn carve_from_ewf_with_stall_detection(
     ));
 
     Ok((chunks_found, orphan_records, carved_evtx_files))
+}
+
+fn carve_from_vhd(path: &str, name: &str, temp_dir: &Path, unalloc: bool) -> Result<(usize, usize, Vec<String>), String> {
+    let (disk, size) = crate::vhd::open_virtual_disk(path)
+        .map_err(|e| format!("Cannot open virtual disk: {}", e))?;
+    let mut reader = BufReader::new(disk);
+    carve_from_seekable(&mut reader, size, name, temp_dir, unalloc)
 }
 
 fn carve_from_vmdk(path: &str, name: &str, temp_dir: &Path, unalloc: bool) -> Result<(usize, usize, Vec<String>), String> {
