@@ -318,55 +318,17 @@ pub async fn load_memgraph(
             );
         }
 
-        // ── Frequency map with 4778/4779 priority (x1000 weight) ──
-        let mut counts: HashMap<(String, String), u32> = HashMap::new();
-
-        for line in &processed_lines {
-            let parts: Vec<String> = line.split(',').map(|s| s.to_string()).collect();
-
-            // ── Direct evidence: (src_ip, src_computer) pair ──
-            if !local_values.contains(parts[idx_src_computer].as_str())
-                && !local_values.contains(parts[idx_src_ip].as_str())
-                && parts[idx_src_computer] != parts[idx_src_ip]
-            {
-                let weight: u32 = if parts[idx_event_id] == "4778" || parts[idx_event_id] == "4779" {
-                    1000
-                } else {
-                    1
-                };
-                *counts
-                    .entry((parts[idx_src_ip].clone(), parts[idx_src_computer].clone()))
-                    .or_insert(0) += weight;
-            }
-
-            // ── Machine-account hint: target_user ends in $ → computer name ──
-            // On Kerberos AD networks every machine has a computer account
-            // MACHINE$. When a 4624 arrives from an IP with src_computer
-            // empty and target_user=MACHINE$, that's strong evidence the IP
-            // belongs to MACHINE. Weight x100 sits between normal events
-            // (x1) and the authoritative 4778/4779 pair (x1000).
-            if local_values.contains(parts[idx_src_computer].as_str())
-                && !local_values.contains(parts[idx_src_ip].as_str())
-            {
-                let target_user = parts[idx_target_user].as_str();
-                if target_user.ends_with('$') && target_user.len() > 1 {
-                    let machine = &target_user[..target_user.len() - 1];
-                    // Reject if it still looks like an IP or has invalid chars
-                    if !looks_like_ip(machine) && !machine.contains('.') && !machine.is_empty() {
-                        *counts
-                            .entry((parts[idx_src_ip].clone(), machine.to_uppercase()))
-                            .or_insert(0) += 100;
-                    }
-                }
-            }
-        }
-
-        // ── Same-login IP/name co-occurrence (Linux) → resolved_name ──
-        // sshd (UseDNS) records the peer by name, auditd / btmp / wtmp keep
-        // its IP: the same login appears as two single-sided rows. A pair
-        // is only used to ANNOTATE the IP node (resolved_name), never to
-        // merge nodes, and only when every vote agrees and the votes are
-        // unlikely to be chance coincidences (graph_hunt_common::resolve).
+        // ── Same-login IP/name co-occurrence → machine identity ──
+        // The same login is often recorded twice on the destination, once
+        // by IP and once by name (sshd with UseDNS vs auditd / btmp / wtmp;
+        // a Windows event with the address vs one with the workstation
+        // name). Each such second is a vote "IP is NAME"; the binomial test
+        // in graph_hunt_common::resolve says whether the votes exceed what
+        // chance coincidences would give, Benjamini-Hochberg across every
+        // (IP, NAME) candidate, one unambiguous name per IP. That test, and
+        // nothing else, decides which IPs are merged into a name: it is the
+        // rule graph-hunt applies, so a loaded graph and graph-hunt-csv see
+        // the same machines.
         let mut cooc = crate::graph_hunt_common::resolve::CoocCollector::new();
         for line in &processed_lines {
             let parts: Vec<&str> = line.split(',').collect();
@@ -390,20 +352,16 @@ pub async fn load_memgraph(
         let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
         drop(cooc);
 
-        // ── Global IP→hostname map ──
-        let mut ip_to_host: HashMap<String, String> = HashMap::new();
-        {
-            let mut best: HashMap<String, (String, u32)> = HashMap::new();
-            for ((ip, host), weight) in &counts {
-                let entry = best.entry(ip.clone()).or_insert((host.clone(), 0));
-                if *weight > entry.1 {
-                    *entry = (host.clone(), *weight);
-                }
-            }
-            for (ip, (host, _)) in best {
-                ip_to_host.insert(ip, host);
-            }
-        }
+        // ── IP → host name map: the test above, and nothing else ──
+        // Until October 2026 a frequency map of (src_ip, src_computer) pairs,
+        // weighted x1000 for 4778/4779 and x100 for machine accounts, chose
+        // the name instead. It took the most frequent name, so a renamed
+        // machine kept its old name alive as a second node and the loaded
+        // graph disagreed with the hunt run on the CSV.
+        let ip_to_host: HashMap<String, String> = resolved_names
+            .iter()
+            .map(|(ip, (name, _, _))| (ip.clone(), name.clone()))
+            .collect();
 
         // ── Edge emission: either grouped or ungrouped ──
         let mut edges_to_emit: Vec<String> = Vec::new();
@@ -720,8 +678,10 @@ pub async fn load_memgraph(
             let vts: Vec<i64> = ips.iter().map(|i| resolved_names[i].1 as i64).collect();
             let pch: Vec<f64> = ips.iter().map(|i| resolved_names[i].2).collect();
             let q_annot = "UNWIND range(0, size($ips) - 1) AS i \
-                           MATCH (h:host {name: $ips[i]}) \
-                           SET h.resolved_name = $names[i], h.resolved_votes = $votes[i], h.resolved_p = $pch[i]";
+                           MATCH (h:host {name: $names[i]}) \
+                           SET h.aliases = coalesce(h.aliases, []) + [$ips[i]], \
+                               h.alias_votes = coalesce(h.alias_votes, []) + [$votes[i]], \
+                               h.alias_p = coalesce(h.alias_p, []) + [$pch[i]]";
             match graph
                 .execute(query(q_annot).param("ips", ips).param("names", names).param("votes", vts).param("pch", pch))
                 .await
@@ -730,12 +690,12 @@ pub async fn load_memgraph(
                     let _ = r.next().await;
                     crate::banner::print_phase_detail(
                         "IP nodes:",
-                        &format!("{} IPs annotated with resolved_name (unanimous same-login evidence, chance coincidence significant at FDR {}; nodes not merged)", resolved_names.len(), alpha),
+                        &format!("{} IP(s) folded into a host name by the same-login test (chance coincidence significant at FDR {}); the host node lists them in `aliases`", resolved_names.len(), alpha),
                     );
                 }
                 Err(e) => {
                     if crate::parse::is_debug_mode() {
-                        eprintln!("[ERROR] resolved_name annotation failed: {:?}", e);
+                        eprintln!("[ERROR] aliases annotation failed: {:?}", e);
                     }
                 }
             }
