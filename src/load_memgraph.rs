@@ -91,17 +91,25 @@ struct ResolvedEdge {
 /// MERGE-scan term.
 const EDGE_BATCH: usize = 5_000;
 
-/// Strip timezone suffix for Memgraph localDateTime().
-/// Handles: "Z", "+00:00", "-05:00", etc.
+/// The form Memgraph's localDateTime() takes: timezone suffix ("Z",
+/// "+00:00", "-05:00") removed and the fraction of a second cut or padded
+/// to 6 digits. Memgraph accepts 0, 3 or 6 digits only; EVTX times carry 7
+/// (100 ns) and other sources 9, and a single such value failed its whole
+/// batch of edges.
 fn strip_timezone(ts: &str) -> String {
-    let ts = ts.trim_end_matches('Z');
+    let mut ts = ts.trim_end_matches('Z');
     if ts.len() > 6 {
         let tail = &ts[ts.len()-6..];
         if (tail.starts_with('+') || tail.starts_with('-')) && tail.contains(':') {
-            return ts[..ts.len()-6].to_string();
+            ts = &ts[..ts.len()-6];
         }
     }
-    ts.to_string()
+    match ts.split_once('.') {
+        Some((whole, frac)) if frac.bytes().all(|c| c.is_ascii_digit()) && !frac.is_empty() => {
+            format!("{}.{:0<6}", whole, &frac[..frac.len().min(6)])
+        }
+        _ => ts.to_string(),
+    }
 }
 
 use crate::load_neo4j::{extract_leading_ip, looks_like_ip};
@@ -330,28 +338,14 @@ pub async fn load_memgraph(
         // nothing else, decides which IPs are merged into a name: it is the
         // rule graph-hunt applies, so a loaded graph and graph-hunt-csv see
         // the same machines.
-        let mut cooc = crate::graph_hunt_common::resolve::CoocCollector::new();
-        for line in &processed_lines {
-            let parts: Vec<&str> = line.split(',').collect();
-            let sc = parts[idx_src_computer];
-            let si = parts[idx_src_ip];
-            let side = if local_values.contains(sc) && !local_values.contains(si) && looks_like_ip(si) {
-                Some((si, true))
-            } else if !local_values.contains(sc) && local_values.contains(si) && !looks_like_ip(sc) {
-                Some((sc, false))
-            } else { None };
-            if let Some((v, is_ip)) = side {
-                // only authentication outcomes with a named account can
-                // vote (see load_neo4j)
-                let et = idx_event_type.map(|i| parts[i]).unwrap_or("");
-                let user = parts[idx_target_user];
-                if (et == "SUCCESSFUL_LOGON" || et == "FAILED_LOGON") && !user.is_empty() && user != "\"\"" && user != "NO_USER" {
-                    cooc.add(parts[idx_dst], user, parts[0], et, v, is_ip);
+        let resolved_names: HashMap<String, (String, u32, f64)> =
+            match crate::graph_hunt_common::engine::ip_names_for_csv(&[file.to_string()], alpha) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[ERROR] same-login test on {}: {}", file, e);
+                    HashMap::new()
                 }
-            }
-        }
-        let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
-        drop(cooc);
+            };
 
         // ── IP → host name map: the test above, and nothing else ──
         // Until October 2026 a frequency map of (src_ip, src_computer) pairs,
@@ -605,6 +599,7 @@ pub async fn load_memgraph(
         }
 
         let mut errors: usize = 0;
+        let mut reported_error = false;
         for (rel_type, edges) in &by_type {
             for chunk in edges.chunks(EDGE_BATCH) {
                 let q_str = format!(
@@ -616,7 +611,8 @@ pub async fn load_memgraph(
                      target_user_name: $target_user_name[i], target_domain_name: $target_domain_name[i], \
                      subject_user_name: $subject_user_name[i], subject_domain_name: $subject_domain_name[i], \
                      event_type: $event_type[i], event_id: $event_id[i], log_source: $log_source[i], \
-                     logon_id: $logon_id[i], count: $count[i]}}]->(d)",
+                     logon_id: $logon_id[i], count: $count[i]}}]->(d) \
+                     RETURN count(r) AS created",
                     edge_op, rel_type,
                 );
                 let q = query(&q_str)
@@ -635,12 +631,26 @@ pub async fn load_memgraph(
                     .param("log_source", chunk.iter().map(|e| e.log_source.clone()).collect::<Vec<String>>())
                     .param("logon_id", chunk.iter().map(|e| e.logon_id.clone()).collect::<Vec<String>>())
                     .param("count", chunk.iter().map(|e| e.count).collect::<Vec<i64>>());
-                match graph.execute(q).await {
-                    Ok(mut result) => { let _ = result.next().await; }
+                // Count what the server created: an error is often raised
+                // only when the result is read, and an edge whose endpoint
+                // MATCH finds nothing is dropped without one.
+                let outcome = match graph.execute(q).await {
+                    Ok(mut result) => match result.next().await {
+                        Ok(Some(row)) => Ok(row.get::<i64>("created").unwrap_or(0).max(0) as usize),
+                        Ok(None) => Ok(0),
+                        Err(e) => Err(format!("{:?}", e)),
+                    },
+                    Err(e) => Err(format!("{:?}", e)),
+                };
+                match outcome {
+                    Ok(created) => errors += chunk.len().saturating_sub(created),
                     Err(e) => {
                         errors += chunk.len();
-                        if crate::parse::is_debug_mode() {
-                            eprintln!("[ERROR] edge batch ({} edges, r:{}) failed: {:?}", chunk.len(), rel_type, e);
+                        if !reported_error || crate::parse::is_debug_mode() {
+                            crate::banner::print_warning(&format!(
+                                "  edge batch of {} (r:{}) not loaded: {}", chunk.len(), rel_type, e
+                            ));
+                            reported_error = true;
                         }
                     }
                 }
@@ -666,7 +676,9 @@ pub async fn load_memgraph(
             let q_cov = "UNWIND range(0, size($names) - 1) AS i                          MATCH (h:host {name: $names[i]})                          SET h.cov_ok = $oks[i], h.cov_fail = $fails[i]";
             match graph.execute(query(q_cov).param("names", names).param("oks", oks).param("fails", fails)).await {
                 Ok(mut r) => {
-                    let _ = r.next().await;
+                    if let Err(e) = r.next().await {
+                        eprintln!("[ERROR] coverage annotation failed: {:?}", e);
+                    }
                     crate::banner::print_phase_detail("Coverage:", &format!("{} destination node(s) annotated with log-file time spans (cov_ok / cov_fail)", per_dst.len()));
                 }
                 Err(e) => eprintln!("[ERROR] coverage annotation failed: {:?}", e),
@@ -703,5 +715,19 @@ pub async fn load_memgraph(
         }
         let loaded = edge_total - errors;
         crate::banner::print_load_summary("Memgraph", loaded, resolved, errors, start_clock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_timezone;
+
+    #[test]
+    fn times_take_the_form_memgraph_accepts() {
+        assert_eq!(strip_timezone("2021-04-23T10:12:22.1234567Z"), "2021-04-23T10:12:22.123456");
+        assert_eq!(strip_timezone("2021-04-23T10:12:22.123456789+02:00"), "2021-04-23T10:12:22.123456");
+        assert_eq!(strip_timezone("2021-04-23T10:12:22.1Z"), "2021-04-23T10:12:22.100000");
+        assert_eq!(strip_timezone("2021-04-23T10:12:22Z"), "2021-04-23T10:12:22");
+        assert_eq!(strip_timezone("2021-04-23T10:12:22-05:00"), "2021-04-23T10:12:22");
     }
 }

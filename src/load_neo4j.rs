@@ -334,7 +334,6 @@ fn streaming_pass1(
     // machine becomes two graph nodes and its history is split in half.
     // Key: (dst, user, second, event_type) -> (ips, names), single-sided
     // rows only.
-    let mut cooc = crate::graph_hunt_common::resolve::CoocCollector::new();
     let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
 
     let file = File::open(path)?;
@@ -352,28 +351,6 @@ fn streaming_pass1(
                     if v.contains('.') && !looks_like_ip(v) {
                         if let Some(short) = v.split('.').next() {
                             fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
-                        }
-                    }
-                }
-                {
-                    let sc = parts[idx.src_computer].as_str();
-                    let si = parts[idx.src_ip].as_str();
-                    let sc_local = local_values.contains(sc);
-                    let si_local = local_values.contains(si);
-                    let side = if sc_local && !si_local && looks_like_ip(si) {
-                        Some((si.to_string(), true))
-                    } else if !sc_local && si_local && !looks_like_ip(sc) {
-                        Some((sc.to_string(), false))
-                    } else { None };
-                    if let Some((v, is_ip)) = side {
-                        // only authentication outcomes with a named
-                        // account can vote; pre-auth touches and session
-                        // ends are skipped (they were 80 % of the rows and
-                        // exhausted memory on a 12 M-row timeline)
-                        let et = if idx.event_type == NONE_COL { "" } else { parts[idx.event_type].as_str() };
-                        let user = parts[idx.target_user].as_str();
-                        if (et == "SUCCESSFUL_LOGON" || et == "FAILED_LOGON") && !user.is_empty() && user != "\"\"" && user != "NO_USER" {
-                            cooc.add(&parts[idx.dst], user, &parts[0], et, &v, is_ip);
                         }
                     }
                 }
@@ -401,8 +378,12 @@ fn streaming_pass1(
     // machine's old name alive as a second node). The IP node that is
     // folded still carries `resolved_name` / `resolved_votes` /
     // `resolved_p` so the analyst can see why.
-    let resolved_names: HashMap<String, (String, u32, f64)> = cooc.resolve(alpha);
-    drop(cooc);
+    // The same-login test runs on the corpus graph-hunt builds from this
+    // file (same origins, names, accounts): feeding it only the rows with
+    // a single source side under-counted each name's login rate and folded
+    // IPs graph-hunt-csv does not.
+    let resolved_names: HashMap<String, (String, u32, f64)> =
+        crate::graph_hunt_common::engine::ip_names_for_csv(&[path.to_string()], alpha)?;
     // Short names shared by two or more different FQDNs stay fully
     // qualified; everything collected above is mapped to its final name.
     let ambiguous: HashSet<String> = fqdn_by_short
@@ -557,7 +538,15 @@ async fn flush_batch(
             // silently by Cypher and must show up as an error here.
             let created: usize = match result.next().await {
                 Ok(Some(row)) => row.get::<i64>("created").unwrap_or(0).max(0) as usize,
-                _ => chunk.len(),
+                Ok(None) => 0,
+                // an error raised while the result is read: the batch was
+                // not written (it used to be counted as loaded)
+                Err(e) => {
+                    crate::banner::print_warning(&format!(
+                        "  edge batch of {} (r:{}) not loaded: {:?}", chunk.len(), rel_type, e
+                    ));
+                    0
+                }
             };
             let missing = chunk.len().saturating_sub(created);
             if missing > 0 && crate::parse::is_debug_mode() {
