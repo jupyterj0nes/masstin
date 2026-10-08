@@ -103,6 +103,13 @@ pub(crate) static PREAUTH_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
 /// "Invalid user admin from 203.0.113.9 [port 4242]": sshd names an
 /// account that does not exist on the host. The account may contain
 /// spaces (scanners send " 0101"). Captures: 1 user, 2 source.
+pub(crate) static PREAUTH_PORT_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:Connection closed by|Connection reset by)\s+([0-9A-Fa-f][0-9A-Fa-f:.]*)\s+port\s+\d+"#).unwrap()
+});
+pub(crate) static PREAUTH_TIMEOUT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:Timeout before authentication for connection from\s+|drop connection .*? from \[)([0-9A-Fa-f][0-9A-Fa-f:.]*)"#).unwrap()
+});
+
 pub(crate) static INVALID_USER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?:^|: )Invalid user (.*?) from (\S+?)(?: port \d+)?\s*$"#).unwrap());
 
@@ -174,6 +181,12 @@ pub(crate) fn preauth_touch(msg: &str) -> Option<(String, String)> {
     if let Some(c) = PREAUTH_BADPROTO_RE.captures(msg) {
         return Some((clean(&c[1]), "preauth-bad-proto".into()));
     }
+    if let Some(c) = PREAUTH_TIMEOUT_RE.captures(msg) {
+        return Some((clean(&c[1]), "preauth-timeout".into()));
+    }
+    if let Some(c) = PREAUTH_PORT_CLOSED_RE.captures(msg) {
+        return Some((clean(&c[1]), "preauth-closed".into()));
+    }
     if let Some(c) = PREAUTH_CLOSED_RE.captures(msg) {
         let d = match (c.get(1).map(|k| k.as_str()), c.get(2)) {
             (Some("invalid"), Some(u)) => format!("preauth-closed invalid-user={}", u.as_str()),
@@ -241,7 +254,7 @@ impl SessionTracker {
 // several possible fields: acct="...", id=<uid>, AUID="...", UID="...".
 static AUDIT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"type=(USER_AUTH|USER_LOGIN|USER_ACCT|USER_START|USER_END).*?addr=([\d\.:a-fA-F]+).*?res=(\w+)"#,
+        r#"type=(USER_AUTH|USER_LOGIN|USER_ACCT|USER_START|USER_END|USER_ERR).*?addr=([\d\.:a-fA-F]+).*?res=(\w+)"#,
     )
     .unwrap()
 });
@@ -1147,7 +1160,7 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         // Only USER_LOGIN (outcome), USER_END (session end) and, as
         // fallback, USER_AUTH (PAM stage). USER_ACCT / USER_START fire once
         // more per session and would double-count.
-        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" && evt_type != "USER_END" {
+        if evt_type != "USER_LOGIN" && evt_type != "USER_AUTH" && evt_type != "USER_END" && evt_type != "USER_ERR" {
             continue;
         }
 
@@ -2453,5 +2466,14 @@ mod repeated_tests {
         assert_eq!(v[0], "Sep 25 10:11:12 host sshd[12]: Failed password for root from 10.0.0.9 port 1 ssh2");
         let plain = "Sep 25 10:11:12 host sshd[12]: Accepted publickey for u from 10.0.0.9 port 1 ssh2".to_string();
         assert_eq!(expand_repeated(plain.clone()), vec![plain]);
+    }
+
+    #[test]
+    fn port_scan_and_timeouts_are_captured() {
+        use super::{PREAUTH_PORT_CLOSED_RE, PREAUTH_TIMEOUT_RE};
+        assert!(PREAUTH_PORT_CLOSED_RE.is_match("Connection closed by 10.240.240.86 port 23048"));
+        assert_eq!(&PREAUTH_PORT_CLOSED_RE.captures("Connection closed by 10.240.240.86 port 23048").unwrap()[1], "10.240.240.86");
+        assert!(PREAUTH_TIMEOUT_RE.is_match("Timeout before authentication for connection from 10.240.240.86 to 10.247.48.12, pid = 770043"));
+        assert!(PREAUTH_TIMEOUT_RE.is_match("drop connection #0 from [10.240.240.86]:40399 on [10.247.48.12]:22 penalty: exceeded LoginGraceTime"));
     }
 }
