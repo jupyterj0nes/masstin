@@ -170,6 +170,7 @@ pub async fn parse_cortex_evtx_forensics_data(
                         "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
                         "Microsoft-Windows-SMBServer/Security",
                         "Microsoft-Windows-SmbClient/Security",
+                        "Microsoft-Windows-SmbClient/Connectivity",
                         "Microsoft-Windows-TerminalServices-RDPClient/Operational",
                         "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
                         "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational",
@@ -177,51 +178,63 @@ pub async fn parse_cortex_evtx_forensics_data(
                         "Microsoft-Windows-WMI-Activity/Operational")
                     | filter message not in ("""::""", null, """""","-")
                     | alter lt = if(
-                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión|Anmeldetyp|Type d.ouverture de session|Tipo di accesso):\s*(\d+)"), 0),
+                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión|Anmeldetyp|Type d.ouverture de session|Tipo di accesso):[ \t]*(\d+)"), 0),
                         event_id = 4648, "runas",
                         event_id in (21,22,24,25,1024,1102,1149,131,4778,4779), "10",
                         event_id in (6,5858), "",
                         "3")
                     | alter srcip = if(
-                        event_id in (4624,4625,21,22,24,25,1149,1009,551), arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Quellnetzwerkadresse|Adresse du réseau source|Indirizzo di rete di origine|Client Name|Nombre de.? cliente|Clientname|Nom du client|Nome client):\s*\\*([\w.-]+)"), 0),
-                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Source Address|Dirección de origen|Quelladresse|Adresse source|Indirizzo di origine):\s*([\w.:-]+)"), 0),
+                        event_id = 1149, coalesce(arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Quellnetzwerkadresse|Adresse du réseau source|Indirizzo di rete di origine):[ \t]*([\w.:-][\w.:%-]*)"), 0), arrayindex(regextract(message, "(?im)^[ \t]*(?:Domain|Dominio|Domäne|Domaine):[ \t]*([0-9]{{1,3}}(?:\.[0-9]{{1,3}}){{3}}|[0-9A-Fa-f]*:[0-9A-Fa-f:.%]+)[ \t]*\r?$"), 0)),
+                        event_id in (4624,4625,21,22,24,25,1009,551), arrayindex(regextract(message, "(?i)(?:Source Network Address|Dirección de red de origen|Quellnetzwerkadresse|Adresse du réseau source|Indirizzo di rete di origine|Client Name|Nombre de.? cliente|Clientname|Nom du client|Nome client):[ \t]*\\*([\w.:-][\w.:%-]*)"), 0),
+                        event_id in (4768,4769,4770,4771,4778,4779), arrayindex(regextract(message, "(?i)Client Address:[ \t]*([\w.:-][\w.:%-]*)"), 0),
+                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Source Address|Dirección de origen|Quelladresse|Adresse source|Indirizzo di origine):[ \t]*([\w.:-]+)"), 0),
                         event_id = 131, arrayindex(regextract(message, "(?i)from client\s+([^:\s]+)"), 0),
                         event_id = 5858, arrayindex(regextract(message, "ClientMachine\s*=\s*([\w.\-$]+)"), 0))
                     | alter process = if(
-                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso|Prozessname|Nom du processus|Nome processo|Nome del processo):\s*([^\r\n]+)"), 0),
-                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):\s*(\S+)"), 0),
+                        event_id in (4624,4648), arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso|Prozessname|Nom du processus|Nome processo|Nome del processo):[ \t]*([^\s][^\r\n]*)"), 0),
+                        event_id = 5140, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):[ \t]*(\S+)"), 0),
                         event_id = 5858, arrayindex(regextract(message, "Operation\s*=\s*([^;]{{1,120}})"), 0),
                         event_id = 6,    arrayindex(regextract(message, "(?i)connection\s*[:=]?\s*(\S+)"), 0),
-                        event_id = 4625, arrayindex(regextract(message, "(?i)(?:Sub Status|Subestado|Unterstatus|Sous-état|Sottostato):\s*(0x[0-9a-f]+)"), 0))
+                        event_id = 4625, arrayindex(regextract(message, "(?i)(?:Sub Status|Subestado|Unterstatus|Sous-état|Sottostato):[ \t]*(0x[0-9a-f]+)"), 0))
                     | alter source_host = if(
-                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo|Arbeitsstationsname|Nom de la station de travail|Nome workstation|Nome stazione di lavoro):\s*\\*([\w.-]+)"), 0),
-                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Source Workstation|Estación de trabajo de origen|Quellarbeitsstation|Station de travail source|Workstation di origine):\s*([\w.-]+)"), 0),
-                        event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102), host_name)
+                        event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Workstation Name|Nombre de estación de trabajo|Arbeitsstationsname|Nom de la station de travail|Nome workstation|Nome stazione di lavoro):[ \t]*\\*([\w.-]+)"), 0),
+                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Source Workstation|Estación de trabajo de origen|Quellarbeitsstation|Station de travail source|Workstation di origine):[ \t]*([\w.-]+)"), 0),
+                        event_id in (4778,4779), arrayindex(regextract(message, "(?i)Client Name:[ \t]*([\w.-]+)"), 0),
+                        event_id in (4648,31001,30803,30804,30805,30806,30807,30808,1024,1102,6), host_name)
                     | alter subject_name = if(
-                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Name|Firmante:.*?Nombre de cuenta|Antragsteller:.*?Kontoname|Sujet:.*?Nom du compte|Soggetto:.*?Nome account|Oggetto:.*?Nome account):\s*([\w.\-$]+)"), 0))
+                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Name|Firmante:.*?Nombre de cuenta|Antragsteller:.*?Kontoname|Sujet:.*?Nom du compte|Soggetto:.*?Nome account|Oggetto:.*?Nome account):[ \t]*([\w.\-$]+)"), 0))
                     | alter subject_domain = if(
-                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Domain|Firmante:.*?Dominio de cuenta|Antragsteller:.*?Kontodomäne|Sujet:.*?Domaine du compte|Soggetto:.*?Dominio account|Oggetto:.*?Dominio account):\s*([\w.\-$ ]+)"), 0))
+                        event_id in (4624,4625,4634,4647,4648,5140), arrayindex(regextract(message, "(?si)(?:Subject:.*?Account Domain|Firmante:.*?Dominio de cuenta|Antragsteller:.*?Kontodomäne|Sujet:.*?Domaine du compte|Soggetto:.*?Dominio account|Oggetto:.*?Dominio account):[ \t]*([\w.\-$ ]+)"), 0))
                     | alter target_user = if(
-                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Name|Nuevo inicio de sesión:.*?Nombre de cuenta|Neue Anmeldung:.*?Kontoname|Nouvelle ouverture de session:.*?Nom du compte|Nuovo accesso:.*?Nome account|Account For Which Logon Failed:.*?Account Name|Cuenta con error de inicio de sesión:.*?Nombre de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontoname|Compte pour lequel l.ouverture de session a échoué:.*?Nom du compte|Account per cui l.accesso non è riuscito:.*?Nome account|Account Whose Credentials Were Used:.*?Account Name|Cuenta cuyas credenciales se usaron:.*?Nombre de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontoname|Compte dont les informations d.identification ont été utilisées:.*?Nom du compte|Account le cui credenziali sono state usate:.*?Nome account):\s*([\w.\-$]+)"), 0),
-                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Logon Account|Cuenta de inicio de sesión|Anmeldekonto|Compte d.ouverture de session|Account di accesso):\s*([\w.\-$]+)"), 0),
+                        event_id in (4768,4769,4770,4771,4778,4779), arrayindex(regextract(message, "(?i)Account Name:[ \t]*(\S+)"), 0),
+                        event_id = 1149, arrayindex(regextract(message, "(?im)^\s*(?:User|Usuario|Benutzer|Utilisateur|Utente):[ \t]*(?:[^\s\\]+\\)?(\S+)"), 0),
+                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Name|Nuevo inicio de sesión:.*?Nombre de cuenta|Neue Anmeldung:.*?Kontoname|Nouvelle ouverture de session:.*?Nom du compte|Nuovo accesso:.*?Nome account|Account For Which Logon Failed:.*?Account Name|Cuenta con error de inicio de sesión:.*?Nombre de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontoname|Compte pour lequel l.ouverture de session a échoué:.*?Nom du compte|Account per cui l.accesso non è riuscito:.*?Nome account|Account Whose Credentials Were Used:.*?Account Name|Cuenta cuyas credenciales se usaron:.*?Nombre de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontoname|Compte dont les informations d.identification ont été utilisées:.*?Nom du compte|Account le cui credenziali sono state usate:.*?Nome account):[ \t]*([\w.\-$]+)"), 0),
+                        event_id = 4776, arrayindex(regextract(message, "(?i)(?:Logon Account|Cuenta de inicio de sesión|Anmeldekonto|Compte d.ouverture de session|Account di accesso):[ \t]*([\w.\-$]+)"), 0),
                         event_id = 5858, arrayindex(regextract(message, "User\s*=\s*(?:[^\s\\]+\\)?([\w.\-$]+)"), 0),
-                        event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s(?:[^\s\\]+)\\([^\s]+)"), 0))
+                        event_id in (1009,551,31001,21,22,24,25), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s(?:[^\s\\]+)\\([^\s]+)"), 0))
                     | alter target_domain = if(
-                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Neue Anmeldung:.*?Kontodomäne|Nouvelle ouverture de session:.*?Domaine du compte|Nuovo accesso:.*?Dominio account|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontodomäne|Compte pour lequel l.ouverture de session a échoué:.*?Domaine du compte|Account per cui l.accesso non è riuscito:.*?Dominio account|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontodomäne|Compte dont les informations d.identification ont été utilisées:.*?Domaine du compte|Account le cui credenziali sono state usate:.*?Dominio account):\s*([\w.\-$]+)"), 0),
-                        event_id in (1009,551,31001,21,22,24,25,1149), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
+                        event_id in (4768,4769,4770,4771), arrayindex(regextract(message, "(?i)(?:Account Domain|Supplied Realm Name):[ \t]*(\S+)"), 0),
+                        event_id in (4778,4779), arrayindex(regextract(message, "(?i)Account Domain:[ \t]*(\S+)"), 0),
+                        event_id = 1149, arrayindex(regextract(message, "(?im)^\s*(?:Domain|Dominio|Domäne|Domaine):[ \t]*(\S+)"), 0),
+                        event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Neue Anmeldung:.*?Kontodomäne|Nouvelle ouverture de session:.*?Domaine du compte|Nuovo accesso:.*?Dominio account|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontodomäne|Compte pour lequel l.ouverture de session a échoué:.*?Domaine du compte|Account per cui l.accesso non è riuscito:.*?Dominio account|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontodomäne|Compte dont les informations d.identification ont été utilisées:.*?Domaine du compte|Account le cui credenziali sono state usate:.*?Dominio account):[ \t]*([\w.\-$]+)"), 0),
+                        event_id in (1009,551,31001,21,22,24,25), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
                     | alter dst_host = if(
-                        event_id in (4624,4625,4634,4647,4776,4778,4779,5140,21,22,24,25,1149,131,5858), host_name,
-                        event_id = 4648, arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino|Zielservername|Nom du serveur cible|Nome del server di destinazione):\s*\\*([\w.-]+)"), 0),
+                        event_id in (4624,4625,4634,4647,4768,4769,4770,4771,4776,4778,4779,5140,21,22,24,25,1149,131,5858), host_name,
+                        event_id = 4648, arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino|Zielservername|Nom du serveur cible|Nome del server di destinazione):[ \t]*\\*([\w.-]+)"), 0),
                         event_id in (31001,30803,30804,30805,30806,30807), arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor|Servername|Nom du serveur|Nome del server):\s\\*(.+)"), 0),
                         event_id = 30808, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):\s\\*(.+)"), 0),
+                        event_id = 1024, arrayindex(regextract(message, "(?i)server\s*\(([^)\s]+)\)"), 0),
                         event_id = 1102, arrayindex(regextract(message, "(?i)(?:server|servidor|serveur)\s+([\w.-]+)\b"), 0),
                         event_id = 6,    arrayindex(regextract(message, "(?i)connection\s*[:=]?\s*(?:https?://)?([\w.-]+)"), 0))
+                    | alter status = if(
+                        event_id in (4768,4769), arrayindex(regextract(message, "(?i)(?:Result Code|Failure Code):[ \t]*(0x[0-9a-fA-F]+)"), 0),
+                        event_id = 4776, arrayindex(regextract(message, "(?i)Error Code:[ \t]*(0x[0-9a-fA-F]+)"), 0))
                     | alter Timestamp  = to_timestamp(event_generated, "millis")
                     {time_filter}
                     | filter ((`source_host` not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost") or srcip not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost")) and dst_host not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost"))
                     | filter (dst_host != source_host) and (dst_host != srcip )
                     {ignore_local_post_clause}
-                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process"#)
+                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process, status"#)
     };
 
     // Phase 2: Query API
@@ -638,18 +651,56 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
 
     // Extraer los valores esperados de la query
     let dst_computer = record.get("dst_host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let event_id = record.get("event_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // a number or a string, depending on the dataset schema
+    let event_id = match record.get("event_id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
     
     let subject_user_name = record.get("subject_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let subject_domain_name = record.get("subject_domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
     
     let target_user_name = record.get("target_user").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let target_domain_name = record.get("target_domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     let logon_type = record.get("lt").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    let src_computer = record.get("source_host").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let src_ip = record.get("srcip").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut src_computer = record.get("source_host").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut src_ip = crate::parse::strip_ipv4_mapped(record.get("srcip").and_then(|v| v.as_str()).unwrap_or(""));
+    // a name in the address column (5858 ClientMachine, a 1149 Client
+    // Name) goes to src_computer, as parse-windows writes it
+    if !src_ip.is_empty() && src_ip.parse::<std::net::IpAddr>().is_err() {
+        if src_computer.is_empty() {
+            src_computer = src_ip.clone();
+        }
+        src_ip.clear();
+    }
+    // WMI 5858 as parse-windows keeps it: a remote client (short names
+    // differ, FQDN vs NetBIOS) and not a service account
+    if event_id == "5858" {
+        let short = |s: &str| s.split('.').next().unwrap_or("").to_ascii_lowercase();
+        if short(&src_computer) == short(&dst_computer) {
+            return Vec::new();
+        }
+        let u = record.get("target_user").and_then(|v| v.as_str()).unwrap_or("");
+        if u == "SYSTEM" || u == "LOCAL SERVICE" || u == "NETWORK SERVICE" {
+            return Vec::new();
+        }
+    }
+    let status = record.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mut target_domain_name = record.get("target_domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // 1149 with an empty domain: the renderer shifts the insertion strings
+    // ("Domain: <address>", "Source Network Address: %3"); parse-windows
+    // reads the parameters and is not affected
+    if event_id == "1149" {
+        let d = crate::parse::strip_ipv4_mapped(&target_domain_name);
+        if d.parse::<std::net::IpAddr>().is_ok() {
+            if src_ip.is_empty() && src_computer.is_empty() {
+                src_ip = d;
+            }
+            target_domain_name.clear();
+        }
+    }
 
     let process = record.get("process").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
@@ -658,18 +709,18 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     // would produce different CSV output for the same underlying event depending
     // on whether it came from parse-windows or parse-cortex-evtx-forensics.
     //
-    // For 4768/4769/4776 parse-windows branches on Status=="0x0" to classify
-    // success/failure. We don't have the Status field in the Cortex query — it
-    // would need yet another alter branch. As a best-effort we classify as
-    // SUCCESSFUL_LOGON and rely on 4771 (pre-auth fail) for the FAILED signal.
-    // TODO: add Status extraction to the XQL query if the false-positive rate
-    // on 4768/4769/4776 proves to be a problem in practice.
+    // 4768/4769/4776: success when the message's Result / Failure / Error
+    // Code is 0x0, as parse-windows reads Status (the query's `status`).
     let event_type = match event_id.as_str() {
         "4624" => "SUCCESSFUL_LOGON".to_string(),
         "4625" => "FAILED_LOGON".to_string(),
         "4634" | "4647" | "4779" => "LOGOFF".to_string(),
         "4648" => "SUCCESSFUL_LOGON".to_string(),
-        "4768" | "4769" | "4776" => "SUCCESSFUL_LOGON".to_string(),
+        // Status as parse-windows reads it; when the message gave none,
+        // success (the query's earlier behaviour)
+        "4768" | "4769" | "4776" => {
+            if status.is_empty() || status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
+        }
         "4770" => "SUCCESSFUL_LOGON".to_string(),
         "4771" => "FAILED_LOGON".to_string(),
         "4778" => "SUCCESSFUL_LOGON".to_string(),
@@ -800,3 +851,52 @@ fn to_epoch_secs(ts: &str) -> Result<i64, Box<dyn Error>> {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(v: serde_json::Value) -> Vec<String> {
+        process_record(&v, false)
+    }
+
+    #[test]
+    fn event_id_is_read_as_a_number_or_a_string() {
+        let a = rec(serde_json::json!({"Timestamp": 1700000000000i64, "event_id": 4624, "dst_host": "SRV02", "srcip": "10.0.0.5", "lt": "3"}));
+        let b = rec(serde_json::json!({"Timestamp": 1700000000000i64, "event_id": "4624", "dst_host": "SRV02", "srcip": "10.0.0.5", "lt": "3"}));
+        assert_eq!(a, b);
+        assert_eq!((a[2].as_str(), a[3].as_str()), ("SUCCESSFUL_LOGON", "4624"));
+    }
+
+    #[test]
+    fn mapped_ipv4_is_stripped_and_a_name_leaves_the_address_column() {
+        let r = rec(serde_json::json!({"event_id": "4768", "dst_host": "DC01", "srcip": "::ffff:10.23.123.11", "status": "0x0"}));
+        assert_eq!(r[8], "10.23.123.11");
+        let r = rec(serde_json::json!({"event_id": "5858", "dst_host": "SRV02.corp", "srcip": "WS07", "target_user": "alice"}));
+        assert_eq!((r[7].as_str(), r[8].as_str()), ("WS07", ""));
+    }
+
+    #[test]
+    fn kerberos_and_ntlm_failures_follow_their_status() {
+        let ok = rec(serde_json::json!({"event_id": "4768", "dst_host": "DC01", "srcip": "10.0.0.5", "status": "0x0"}));
+        let bad = rec(serde_json::json!({"event_id": "4776", "dst_host": "DC01", "source_host": "WS07", "status": "0xc000006a"}));
+        let none = rec(serde_json::json!({"event_id": "4769", "dst_host": "DC01", "srcip": "10.0.0.5"}));
+        assert_eq!((ok[2].as_str(), bad[2].as_str(), none[2].as_str()), ("SUCCESSFUL_LOGON", "FAILED_LOGON", "SUCCESSFUL_LOGON"));
+    }
+
+    #[test]
+    fn rdp_1149_with_the_address_shifted_into_the_domain() {
+        // "User: admmig / Domain: 10.23.123.11 / Source Network Address: %3",
+        // as Windows renders a 1149 whose domain insertion string is empty
+        let r = rec(serde_json::json!({"event_id": "1149", "dst_host": "FS03", "target_user": "admmig", "target_domain": "10.23.123.11", "srcip": "10.23.123.11"}));
+        assert_eq!((r[5].as_str(), r[6].as_str(), r[8].as_str()), ("admmig", "", "10.23.123.11"));
+        let r = rec(serde_json::json!({"event_id": "1149", "dst_host": "PC01", "target_user": "admin01", "target_domain": "example", "srcip": "10.0.2.15"}));
+        assert_eq!((r[6].as_str(), r[8].as_str()), ("example", "10.0.2.15"));
+    }
+
+    #[test]
+    fn wmi_from_the_machine_itself_or_a_service_account_is_dropped() {
+        assert!(rec(serde_json::json!({"event_id": "5858", "dst_host": "SRV02.corp.local", "srcip": "SRV02", "target_user": "alice"})).is_empty());
+        assert!(rec(serde_json::json!({"event_id": "5858", "dst_host": "SRV02", "srcip": "WS07", "target_user": "NETWORK SERVICE"})).is_empty());
+    }
+}

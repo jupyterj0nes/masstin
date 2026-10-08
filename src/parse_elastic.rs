@@ -1,7 +1,7 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use serde_json::Value;
-use std::{collections::HashMap, error::Error};
+use std::collections::HashMap;
 use std::path::Path;
 
 static DEBUG_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -14,26 +14,97 @@ pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// **Event IDs sorted by log type**
-/// 5145 intentionally excluded — see parse.rs::SECURITY_EVENT_IDS for rationale
-/// (file-access audit noise that adds no lateral-movement signal beyond 5140).
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140"];
-const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
-const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
-const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
-const RDPCLIENT_EVENT_IDS: &[&str] = &["1024","1102"];
-const RDPCONNMANAGER_EVENT_IDS: &[&str] = &["1149"];
-const RDPLOCALSESSION_EVENT_IDS: &[&str] = &["21","22","24","25"];
-const RDPKORE_EVENT_IDS: &[&str] = &["131"];
-
-// LogData schema is shared with the rest of masstin. We re-export here so
-// local functions that construct records can use the short name.
+// LogData schema is shared with the rest of masstin.
 use crate::parse::LogData;
+use crate::parse::WinRec;
 
 /// `winlog.event_id`: a number in Winlogbeat 7, a string from 8.0 on.
 fn winlog_event_id(json: &Value) -> Option<i64> {
     let v = json.get("winlog")?.get("event_id")?;
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// UserData is written by Winlogbeat as `winlog.user_data`, the children of
+/// its single element (`EventXML`, `EventData`, `Operation_ClientFailure`)
+/// lifted one level, with the element name in `xml_name`. Leaves are taken
+/// by name at any depth so either shape reads the same.
+fn flatten_user_data(v: &Value, out: &mut HashMap<String, String>) {
+    if let Value::Object(m) = v {
+        for (k, x) in m {
+            if k == "xml_name" {
+                continue;
+            }
+            match x {
+                Value::Object(_) => flatten_user_data(x, out),
+                _ => {
+                    if let Some(s) = scalar(x) {
+                        out.insert(k.clone(), s);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One Winlogbeat document as the record parse-windows maps: the same
+/// event, the same fields, so the same row.
+fn rec_from_json(json: &Value) -> Option<(String, WinRec)> {
+    let w = json.get("winlog")?;
+    let event_id = winlog_event_id(json)?.to_string();
+    let mut fields = HashMap::new();
+    let ed = w.get("event_data").filter(|e| e.is_object());
+    if let Some(Value::Object(m)) = ed {
+        for (k, x) in m {
+            if let Some(s) = scalar(x) {
+                fields.insert(k.clone(), s);
+            }
+        }
+    }
+    if let Some(ud) = w.get("user_data") {
+        flatten_user_data(ud, &mut fields);
+    }
+    let text = |v: Option<&Value>| v.and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // the machine that wrote the event; host.name is the shipper, which is
+    // the collector under Windows Event Forwarding
+    let mut computer = text(w.get("computer_name"));
+    if computer.is_empty() {
+        computer = text(json.get("host").and_then(|h| h.get("name")));
+    }
+    let channel = text(w.get("channel"));
+    Some((channel, WinRec {
+        event_id,
+        // @timestamp is the event's time in Winlogbeat output; documents
+        // taken before ingest may carry only winlog.time_created
+        time: {
+            let t = text(json.get("@timestamp"));
+            if t.is_empty() { text(w.get("time_created")) } else { t }
+        },
+        computer,
+        user_sid: text(w.get("user").and_then(|u| u.get("identifier"))),
+        fields,
+        has_event_data: ed.is_some(),
+    }))
+}
+
+/// One Winlogbeat document to a row, through the parse-windows mapping of
+/// its channel (or of its event id when the export carries no channel).
+pub(crate) fn winlogbeat_row(json: &Value, file_path: &str) -> Option<LogData> {
+    let (channel, rec) = rec_from_json(json)?;
+    let map = if channel.is_empty() {
+        crate::parse::mapper_for_id(&rec.event_id)?
+    } else {
+        crate::parse::mapper_for_channel(&channel, &rec.event_id)?
+    };
+    map(&rec, file_path)
 }
 
 /// **Processes a Winlogbeat JSON file and extracts relevant events**
@@ -54,26 +125,8 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
 
     for line in &mut lines {
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            if let Some(event_id) = winlog_event_id(&json) {
-                let event_id_str = event_id.to_string();
-
-                if SECURITY_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_security_event(&json, file_path));
-                } else if SMBCLIENT_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_smb_client_event(&json, file_path));
-                } else if SMBCLIENT_CONNECTIVITY_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_smb_client_connectivity_event(&json, file_path));
-                } else if SMBSERVER_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_smb_server_event(&json, file_path));
-                } else if RDPCLIENT_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_rdp_client_event(&json, file_path));
-                } else if RDPCONNMANAGER_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_rdp_connmanager_event(&json, file_path));
-                } else if RDPLOCALSESSION_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_rdp_localsession_event(&json, file_path));
-                } else if RDPKORE_EVENT_IDS.contains(&event_id_str.as_str()) {
-                    log_data.push(parse_rdpkore_event(&json, file_path));
-                }
+            if let Some(row) = winlogbeat_row(&json, file_path) {
+                log_data.push(row);
             }
         }
     }
@@ -82,215 +135,6 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
     }
 
     log_data
-}
-
-/// **Specific functions to extract data by event type**
-fn parse_security_event(json: &Value, file_path: &str) -> LogData {
-    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
-    let ed = json.get("winlog").and_then(|w| w.get("event_data"));
-    let status = ed.and_then(|d| d.get("Status")).and_then(|s| s.as_str()).unwrap_or("");
-    let sub_status = ed.and_then(|d| d.get("SubStatus")).and_then(|s| s.as_str()).unwrap_or("");
-    let process_name = ed.and_then(|d| d.get("ProcessName")).and_then(|n| n.as_str()).unwrap_or("");
-    let target_logon_id = ed.and_then(|d| d.get("TargetLogonId")).and_then(|n| n.as_str()).unwrap_or("");
-
-    let event_type = match event_id_str.as_str() {
-        "4624" => "SUCCESSFUL_LOGON".to_string(),
-        "4625" => "FAILED_LOGON".to_string(),
-        "4634" => "LOGOFF".to_string(),
-        "4647" => "LOGOFF".to_string(),
-        "4648" => "SUCCESSFUL_LOGON".to_string(),
-        "4768" | "4769" | "4776" => {
-            if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
-        },
-        "4770" => "SUCCESSFUL_LOGON".to_string(),
-        "4771" => "FAILED_LOGON".to_string(),
-        "4778" => "SUCCESSFUL_LOGON".to_string(),
-        "4779" => "LOGOFF".to_string(),
-        "5140" => "SUCCESSFUL_LOGON".to_string(),
-        _ => "CONNECT".to_string(),
-    };
-
-    let share_name = ed.and_then(|d| d.get("ShareName")).and_then(|s| s.as_str()).unwrap_or("");
-    let logon_type = crate::parse::infer_logon_type(&event_id_str, ed.and_then(|d| d.get("LogonType")).and_then(|lt| lt.as_str()).unwrap_or(""));
-
-    let detail = match event_id_str.as_str() {
-        "4624" | "4648" => process_name.to_string(),
-        "4625" => sub_status.to_string(),
-        "5140" => share_name.to_string(),
-        _ => String::new(),
-    };
-
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type,
-        event_id: event_id_str,
-        subject_user_name: ed.and_then(|d| d.get("SubjectUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        subject_domain_name: ed.and_then(|d| d.get("SubjectDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_user_name: ed.and_then(|d| d.get("TargetUserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: ed.and_then(|d| d.get("TargetDomainName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        logon_type,
-        workstation_name: ed.and_then(|d| d.get("WorkstationName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: ed.and_then(|d| d.get("IpAddress")).and_then(|ip| ip.as_str()).unwrap_or("").to_string(),
-        logon_id: target_logon_id.to_string(),
-        detail,
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
-    let ed = json.get("winlog").and_then(|w| w.get("event_data"));
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "FAILED_LOGON".to_string(), // 31001: client failed to authenticate
-        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: ed.and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: "".to_string(),
-        logon_type: "3".to_string(),
-        workstation_name: ed.and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: ed.and_then(|d| d.get("ShareName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData {
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "CONNECT".to_string(),
-        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: "".to_string(),
-        logon_type: "3".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ServerName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
-    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
-    let event_type = match event_id_str.as_str() {
-        "1009" => "FAILED_LOGON".to_string(), // server denied anonymous access
-        "551" => "FAILED_LOGON".to_string(),
-        _ => "CONNECT".to_string(),
-    };
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type,
-        event_id: event_id_str,
-        subject_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: "".to_string(),
-        target_domain_name: "".to_string(),
-        logon_type: "3".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_rdp_client_event(json: &Value, file_path: &str) -> LogData {
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "CONNECT".to_string(),
-        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserID")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: "".to_string(),
-        logon_type: "10".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Value")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_rdp_connmanager_event(json: &Value, file_path: &str) -> LogData {
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "SUCCESSFUL_LOGON".to_string(),
-        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param1")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        target_domain_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param2")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        logon_type: "10".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param3")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_rdp_localsession_event(json: &Value, file_path: &str) -> LogData {
-    let remote_user = json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("User")).and_then(|n| n.as_str()).unwrap_or("").to_string();
-    let (target_domain_name, target_user_name) = if remote_user.contains("\\") {
-        let parts: Vec<&str> = remote_user.split('\\').collect();
-        (parts[0].to_string(), parts[1].to_string())
-    } else {
-        ("".to_string(), remote_user)
-    };
-
-    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
-    let event_type = match event_id_str.as_str() {
-        "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
-        "24" => "LOGOFF".to_string(),
-        _ => "CONNECT".to_string(),
-    };
-
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type,
-        event_id: event_id_str,
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name,
-        target_domain_name,
-        logon_type: "10".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Address")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
-}
-
-fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
-    LogData {
-        time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        event_type: "CONNECT".to_string(),
-        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
-        subject_user_name: "".to_string(),
-        subject_domain_name: "".to_string(),
-        target_user_name: "".to_string(),
-        target_domain_name: "".to_string(),
-        logon_type: "10".to_string(),
-        workstation_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("ClientIP")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        ip_address: "".to_string(),
-        logon_id: "".to_string(),
-        detail: "".to_string(),
-        filename: file_path.to_string(),
-    }
 }
 
 /// **Filters, sorts and writes the extracted events as CSV**
@@ -387,4 +231,70 @@ pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, outp
     write_rows(log_data, output);
 
     crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(doc: &str) -> Option<LogData> {
+        winlogbeat_row(&serde_json::from_str::<Value>(doc).unwrap(), "wlb.json")
+    }
+
+    // From the Elastic integrations test fixture for 4778 (Winlogbeat 8:
+    // the event id is a string).
+    const W4778: &str = r#"{"@timestamp":"2020-04-05T16:33:32.388Z","host":{"name":"DC_TEST2k12.TEST.SAAS"},"winlog":{"channel":"Security","computer_name":"DC_TEST2k12.TEST.SAAS","event_id":"4778","provider_name":"Microsoft-Windows-Security-Auditing","event_data":{"AccountDomain":"TEST","AccountName":"at_adm","ClientAddress":"10.100.150.9","ClientName":"EQP01777","LogonID":"0x76fea87","SessionName":"RDP-Tcp#127"}}}"#;
+
+    #[test]
+    fn rdp_reconnect_keeps_account_and_origin() {
+        let r = row(W4778).expect("4778 is a row");
+        assert_eq!((r.target_user_name.as_str(), r.target_domain_name.as_str()), ("at_adm", "TEST"));
+        assert_eq!((r.workstation_name.as_str(), r.ip_address.as_str()), ("EQP01777", "10.100.150.9"));
+        assert_eq!((r.logon_type.as_str(), r.logon_id.as_str()), ("10", "0x76fea87"));
+    }
+
+    #[test]
+    fn explicit_credentials_point_at_the_target_server() {
+        let doc = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Security","computer_name":"WS01.corp","event_id":4648,"event_data":{"TargetUserName":"admin","TargetDomainName":"CORP","TargetServerName":"SRV02.corp","IpAddress":"10.0.0.20","ProcessName":"C:\\Windows\\System32\\runas.exe"}}}"#;
+        let r = row(doc).unwrap();
+        assert_eq!(r.computer, "SRV02.corp");
+        assert_eq!(r.workstation_name, "WS01.corp");
+        assert_eq!(r.ip_address, "");
+    }
+
+    #[test]
+    fn smb_and_rdp_client_events_go_from_the_client_to_the_server() {
+        let smb = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Microsoft-Windows-SmbClient/Security","computer_name":"WS01","event_id":"31001","event_data":{"UserName":"CORP\\bob","ServerName":"\\\\192.0.2.31","ShareName":"\\\\192.0.2.31\\C$"}}}"#;
+        let r = row(smb).unwrap();
+        assert_eq!((r.computer.as_str(), r.workstation_name.as_str()), ("192.0.2.31", "WS01"));
+        assert_eq!((r.target_user_name.as_str(), r.target_domain_name.as_str(), r.detail.as_str()), ("bob", "CORP", "C$"));
+        let rdp = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Microsoft-Windows-TerminalServices-RDPClient/Operational","computer_name":"WS01","event_id":1024,"user":{"identifier":"S-1-5-21-1-2-3-1001"},"event_data":{"Value":"SRV02"}}}"#;
+        let r = row(rdp).unwrap();
+        assert_eq!((r.computer.as_str(), r.workstation_name.as_str()), ("SRV02", "WS01"));
+    }
+
+    #[test]
+    fn user_data_events_are_read_from_user_data() {
+        let doc = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational","computer_name":"SRV02","event_id":"1149","user_data":{"xml_name":"EventXML","Param1":"alice","Param2":"CORP","Param3":"10.0.0.5"}}}"#;
+        let r = row(doc).unwrap();
+        assert_eq!((r.target_user_name.as_str(), r.target_domain_name.as_str(), r.ip_address.as_str()), ("alice", "CORP", "10.0.0.5"));
+        let lsm = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Microsoft-Windows-TerminalServices-LocalSessionManager/Operational","computer_name":"SRV02","event_id":"21","user_data":{"xml_name":"EventXML","User":"CORP\\alice","SessionID":"3","Address":"10.0.0.5"}}}"#;
+        let r = row(lsm).unwrap();
+        assert_eq!((r.target_user_name.as_str(), r.ip_address.as_str(), r.logon_id.as_str()), ("alice", "10.0.0.5", "3"));
+    }
+
+    #[test]
+    fn the_channel_decides_the_family() {
+        // Sysmon 22 (DNS query) is not an RDP reconnection, Security 1102
+        // (log cleared) is not an RDP client event
+        let dns = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Microsoft-Windows-Sysmon/Operational","computer_name":"WS01","event_id":"22","event_data":{"QueryName":"example.org"}}}"#;
+        assert!(row(dns).is_none());
+        let cleared = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"channel":"Security","computer_name":"DC01","event_id":"1102","user_data":{"SubjectUserName":"admin"}}}"#;
+        assert!(row(cleared).is_none());
+        // without a channel, only the ids that belong to one family
+        let bare = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"computer_name":"WS01","event_id":"22"}}"#;
+        assert!(row(bare).is_some());
+        let bare6 = r#"{"@timestamp":"2026-01-01T00:00:00Z","winlog":{"computer_name":"WS01","event_id":"6","event_data":{"connection":"srv/wsman"}}}"#;
+        assert!(row(bare6).is_none());
+    }
 }

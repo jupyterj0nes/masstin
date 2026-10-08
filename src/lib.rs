@@ -932,15 +932,12 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
     for line in crate::textlines::EvidenceLines::new(reader).take(1000) {
         // Try to parse each line as JSON
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            // Check for some typical Winlogbeat fields
-            if json
-                .get("agent")
-                .and_then(|agent| agent.get("type"))
-                .and_then(|t| t.as_str())
-                == Some("winlogbeat")
-                && json.get("winlog").is_some()
-                && json.get("event").is_some()
-                && json.get("@timestamp").is_some()
+            // The winlog.* shape: Winlogbeat writes it, and so does Elastic
+            // Agent's Windows integration (agent.type "filebeat"), so the
+            // shape decides, not the shipper's name.
+            let w = json.get("winlog");
+            if w.and_then(|w| w.get("event_id")).is_some()
+                && (w.and_then(|w| w.get("channel")).is_some() || w.and_then(|w| w.get("provider_name")).is_some())
             {
                 return true;
             }
