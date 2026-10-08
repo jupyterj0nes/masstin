@@ -3,7 +3,7 @@
 ## Unreleased
 
 - `parse-windows` / `parse-image` / `parse-massive` / `parser-elastic`: **a logoff carries the origin of the logon it closes.** 4634 and 4647 name no source machine, so every Windows LOGOFF row had none (2,277 rows on the DFIR Madness Szechuan case) and graph-hunt and the loaders discarded them. Each now takes the origin, and the logon type when it has none (4647), of the 4624 with the same logon ID on the same machine, the latest one at or before it, as parse-linux pairs a session end with its login by sshd pid. A logoff whose logon is not in the evidence names no origin and is not written (a masstin row needs an origin and a destination); the run prints how many were paired and how many dropped. On Szechuan 2,299 of 2,300 are paired. Other rows are unchanged on the public EVTX sets.
-- `graph-hunt` / `graph-hunt-neo4j` / `graph-hunt-csv`: **the same timeline gives the same output on every run.** When two logon types were equally rare on a destination, the explanation named whichever a hash map listed first, which changed from run to run (1 run in 4 on Szechuan wrote "logon type 3 is rare" instead of "logon type 10"). Ties are now broken by name; ten runs give byte-identical CSV and report.
+- `graph-hunt` / `graph-hunt-neo4j` / `graph-hunt-csv`: **the same timeline gives the same output on every run.** When two logon types were equally rare on a destination, the explanation named whichever a hash map listed first, which changed from run to run (1 run in 4 on Szechuan wrote "logon type 3 is rare" instead of "logon type 10"). Ties are now broken by name; ten runs give byte-identical CSV and report. The functional CI runs the hunt three times on every operating system and requires identical output.
 
 ## v1.3.2 — 2026-10-08
 

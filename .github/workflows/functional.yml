@@ -86,6 +86,13 @@ jobs:
           python3 .github/scripts/normalize_timeline.py out/mitre.csv EVTX-to-MITRE-Attack | tee -a out/hashes.txt
           python3 .github/scripts/normalize_timeline.py out/samples.csv EVTX-ATTACK-SAMPLES | tee -a out/hashes.txt
           echo "hunt rows: $(wc -l < out/hunt.csv)" | tee -a out/hashes.txt
+          # the same timeline must give the same hunt on every run (a
+          # hash-map order once changed an explanation 1 run in 4)
+          for i in 2 3; do
+            "$BIN" -a graph-hunt-csv -f out/mitre.csv --investigation-from "2021-01-01 00:00:00" -o out/hunt-$i.csv --report out/hunt-$i.md --overwrite >/dev/null
+            cmp out/hunt.csv out/hunt-$i.csv && cmp out/hunt.md out/hunt-$i.md || { echo "::error::graph-hunt-csv gave a different output on run $i"; exit 1; }
+          done
+          echo "graph-hunt-csv: 3 runs, identical output"
 
       - name: parse-mac on a log show export (all three OSes)
         shell: bash
