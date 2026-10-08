@@ -453,16 +453,16 @@ fn row(ts_iso: String, dst: &str, file: &str, c: Classified) -> LogData {
 
 /// A Unified Log `LogData.time` is nanoseconds since the Unix epoch. Render
 /// it as the ISO form masstin writes everywhere (`…Z`, microsecond
-/// precision), which every downstream reader already accepts. Rounded to
+/// precision), which every downstream reader already accepts. Truncated to
 /// the microsecond the way `log show` prints it, so a bundle and its
-/// export carry the same instant.
+/// export carry the same instant (up to the float the crate hands over).
 fn ul_time_iso(nanos: f64) -> String {
     us_iso(ul_micros(nanos))
 }
 
-/// Microseconds since the epoch, rounded as `log show` rounds.
+/// Microseconds since the epoch, truncated as `log show` truncates.
 fn ul_micros(nanos: f64) -> i64 {
-    (nanos / 1000.0).round() as i64
+    (nanos / 1000.0).floor() as i64
 }
 
 /// Parse the `timestamp` field of a `log show` JSON export
