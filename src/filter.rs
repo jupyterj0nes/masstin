@@ -506,3 +506,84 @@ pub fn print_filter_summary() {
     }
     eprintln!("  ──────────────────────────────────────────────────");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(dst: &str, src_computer: &str, src_ip: &str, logon_type: &str) -> LogData {
+        LogData {
+            time_created: "2026-10-08T10:00:00Z".into(),
+            computer: dst.into(),
+            event_type: "SUCCESSFUL_LOGON".into(),
+            event_id: "4624".into(),
+            subject_user_name: String::new(),
+            subject_domain_name: String::new(),
+            target_user_name: "alice".into(),
+            target_domain_name: String::new(),
+            logon_type: logon_type.into(),
+            workstation_name: src_computer.into(),
+            ip_address: src_ip.into(),
+            logon_id: String::new(),
+            filename: String::new(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn globs_are_case_insensitive_and_anchor_where_the_star_is_not() {
+        let exact = GlobPattern::parse("Admin");
+        assert!(exact.matches("ADMIN") && !exact.matches("admin2"));
+        let prefix = GlobPattern::parse("svc_*");
+        assert!(prefix.matches("SVC_backup") && !prefix.matches("x_svc_backup"));
+        let suffix = GlobPattern::parse("*$");
+        assert!(suffix.matches("WS01$") && !suffix.matches("alice"));
+        let contains = GlobPattern::parse("*mon*");
+        assert!(contains.matches("JUMP-MON-01"));
+        // an empty value never matches, and a bare "*" matches nothing
+        assert!(!prefix.matches(""));
+        assert!(!GlobPattern::parse("*").matches("anything"));
+    }
+
+    #[test]
+    fn ip_matchers_take_single_addresses_and_cidr_ranges() {
+        let net = IpMatcher::parse("10.0.0.0/8").unwrap();
+        assert!(net.matches(&"10.200.1.1".parse().unwrap()));
+        assert!(!net.matches(&"11.0.0.1".parse().unwrap()));
+        let v6 = IpMatcher::parse("fe80::/10").unwrap();
+        assert!(v6.matches(&"fe80::1".parse().unwrap()));
+        let one = IpMatcher::parse(" 192.0.2.7 ").unwrap();
+        assert!(one.matches(&"192.0.2.7".parse().unwrap()));
+        assert!(IpMatcher::parse("10.0.0.0/33").is_err());
+        assert!(IpMatcher::parse("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn lists_read_inline_entries_and_files_skipping_comments() {
+        let p = std::env::temp_dir().join(format!("masstin-filter-{}.txt", std::process::id()));
+        std::fs::write(&p, "# service accounts\nsvc_*\n\n  backup$  \n").unwrap();
+        let arg = format!("admin,@{}", p.display());
+        let globs = parse_glob_list(&arg).unwrap();
+        let names: Vec<&str> = globs.iter().map(|g| g.original.as_str()).collect();
+        assert_eq!(names, vec!["admin", "svc_*", "backup$"]);
+        let _ = std::fs::remove_file(&p);
+        assert!(parse_glob_list("@/no/such/file.txt").is_err());
+        assert_eq!(parse_ip_list("10.0.0.0/8, ,192.0.2.1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_row_is_local_only_when_neither_source_field_is_useful() {
+        // a routable IP keeps the row whatever the computer field says
+        assert!(classify_local(&row("DC01", "LOCAL", "10.0.0.5", "3")).is_none());
+        // a real remote computer name keeps the row without an IP
+        assert!(classify_local(&row("DC01", "WS07", "", "3")).is_none());
+        // both noise: the reason is the first that applies
+        assert!(matches!(classify_local(&row("DC01", "", "127.0.0.1", "3")), Some(LocalReason::LoopbackIp)));
+        assert!(matches!(classify_local(&row("DC01", "", "fe80::1", "3")), Some(LocalReason::LoopbackIp)));
+        assert!(matches!(classify_local(&row("DC01", "LOCAL", "", "10")), Some(LocalReason::LiteralLocal)));
+        assert!(matches!(classify_local(&row("DC01", "-", "-", "5")), Some(LocalReason::ServiceLogon)));
+        assert!(matches!(classify_local(&row("DC01", "", "", "2")), Some(LocalReason::InteractiveLogon)));
+        assert!(matches!(classify_local(&row("DC01", "dc01", "", "3")), Some(LocalReason::SelfReference)));
+        assert!(matches!(classify_local(&row("DC01", "MSTSC", "", "3")), Some(LocalReason::BothNoise)));
+    }
+}
