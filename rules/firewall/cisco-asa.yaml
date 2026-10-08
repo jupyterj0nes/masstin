@@ -54,9 +54,9 @@ parsers:
       contains: ["ASA-6-113004"]
     extract:
       type: regex
-      pattern: 'ASA-6-113004:\s*AAA user authentication Successful\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-113004:\s*AAA user authentication Successful\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)'
     map:
-      time_created:       ""
+      time_created:       "${ts}"
       computer:           "${server}"
       event_type:         "SUCCESSFUL_LOGON"
       event_id:           "ASA-113004"
@@ -74,9 +74,9 @@ parsers:
       contains: ["ASA-6-113005"]
     extract:
       type: regex
-      pattern: 'ASA-6-113005:\s*AAA user authentication Rejected\s*:\s*reason\s*=\s*(?P<reason>[^:]+?)\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)(?:\s*:\s*user IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+))?'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-113005:\s*AAA user authentication Rejected\s*:\s*reason\s*=\s*(?P<reason>[^:]+?)\s*:\s*server\s*=\s*(?P<server>\S+)\s*:\s*user\s*=\s*(?P<user>\S+)(?:\s*:\s*user IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+))?'
     map:
-      time_created:       ""
+      time_created:       "${ts}"
       computer:           "${server}"
       event_type:         "FAILED_LOGON"
       event_id:           "ASA-113005"
@@ -96,9 +96,9 @@ parsers:
       contains: ["ASA-6-605004"]
     extract:
       type: regex
-      pattern: 'ASA-6-605004:\s*Login denied from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-605004:\s*Login denied from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
     map:
-      time_created:       ""
+      time_created:       "${ts}"
       computer:           "${dst}"
       event_type:         "FAILED_LOGON"
       event_id:           "ASA-605004"
@@ -118,9 +118,9 @@ parsers:
       contains: ["ASA-6-605005"]
     extract:
       type: regex
-      pattern: 'ASA-6-605005:\s*Login permitted from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-605005:\s*Login permitted from\s*(?P<src>[\d\.:a-fA-F]+)/(?P<sport>\d+)\s*to\s*(?P<if>[^:]+):(?P<dst>[\d\.:a-fA-F]+)/(?P<svc>\S+)\s*for user\s*"(?P<user>[^"]+)"'
     map:
-      time_created:       ""
+      time_created:       "${ts}"
       computer:           "${dst}"
       event_type:         "SUCCESSFUL_LOGON"
       event_id:           "ASA-605005"
@@ -140,10 +140,10 @@ parsers:
       contains: ["ASA-6-716001"]
     extract:
       type: regex
-      pattern: 'ASA-6-716001:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session started'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-716001:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session started'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "SUCCESSFUL_LOGON"
       event_id:           "ASA-716001"
       subject_user_name:  "${user}"
@@ -162,10 +162,10 @@ parsers:
       contains: ["ASA-6-716002"]
     extract:
       type: regex
-      pattern: 'ASA-6-716002:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session terminated'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-716002:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+WebVPN session terminated'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "LOGOFF"
       event_id:           "ASA-716002"
       subject_user_name:  "${user}"

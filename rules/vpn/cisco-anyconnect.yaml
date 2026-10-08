@@ -52,10 +52,10 @@ parsers:
       contains: ["ASA-6-113039"]
     extract:
       type: regex
-      pattern: 'ASA-6-113039:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+AnyConnect parent session started'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-113039:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?\s+AnyConnect parent session started'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "SUCCESSFUL_LOGON"
       event_id:           "ASA-113039"
       subject_user_name:  "${user}"
@@ -74,10 +74,10 @@ parsers:
       contains: ["ASA-6-722022"]
     extract:
       type: regex
-      pattern: 'ASA-6-722022:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection (?P<state>established|created|accepted)'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-722022:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection (?P<state>established|created|accepted)'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "SUCCESSFUL_LOGON"
       event_id:           "ASA-722022"
       subject_user_name:  "${user}"
@@ -96,10 +96,10 @@ parsers:
       contains: ["ASA-6-722023"]
     extract:
       type: regex
-      pattern: 'ASA-6-722023:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection terminated'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-6-722023:\s*Group\s*(?:<|")?(?P<group>[^>"]+?)(?:>|")?\s+User\s*(?:<|")?(?P<user>[^>"]+?)(?:>|")?\s+IP\s*(?:<|")?(?P<ip>[\d\.:a-fA-F]+)(?:>|")?.*?SVC connection terminated'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "LOGOFF"
       event_id:           "ASA-722023"
       subject_user_name:  "${user}"
@@ -118,10 +118,10 @@ parsers:
       contains_any: ["ASA-4-113019", "ASA-5-113019"]
     extract:
       type: regex
-      pattern: 'ASA-[45]-113019:\s*Group\s*=\s*(?P<group>[^,]+),\s*Username\s*=\s*(?P<user>[^,]+),\s*IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+),\s*Session disconnected.*?(?:Duration:\s*(?P<duration>[^,]+))?.*?(?:Reason:\s*(?P<reason>.+?))?\s*$'
+      pattern: '^(?:(?:<\d+>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<host>[^\s:]+)\s*:?\s*)?.*?ASA-[45]-113019:\s*Group\s*=\s*(?P<group>[^,]+),\s*Username\s*=\s*(?P<user>[^,]+),\s*IP\s*=\s*(?P<ip>[\d\.:a-fA-F]+),\s*Session disconnected.*?(?:Duration:\s*(?P<duration>[^,]+))?.*?(?:Reason:\s*(?P<reason>.+?))?\s*$'
     map:
-      time_created:       ""
-      computer:           ""
+      time_created:       "${ts}"
+      computer:           "${host}"
       event_type:         "LOGOFF"
       event_id:           "ASA-113019"
       subject_user_name:  "${user}"
