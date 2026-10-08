@@ -253,7 +253,7 @@ fn parse_rfc3164_timestamp(
 
 /// logrotate `dateext` suffix → the date the file was rotated. Tolerates
 /// the trailing `.gz`: `secure-20260830.gz` → 2026-08-30.
-fn rotation_date_from_name(fname: &str) -> Option<NaiveDate> {
+pub(crate) fn rotation_date_from_name(fname: &str) -> Option<NaiveDate> {
     let base = fname.strip_suffix(".gz").unwrap_or(fname);
     let idx = base.rfind('-')?;
     let stamp = &base[idx + 1..];

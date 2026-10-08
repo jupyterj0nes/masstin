@@ -283,6 +283,9 @@ pub fn parse_custom(
     crate::banner::print_phase("2", "3", &format!("Processing {} log file(s)...", files.len()));
 
     let mut all_records: Vec<LogData> = Vec::new();
+    // matched lines that name no origin or no destination: not a row
+    let mut no_origin = 0usize;
+    let mut no_destination = 0usize;
     let mut total_lines = 0usize;
     let mut total_matched = 0usize;
     let mut total_rejected = 0usize;
@@ -305,17 +308,22 @@ pub fn parse_custom(
                 continue;
             }
         };
-        let reader = BufReader::new(file);
+        // the last day this file can hold, for syslog stamps without a
+        // year: its logrotate suffix, or the day after it was last written
+        let year_bound = crate::parse_linux::rotation_date_from_name(&fname).or_else(|| {
+            std::fs::metadata(file_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).date_naive() + chrono::Duration::days(1))
+        });
+        let year_bound = year_bound.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+        let mut lines = crate::textlines::EvidenceLines::new(BufReader::new(file));
 
         let mut file_lines = 0usize;
         let mut file_matched = 0usize;
         let mut file_rejected = 0usize;
 
-        for (lineno, line_result) in reader.lines().enumerate() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+        for (lineno, line) in (&mut lines).enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -334,6 +342,7 @@ pub fn parse_custom(
                     let mut ctx: HashMap<String, String> = HashMap::new();
                     ctx.insert("__source_file".to_string(), fname.clone());
                     ctx.insert("__line_number".to_string(), (lineno + 1).to_string());
+                    ctx.insert("__year_bound".to_string(), year_bound.clone());
 
                     if !apply_extract(&p.extract, p.extract_regex.as_ref(), &line, &mut ctx) {
                         continue;
@@ -355,7 +364,17 @@ pub fn parse_custom(
 
                     // Map into LogData
                     let record = build_log_data(&p.map, &ctx, &fname);
-                    all_records.push(record);
+                    // every masstin row has an origin and a destination; a
+                    // line that names neither source nor target is counted,
+                    // not written
+                    let blank = |v: &str| { let t = v.trim(); t.is_empty() || t == "-" };
+                    if blank(&record.computer) {
+                        no_destination += 1;
+                    } else if blank(&record.workstation_name) && blank(&record.ip_address) {
+                        no_origin += 1;
+                    } else {
+                        all_records.push(record);
+                    }
                     *per_parser_hits.entry(p.name.clone()).or_insert(0) += 1;
                     file_matched += 1;
                     matched = true;
@@ -388,6 +407,9 @@ pub fn parse_custom(
     eprintln!("    Matched:       {} ({:.1}%)", total_matched,
         if total_lines > 0 { 100.0 * total_matched as f64 / total_lines as f64 } else { 0.0 });
     eprintln!("    Rejected:      {}", total_rejected);
+    if no_origin + no_destination > 0 {
+        eprintln!("    Not written:   {} without an origin, {} without a destination (matched, but a row needs both)", no_origin, no_destination);
+    }
     if !per_parser_hits.is_empty() {
         eprintln!("    Hits per parser:");
         let mut hits: Vec<(&String, &usize)> = per_parser_hits.iter().collect();
@@ -618,7 +640,10 @@ fn build_log_data(
         // vendor timestamps the fallback reads (asctime, epoch) are written
         // as ISO UTC so the CSV stays homogeneous; masstin's own shapes
         // are kept as they come
-        time_created: crate::timefmt::normalise_for_csv(&get("time_created")),
+        time_created: crate::timefmt::normalise_for_csv_bounded(
+            &get("time_created"),
+            ctx.get("__year_bound").and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
+        ),
         computer: get("computer"),
         event_type: get("event_type"),
         event_id: get("event_id"),

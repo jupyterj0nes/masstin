@@ -259,7 +259,7 @@ These are the columns of masstin's unified `LogData` schema — the same ones yo
 
 | Field | Typical use |
 |---|---|
-| `time_created` | Event timestamp. ISO / RFC 3339 values (`2026-03-15T10:00:00Z`, `2026-03-15 10:00:00`, with or without fraction and offset) are written as they come. C asctime (`Fri May 31 17:35:42 2019`, Zscaler) and Unix epochs in seconds, ms, µs or ns (Cloudflare) are rewritten as ISO UTC (`2019-05-31T17:35:42Z`) so the CSV stays homogeneous. Anything else is written as it came and reported as unparseable by the loaders |
+| `time_created` | Event timestamp. ISO / RFC 3339 values (`2026-03-15T10:00:00Z`, `2026-03-15 10:00:00`, with or without fraction and offset) are written as they come. Casctime (`Fri May 31 17:35:42 2019`, Zscaler), `Apr 13 2026 09:00:15` (Cisco ASA with `logging timestamp`), slashed dates (`2026/04/13 09:15:18`, Palo Alto) and Unix epochs in seconds (also with a fraction, `1744530015.123`, Squid), ms, µs or ns (Cloudflare) are rewritten as ISO UTC (`2019-05-31T17:35:42Z`) so the CSV stays homogeneous. A syslog stamp without a year (`Apr 13 09:14:22`) takes the year of the last day the file can hold (its logrotate suffix `-YYYYMMDD`, or the day after it was last written), the year before when the date would fall after it, as parse-linux does; it is taken as UTC. Anything else is written as it came and reported as unparseable by the loaders |
 | `computer` | Destination machine / device the event happened on (e.g. firewall name, gateway name) |
 | `event_type` | One of `SUCCESSFUL_LOGON`, `FAILED_LOGON`, `LOGOFF`, `CONNECT` |
 | `event_id` | Short identifier of the event flavour (e.g. `GP-GW-AUTH-SUCC`) |
@@ -292,6 +292,10 @@ masstin -a parse-custom --rules my-rule.yaml -f sample.log --dry-run
 ```
 
 ---
+
+## Rows without an origin or a destination
+
+Every masstin row has an origin (`workstation_name` or `ip_address`) and a destination (`computer`). A line that matches a parser but whose mapping leaves either empty is not written: the summary counts it under `Not written`. Some vendor events name only one side (Cisco ASA 113004, a successful AAA authentication, names the AAA server and the user but not the client); they are counted, not turned into half rows.
 
 ## Rejected lines and debug mode
 
