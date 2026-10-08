@@ -110,6 +110,7 @@ pub async fn load_memgraph(
     files: &Vec<String>,
     database: &String,
     user: &String,
+    db: &str,
     ungrouped: bool,
     start_time: Option<&String>,
     end_time: Option<&String>,
@@ -133,7 +134,7 @@ pub async fn load_memgraph(
         .uri(database)
         .user(user)
         .password("")
-        .db("memgraph")
+        .db(db)
         .build()
         .unwrap();
     let graph = Graph::connect(config).await.unwrap();

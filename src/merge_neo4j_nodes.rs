@@ -15,6 +15,7 @@ use rpassword;
 pub async fn merge_neo4j_nodes(
     database: &String,
     user: &String,
+    db: &str,
     old_name: &String,
     new_name: &String,
 ) {
@@ -26,7 +27,20 @@ pub async fn merge_neo4j_nodes(
     crate::banner::print_phase_detail("New node:", new_name);
 
     let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
-    let graph = Graph::new(database, user, &pass).await.unwrap();
+    let config = match ConfigBuilder::default().uri(database).user(user).password(&pass).db(db).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("MASSTIN - Error: failed to build Neo4j config: {}", e);
+            return;
+        }
+    };
+    let graph = match Graph::connect(config).await {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("MASSTIN - Error: cannot connect to {}: {}", database, e);
+            return;
+        }
+    };
     crate::banner::print_phase_result("Connected");
 
     // Phase 2: discover rel types touching the old node

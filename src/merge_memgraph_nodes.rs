@@ -8,6 +8,7 @@ use futures::stream::*;
 pub async fn merge_memgraph_nodes(
     database: &String,
     user: &String,
+    db: &str,
     old_name: &String,
     new_name: &String,
 ) {
@@ -22,7 +23,7 @@ pub async fn merge_memgraph_nodes(
         .uri(database)
         .user(user)
         .password("")
-        .db("memgraph")
+        .db(db)
         .build()
         .unwrap();
     let graph = Graph::connect(config).await.unwrap();

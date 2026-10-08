@@ -75,10 +75,9 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
     crate::banner::print_phase("1", "3", "Scanning forensic images for EVTX remnants...");
 
     if unalloc_only {
-        crate::banner::print_info("  Mode: unallocated space only (--carve-unalloc)");
-    } else {
-        crate::banner::print_info("  Mode: full disk scan (use --carve-unalloc for faster unallocated-only)");
+        crate::banner::print_warning("  --carve-unalloc is not implemented yet: scanning the whole image");
     }
+    crate::banner::print_info("  Mode: full disk scan");
 
     let base_temp = std::env::temp_dir().join("masstin_carve_extract");
     let _ = fs::remove_dir_all(&base_temp);
