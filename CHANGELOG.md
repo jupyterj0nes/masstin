@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `parse-linux` (syslog and journald): **an `Invalid user` is a failed logon.** sshd writes `Invalid user admin from <ip> port <n>` when a client names an account that does not exist; on a server that only takes keys that, and `Connection closed by invalid user admin ... [preauth]`, is all it writes (no `Failed password` line ever comes, the client cannot send one). The line was ignored and the close became a `CONNECT` with the account only in `detail`, so a brute force or account enumeration against such a server showed as pre-auth touches with no account. Each such connection (sshd pid) without a `Failed` / `Accepted` line is now one `FAILED_LOGON` with the account in its column and detail `invalid-user`, replacing its pre-auth `CONNECT`; a connection that did log `Failed ... for invalid user` keeps that row and gets no second one. An account with spaces (`Invalid user  0101`, which `Failed password` did not parse) is recovered the same way. On loghub's OpenSSH_2k (a password server): 4 more failed logons, 4 fewer pre-auth touches. `Connection closed by authenticating user root ... [preauth]` (an existing account that did not finish authenticating) is unchanged, still a pre-auth `CONNECT`.
+
 ## v1.3.3 — 2026-10-08
 
 ### Windows sessions end where they end, and a hunt is reproducible

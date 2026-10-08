@@ -97,8 +97,71 @@ pub(crate) static PREAUTH_NOIDENT_RE: Lazy<Regex> =
 pub(crate) static PREAUTH_BADPROTO_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"Bad protocol version identification .* from (\S+)"#).unwrap());
 pub(crate) static PREAUTH_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(?:invalid|authenticating) user (\S+)\s+)?([0-9A-Fa-f][0-9A-Fa-f:.]*)\b.*\[preauth\]"#).unwrap()
+    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(invalid|authenticating) user (\S+)\s+)?([0-9A-Fa-f][0-9A-Fa-f:.]*)\b.*\[preauth\]"#).unwrap()
 });
+
+/// "Invalid user admin from 203.0.113.9 [port 4242]": sshd names an
+/// account that does not exist on the host. The account may contain
+/// spaces (scanners send " 0101"). Captures: 1 user, 2 source.
+pub(crate) static INVALID_USER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?:^|: )Invalid user (.*?) from (\S+?)(?: port \d+)?\s*$"#).unwrap());
+
+/// The marker `RawEvt.evt` of an "Invalid user" line, resolved per
+/// connection by `invalid_users_as_failures` before anything reads it.
+pub(crate) const INVALID_USER_EVT: &str = "SSH_INVALID_USER";
+
+/// A connection (sshd pid) that named an account that does not exist on
+/// the host is a failed logon, as a 4625 with an unknown user is on
+/// Windows. When the connection also logged "Failed <method> for invalid
+/// user", that line is the failure and the marker is dropped. When it
+/// logged no outcome at all (a server that only takes keys never sees a
+/// password: "Invalid user X" and "Connection closed by invalid user X
+/// ... [preauth]" are all it writes), one SSH_FAILED row is written with
+/// the account, detail `invalid-user`, and the connection's pre-auth
+/// CONNECT rows are dropped: they are the same connection. Lines without
+/// a pid are taken one by one.
+pub(crate) fn invalid_users_as_failures(out: &mut Vec<RawEvt>, prefix: &str) {
+    use std::collections::{HashMap, HashSet};
+    let mut has_outcome: HashSet<u32> = HashSet::new();
+    for e in out.iter() {
+        if e.pid != 0 && (e.evt == "SSH_FAILED" || e.evt == "SSH_SUCCESS") {
+            has_outcome.insert(e.pid);
+        }
+    }
+    // first announcement per pid: an "Invalid user" line, else a pre-auth
+    // close that names an invalid user
+    let mut first: HashMap<u32, usize> = HashMap::new();
+    for (i, e) in out.iter().enumerate() {
+        let announced = e.evt == INVALID_USER_EVT
+            || (e.evt == "SSH_PREAUTH" && e.tty_or_proc.contains("invalid-user="));
+        if announced && e.pid != 0 && !has_outcome.contains(&e.pid) {
+            first.entry(e.pid).or_insert(i);
+        }
+    }
+    let converted: HashSet<u32> = first.keys().copied().collect();
+    let keep_idx: HashSet<usize> = first.values().copied().collect();
+    let old = std::mem::take(out);
+    for (i, mut e) in old.into_iter().enumerate() {
+        let announced = e.evt == INVALID_USER_EVT
+            || (e.evt == "SSH_PREAUTH" && e.tty_or_proc.contains("invalid-user="));
+        if keep_idx.contains(&i) || (announced && e.pid == 0) {
+            if e.evt == "SSH_PREAUTH" {
+                // "ssh/preauth-closed invalid-user=admin"
+                e.user = e.tty_or_proc.split("invalid-user=").nth(1).unwrap_or("").to_string();
+            }
+            e.evt = "SSH_FAILED".into();
+            e.tty_or_proc = format!("{}/invalid-user", prefix);
+            out.push(e);
+        } else if e.evt == INVALID_USER_EVT {
+            // the connection logged its own Failed line, or this is a later
+            // repeat of the announcement
+        } else if e.evt == "SSH_PREAUTH" && converted.contains(&e.pid) {
+            // the same connection, now a failed logon
+        } else {
+            out.push(e);
+        }
+    }
+}
 
 /// Classify an sshd message as a pre-authentication touch. Returns
 /// (source, detail) — detail names the kind and, for closed/disconnect
@@ -112,11 +175,12 @@ pub(crate) fn preauth_touch(msg: &str) -> Option<(String, String)> {
         return Some((clean(&c[1]), "preauth-bad-proto".into()));
     }
     if let Some(c) = PREAUTH_CLOSED_RE.captures(msg) {
-        let d = match c.get(1) {
-            Some(u) => format!("preauth-closed user={}", u.as_str()),
-            None => "preauth-closed".into(),
+        let d = match (c.get(1).map(|k| k.as_str()), c.get(2)) {
+            (Some("invalid"), Some(u)) => format!("preauth-closed invalid-user={}", u.as_str()),
+            (_, Some(u)) => format!("preauth-closed user={}", u.as_str()),
+            _ => "preauth-closed".into(),
         };
-        return Some((clean(&c[2]), d));
+        return Some((clean(&c[3]), d));
     }
     None
 }
@@ -912,6 +976,26 @@ fn parse_secure_or_messages(
             continue;
         }
 
+        // 3b2) "Invalid user X from SRC": resolved per connection at the
+        //      end of the file (invalid_users_as_failures)
+        if let Some(cap) = INVALID_USER_RE.captures(&msg) {
+            let src = cap[2].to_string();
+            if !filter_ip || looks_like_ip(&src) {
+                out.push(RawEvt {
+                    ts_rfc3339:  when.clone(),
+                    user:        cap[1].trim().to_string(),
+                    remote:      src,
+                    tty_or_proc: "ssh/invalid-user".into(),
+                    evt:         INVALID_USER_EVT.into(),
+                    filename:    path.display().to_string(),
+                    dst_host:    dst_host.into(),
+                    pid: line_pid,
+                    conn: 0,
+                });
+            }
+            continue;
+        }
+
         // 3c) Pre-authentication touch (no account): CONNECT row. The
         //     user column stays empty on purpose — an announced user name
         //     is not an authenticated identity; it goes in the detail.
@@ -997,6 +1081,7 @@ fn parse_secure_or_messages(
     if let Some(p) = lines.problem(path) {
         crate::banner::print_warning(&format!("  {}", p));
     }
+    invalid_users_as_failures(&mut out, "ssh");
     if tracker.pam_closes == 0 && !disconnect_fallback.is_empty() {
         if is_debug_mode() {
             println!("    {}: no pam session lines, using {} 'Disconnected from user' lines as session ends",
@@ -2327,7 +2412,38 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
 
 #[cfg(test)]
 mod repeated_tests {
-    use super::expand_repeated;
+    use super::{expand_repeated, invalid_users_as_failures, RawEvt, INVALID_USER_EVT, INVALID_USER_RE};
+
+    #[test]
+    fn invalid_user_is_a_failed_logon() {
+        let ev = |t: &str, evt: &str, user: &str, detail: &str, pid: u32| RawEvt {
+            ts_rfc3339: t.into(), user: user.into(), remote: "203.0.113.9".into(),
+            tty_or_proc: detail.into(), evt: evt.into(), filename: "auth.log".into(),
+            dst_host: "web01".into(), pid, conn: 0,
+        };
+        let mut out = vec![
+            // key-only server: announcement and pre-auth close, nothing else
+            ev("t1", INVALID_USER_EVT, "admin", "ssh/invalid-user", 10),
+            ev("t2", "SSH_PREAUTH", "", "ssh/preauth-closed invalid-user=admin", 10),
+            // password server: the Failed line is the failure, no extra row
+            ev("t3", INVALID_USER_EVT, "guest", "ssh/invalid-user", 11),
+            ev("t4", "SSH_FAILED", "guest", "ssh/password invalid-user", 11),
+            // only the close names the invalid user
+            ev("t5", "SSH_PREAUTH", "", "ssh/preauth-closed invalid-user=test", 12),
+            // an existing account that gave up: still a pre-auth touch
+            ev("t6", "SSH_PREAUTH", "", "ssh/preauth-closed user=root", 13),
+        ];
+        invalid_users_as_failures(&mut out, "ssh");
+        let got: Vec<(&str, &str, &str)> = out.iter().map(|e| (e.ts_rfc3339.as_str(), e.evt.as_str(), e.user.as_str())).collect();
+        assert_eq!(got, vec![
+            ("t1", "SSH_FAILED", "admin"),
+            ("t4", "SSH_FAILED", "guest"),
+            ("t5", "SSH_FAILED", "test"),
+            ("t6", "SSH_PREAUTH", ""),
+        ]);
+        assert!(INVALID_USER_RE.is_match("web01 sshd[4242]: Invalid user admin from 203.0.113.9 port 4242"));
+        assert_eq!(&INVALID_USER_RE.captures("Invalid user  0101 from 5.188.10.180").unwrap()[1], " 0101");
+    }
 
     #[test]
     fn repeated_lines_are_expanded() {
