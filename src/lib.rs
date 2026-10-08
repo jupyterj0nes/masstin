@@ -100,8 +100,9 @@ pub struct Cli {
     #[arg(long)]
     overwrite: bool,
 
-    /// If specified, print output only to stdout
-    #[arg(long)]
+    /// No effect, kept so existing command lines still parse: output goes
+    /// to stdout whenever `-o` is omitted.
+    #[arg(long, hide = true)]
     stdout: bool,
 
     /// If specified, print debug information
@@ -176,7 +177,8 @@ pub struct Cli {
     #[arg(long)]
     all_volumes: bool,
 
-    /// Carve only unallocated space (faster). Default: carve entire disk.
+    /// Planned: carve only unallocated space. Not implemented yet; the
+    /// whole image is scanned either way.
     #[arg(long)]
     carve_unalloc: bool,
 
@@ -438,6 +440,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 &config.file,
                 &config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap_or(&default_user),
+                config.db.as_deref().unwrap_or("memgraph"),
                 config.ungrouped,
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
@@ -541,6 +544,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             merge_neo4j_nodes(
                 config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap(),
+                config.db.as_deref().unwrap_or("neo4j"),
                 config.old_node.as_ref().unwrap(),
                 config.new_node.as_ref().unwrap(),
             )
@@ -551,6 +555,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             merge_memgraph_nodes(
                 config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap_or(&default_user),
+                config.db.as_deref().unwrap_or("memgraph"),
                 config.old_node.as_ref().unwrap(),
                 config.new_node.as_ref().unwrap(),
             )
@@ -561,6 +566,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             crate::graph_hunt::graph_hunt(
                 config.database.as_ref().unwrap(),
                 config.user.as_ref().unwrap_or(&default_user),
+                config.db.as_deref().unwrap_or("memgraph"),
                 config.investigation_from.as_ref().unwrap(),
                 config.skip_detectors.as_deref(),
                 config.only_detectors.as_deref(),

@@ -445,8 +445,9 @@ pub fn parse_custom(
                 ));
             }
         }
-    } else {
-        crate::banner::print_warning("  No -o specified, skipping CSV write");
+    } else if let Err(e) = crate::csv_out::write_timeline(&all_records, None) {
+        // no -o: the timeline goes to stdout, as with every other parser
+        crate::banner::print_warning(&format!("  Error writing output: {}", e));
     }
 }
 

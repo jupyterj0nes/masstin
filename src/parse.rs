@@ -1688,7 +1688,10 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
             log_data = parse_smb_server(file, SMBSERVER_EVENT_IDS.to_vec())
         },
         "Microsoft-Windows-SMBClient" => {
-            log_data = parse_smb_client(file, SMBCLIENT_EVENT_IDS.to_vec())
+            // the Security (31001) and Connectivity (30803-30808) channels
+            // share this provider; their event ids do not overlap
+            log_data = parse_smb_client(file, SMBCLIENT_EVENT_IDS.to_vec());
+            log_data.extend(parse_smb_client_connectivity(file, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec()));
         },
         "Microsoft-Windows-TerminalServices-ClientActiveXCore" => {
             log_data = parse_rdp_client(file, RDPCLIENT_EVENT_IDS.to_vec())
@@ -1701,9 +1704,6 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         },
         "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS" => {
             log_data = parse_rdpkore(file, RDPKORE_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-SmbClient%4Connectivity.evtx" => {
-            log_data = parse_smb_client_connectivity(file, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec())
         },
         "Microsoft-Windows-WinRM" => {
             log_data = parse_winrm(file, WINRM_EVENT_IDS.to_vec())

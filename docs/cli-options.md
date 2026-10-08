@@ -25,7 +25,6 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--cortex-max-passes` | Hard cap on auto-pagination passes for both Cortex actions (default 200) |
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
-| `--stdout` | Print output to stdout only |
 | `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and rejected lines in `parse-custom`) |
 | `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
 | `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](../rules/)) |
