@@ -2471,9 +2471,9 @@ mod repeated_tests {
     #[test]
     fn port_scan_and_timeouts_are_captured() {
         use super::{PREAUTH_PORT_CLOSED_RE, PREAUTH_TIMEOUT_RE};
-        assert!(PREAUTH_PORT_CLOSED_RE.is_match("Connection closed by 10.240.240.86 port 23048"));
-        assert_eq!(&PREAUTH_PORT_CLOSED_RE.captures("Connection closed by 10.240.240.86 port 23048").unwrap()[1], "10.240.240.86");
-        assert!(PREAUTH_TIMEOUT_RE.is_match("Timeout before authentication for connection from 10.240.240.86 to 10.247.48.12, pid = 770043"));
-        assert!(PREAUTH_TIMEOUT_RE.is_match("drop connection #0 from [10.240.240.86]:40399 on [10.247.48.12]:22 penalty: exceeded LoginGraceTime"));
+        assert!(PREAUTH_PORT_CLOSED_RE.is_match("Connection closed by 203.0.113.86 port 23048"));
+        assert_eq!(&PREAUTH_PORT_CLOSED_RE.captures("Connection closed by 203.0.113.86 port 23048").unwrap()[1], "203.0.113.86");
+        assert!(PREAUTH_TIMEOUT_RE.is_match("Timeout before authentication for connection from 203.0.113.86 to 192.0.2.12, pid = 770043"));
+        assert!(PREAUTH_TIMEOUT_RE.is_match("drop connection #0 from [203.0.113.86]:40399 on [192.0.2.12]:22 penalty: exceeded LoginGraceTime"));
     }
 }
