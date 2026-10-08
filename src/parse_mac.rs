@@ -95,6 +95,171 @@ static SCREENSHARE_FAIL_RE: Lazy<Regex> = Lazy::new(|| {
 static SCREENSHARE_TYPE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"::\s*Type:\s*(\S+)").unwrap());
 
+// Sonoma 14.8 and Sequoia 15.7 no longer write the "Authentication: ..."
+// line (the format string is gone from screensharingd). An ARD / VNC logon
+// leaves separate lines, same process, same instant:
+//   "*outUID= 502"                       the account's uid (successes only)
+//   "authResult = 0" / "authResult = 1"  the outcome
+//   "new viewer connection: 10.0.0.9"    the client's address (seen on
+//                                        Sequoia failures; "Connection
+//                                        accepted :: Viewer Address: %s" is
+//                                        the other form in the binary)
+// They are paired per process within a few seconds (`pair_screenshare`).
+// A row needs an origin: an outcome without a viewer address is counted
+// and dropped, a viewer address without an outcome is a CONNECT.
+static SS_VIEWER_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:new viewer connection:|Connection accepted :: Viewer Address:)\s*(\S+)").unwrap()
+});
+static SS_AUTH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^authResult = (\d+)").unwrap());
+static SS_UID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\*outUID= (\d+)").unwrap());
+
+/// One screensharingd line of the modern, split kind.
+#[derive(Debug, Clone, PartialEq)]
+enum SsKind {
+    Viewer(String),
+    Auth(u32),
+    Uid(u64),
+}
+
+#[derive(Debug, Clone)]
+struct SsEvt {
+    /// microseconds since the epoch
+    t_us: i64,
+    pid: u64,
+    kind: SsKind,
+}
+
+fn screenshare_event(process: &str, message: &str) -> Option<SsKind> {
+    let b = proc_base(process);
+    if b != "screensharingd" {
+        return None;
+    }
+    let m = message.trim();
+    if let Some(c) = SS_VIEWER_RE.captures(m) {
+        return Some(SsKind::Viewer(c[1].trim_end_matches(|ch: char| ch == ',' || ch == '.').to_string()));
+    }
+    if let Some(c) = SS_AUTH_RE.captures(m) {
+        return c[1].parse().ok().map(SsKind::Auth);
+    }
+    if let Some(c) = SS_UID_RE.captures(m) {
+        return c[1].parse().ok().map(SsKind::Uid);
+    }
+    None
+}
+
+fn us_iso(t_us: i64) -> String {
+    Utc.timestamp_nanos(t_us.saturating_mul(1000))
+        .to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Pair the split screensharingd lines into rows. Per process: a viewer
+/// address and an outcome within `WINDOW` of each other make a login row
+/// (SUCCESSFUL_LOGON with `uid:<n>` when the uid was logged just before,
+/// FAILED_LOGON otherwise); a viewer address with no outcome is a CONNECT;
+/// an outcome with no address is counted in `no_origin` and dropped.
+/// Returns the rows and the number of outcomes dropped for lack of origin.
+fn pair_screenshare(mut evts: Vec<SsEvt>, dst: &str, file: &str) -> (Vec<LogData>, usize) {
+    const WINDOW: i64 = 5_000_000;
+    const UID_WINDOW: i64 = 2_000_000;
+    evts.sort_by_key(|e| e.t_us);
+    let mut rows = Vec::new();
+    let mut no_origin = 0usize;
+    // per pid: pending viewer (ip, t), pending outcome (result, t), last uid (n, t)
+    let mut viewer: HashMap<u64, (String, i64)> = HashMap::new();
+    let mut auth: HashMap<u64, (u32, i64)> = HashMap::new();
+    let mut uid: HashMap<u64, (u64, i64)> = HashMap::new();
+    // per pid: the address of the connection last turned into a row, so the
+    // accept path logging it again a moment later is not a second row
+    let mut recent: HashMap<u64, (String, i64)> = HashMap::new();
+    let emit = |rows: &mut Vec<LogData>, ip: &str, t: i64, res: Option<u32>, who: Option<u64>| {
+        let (event_type, event_id, detail) = match res {
+            Some(0) => ("SUCCESSFUL_LOGON", "MAC-SCREENSHARE-OK", "screen sharing authenticated (authResult 0)".to_string()),
+            Some(r) => ("FAILED_LOGON", "MAC-SCREENSHARE-FAIL", format!("screen sharing authentication failed (authResult {})", r)),
+            None => ("CONNECT", "MAC-SCREENSHARE-CONNECT", "screen sharing viewer connected, outcome not logged".to_string()),
+        };
+        rows.push(row(
+            us_iso(t),
+            dst,
+            file,
+            Classified {
+                event_type,
+                event_id,
+                user: who.map(|u| format!("uid:{}", u)).unwrap_or_default(),
+                src: ip.to_string(),
+                logon_type: "ScreenSharing",
+                detail,
+            },
+        ));
+    };
+    let flush_viewer = |rows: &mut Vec<LogData>, v: Option<(String, i64)>| {
+        if let Some((ip, t)) = v {
+            emit(rows, &ip, t, None, None);
+        }
+    };
+    for e in evts {
+        match e.kind {
+            SsKind::Uid(n) => {
+                uid.insert(e.pid, (n, e.t_us));
+            }
+            SsKind::Auth(res) => {
+                let who = uid.get(&e.pid).filter(|(_, t)| (e.t_us - t).abs() <= UID_WINDOW).map(|(n, _)| *n);
+                match viewer.get(&e.pid) {
+                    Some((ip, t)) if (e.t_us - t).abs() <= WINDOW => {
+                        let (ip, t) = (ip.clone(), *t);
+                        viewer.remove(&e.pid);
+                        emit(&mut rows, &ip, t.min(e.t_us), Some(res), if res == 0 { who } else { None });
+                        recent.insert(e.pid, (ip, e.t_us));
+                    }
+                    other => {
+                        if other.is_some() {
+                            // an older viewer that never got an outcome
+                            let v = viewer.remove(&e.pid);
+                            flush_viewer(&mut rows, v);
+                        }
+                        if let Some((_, t)) = auth.get(&e.pid) {
+                            if (e.t_us - t).abs() > WINDOW {
+                                no_origin += 1;
+                            }
+                        }
+                        auth.insert(e.pid, (res, e.t_us));
+                    }
+                }
+            }
+            SsKind::Viewer(ip) => {
+                if let Some((rip, rt)) = recent.get(&e.pid) {
+                    if *rip == ip && (e.t_us - rt).abs() <= WINDOW {
+                        continue;
+                    }
+                }
+                if let Some((res, t)) = auth.get(&e.pid).copied() {
+                    if (e.t_us - t).abs() <= WINDOW {
+                        auth.remove(&e.pid);
+                        let who = uid.get(&e.pid).filter(|(_, tu)| (t - tu).abs() <= UID_WINDOW).map(|(n, _)| *n);
+                        emit(&mut rows, &ip, t.min(e.t_us), Some(res), if res == 0 { who } else { None });
+                        recent.insert(e.pid, (ip, e.t_us));
+                        continue;
+                    }
+                }
+                match viewer.get(&e.pid) {
+                    Some((vip, t)) if *vip == ip && (e.t_us - t).abs() <= WINDOW => {
+                        // the accept path logs the address again: same connection
+                    }
+                    _ => {
+                        let v = viewer.remove(&e.pid);
+                        flush_viewer(&mut rows, v);
+                        viewer.insert(e.pid, (ip, e.t_us));
+                    }
+                }
+            }
+        }
+    }
+    for (_, v) in viewer.drain() {
+        flush_viewer(&mut rows, Some(v));
+    }
+    no_origin += auth.len();
+    (rows, no_origin)
+}
+
 /// Route a source token to the right column: an address goes to `src_ip`,
 /// anything else (a hostname) to `src_computer`. Returns
 /// `(src_computer, src_ip)`.
@@ -288,11 +453,16 @@ fn row(ts_iso: String, dst: &str, file: &str, c: Classified) -> LogData {
 
 /// A Unified Log `LogData.time` is nanoseconds since the Unix epoch. Render
 /// it as the ISO form masstin writes everywhere (`…Z`, microsecond
-/// precision), which every downstream reader already accepts.
+/// precision), which every downstream reader already accepts. Rounded to
+/// the microsecond the way `log show` prints it, so a bundle and its
+/// export carry the same instant.
 fn ul_time_iso(nanos: f64) -> String {
-    let n = nanos as i64;
-    Utc.timestamp_nanos(n)
-        .to_rfc3339_opts(SecondsFormat::Micros, true)
+    us_iso(ul_micros(nanos))
+}
+
+/// Microseconds since the epoch, rounded as `log show` rounds.
+fn ul_micros(nanos: f64) -> i64 {
+    (nanos / 1000.0).round() as i64
 }
 
 /// Parse the `timestamp` field of a `log show` JSON export
@@ -375,6 +545,10 @@ struct Tally {
     /// 40 of each, printed with --debug so an empty timeline can be
     /// explained)
     unclassified: Vec<String>,
+    /// modern screensharingd lines, paired at the end (see `pair_screenshare`)
+    ss: Vec<SsEvt>,
+    /// screensharingd outcomes dropped for lack of a viewer address
+    ss_no_origin: usize,
 }
 
 /// Filter one batch of resolved Unified Log records down to lateral-movement
@@ -396,6 +570,10 @@ fn harvest(records: &[UlData], dst: &str, file: &str, out: &mut Vec<LogData>, ta
                 out.push(row(ul_time_iso(r.time), dst, file, c));
             }
             None => {
+                if let Some(kind) = screenshare_event(&r.process, &r.message) {
+                    tally.ss.push(SsEvt { t_us: ul_micros(r.time), pid: r.pid, kind });
+                    continue;
+                }
                 // up to 40 per process, so a busy sshd does not hide what
                 // screensharingd wrote
                 let is_ssh = proc_base(&r.process).starts_with("sshd");
@@ -469,6 +647,10 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
         let (results, _) = build_log(&leftover, &provider, &cache, &timesync, false);
         harvest(&results, &dst, &leftover.evidence.clone(), out, &mut tally);
     }
+    let (ss_rows, dropped) = pair_screenshare(std::mem::take(&mut tally.ss), &dst, &dir.display().to_string());
+    tally.rows += ss_rows.len();
+    tally.ss_no_origin = dropped;
+    out.extend(ss_rows);
     if crate::parse::is_debug_mode() {
         eprintln!(
             "[DEBUG] logarchive {}: {} tracev3 file(s), {} record(s) scanned, {} from sshd, {} from screensharingd, {} lateral-movement row(s)",
@@ -479,6 +661,12 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
             tally.screenshare,
             tally.rows
         );
+        if tally.ss_no_origin > 0 {
+            eprintln!(
+                "[DEBUG]   {} screensharingd outcome(s) (authResult) without a viewer address: no origin, no row",
+                tally.ss_no_origin
+            );
+        }
         for m in &tally.unclassified {
             eprintln!("[DEBUG]   not a logon: {}", m);
         }
@@ -489,8 +677,8 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
 
 /// Pull `(process, message, timestamp)` out of one `log show` JSON object.
 /// `log show` names them `processImagePath` (or `process`), `eventMessage`
-/// and `timestamp`.
-fn classify_json_value(v: &serde_json::Value, dst: &str, file: &str) -> Option<LogData> {
+/// and `timestamp`. A modern screensharingd line goes to `ss` for pairing.
+fn classify_json_value(v: &serde_json::Value, dst: &str, file: &str, ss: &mut Vec<SsEvt>) -> Option<LogData> {
     let process = v
         .get("processImagePath")
         .or_else(|| v.get("process"))
@@ -500,13 +688,23 @@ fn classify_json_value(v: &serde_json::Value, dst: &str, file: &str) -> Option<L
         return None;
     }
     let message = v.get("eventMessage").and_then(|x| x.as_str()).unwrap_or("");
-    let c = classify(process, message)?;
     let ts = v
         .get("timestamp")
         .and_then(|x| x.as_str())
         .map(json_time_iso)
         .unwrap_or_default();
-    Some(row(ts, dst, file, c))
+    match classify(process, message) {
+        Some(c) => Some(row(ts, dst, file, c)),
+        None => {
+            if let Some(kind) = screenshare_event(process, message) {
+                if let Ok(t) = DateTime::parse_from_rfc3339(&ts) {
+                    let pid = v.get("processID").and_then(|x| x.as_u64()).unwrap_or(0);
+                    ss.push(SsEvt { t_us: t.timestamp_micros(), pid, kind });
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Parse a `log show` export: `--style ndjson` (one object per line) or
@@ -524,6 +722,7 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
         }
     };
     let mut reader = BufReader::new(f);
+    let mut ss: Vec<SsEvt> = Vec::new();
     let first = match reader.fill_buf() {
         Ok(b) => b.iter().copied().find(|c| !c.is_ascii_whitespace()),
         Err(_) => None,
@@ -536,11 +735,12 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
         }
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text) {
             for v in &items {
-                if let Some(r) = classify_json_value(v, &dst, &file) {
+                if let Some(r) = classify_json_value(v, &dst, &file, &mut ss) {
                     out.push(r);
                 }
             }
         }
+        out.extend(pair_screenshare(ss, &dst, &file).0);
         return;
     }
     // `--style ndjson`: one object per line, streamed.
@@ -550,11 +750,12 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(r) = classify_json_value(&v, &dst, &file) {
+            if let Some(r) = classify_json_value(&v, &dst, &file, &mut ss) {
                 out.push(r);
             }
         }
     }
+    out.extend(pair_screenshare(ss, &dst, &file).0);
 }
 
 /// True when a file looks like a `log show` JSON / NDJSON export: a JSON
@@ -722,6 +923,63 @@ mod tests {
         assert!(classify("sshd-session", "Invalid user nosuchuser from 127.0.0.1 port 49186").is_none());
         let c = classify("sshd-session", "Failed password for invalid user nosuchuser from 127.0.0.1 port 49186 ssh2").unwrap();
         assert_eq!((c.event_type, c.user.as_str()), ("FAILED_LOGON", "nosuchuser"));
+    }
+
+    /// The split lines Sequoia 15.7 wrote for two refused ARD attempts and
+    /// one accepted one (GitHub runner, 2026-10-08), and what Sonoma 14.8
+    /// wrote for the same: outcomes without any viewer address.
+    #[test]
+    fn modern_screensharing_lines_are_paired_by_process() {
+        let us = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_micros();
+        let ev = |t: &str, pid: u64, m: &str| SsEvt { t_us: us(t), pid, kind: screenshare_event("screensharingd", m).unwrap() };
+        // Sequoia: an outcome and the address in the same instant; then the
+        // address logged twice (accept path, then bad-auth path) around
+        // the outcome; then a success with uid and no address
+        let evts = vec![
+            ev("2026-10-08T09:26:13.426000Z", 5880, "authResult = 1"),
+            ev("2026-10-08T09:26:13.426000Z", 5880, "new viewer connection: 127.0.0.1"),
+            ev("2026-10-08T09:26:23.419000Z", 5880, "new viewer connection: 127.0.0.1"),
+            ev("2026-10-08T09:26:23.622000Z", 5880, "authResult = 1"),
+            ev("2026-10-08T09:26:23.622000Z", 5880, "new viewer connection: 127.0.0.1"),
+            ev("2026-10-08T09:24:46.977000Z", 4885, "*outUID= 502"),
+            ev("2026-10-08T09:24:46.977000Z", 4885, "authResult = 0"),
+        ];
+        let (rows, dropped) = pair_screenshare(evts, "MAC-CI", "f");
+        assert_eq!(dropped, 1, "the success without a viewer address is dropped");
+        assert_eq!(rows.len(), 2, "{:?}", rows.iter().map(|r| (&r.time_created, &r.event_type)).collect::<Vec<_>>());
+        for r in &rows {
+            assert_eq!(r.event_type, "FAILED_LOGON");
+            assert_eq!(r.event_id, "MAC-SCREENSHARE-FAIL");
+            assert_eq!(r.ip_address, "127.0.0.1");
+            assert_eq!(r.logon_type, "ScreenSharing");
+            assert_eq!(r.target_user_name, "");
+        }
+        assert_eq!(rows[0].time_created, "2026-10-08T09:26:13.426000Z");
+        assert_eq!(rows[1].time_created, "2026-10-08T09:26:23.419000Z");
+        // a success with the address logged becomes a login with the uid
+        let evts = vec![
+            ev("2026-10-08T09:16:13.423000Z", 2819, "*outUID= 502"),
+            ev("2026-10-08T09:16:13.423000Z", 2819, "authResult = 0"),
+            ev("2026-10-08T09:16:13.500000Z", 2819, "Connection accepted :: Viewer Address: 10.0.0.9"),
+        ];
+        let (rows, dropped) = pair_screenshare(evts, "MAC-CI", "f");
+        assert_eq!((rows.len(), dropped), (1, 0));
+        assert_eq!((rows[0].event_type.as_str(), rows[0].target_user_name.as_str(), rows[0].ip_address.as_str()), ("SUCCESSFUL_LOGON", "uid:502", "10.0.0.9"));
+        // an address with no outcome in the window is a CONNECT
+        let evts = vec![ev("2026-10-08T09:30:00.000000Z", 7, "new viewer connection: 10.0.0.9")];
+        let (rows, dropped) = pair_screenshare(evts, "MAC-CI", "f");
+        assert_eq!((rows.len(), dropped), (1, 0));
+        assert_eq!((rows[0].event_type.as_str(), rows[0].event_id.as_str()), ("CONNECT", "MAC-SCREENSHARE-CONNECT"));
+        // Sonoma: outcomes only
+        let evts = vec![
+            ev("2026-10-08T09:24:43.476000Z", 3085, "*outUID= 502"),
+            ev("2026-10-08T09:24:43.476000Z", 3085, "authResult = 0"),
+            ev("2026-10-08T09:25:36.463000Z", 4248, "authResult = 1"),
+            ev("2026-10-08T09:25:45.752000Z", 4248, "authResult = 1"),
+        ];
+        let (rows, dropped) = pair_screenshare(evts, "MAC-CI", "f");
+        assert_eq!((rows.len(), dropped), (0, 3));
+        assert!(screenshare_event("sshd", "authResult = 1").is_none());
     }
 
     #[test]

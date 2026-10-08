@@ -185,5 +185,5 @@ jobs:
           grep -q MAC-SSHD-PREAUTH out/mac-ndjson.csv || { echo "::error::no SSH pre-auth CONNECT row from the log show export"; exit 1; }
           grep -q MAC-SSHD-LOGOFF out/mac-ndjson.csv || { echo "::error::no SSH LOGOFF row from the log show export"; exit 1; }
           grep -q MAC-SSHD-OK   out/mac-logarchive.csv || { echo "::error::the .logarchive holds no persisted SSH success: info-level sshd lines are not written to disk on this macOS"; exit 1; }
-          grep -q MAC-SCREENSHARE out/mac-ndjson.csv && echo "Screen Sharing rows present" || echo "::warning::no Screen Sharing row (screensharingd may not accept VNC on a headless runner)"
+          grep -q MAC-SCREENSHARE out/mac-ndjson.csv && echo "Screen Sharing rows present" || echo "::warning::no Screen Sharing row: this macOS wrote no viewer address next to its authResult lines (Sonoma does not; Sequoia only on failures)"
           echo "parse-mac extracted real SSH logons from a real macOS Unified Log"
