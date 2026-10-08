@@ -113,7 +113,7 @@ pub struct Cli {
     #[arg(long)]
     silent: bool,
 
-    /// Cortex API base URL (must start with 'api-' if using parse_cortex)
+    /// Cortex API base URL (must start with 'https://api-')
     #[arg(long)]
     cortex_url: Option<String>,
 
@@ -134,7 +134,7 @@ pub struct Cli {
 
     /// For `parse-cortex`: restrict the XQL network query to admin/lateral-movement
     /// ports only (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986).
-    /// Without this flag the query still defaults to (22, 445, 3389). Use it when
+    /// Without this flag the query defaults to (22, 445, 3389, 5985, 5986). Use it when
     /// you want WinRM/RPC/VNC/SQL pivoting visible as well, or when the default
     /// three-port query returns too much noise/hits the 1M API cap.
     #[arg(long)]
@@ -159,7 +159,8 @@ pub struct Cli {
 
     /// For `parse-cortex-evtx-forensics`: comma-separated list of Windows Event IDs
     /// to include in the forensics XQL query. Overrides the default set
-    /// (4624,4625,4648,21,22,24,25,1009,551,31001,30803-30808,1024,1102,1149).
+    /// (4624,4625,4634,4647,4648,4768-4771,4776,4778,4779,5140,31001,30803-30808,
+    /// 1009,551,1024,1102,1149,21,22,24,25,131,6,5858).
     /// Example: --cortex-event-ids 4624,4625,4648
     #[arg(long)]
     cortex_event_ids: Option<String>,
@@ -168,8 +169,7 @@ pub struct Cli {
     /// collapsing duplicate (src, user, dst) triples into a single edge with
     /// a `count` property. Useful when you want to see every individual
     /// lateral movement event, typically combined with --start-time /
-    /// --end-time to restrict the view to a narrow time window. Also usable
-    /// with `merge` to produce an ungrouped intermediate CSV.
+    /// --end-time to restrict the view to a narrow time window.
     #[arg(long)]
     ungrouped: bool,
 

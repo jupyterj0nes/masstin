@@ -3,7 +3,7 @@
 The 14-column timeline every action writes. Back to the [README](../README.md).
 
 
-All actions produce a unified CSV with 14 columns:
+Every parse action (and `merge`) produces a unified CSV with 14 columns. `graph-hunt*` write their own results CSV, described in [graph-hunt.md](graph-hunt.md):
 
 | Column | Description |
 |--------|-------------|

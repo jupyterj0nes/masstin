@@ -127,7 +127,7 @@ If you omit all three, the parser matches nothing. This is intentional — it pr
 
 ### `extract` block
 
-Pulls fields out of the matched line. Three extractor types are supported in v1:
+Pulls fields out of the matched line. Four extractor types are supported: `csv`, `regex`, `keyvalue` and `json`:
 
 #### `type: csv`
 
@@ -295,9 +295,9 @@ masstin -a parse-custom --rules my-rule.yaml -f sample.log --dry-run
 
 ## Rejected lines and debug mode
 
-When a line doesn't match any parser, it's counted as rejected. The summary always prints the count; the first 20 rejected lines are shown in dry-run mode.
+When a line doesn't match any parser, it's counted as rejected. The summary always prints the count; the first 5 rejected lines are shown in dry-run mode.
 
-With `--debug` and an output file, masstin also writes `<output>.rejected.log` alongside the CSV containing file:line:text for the rejected sample. That's your clue for what your rule is still missing.
+With `--debug` and an output file, masstin also writes `<output>.rejected.log` alongside the CSV with the first 20 rejected lines, one per line as `file:line<TAB>text`. That's your clue for what your rule is still missing.
 
 ```bash
 masstin -a parse-custom --rules my-rule.yaml -f big.log -o out.csv --debug
@@ -310,7 +310,7 @@ masstin -a parse-custom --rules my-rule.yaml -f big.log -o out.csv --debug
 ## Writing your first rule — step by step
 
 1. **Collect 5-10 sample lines** from each event type you care about. Put them in a `.sample.log` file.
-2. **Copy an existing rule** from `rules/` that has a similar format. `palo-alto-globalprotect.yaml` is a good template for CSV+keyvalue logs; `fortinet-fortigate.yaml` (when complete) will be a good template for pure keyvalue logs.
+2. **Copy an existing rule** from `rules/` that has a similar format. `palo-alto-globalprotect.yaml` is a good template for CSV+keyvalue logs; `fortinet-fortigate.yaml` is a good template for pure keyvalue logs, `zscaler-zpa.yaml` for JSON.
 3. **Write the `meta` block** with vendor, product, version, and `reference_url`. Future-you will thank past-you when the format changes.
 4. **Write a `prefilter`** with 2-3 substrings guaranteed to appear in every relevant line. Skip this if your log file is dedicated to this vendor.
 5. **Write ONE parser first** — the one for "login success". Use `contains` or `contains_any` to claim the lines.
@@ -336,7 +336,7 @@ All of these are on the roadmap if there's demand.
 
 ## Roadmap
 
-- `type: json` extractor with jq-style path selectors
+- jq-style selectors for the `json` extractor (today: dot paths)
 - Conditional `map` with `when: ${var} == "foo"` style predicates
 - Multiple `regex_multi` patterns on the same input for logs with optional fields
 - Per-rule validation (`masstin -a parse-custom --validate rule.yaml`)

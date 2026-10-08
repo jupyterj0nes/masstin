@@ -1,6 +1,6 @@
 # graph-hunt: statistical scoring
 
-Status: implemented September 2026 (masstin `graph-hunt` / `graph-hunt-neo4j`).
+Status: implemented September 2026 (masstin `graph-hunt` / `graph-hunt-neo4j` / `graph-hunt-csv`).
 
 ## Why
 
@@ -53,9 +53,9 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
    | causal-path | causal paths through this origin as pivot with a credential switch and a new access, summed over path certainties (see below) |
    | credential-switch | logins with a credential switch and a new access: the account belongs to other origins in the reference, this origin never used it, and the destination is new for the origin or for the account |
 
-8. **Joint test.** The statistic is T = Σ −ln(marginal tail share) over the coordinates above zero. It is calibrated empirically: p = (1 + #baseline origin-days with T ≥ T_obs) / (1 + N), with each baseline point's T computed leaving itself out. This is a conformal p-value. It is valid for exchangeable days whatever the dependence between coordinates, because dependence only costs power. Corroboration is therefore measured jointly, not added as a bonus. The number of baseline origin-days at least as high in every coordinate at once is reported alongside as a plain check.
-9. **Host-day profile.** For destination hosts in the panel, the engine measures the change in PageRank (scaled to mean 1) and in normalised betweenness when the day's logins are added to the baseline graph. On baseline days the same is done by removing that day's unique pairs and adding them back. The same joint calibration applies.
-10. **Decision.** Each machine's joint tests are combined with Simes (valid under positive dependence). Benjamini-Hochberg across machines controls the false discovery rate at alpha. Significant machines come first; everything else stays in the CSV, marked `significant = no`.
+8. **Joint test.** The test is per connection (see below): its coordinates are what is new about it, its origin-day profile above, and its destination-side context. The statistic is T = Σ −ln(marginal tail share) over the coordinates above zero. It is calibrated empirically: p = (1 + #new baseline connections of the same result with T ≥ T_obs) / (1 + N), with each baseline point's T computed leaving itself out. This is a conformal p-value. It is valid for exchangeable connections whatever the dependence between coordinates, because dependence only costs power. Corroboration is therefore measured jointly, not added as a bonus. For each coordinate, the number of baseline connections at least as high and the baseline days they fall on are reported alongside as a plain check.
+9. **Host-day profile.** For destination hosts in the panel, the engine measures the change in PageRank (scaled to mean 1) and in normalised betweenness when the day's logins are added to the baseline graph. On baseline days the same is done by removing that day's unique pairs and adding them back. Both changes are coordinates of the connection's joint test.
+10. **Decision.** Benjamini-Hochberg across the new window connections controls the false discovery rate at alpha; habitual connections have p = 1 and are not tests. Significant connections come first; everything else stays in the CSV, marked `significant = no`.
 
 ## Unit of the test: the connection
 
@@ -70,8 +70,8 @@ origin-day profile below), a Louvain community crossing, the rarity of its
 logon type, a chain it starts, the destination's centrality change. It is
 compared, with the same conformal joint test, against the connections of
 the same result on the baseline days, on the destinations both days could
-show. Benjamini-Hochberg runs across all connections. The machine-level
-tests described below are the building blocks of that context.
+show. Benjamini-Hochberg runs across the new connections. The origin-day
+and host-day profiles described above are the building blocks of that context.
 
 ### Hopper's signature: credential switch and new access
 
@@ -104,7 +104,7 @@ both cuts false alarms eightfold against per-login anomaly detection:
   the U1653 traffic until the weight was added.
 - **new access**: the destination is new for the origin or for the account.
 
-Both are facts already measured by the leave-one-day-out reference; no
+Both are facts already measured by the past-only reference; no
 constant is involved. They enter the engine in two ways:
 
 1. as the origin-day coordinate `credential-switch` (logins that day with
@@ -164,7 +164,7 @@ the engine already measured; the report computes nothing.
 
 - **What is exchangeable.** The null is the set of baseline connections of the same result on the panel; each window connection is compared with all of them. The p-value is therefore valid when *connections* are exchangeable across baseline days, not merely days: a day with thousands of habitual batch connections weighs more than a quiet weekend day. Weekly seasonality can break this in either direction. The check that matters is the calibration run on an incident-free window (see Validation), which should be done on a window that contains both weekdays and weekend days. A day-weighted p-value (each baseline day counting once) would be valid under exchangeable days alone, but its floor would be 1 / (days + 1): with 28 baseline days nothing could ever pass a 5 % false discovery rate over thousands of tests. That is why the connection-level null is kept and stated.
 - **The null is the set of new baseline connections** of the same result, and the family of tests the set of new window connections: the question answered is "given that a connection is new, how unusual is its profile among the new connections of normal days?". With habitual connections in the null, merely being new read as a 4 % event (400 new among 10,519), and on an incident-free window every new connection passed a 5 % false discovery rate once habitual connections were taken out of the family. The rate of new connections itself is measured by the origin-day coordinates (destinations reached for the first time, accounts new to the origin), not by the fact of novelty alone.
-- **Null connections need prior coverage.** A baseline connection enters the null only if its destination was covered on some day before the day's reference gap: on the first covered day of a destination every connection to it is new for lack of history, not for being unusual, and those days would fill the null with spurious fan-outs.
+- **Null connections need prior coverage.** A baseline connection enters the null only if its destination was covered on some earlier day: on the first covered day of a destination every connection to it is new for lack of history, not for being unusual, and those days would fill the null with spurious fan-outs.
 - **The family of tests** is the set of *new* window connections (some fact about them is new). Habitual connections are not tests: they are listed with p = 1 and stay outside Benjamini-Hochberg, so they cost no power. The run prints the smallest reachable p per result (1 / (N + 1), N being the null size), which is the resolution of the data.
 - **Ties.** Every connection more extreme than the whole null gets the floor p. Rows with the same p are ordered by the joint surprise T (the sum of the marginal surprises), then by time. T is informative but is not a probability and is not comparable across results (logins, failures, pre-auth have different nulls).
 - **Counts in the explanations.** "shared by 27 of 10519 baseline logins, on 9 of 28 days" gives the share of the null with that fact and the number of distinct baseline days it fell on. The second number is what an analyst can defend without reference to the model.
@@ -224,8 +224,8 @@ One rule of machine identity, everywhere. `graph-hunt-csv` folds IP and name by 
 
 ## Deviations from the first version of the plan, and why
 
-- **History plateau H\* (Mann-Kendall) → past-only reference, every day alike.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). Leave-one-day-out gives every day the same reference instead.
-- **Simes within families + Fisher across families → one joint test per origin-day.** Fisher assumes independent families, which does not hold. Testing each signal separately also multiplied the testing burden: 31 novel-edge tests for one fan-out. The joint test measures corroboration directly and stays valid under any dependence.
+- **History plateau H\* (Mann-Kendall) → past-only reference, every day alike.** The novelty rate never levels off, because rare legitimate combinations keep appearing. On millions of observations the trend test declared even tiny declines significant (H\* = 490 days). The past-only reference (step 4) gives every day the same rule instead; leave-one-day-out, tried on the way, was dropped (step 4).
+- **Simes within families + Fisher across families → one joint test (first per origin-day, now per connection).** Fisher assumes independent families, which does not hold. Testing each signal separately also multiplied the testing burden: 31 novel-edge tests for one fan-out. The joint test measures corroboration directly and stays valid under any dependence.
 
 - **Null matched to the window day's kind (weekday / weekend): measured and dropped (October 2026).** Each window day was compared only with the null days of its kind. It halves the null for a weekday and raises the floor of the reachable p-values enough that findings which pass with the mixed null no longer pass Benjamini-Hochberg, without changing the order: a weekend scan can hold most of the new baseline logins. The mixed null is the conservative choice for a weekday (the weekend novelty makes it heavier) and a calibration window containing a weekend showed no weekend alarm. The run prints the split ("Day kinds: null 20 weekday and 8 weekend day(s); window 5 weekday and 1 weekend day(s)") so the analyst can see it. A depth rule relative to the panel span instead of the days with data was tried at the same time and dropped too: it discarded a weekend day with years of secure-log reference behind it.
 - **Hour of day per account: measured and dropped (October 2026).** The idea was a coordinate for a login outside the account's usual hours, read from the baseline. On LANL the red team works office hours: the quiet source C22409 logs in between 13:00 and 15:00, C19932 between 8:00 and 18:00, and the red team as a whole has no login between 23:00 and 6:00 while the network has 3 % of its logins in each of those hours. On real data the attacker entered in the middle of the working afternoon. The signal would separate nothing, and on a DFIR baseline of one to four weeks most accounts have too few logins for an hourly profile anyway; a coordinate that is almost always zero only dilutes the joint test.
@@ -234,6 +234,6 @@ One rule of machine identity, everywhere. `graph-hunt-csv` folds IP and name by 
 ## Validation
 
 - **Parser:** row-for-row against counts computed independently from the raw logs.
-- **Statistics:** each p-value states its counts, which are recomputed independently from the CSV for selected machines.
-- **Calibration:** a hunt over a period without the incident should give few significant machines, consistent with the controlled false discovery rate.
-- **Synthetic corpus** with ground truth (5M edges, Neo4j database `neo4j`): precision and recall.
+- **Statistics:** each p-value states its counts, which are recomputed independently from the CSV for selected connections.
+- **Calibration:** a hunt over a period without the incident should give few significant connections, consistent with the controlled false discovery rate.
+- **Synthetic corpus** with ground truth (5M edges, Neo4j database `neo4j`): used for the previous, hand-weighted detectors (May 2026) and retired with them; never re-run with the statistical engine. The public benchmark is LANL ([graph-hunt.md](graph-hunt.md#detection-quality)).

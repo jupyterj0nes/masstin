@@ -10,8 +10,8 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 
 | Event ID | Description | Logon Type |
 |----------|-------------|------------|
-| 4624 | Successful logon | 3 (Network), 10 (RDP) |
-| 4625 | Failed logon | 3, 10 |
+| 4624 | Successful logon | as logged (3 Network and 10 RDP are the lateral ones) |
+| 4625 | Failed logon | as logged |
 | 4634 | Logoff | — |
 | 4647 | User-initiated logoff | — |
 | 4648 | Logon with explicit credentials (RunAs) | — |
@@ -87,7 +87,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | `lastlog` | Binary | Last login per user |
 | `uac-<host>-<os>-<stamp>.tar.gz` | Archive | UAC (Unix-like Artifacts Collector) triages, streamed selectively; nested zip / tar.gz combinations walked |
 
-What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, journald, auditd `USER_LOGIN`), `LOGIN` / `FAILED_LOGIN` (wtmp / btmp), `LASTLOG`, `SSH_PREAUTH` (`CONNECT` rows for connections that ended before authenticating) and `LOGOUT` (`LOGOFF` rows paired with their login). `logon_id` carries the sshd process id on every row that has one, the same on a login and on its LOGOFF. RFC3164 syslog timestamps are converted from the host's local zone to UTC; auditd records of a connection already in the sshd log are dropped, paired by pid.
+What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, journald, auditd `USER_LOGIN`), `LOGIN` / `FAILED_LOGIN` (wtmp / btmp), `LASTLOG`, `SSH_PREAUTH` (`CONNECT` rows for connections that ended before authenticating), `SSH_CONNECT` (`CONNECT` rows for sshd started by xinetd) and `LOGOUT` (`LOGOFF` rows paired with their login). `logon_id` carries the sshd process id on every row that has one, the same on a login and on its LOGOFF. RFC3164 syslog timestamps are converted from the host's local zone to UTC; auditd records of a connection already in the sshd log are dropped, paired by pid.
 
 > **Domain-joined Linux (SSSD / Active Directory):** on Ubuntu 22 + SSSD hosts, `/var/log/auth.log` is often nearly empty because PAM routes auth through the systemd journal. Masstin reads `.journal` / `.journal~` files directly and applies the same `Accepted (password|publickey)` / `Failed password` regexes as on text logs, so SSH logins from AD users surface in the timeline with no extra configuration. Combined with the audit.log `USER_LOGIN` path, this recovers the full lateral-movement picture on modern enterprise Linux.
 
@@ -108,7 +108,7 @@ What `parse-mac` writes, per row: `SUCCESSFUL_LOGON` (sshd `Accepted`, screensha
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
 
-Parses all 33 Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id`, `winlog.event_data.*`).
+Parses the Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id` as a number or, from Winlogbeat 8, a string, `winlog.event_data.*`), except WinRM 6, WMI 5858 and Sysmon 3, which it does not read yet.
 
 ## Cortex XDR
 
@@ -130,7 +130,7 @@ Default admin port list queried by `parse-cortex`:
 
 ### EVTX Forensics (via XQL)
 
-Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR forensic collection agent and the offline collector (triage packages uploaded to the tenant land in the same dataset). The query mirrors the event ID and source set of `parse-windows` exactly, including Security, TerminalServices-LocalSessionManager, SMBServer/Security, SmbClient/Security, RDPClient, RemoteConnectionManager, RdpCoreTS, WinRM/Operational and WMI-Activity/Operational. Regex extraction currently ships with EN / ES / DE / FR / IT keyword variants and auto-paginates via time bisection if a window saturates the 1M API cap.
+Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR forensic collection agent and the offline collector (triage packages uploaded to the tenant land in the same dataset). The query asks for the event IDs of `parse-windows` from Security, TerminalServices-LocalSessionManager, SMBServer/Security, SmbClient/Security, RDPClient, RemoteConnectionManager, RdpCoreTS, WinRM/Operational and WMI-Activity/Operational. Rows without a usable source are dropped server side, so 4634, 4647, 4768-4771, 4778/4779, WinRM 6 and RDP client 1024 do not come through today; SmbClient/Connectivity and Sysmon are not queried. Regex extraction currently ships with EN / ES / DE / FR / IT keyword variants and auto-paginates via time bisection if a window saturates the 1M API cap.
 
 ---
 

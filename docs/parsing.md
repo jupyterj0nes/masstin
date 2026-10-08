@@ -14,10 +14,10 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 | `Provider.Name` fallback for archived / renamed EVTX | ✅ | ✅ | ✅ |
 | Forensic disk images (E01, VMDK, VHD/VHDX, raw, dd, img) | ❌ | ✅ | ✅ |
 | NTFS walker → `winevt/Logs` + VSS recovery | ❌ | ✅ | ✅ |
-| UAL databases (`LogFiles/Sum/*.mdb`) | ❌ | ✅ | ✅ |
+| UAL databases (`LogFiles/Sum/*.mdb`) | ✅ | ✅ | ✅ |
 | Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
 | MountPoints2 (NTUSER.DAT registry hive) | ❌ | ✅ | ✅ |
-| Triage detection (KAPE / Velociraptor / Cortex XDR) with per-source labels | ❌ | ❌ | ✅ |
+| Triage detection (KAPE / Velociraptor / Cortex XDR) with per-source labels | ✅ | ❌ | ✅ |
 | Loose-artifact promotion of `-d` directories into the pipeline | ❌ | ❌ | ✅ |
 
 Rule of thumb:
@@ -27,7 +27,7 @@ Rule of thumb:
 - **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
 - **Linux logs / UAC triage** → `parse-linux`; **macOS `.logarchive` or `log show` JSON** → `parse-mac`; **any other text / JSON log** → `parse-custom` with a YAML rule
 
-In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
+In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity, Sysmon) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
 
 ## Parse Windows: Generate a lateral movement timeline
 
@@ -72,6 +72,7 @@ Rotated logs are handled the way logrotate leaves them: `secure-20240616`, `mess
 |---|---|---|
 | `secure` / `auth.log` / `messages` (+ rotations, `.gz`) | `SSH_SUCCESS` for every `Accepted <method>` (password, publickey, keyboard-interactive/pam, gssapi-with-mic…), `SSH_FAILED` for every `Failed <method>` including `invalid user` guesses and `not allowed because` policy denials | `detail` carries the method (`ssh/publickey`, `ssh/password invalid-user`, `ssh/not-allowed`). Sources are kept whether sshd logged an IP or a resolved hostname (`UseDNS yes`). `pam_unix(sshd:auth)` failures are only used when sshd logged no outcome lines at all — on SSSD/LDAP hosts pam_unix fails for every directory user before pam_sss succeeds |
 | `audit.log*` | `USER_LOGIN` / `USER_AUTH` with `addr=` → `SSH_SUCCESS` / `SSH_FAILED` | epoch timestamps; `detail` = `audit` |
+| xinetd lines in `secure` / `messages` | `SSH_CONNECT` for `START: ssh ... from=` | `CONNECT` rows: sshd started by xinetd, outcome not in that line |
 | `wtmp*` / `utmp` | `LOGIN` / `LOGOUT` per session with a remote source (IP or hostname) | console sessions and boot/runlevel records are dropped |
 | `btmp*` | `FAILED_LOGIN` | rotated and gzipped files included |
 | `lastlog` | `LASTLOG`: last login per account with its source | uid → name via the collected `/etc/passwd`; the only trace left of accounts whose activity predates every surviving rotation |
@@ -219,12 +220,12 @@ Queries the Cortex XDR API directly to retrieve network connection data or EVTX 
 
 ```bash
 # Network connection data
-masstin -a parse-cortex --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
+masstin -a parse-cortex --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com \
   --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
   -o cortex-network.csv
 
 # EVTX forensics collected by Cortex agents
-masstin -a parse-cortex-evtx-forensics --cortex-url api-xxxx.xdr.xx.paloaltonetworks.com \
+masstin -a parse-cortex-evtx-forensics --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com \
   --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
   -o cortex-evtx.csv
 ```
@@ -234,13 +235,17 @@ the backing store for Cortex's forensic triage feature, where the XDR forensic
 agent collects Windows Event Logs from endpoints on demand. The same dataset also
 receives logs uploaded by the Cortex XDR offline collector, so triage packages
 gathered from air-gapped or unreachable hosts and pushed into the tenant are
-queried through the exact same path. masstin mirrors the event IDs and extraction
-logic of `parse-windows`, so output from this action merges cleanly with host-side
-artifacts.
+queried through the exact same path. masstin asks for the event IDs of `parse-windows`
+and writes the same columns, so the output merges with host-side artifacts. The
+extraction is done by regular expressions on the rendered message text, server side,
+and rows without a usable source are dropped there: 4634, 4647, the Kerberos events
+(4768-4771), 4778/4779, WinRM 6 and RDP client 1024 do not come through today, the
+SMB client Connectivity channel (30803-30808) is not queried and Sysmon 3 is not
+covered. Parity with `parse-windows` is on the roadmap.
 
 ## Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
 
-For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, flat JSON event exports, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 9 researched rules in [`rules/`](../rules/) that you can use out of the box.
+For any log format masstin doesn't natively support (Palo Alto GlobalProtect, Cisco AnyConnect, Fortinet SSL VPN, OpenVPN, Squid, flat JSON event exports, etc.), the `parse-custom` action reads YAML rule files that describe how to turn each line into a masstin `LogData` record. The repo ships with a library of 13 researched rules (50 parsers) in [`rules/`](../rules/) that you can use out of the box.
 
 ```bash
 # Run a single rule against a log file
@@ -262,13 +267,17 @@ The library currently covers:
 |------|---------|--------|
 | `vpn/palo-alto-globalprotect.yaml` | 5 | Palo Alto SYSTEM log subtype=globalprotect (legacy CSV syslog) |
 | `vpn/cisco-anyconnect.yaml` | 4 | Cisco ASA `%ASA-6-113039/722022/722023` + `%ASA-4-113019` |
+| `vpn/checkpoint-remote-access.yaml` | 3 | Check Point Log Exporter syslog: Remote Access / Mobile Access login, failure, logout |
 | `vpn/fortinet-ssl-vpn.yaml` | 3 | FortiGate `type=event subtype=vpn` (tunnel-up/down/ssl-login-fail) |
 | `vpn/openvpn.yaml` | 4 | OpenVPN free-form syslog (Peer Connection / AUTH_FAILED / SIGTERM) |
 | `firewall/palo-alto-traffic.yaml` | 2 | PAN-OS TRAFFIC log CSV — authenticated sessions (User-ID) only |
 | `firewall/cisco-asa.yaml` | 6 | ASA `113004/113005/605004/605005/716001/716002` |
 | `firewall/fortinet-fortigate.yaml` | 4 | FortiGate `subtype=system\|user` admin login, user auth |
+| `firewall/checkpoint-admin.yaml` | 3 | Check Point administrator logins to the management, failures, Expert Shell SSH |
 | `proxy/squid.yaml` | 3 | Squid access.log CONNECT tunnel, HTTP, TCP_DENIED |
 | `json/mordor.yaml` | 6 | Mordor / OTRF Security-Datasets flat NDJSON (Sysmon 3 on LM ports, 4624/4625/4634/4647/4648/5140) |
+| `json/zscaler-zpa.yaml` | 4 | Zscaler ZPA LSS JSON: device session authenticated / failed / disconnected, application connections |
+| `json/cloudflare-access.yaml` | 3 | Cloudflare Access Logpush `access_requests`: login allowed / denied, logout |
 
 Every rule is researched against vendor official documentation and validated against realistic sample log lines committed under each category's `samples/` directory. See [`rules/README.md`](../rules/README.md) for the full references table and [`docs/custom-parsers.md`](custom-parsers.md) for the schema specification.
 
@@ -293,8 +302,8 @@ masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
 masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local \
     --exclude-ips '10.0.0.0/8,172.16.0.0/12,fe80::/10'
 
-# Pre-flight: --dry-run with any filter shows a stats breakdown without
-# writing the CSV — validate the filter composition before committing
+# Pre-flight: --dry-run with any filter shows a stats breakdown and writes
+# only the CSV header — validate the filter composition before committing
 masstin -a parse-image -d /evidence/ -o timeline.csv --ignore-local --dry-run
 
 # Re-filter an existing CSV via merge (no re-parsing of images)
@@ -306,7 +315,7 @@ masstin -a merge -f old-timeline.csv --ignore-local --exclude-users @svc.txt \
 
 | Flag | Drops records where... | Applies to |
 |---|---|---|
-| `--ignore-local` | Neither src_ip nor src_computer carries a useful value. IP useful = valid, non-loopback, non-link-local. Computer useful = non-empty, non-`-`, non-`LOCAL`, non-`MSTSC`, non-`default_value`, non-self-reference. | All parser actions |
+| `--ignore-local` | Neither src_ip nor src_computer carries a useful value. IP useful = valid, non-loopback, non-link-local. Computer useful = non-empty, non-`-`, non-`LOCAL`, non-`MSTSC`, non-`default_value`, non-self-reference. | All parser actions + `merge` |
 | `--exclude-users LIST` | `subject_user_name` OR `target_user_name` matches any glob in the list (case-insensitive). | All parser actions + `merge` |
 | `--exclude-hosts LIST` | `dst_computer` OR `src_computer` matches any glob. | All parser actions + `merge` |
 | `--exclude-ips LIST` | `src_ip` matches any individual IP or CIDR range in the list. | All parser actions + `merge` |
@@ -417,7 +426,7 @@ The `source:` line under each triage shows the **full path** to the zip — crit
 
 This applies to **every parser action** that walks directories: `parse-windows`, `parse-image`, `parse-massive`, `parse-linux`. The same source labels show up regardless of which action you ran, so the breakdown format is consistent across the whole tool.
 
-After the summary, the action prints a **load-into-graph hint** with both Memgraph and Neo4j commands ready to copy-paste, with the output path canonicalised to the long form (no 8.3 short names like `C00PR~1.DES` leaking into the suggestion):
+After the summary, `parse-image`, `parse-massive` and `carve-image` print a **load-into-graph hint** with both Memgraph and Neo4j commands ready to copy-paste, with the output path canonicalised to the long form (no 8.3 short names like `C00PR~1.DES` leaking into the suggestion):
 
 ```
         Load into graph (pick one):
@@ -518,6 +527,6 @@ Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux 
 
 | Source | What it tracks | Article |
 |--------|---------------|---------|
-| Winlogbeat JSON | All Windows Event IDs in JSON format | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Winlogbeat JSON | The Windows Event IDs above except WinRM 6, WMI 5858 and Sysmon 3 | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
 | Cortex XDR Network | RDP, SMB, SSH connections via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 | Cortex XDR EVTX Forensics | Forensic event logs from agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
