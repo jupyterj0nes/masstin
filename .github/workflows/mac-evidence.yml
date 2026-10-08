@@ -99,9 +99,17 @@ jobs:
           # the runner's python is externally managed (PEP 668): use a venv
           python3 -m venv "$RUNNER_TEMP/vnc" && "$RUNNER_TEMP/vnc/bin/pip" install --quiet vncdotool
           VNCDO="$RUNNER_TEMP/vnc/bin/vncdo"
-          # a correct and a wrong VNC password
-          "$VNCDO" -s 127.0.0.1::5900 -p ci-vnc-pw --timeout 15 expect /dev/null 0 || true
-          "$VNCDO" -s 127.0.0.1::5900 -p wrong-pw --timeout 15 expect /dev/null 0 || true
+          # screensharingd offers ARD authentication (type 30, Diffie-Hellman
+          # against the account password) and vncdotool takes it, so the
+          # runner account gets a known password (sudo stays NOPASSWD); a
+          # correct and a wrong attempt, each logged by screensharingd as
+          # "Authentication: SUCCEEDED/FAILED :: User Name: ... :: Viewer Address: ..."
+          sudo dscl . -passwd "/Users/$USER" 'Ci-Pass-2026!' || true
+          "$VNCDO" -s 127.0.0.1::5900 -u "$USER" -p 'Ci-Pass-2026!' --timeout 15 expect /dev/null 0 || true
+          sleep 2
+          "$VNCDO" -s 127.0.0.1::5900 -u "$USER" -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
+          sleep 2
+          "$VNCDO" -s 127.0.0.1::5900 -u nosuchuser -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
           sleep 5
 
       - name: Collect the Unified Log of that span
