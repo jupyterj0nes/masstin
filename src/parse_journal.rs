@@ -143,6 +143,23 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             continue;
         }
 
+        // "Invalid user X from SRC" (see parse_linux::invalid_users_as_failures)
+        if let Some(cap) = crate::parse_linux::INVALID_USER_RE.captures(&msg) {
+            out.push(RawEvt {
+                ts_rfc3339,
+                user: cap[1].trim().to_string(),
+                remote: cap[2].to_string(),
+                tty_or_proc: "journal-ssh/invalid-user".into(),
+                evt: crate::parse_linux::INVALID_USER_EVT.into(),
+                filename: path.display().to_string(),
+                dst_host: dst_host.to_string(),
+                pid,
+                conn: 0,
+            });
+            matched += 1;
+            continue;
+        }
+
         // Pre-authentication touch (see parse_linux::preauth_touch).
         if let Some((src, kind)) = preauth_touch(&msg) {
             out.push(RawEvt {
@@ -205,5 +222,6 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             path.display(), scanned, matched);
     }
 
+    crate::parse_linux::invalid_users_as_failures(&mut out, "journal-ssh");
     out
 }
