@@ -1694,7 +1694,77 @@ fn time_sort_key(raw: &str) -> Option<chrono::NaiveDateTime> {
     crate::timefmt::parse_fallback(t)
 }
 
+/// 4634 / 4647 (logoff) name no origin: the logon they close does. That is
+/// the 4624 with the same TargetLogonId on the same machine, the latest one
+/// at or before the logoff (a logon id can be reused after a reboot). Its
+/// origin, and its logon type when the logoff has none (4647), are copied.
+/// A logoff whose logon is not in the evidence names no origin, and a
+/// masstin row needs one: it is not written. Returns the rows, how many
+/// logoffs were given an origin and how many were dropped.
+pub(crate) fn pair_logoffs(rows: Vec<LogData>) -> (Vec<LogData>, usize, usize) {
+    let blank = |v: &str| { let t = v.trim(); t.is_empty() || t == "-" };
+    let key = |r: &LogData| (r.computer.to_ascii_lowercase(), r.logon_id.to_ascii_lowercase());
+    let mut logons: HashMap<(String, String), Vec<(Option<chrono::NaiveDateTime>, String, String, String)>> = HashMap::new();
+    for r in &rows {
+        if r.event_id == "4624" && !blank(&r.logon_id) {
+            logons.entry(key(r)).or_default().push((
+                time_sort_key(&r.time_created),
+                r.workstation_name.clone(),
+                r.ip_address.clone(),
+                r.logon_type.clone(),
+            ));
+        }
+    }
+    for v in logons.values_mut() {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    let (mut filled, mut dropped) = (0usize, 0usize);
+    let mut out = Vec::with_capacity(rows.len());
+    for mut r in rows {
+        let is_logoff = r.event_id == "4634" || r.event_id == "4647";
+        if !is_logoff || !blank(&r.workstation_name) || !blank(&r.ip_address) {
+            out.push(r);
+            continue;
+        }
+        let t = time_sort_key(&r.time_created);
+        let found = logons.get(&key(&r)).and_then(|v| {
+            match t {
+                // the latest logon at or before the logoff
+                Some(t) => v.iter().rev().find(|l| l.0.map_or(true, |lt| lt <= t)),
+                None => v.last(),
+            }
+        });
+        match found {
+            Some((_, wks, ip, lt)) => {
+                r.workstation_name = wks.clone();
+                r.ip_address = ip.clone();
+                if r.logon_type.is_empty() {
+                    r.logon_type = lt.clone();
+                }
+                filled += 1;
+                out.push(r);
+            }
+            None => dropped += 1,
+        }
+    }
+    (out, filled, dropped)
+}
+
+/// The summary line for `pair_logoffs`.
+pub(crate) fn report_logoff_pairing(filled: usize, dropped: usize) {
+    if filled + dropped > 0 {
+        crate::banner::print_info(&format!(
+            "  Logoffs (4634/4647): {} given the origin of the logon they close (same logon ID), {} not written (their logon is not in the evidence)",
+            filled, dropped
+        ));
+    }
+}
+
 fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {
+    // before the noise filter: a logoff without its origin would be dropped
+    // by --ignore-local before it could be given one
+    let (log_data, filled, dropped) = pair_logoffs(log_data);
+    report_logoff_pairing(filled, dropped);
     // Deduplicate events (e.g., same event from live volume and VSS snapshot)
     // Key: (time_created, dst_computer, event_id, event_type, target_user_name, src_ip)
     // Prefer live volume events over VSS (shorter filename = no "vss_" in path)
@@ -2392,6 +2462,31 @@ struct WMIClientFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logoffs_take_the_origin_of_their_logon() {
+        let row = |t: &str, eid: &str, et: &str, wks: &str, ip: &str, lt: &str, lid: &str| LogData {
+            time_created: t.into(), computer: "SRV01.corp".into(), event_type: et.into(), event_id: eid.into(),
+            subject_user_name: String::new(), subject_domain_name: String::new(),
+            target_user_name: "alice".into(), target_domain_name: "CORP".into(), logon_type: lt.into(),
+            workstation_name: wks.into(), ip_address: ip.into(), logon_id: lid.into(),
+            filename: "Security.evtx".into(), detail: String::new(),
+        };
+        let rows = vec![
+            row("2026-01-01T08:00:00Z", "4624", "SUCCESSFUL_LOGON", "WS01", "10.0.0.5", "3", "0x1a2b"),
+            // the same logon id reused after a reboot, from another machine
+            row("2026-01-02T08:00:00Z", "4624", "SUCCESSFUL_LOGON", "WS02", "10.0.0.6", "10", "0x1a2b"),
+            row("2026-01-01T09:00:00Z", "4634", "LOGOFF", "", "", "3", "0x1a2b"),
+            row("2026-01-02T09:00:00Z", "4647", "LOGOFF", "", "", "", "0x1A2B"),
+            // its logon is not in the evidence
+            row("2026-01-03T09:00:00Z", "4634", "LOGOFF", "", "", "3", "0xdead"),
+        ];
+        let (out, filled, dropped) = pair_logoffs(rows);
+        assert_eq!((filled, dropped, out.len()), (2, 1, 4));
+        let off: Vec<&LogData> = out.iter().filter(|r| r.event_type == "LOGOFF").collect();
+        assert_eq!((off[0].workstation_name.as_str(), off[0].ip_address.as_str()), ("WS01", "10.0.0.5"));
+        assert_eq!((off[1].workstation_name.as_str(), off[1].logon_type.as_str()), ("WS02", "10"));
+    }
 
     #[test]
     fn unc_server_and_share() {
