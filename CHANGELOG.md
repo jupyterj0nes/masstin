@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `carve-image`: **a chunk that hangs the EVTX decoder no longer hangs the carve on VMDK, VHD/VHDX and raw images.** The provider check of each candidate chunk ran with a 3-second budget on E01 only; the other image formats caught panics but not an endless loop in the decoder. Both paths now share the timed check; a hung chunk is reported and skipped. Same rows as before on a raw image of the public EVTX samples (266).
+- `merge-neo4j-nodes` reads the password from `$NEO4J_PASSWORD`, as `load-neo4j` and `graph-hunt-neo4j` do (it only prompted).
+- **CI:** the functional workflow loads the public EVTX timeline into Neo4j and Memgraph (service containers), requires the same node and edge counts from both loaders, the same hunt from `graph-hunt-csv`, `graph-hunt-neo4j` and `graph-hunt`, and that both node merges move every edge and remove the old node. Those actions ran in no workflow before.
+
 ## v1.3.1 — 2026-10-08
 
 ### The same row from every carrier
