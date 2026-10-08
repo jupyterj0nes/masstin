@@ -942,7 +942,21 @@ struct Entities {
     of_node: Vec<u32>,
 }
 
+/// IP -> host name for masstin timeline CSVs, by the same-login test on
+/// the corpus graph-hunt builds from them (same origins, short names,
+/// accounts and outcomes). The loaders call it, so a loaded graph has the
+/// machines graph-hunt-csv sees.
+pub(crate) fn ip_names_for_csv(files: &[String], alpha: f64) -> std::io::Result<HashMap<String, (String, u32, f64)>> {
+    let (c, _) = corpus_from_csv(files)?;
+    Ok(resolve_corpus(&c, alpha).into_iter().map(|(ip, r)| (ip, (r.name, r.votes, r.p_chance))).collect())
+}
+
 fn build_entities(c: &Corpus, alpha: f64) -> (Entities, HashMap<String, resolve::Resolution>) {
+    let res = resolve_corpus(c, alpha);
+    build_entities_from(c, res)
+}
+
+fn resolve_corpus(c: &Corpus, alpha: f64) -> HashMap<String, resolve::Resolution> {
     // Only the seconds where an IP-sourced login exists can hold a vote, so
     // the co-occurrence map is built for those alone (a map with one entry
     // per login took several GB on 21 M rows that held no IP at all); the
@@ -978,6 +992,10 @@ fn build_entities(c: &Corpus, alpha: f64) -> (Entities, HashMap<String, resolve:
             });
         resolve::resolve_ip_names_with(obs, alpha, &rates)
     };
+    res
+}
+
+fn build_entities_from(c: &Corpus, res: HashMap<String, resolve::Resolution>) -> (Entities, HashMap<String, resolve::Resolution>) {
     let mut names = Interner::default();
     let mut aliases: Vec<BTreeSet<String>> = Vec::new();
     let mut of_node = Vec::with_capacity(c.nodes.names.len());
@@ -2108,6 +2126,13 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             .then(nan_last(a.p).partial_cmp(&nan_last(b.p)).unwrap())
             .then(nan_last(-a.tstat).partial_cmp(&nan_last(-b.tstat)).unwrap())
             .then(a.first.cmp(&b.first))
+            // ties broken by the connection itself, so the order does not
+            // depend on the order the rows arrived in (CSV, Neo4j, Memgraph)
+            .then_with(|| a.origin.cmp(&b.origin))
+            .then_with(|| a.dest.cmp(&b.dest))
+            .then_with(|| a.account.cmp(&b.account))
+            .then_with(|| a.result.cmp(b.result))
+            .then_with(|| a.day.cmp(&b.day))
     });
     let sig_g = |g: u8| out.iter().filter(|c| c.evaluable && c.q <= alpha && c.group == g).count();
     lines.push(format!(
