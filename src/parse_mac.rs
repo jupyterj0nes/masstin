@@ -66,6 +66,20 @@ use crate::parse_linux::{
     preauth_touch, SSH_DISCONNECT_RE, SSH_FAIL_RE, SSH_NOTALLOWED_RE, SSH_OK_RE,
 };
 
+// ────────────────────────── sshd on macOS, pre-auth ──────────────────────────
+// Seen on real Sonoma 14.8 and Sequoia 15.7 bundles (OpenSSH 9.9,
+// sshd-session): a connection that closes before authenticating is logged
+// without the `[preauth]` tag Linux writes, as a bare
+//   "Connection closed by 127.0.0.1 port 49181"
+// (a closed session is "Disconnected from user ..." / "Connection closed by
+// user ..."), and a client that sends no SSH banner as
+//   "banner exchange: Connection from 127.0.0.1 port 49188: invalid format"
+// (the wording that replaced "Bad protocol version identification").
+static MAC_PREAUTH_CLOSED_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^Connection closed by ([0-9A-Fa-f][0-9A-Fa-f:.]*) port \d+\s*$").unwrap());
+static MAC_PREAUTH_BANNER_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"banner exchange: Connection from (\S+) port \d+: invalid format").unwrap());
+
 // ───────────────────────────── screensharingd ────────────────────────────────
 // "Authentication: SUCCEEDED :: User Name: deanwinchester :: Viewer Address: 192.168.1.1 :: Type: DH"
 // "Authentication: FAILED :: User Name: geertl :: Viewer Address: 10.0.0.9 :: Type: DH"
@@ -186,6 +200,26 @@ fn classify(process: &str, message: &str) -> Option<Classified> {
                 src,
                 logon_type: "SSH",
                 detail: format!("ssh {}", kind),
+            });
+        }
+        if let Some(c) = MAC_PREAUTH_CLOSED_RE.captures(message.trim()) {
+            return Some(Classified {
+                event_type: "CONNECT",
+                event_id: "MAC-SSHD-PREAUTH",
+                user: String::new(),
+                src: c[1].to_string(),
+                logon_type: "SSH",
+                detail: "ssh preauth-closed".to_string(),
+            });
+        }
+        if let Some(c) = MAC_PREAUTH_BANNER_RE.captures(message) {
+            return Some(Classified {
+                event_type: "CONNECT",
+                event_id: "MAC-SSHD-PREAUTH",
+                user: String::new(),
+                src: c[1].to_string(),
+                logon_type: "SSH",
+                detail: "ssh preauth-bad-proto".to_string(),
             });
         }
         return None;
@@ -338,7 +372,8 @@ struct Tally {
     screenshare: usize,
     rows: usize,
     /// sshd / screensharingd messages that classified as nothing (first
-    /// 40, printed with --debug so an empty timeline can be explained)
+    /// 40 of each, printed with --debug so an empty timeline can be
+    /// explained)
     unclassified: Vec<String>,
 }
 
@@ -361,7 +396,11 @@ fn harvest(records: &[UlData], dst: &str, file: &str, out: &mut Vec<LogData>, ta
                 out.push(row(ul_time_iso(r.time), dst, file, c));
             }
             None => {
-                if tally.unclassified.len() < 40 {
+                // up to 40 per process, so a busy sshd does not hide what
+                // screensharingd wrote
+                let is_ssh = proc_base(&r.process).starts_with("sshd");
+                let same: usize = tally.unclassified.iter().filter(|m| m.contains(if is_ssh { " sshd" } else { " screensharing" })).count();
+                if same < 40 {
                     tally.unclassified.push(format!("{} {} [{:?} {:?}]: {}", ul_time_iso(r.time), proc_base(&r.process), r.event_type, r.log_type, r.message.trim()));
                 }
             }
@@ -665,6 +704,24 @@ mod tests {
         .unwrap();
         assert_eq!(pre.event_type, "CONNECT");
         assert_eq!(pre.src, "198.51.100.4");
+    }
+
+    /// Lines as Sonoma 14.8 and Sequoia 15.7 (OpenSSH 9.9, sshd-session)
+    /// wrote them on the GitHub macOS runners, read back from the
+    /// collected .logarchive.
+    #[test]
+    fn macos_preauth_shapes_from_real_bundles() {
+        let c = classify("/usr/libexec/sshd-session", "Connection closed by 127.0.0.1 port 49181").unwrap();
+        assert_eq!((c.event_type, c.src.as_str(), c.detail.as_str()), ("CONNECT", "127.0.0.1", "ssh preauth-closed"));
+        let c = classify("sshd-session", "banner exchange: Connection from 127.0.0.1 port 49188: invalid format").unwrap();
+        assert_eq!((c.event_type, c.src.as_str(), c.detail.as_str()), ("CONNECT", "127.0.0.1", "ssh preauth-bad-proto"));
+        // a closed session is not a pre-auth touch
+        assert!(classify("sshd-session", "Connection closed by user runner 127.0.0.1 port 49184").is_none());
+        assert!(classify("sshd-session", "Received disconnect from 127.0.0.1 port 49184:11: disconnected by user").is_none());
+        // the "Invalid user" announcement precedes the Failed line that counts
+        assert!(classify("sshd-session", "Invalid user nosuchuser from 127.0.0.1 port 49186").is_none());
+        let c = classify("sshd-session", "Failed password for invalid user nosuchuser from 127.0.0.1 port 49186 ssh2").unwrap();
+        assert_eq!((c.event_type, c.user.as_str()), ("FAILED_LOGON", "nosuchuser"));
     }
 
     #[test]
