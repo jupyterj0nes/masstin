@@ -46,7 +46,7 @@
 // -----------------------------------------------------------------------------
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
@@ -329,15 +329,42 @@ fn is_logarchive_dir(dir: &Path) -> bool {
     false
 }
 
+/// What a logarchive pass saw, for `--debug`: how many records were
+/// scanned, how many came from sshd / screensharingd, how many became rows.
+#[derive(Default)]
+struct Tally {
+    scanned: usize,
+    sshd: usize,
+    screenshare: usize,
+    rows: usize,
+    /// sshd / screensharingd messages that classified as nothing (first
+    /// 40, printed with --debug so an empty timeline can be explained)
+    unclassified: Vec<String>,
+}
+
 /// Filter one batch of resolved Unified Log records down to lateral-movement
 /// rows, appending them to `out`.
-fn harvest(records: &[UlData], dst: &str, file: &str, out: &mut Vec<LogData>) {
+fn harvest(records: &[UlData], dst: &str, file: &str, out: &mut Vec<LogData>, tally: &mut Tally) {
+    tally.scanned += records.len();
     for r in records {
         if !is_relevant_process(&r.process) {
             continue;
         }
-        if let Some(c) = classify(&r.process, &r.message) {
-            out.push(row(ul_time_iso(r.time), dst, file, c));
+        if proc_base(&r.process).starts_with("sshd") {
+            tally.sshd += 1;
+        } else {
+            tally.screenshare += 1;
+        }
+        match classify(&r.process, &r.message) {
+            Some(c) => {
+                tally.rows += 1;
+                out.push(row(ul_time_iso(r.time), dst, file, c));
+            }
+            None => {
+                if tally.unclassified.len() < 40 {
+                    tally.unclassified.push(format!("{} {} [{:?} {:?}]: {}", ul_time_iso(r.time), proc_base(&r.process), r.event_type, r.log_type, r.message.trim()));
+                }
+            }
         }
     }
 }
@@ -364,6 +391,8 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
 
     let mut oversize: Vec<_> = Vec::new();
     let mut missing: Vec<UnifiedLogData> = Vec::new();
+    let mut tally = Tally::default();
+    let mut files = 0usize;
 
     for mut source in provider.tracev3_files() {
         let path = source.source_path().to_string();
@@ -378,6 +407,7 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
         if source.reader().read_to_end(&mut buf).is_err() {
             continue;
         }
+        files += 1;
         let iter = UnifiedLogIterator {
             data: buf,
             header: Vec::new(),
@@ -386,7 +416,7 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
         for mut chunk in iter {
             chunk.oversize.append(&mut oversize);
             let (results, missing_logs) = build_log(&chunk, &provider, &cache, &timesync, true);
-            harvest(&results, &dst, &path, out);
+            harvest(&results, &dst, &path, out, &mut tally);
             oversize = chunk.oversize;
             missing.push(missing_logs);
         }
@@ -398,7 +428,21 @@ fn parse_logarchive(dir: &Path, out: &mut Vec<LogData>) {
     for mut leftover in std::mem::take(&mut missing) {
         leftover.oversize.clone_from(&oversize);
         let (results, _) = build_log(&leftover, &provider, &cache, &timesync, false);
-        harvest(&results, &dst, &leftover.evidence.clone(), out);
+        harvest(&results, &dst, &leftover.evidence.clone(), out, &mut tally);
+    }
+    if crate::parse::is_debug_mode() {
+        eprintln!(
+            "[DEBUG] logarchive {}: {} tracev3 file(s), {} record(s) scanned, {} from sshd, {} from screensharingd, {} lateral-movement row(s)",
+            dir.display(),
+            files,
+            tally.scanned,
+            tally.sshd,
+            tally.screenshare,
+            tally.rows
+        );
+        for m in &tally.unclassified {
+            eprintln!("[DEBUG]   not a logon: {}", m);
+        }
     }
 }
 
@@ -427,50 +471,68 @@ fn classify_json_value(v: &serde_json::Value, dst: &str, file: &str) -> Option<L
 }
 
 /// Parse a `log show` export: `--style ndjson` (one object per line) or
-/// `--style json` (a single array). Both are detected from the content.
+/// `--style json` (a single array). Both are detected from the first
+/// non-blank byte. An NDJSON export is read line by line: a `log show` of a
+/// few weeks is several GB and must not be held in memory whole.
 fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
     let dst = host_from_path(path);
     let file = path.display().to_string();
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => {
             crate::banner::print_info(&format!("macOS: cannot read {}: {}", file, e));
             return;
         }
     };
-    let trimmed = text.trim_start();
-    if trimmed.starts_with('[') {
-        // `--style json`: a single array.
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text)
-        {
+    let mut reader = BufReader::new(f);
+    let first = match reader.fill_buf() {
+        Ok(b) => b.iter().copied().find(|c| !c.is_ascii_whitespace()),
+        Err(_) => None,
+    };
+    if first == Some(b'[') {
+        // `--style json`: a single array; has to be read whole.
+        let mut text = String::new();
+        if reader.read_to_string(&mut text).is_err() {
+            return;
+        }
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text) {
             for v in &items {
                 if let Some(r) = classify_json_value(v, &dst, &file) {
                     out.push(r);
                 }
             }
         }
-    } else {
-        // `--style ndjson`: one object per line.
-        for line in text.lines() {
-            let line = line.trim().trim_end_matches(',');
-            if line.is_empty() || line == "[" || line == "]" {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(r) = classify_json_value(&v, &dst, &file) {
-                    out.push(r);
-                }
+        return;
+    }
+    // `--style ndjson`: one object per line, streamed.
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim().trim_end_matches(',');
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(r) = classify_json_value(&v, &dst, &file) {
+                out.push(r);
             }
         }
     }
 }
 
-/// True when a file looks like a `log show` JSON / NDJSON export.
+/// True when a file looks like a `log show` JSON / NDJSON export: a JSON
+/// extension and, in its first 64 KB, the `eventMessage` key `log show`
+/// writes on every record. A Velociraptor result file or any other JSON
+/// lying in a triage tree is left alone.
 fn looks_like_json_export(path: &Path) -> bool {
     match path.extension().and_then(|s| s.to_str()) {
-        Some("json") | Some("ndjson") | Some("jsonl") => true,
-        _ => false,
+        Some("json") | Some("ndjson") | Some("jsonl") => {}
+        _ => return false,
     }
+    let mut head = vec![0u8; 65_536];
+    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    String::from_utf8_lossy(&head[..n]).contains("\"eventMessage\"")
 }
 
 // ──────────────────────────── entry point ────────────────────────────────────
@@ -478,6 +540,9 @@ fn looks_like_json_export(path: &Path) -> bool {
 pub fn parse_mac(files: &[String], dirs: &[String], output: Option<&String>) {
     let start = std::time::Instant::now();
     crate::banner::print_search_start();
+    // the discovery walk and the parse are one pass here: a .logarchive is
+    // read as it is found
+    crate::banner::print_processing_start();
 
     let mut rows: Vec<LogData> = Vec::new();
     let mut sources = 0usize;
@@ -536,6 +601,10 @@ pub fn parse_mac(files: &[String], dirs: &[String], output: Option<&String>) {
             .then(a.filename.cmp(&b.filename))
     });
 
+    // --ignore-local / --exclude-* apply here as on every other parser
+    rows.retain(|r| crate::filter::should_keep_record(r));
+
+    crate::banner::print_output_start();
     if rows.is_empty() {
         crate::banner::print_info(
             "macOS: no SSH or Screen Sharing lateral movement found in the sources provided",
@@ -545,12 +614,7 @@ pub fn parse_mac(files: &[String], dirs: &[String], output: Option<&String>) {
         eprintln!("Error writing macOS timeline: {}", e);
         return;
     }
-    crate::banner::print_info(&format!(
-        "macOS: {} row(s) from {} source(s) in {:.1}s",
-        rows.len(),
-        sources,
-        start.elapsed().as_secs_f32()
-    ));
+    crate::banner::print_summary(rows.len(), sources, 0, output.map(|s| s.as_str()), start);
 }
 
 // ───────────────────────────────── tests ─────────────────────────────────────

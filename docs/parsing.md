@@ -112,6 +112,8 @@ A `.logarchive` is a bundle of binary `tracev3` records with `dsc` / `uuidtext` 
 
 The destination of every row is the Mac being analysed; its name is taken from the `.logarchive` bundle name (a `log collect` archive is conventionally named after the host). Console logins (`loginwindow`), `sudo` and `su` are host-local, not lateral movement, and are dropped — as on every other masstin parser.
 
+`--ignore-local` and the `--exclude-*` flags apply as on every other parser. An empty timeline from a real Mac is common: the Unified Log keeps sshd's `Accepted` / `Failed` lines at the *info* level, which macOS does not always persist to disk, and the OpenDirectory activity sshd leaves behind while it authenticates is not a logon text. Run with `--debug` to see, per bundle, how many records were scanned, how many came from `sshd` / `screensharingd` and which of those did not classify.
+
 Not yet read (see the roadmap): `smbd` share connections (the Unified Log message format is not documented reliably enough to parse without guessing), `/var/log/system.log` / ASL text, the `utmpx` / `wtmpx` login databases, and APFS disk images.
 
 ## Parse forensic images — auto-detect Windows and Linux
