@@ -111,7 +111,10 @@ jobs:
           # runner account gets a known password (sudo stays NOPASSWD); a
           # correct and a wrong attempt, each logged by screensharingd as
           # "Authentication: SUCCEEDED/FAILED :: User Name: ... :: Viewer Address: ..."
-          "$VNCDO" -s 127.0.0.1::5900 -u citest -p 'Ci-Pass-2026!' --timeout 20 expect /dev/null 0 || true
+          # the successful session is held open for a few seconds so that the
+          # post-authentication lines (Connection accepted :: Viewer Address)
+          # get written; a failed attempt ends by itself
+          "$VNCDO" -s 127.0.0.1::5900 -u citest -p 'Ci-Pass-2026!' --timeout 30 pause 8 || true
           sleep 3
           "$VNCDO" -s 127.0.0.1::5900 -u citest -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
           sleep 3
@@ -145,7 +148,7 @@ jobs:
           echo "== what the Unified Log kept (sshd / screensharingd, info level)"
           log show --last 20m --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -vE '^Timestamp' | head -200
           echo "== from the archive itself (what a collected bundle holds)"
-          log show out/MAC-CI.logarchive --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -E 'Accepted|Failed|Disconnected|identification|banner exchange|Connection closed|Authentication:|authResult|new viewer|bad auth|User Name|Viewer Address' | head -80
+          log show out/MAC-CI.logarchive --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -E 'Accepted|Failed|Disconnected|identification|banner exchange|Connection closed|Authentication:|authResult|outUID|new viewer|good auth|bad auth|User Name|Viewer Address|Connection accepted|Remote user|ScreensharingAgent' | head -80
 
       - name: parse-mac on the export and on the .logarchive
         run: |
