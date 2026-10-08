@@ -90,7 +90,14 @@ jobs:
         run: |
           set -x
           K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$K" -activate -configure -access -on -users "$USER" -privs -all -restart -agent -console || true
+          # screensharingd offers ARD authentication (type 30, Diffie-Hellman
+          # against an account password). The runner account's password is
+          # unknown and dscl refuses to change it without the old one, so a
+          # second local user with a known password is created for the
+          # Screen Sharing attempts (and one SSH password login).
+          sudo sysadminctl -addUser citest -fullName "CI Test" -password 'Ci-Pass-2026!' -admin 2>&1 | tail -2 || true
+          dscl . -read /Users/citest UniqueID || true
+          sudo "$K" -activate -configure -access -on -users "runner,citest" -privs -all -restart -agent -console || true
           sudo "$K" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw ci-vnc-pw || true
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
@@ -104,12 +111,22 @@ jobs:
           # runner account gets a known password (sudo stays NOPASSWD); a
           # correct and a wrong attempt, each logged by screensharingd as
           # "Authentication: SUCCEEDED/FAILED :: User Name: ... :: Viewer Address: ..."
-          sudo dscl . -passwd "/Users/$USER" 'Ci-Pass-2026!' || true
-          "$VNCDO" -s 127.0.0.1::5900 -u "$USER" -p 'Ci-Pass-2026!' --timeout 15 expect /dev/null 0 || true
-          sleep 2
-          "$VNCDO" -s 127.0.0.1::5900 -u "$USER" -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
-          sleep 2
+          "$VNCDO" -s 127.0.0.1::5900 -u citest -p 'Ci-Pass-2026!' --timeout 20 expect /dev/null 0 || true
+          sleep 3
+          "$VNCDO" -s 127.0.0.1::5900 -u citest -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
+          sleep 3
           "$VNCDO" -s 127.0.0.1::5900 -u nosuchuser -p 'wrong-password' --timeout 15 expect /dev/null 0 || true
+          # and an SSH password login with the same account (Accepted keyboard-interactive/pam)
+          cat > "$RUNNER_TEMP/goodpw.exp" <<'EXP'
+          set timeout 25
+          spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive citest@127.0.0.1 "echo logged-in-as-citest; sleep 2"
+          expect {
+            -re "(?i)password:" { send "Ci-Pass-2026!\r"; exp_continue }
+            eof { exit 0 }
+            timeout { exit 0 }
+          }
+          EXP
+          expect "$RUNNER_TEMP/goodpw.exp" || true
           sleep 5
 
       - name: Collect the Unified Log of that span
@@ -128,7 +145,7 @@ jobs:
           echo "== what the Unified Log kept (sshd / screensharingd, info level)"
           log show --last 20m --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -vE '^Timestamp' | head -200
           echo "== from the archive itself (what a collected bundle holds)"
-          log show out/MAC-CI.logarchive --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -E 'Accepted|Failed|Disconnected|identification|Authentication:' | head -50
+          log show out/MAC-CI.logarchive --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -E 'Accepted|Failed|Disconnected|identification|banner exchange|Connection closed|Authentication:|authResult|new viewer|bad auth|User Name|Viewer Address' | head -80
 
       - name: parse-mac on the export and on the .logarchive
         run: |
