@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.3.2 — 2026-10-08
+
+### A loaded graph holds every edge
+
+`load-memgraph` lost edges without saying so: a time with 7 digits of a second (every EVTX time) made its whole batch fail, and on the public EVTX samples the graph held 225 of the 787 edges the loader reported. Both loaders now count what the database created and report a failed batch. The loaders also decide machine identity on the same corpus as graph-hunt, so a hunt on a loaded Neo4j or Memgraph graph gives the same output as `graph-hunt-csv`, which the functional CI now checks against real Neo4j and Memgraph instances on every push. Carving VMDK, VHD/VHDX and raw images gets the decoder timeout E01 had.
 
 - `load-memgraph`: **no more silently lost edges.** Memgraph's `localDateTime()` takes 0, 3 or 6 digits of a second; EVTX times carry 7 (and other sources 9), and one such value made its whole batch of edges fail, while the loader reported every edge as loaded: on the public EVTX samples 562 of 787 edges (the two largest accounts) were missing from the graph. Times are now cut to 6 digits for Memgraph, and both loaders count what the server says it created; a batch that fails is reported (an error raised while the result was read used to be counted as success, in the Neo4j loader too).
 - `load-neo4j` / `load-memgraph`: **the same machines as graph-hunt-csv.** The loaders ran the same-login test on the rows with a single source side only, which under-counted each name's login rate and folded IPs graph-hunt does not (on the public EVTX samples, `10.23.123.11` into `ATTACKER`). They now run it on the corpus graph-hunt builds from the same file.
