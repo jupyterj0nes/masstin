@@ -108,7 +108,7 @@ What `parse-mac` writes, per row: `SUCCESSFUL_LOGON` (sshd `Accepted`, screensha
 
 [Full article →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/)
 
-Parses the Windows Event IDs listed above from Winlogbeat JSON format (`@timestamp`, `winlog.event_id` as a number or, from Winlogbeat 8, a string, `winlog.event_data.*`), except WinRM 6, WMI 5858 and Sysmon 3, which it does not read yet.
+Parses the Windows Event IDs listed above from Winlogbeat JSON (`winlog.channel`, `winlog.event_id` as a number or, from Winlogbeat 8, a string, `winlog.event_data.*` and `winlog.user_data.*`) through the same per-event mapping as `parse-windows`, so an event gives the same row from an EVTX or from Elastic. Elastic Agent's Windows integration writes the same documents and is read too.
 
 ## Cortex XDR
 
@@ -130,7 +130,7 @@ Default admin port list queried by `parse-cortex`:
 
 ### EVTX Forensics (via XQL)
 
-Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR forensic collection agent and the offline collector (triage packages uploaded to the tenant land in the same dataset). The query asks for the event IDs of `parse-windows` from Security, TerminalServices-LocalSessionManager, SMBServer/Security, SmbClient/Security, RDPClient, RemoteConnectionManager, RdpCoreTS, WinRM/Operational and WMI-Activity/Operational. Rows without a usable source are dropped server side, so 4634, 4647, 4768-4771, 4778/4779, WinRM 6 and RDP client 1024 do not come through today; SmbClient/Connectivity and Sysmon are not queried. Regex extraction currently ships with EN / ES / DE / FR / IT keyword variants and auto-paginates via time bisection if a window saturates the 1M API cap.
+Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR forensic collection agent and the offline collector (triage packages uploaded to the tenant land in the same dataset). The query asks for the event IDs of `parse-windows` from Security, TerminalServices-LocalSessionManager, SMBServer/Security, SmbClient/Security, SmbClient/Connectivity, RDPClient, RemoteConnectionManager, RdpCoreTS, WinRM/Operational and WMI-Activity/Operational, and drops rows without an origin server side. Logoffs 4634/4647 (no origin in the message, no logon id in the dataset) and Sysmon 3 are not covered. Regex extraction currently ships with EN / ES / DE / FR / IT keyword variants and auto-paginates via time bisection if a window saturates the 1M API cap.
 
 ---
 

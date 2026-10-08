@@ -208,7 +208,7 @@ Each UAL record generates two timeline entries (first seen + last seen). Server 
 
 ## Parse Winlogbeat JSON
 
-Parses Winlogbeat JSON logs forwarded to Elasticsearch. Extracts the same lateral movement data from JSON format when EVTX files are unavailable.
+Parses Winlogbeat JSON logs forwarded to Elasticsearch (and the same `winlog.*` documents written by Elastic Agent's Windows integration). Each document is reduced to the event and its fields and goes through the same per-event mapping as `parse-windows`, chosen by the event's channel, so the same event gives the same row from an EVTX or from Elastic. Documents without a channel are mapped by event id where the id belongs to one family only.
 
 ```bash
 masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
@@ -237,11 +237,18 @@ receives logs uploaded by the Cortex XDR offline collector, so triage packages
 gathered from air-gapped or unreachable hosts and pushed into the tenant are
 queried through the exact same path. masstin asks for the event IDs of `parse-windows`
 and writes the same columns, so the output merges with host-side artifacts. The
-extraction is done by regular expressions on the rendered message text, server side,
-and rows without a usable source are dropped there: 4634, 4647, the Kerberos events
-(4768-4771), 4778/4779, WinRM 6 and RDP client 1024 do not come through today, the
-SMB client Connectivity channel (30803-30808) is not queried and Sysmon 3 is not
-covered. Parity with `parse-windows` is on the roadmap.
+dataset keeps the rendered message text, so the fields are taken by regular
+expressions on it, server side, and a row without an origin is dropped there (a
+masstin row needs an origin and a destination). Logons, failures with their
+SubStatus, explicit credentials, Kerberos (4768-4771, failures from their result
+code), NTLM (4776), session reconnects (4778/4779), shares (5140), the SMB server and
+client channels including Connectivity (30803-30808), RDP client, RemoteConnectionManager
+(1149), LocalSessionManager, RdpCoreTS, WinRM 6 and WMI 5858 come through. Not covered:
+logoffs 4634/4647 (their message names no origin and the dataset gives no logon id to
+pair them) and Sysmon 3 (`parse-cortex` reads Cortex's own network data). The labels
+are matched in English, with Spanish, German, French and Italian variants for the
+logon events. The query was checked by evaluating its expressions on the real
+rendered messages of the public EVTX sample sets, not on a live tenant.
 
 ## Custom parsers (parse-custom): VPN, firewall and proxy logs via YAML rules
 
@@ -527,6 +534,6 @@ Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux 
 
 | Source | What it tracks | Article |
 |--------|---------------|---------|
-| Winlogbeat JSON | The Windows Event IDs above except WinRM 6, WMI 5858 and Sysmon 3 | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
+| Winlogbeat JSON | All the Windows Event IDs above, through the same mapping as `parse-windows` | [Read more →](https://weinvestigateanything.com/en/artifacts/winlogbeat-elastic-artifacts/) |
 | Cortex XDR Network | RDP, SMB, SSH connections via API | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |
 | Cortex XDR EVTX Forensics | Forensic event logs from agents | [Read more →](https://weinvestigateanything.com/en/artifacts/cortex-xdr-artifacts/) |

@@ -105,12 +105,12 @@ pub(crate) fn split_account(v: &str) -> (String, String) {
 
 /// Source columns for a host name recorded by a client-side channel: the
 /// name goes to src_computer, an address to src_ip, never both.
-fn source_columns(host: &str) -> (String, String) {
+pub(crate) fn source_columns(host: &str) -> (String, String) {
     let h = host.trim().to_string();
     if h.parse::<std::net::IpAddr>().is_ok() { (String::new(), h) } else { (h, String::new()) }
 }
 
-fn strip_ipv4_mapped(ip: &str) -> String {
+pub(crate) fn strip_ipv4_mapped(ip: &str) -> String {
     if let Some(v4) = ip.strip_prefix("::ffff:") {
         return v4.to_string();
     }
@@ -691,759 +691,590 @@ pub(crate) fn detect_vss_index(path: &str) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------------------
-// SECURITY LOG PARSER
+// ONE MAPPING PER EVENT FAMILY, WHATEVER CARRIED THE EVENT
+//
+// A Windows event reaches masstin as EVTX XML (parse-windows, parse-image,
+// parse-massive) or as a Winlogbeat JSON document (parser-elastic). Both are
+// reduced to a `WinRec` (event id, time, computer, the System UserID SID and
+// the event's fields by name) and turned into a row by the same `map_*`
+// function, so the two readers cannot drift apart again: they did, and the
+// Winlogbeat reader read 4778/4779 and 4776 with the 4624 field names (no
+// account, no origin) and wrote 4648, 31001 and 1024 with the edge reversed.
+// ---------------------------------------------------------------------------------------
+
+/// A Windows event reduced to what the lateral-movement mapping reads.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WinRec {
+    pub event_id: String,
+    pub time: String,
+    pub computer: String,
+    /// System/Security/@UserID (Winlogbeat: `winlog.user.identifier`)
+    pub user_sid: String,
+    /// EventData `<Data Name=..>` values and the UserData leaves, by name.
+    /// A key is present only when the event carried that element.
+    pub fields: HashMap<String, String>,
+    /// The event had an EventData block (some families require one).
+    pub has_event_data: bool,
+}
+
+impl WinRec {
+    fn f(&self, k: &str) -> String {
+        self.fields.get(k).cloned().unwrap_or_default()
+    }
+    fn has(&self, k: &str) -> bool {
+        self.fields.contains_key(k)
+    }
+}
+
+fn put(fields: &mut HashMap<String, String>, k: &str, v: &Option<String>) {
+    if let Some(v) = v {
+        fields.insert(k.to_string(), v.clone());
+    }
+}
+
+fn rec_from_event(event: &Event) -> Option<WinRec> {
+    let mut fields = HashMap::new();
+    let has_event_data = event.EventData.is_some();
+    if let Some(ed) = event.EventData.as_ref() {
+        for d in &ed.Datas {
+            if let Some(name) = d.Name.as_ref() {
+                fields.insert(name.clone(), d.body.clone().unwrap_or_default());
+            }
+        }
+    }
+    Some(WinRec {
+        event_id: event.System.EventID.clone()?,
+        time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+        computer: event.System.Computer.clone().unwrap_or_default(),
+        user_sid: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
+        fields,
+        has_event_data,
+    })
+}
+
+fn rec_from_event2(event: &Event2) -> Option<WinRec> {
+    let mut fields = HashMap::new();
+    if let Some(ud) = event.UserData.as_ref() {
+        if let Some(ed) = ud.EventData.as_ref() {
+            put(&mut fields, "UserName", &ed.UserName);
+            put(&mut fields, "ClientName", &ed.ClientName);
+            put(&mut fields, "ClientAddress", &ed.ClientAddress);
+            put(&mut fields, "Status", &ed.Status);
+        }
+        if let Some(x) = ud.EventXML.as_ref() {
+            put(&mut fields, "Param1", &x.Param1);
+            put(&mut fields, "Param2", &x.Param2);
+            put(&mut fields, "Param3", &x.Param3);
+            put(&mut fields, "User", &x.User);
+            put(&mut fields, "Address", &x.Address);
+            put(&mut fields, "SessionID", &x.SessionID);
+        }
+    }
+    Some(WinRec {
+        event_id: event.System.EventID.clone()?,
+        time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+        computer: event.System.Computer.clone().unwrap_or_default(),
+        user_sid: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
+        fields,
+        has_event_data: false,
+    })
+}
+
+/// Iterate the records of one EVTX file whose id is in `ids`, as WinRecs
+/// built by `build`, and map each with `map`.
+fn evtx_rows(
+    file: &str,
+    ids: &[&str],
+    build: fn(&str) -> Option<WinRec>,
+    map: fn(&WinRec, &str) -> Option<LogData>,
+) -> Vec<LogData> {
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing {}", file);
+    }
+    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+    for record in parser.records() {
+        let r = match record { Ok(r) => r, Err(_) => continue };
+        let rec = match build(r.data.as_str()) { Some(x) => x, None => continue };
+        if !ids.contains(&rec.event_id.as_str()) {
+            continue;
+        }
+        if let Some(row) = map(&rec, file) {
+            log_data.push(row);
+        }
+    }
+    log_data
+}
+
+fn build_event(xml: &str) -> Option<WinRec> {
+    rec_from_event(&from_str::<Event>(xml).ok()?)
+}
+fn build_event2(xml: &str) -> Option<WinRec> {
+    rec_from_event2(&from_str::<Event2>(xml).ok()?)
+}
+fn build_wmi(xml: &str) -> Option<WinRec> {
+    let event: EventWMI = from_str(xml).ok()?;
+    let mut fields = HashMap::new();
+    if let Some(ud) = event.UserData.as_ref() {
+        put(&mut fields, "ClientMachine", &ud.client_machine());
+        put(&mut fields, "User", &ud.user());
+        put(&mut fields, "Operation", &ud.operation());
+    }
+    Some(WinRec {
+        event_id: event.System.EventID.clone()?,
+        time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+        computer: event.System.Computer.clone().unwrap_or_default(),
+        user_sid: String::new(),
+        fields,
+        has_event_data: false,
+    })
+}
+
+type MapFn = fn(&WinRec, &str) -> Option<LogData>;
+
+/// The mapping for an event of `channel` (the EVTX channel name, as
+/// Winlogbeat writes it in `winlog.channel`), or None when masstin does not
+/// read that event. Event ids are only unique within a channel (1102 is an
+/// RDP client event and also "audit log cleared" in Security; 6 and 3 exist
+/// in many channels), so the channel decides the family.
+pub(crate) fn mapper_for_channel(channel: &str, event_id: &str) -> Option<MapFn> {
+    let c = channel.to_ascii_lowercase();
+    let table: [(&str, &[&str], MapFn); 11] = [
+        ("security", SECURITY_EVENT_IDS, map_security),
+        ("microsoft-windows-smbserver/", SMBSERVER_EVENT_IDS, map_smb_server),
+        ("microsoft-windows-smbclient/security", SMBCLIENT_EVENT_IDS, map_smb_client),
+        ("microsoft-windows-smbclient/connectivity", SMBCLIENT_CONNECTIVITY_EVENT_IDS, map_smb_client_connectivity),
+        ("microsoft-windows-terminalservices-rdpclient/", RDPCLIENT_EVENT_IDS, map_rdp_client),
+        ("microsoft-windows-terminalservices-remoteconnectionmanager/", RDPCONNMANAGER_EVENT_IDS, map_rdp_connmanager),
+        ("microsoft-windows-terminalservices-localsessionmanager/", RDPLOCALSESSION_EVENT_IDS, map_rdp_localsession),
+        ("microsoft-windows-remotedesktopservices-rdpcorets/", RDPKORE_EVENT_IDS, map_rdpkore),
+        ("microsoft-windows-winrm/", WINRM_EVENT_IDS, map_winrm),
+        ("microsoft-windows-wmi-activity/", WMI_EVENT_IDS, map_wmi),
+        ("microsoft-windows-sysmon/", SYSMON_EVENT_IDS, map_sysmon),
+    ];
+    table.iter()
+        .find(|(prefix, ids, _)| {
+            (if *prefix == "security" { c == "security" } else { c.starts_with(prefix) }) && ids.contains(&event_id)
+        })
+        .map(|(_, _, f)| *f)
+}
+
+/// For records that do not say their channel (old exports): the event ids
+/// that belong to one family only. 1102, 6 and 3 are left out: without the
+/// channel they are as likely to be something else.
+pub(crate) fn mapper_for_id(event_id: &str) -> Option<MapFn> {
+    let table: [(&[&str], MapFn); 8] = [
+        (SECURITY_EVENT_IDS, map_security),
+        (SMBCLIENT_EVENT_IDS, map_smb_client),
+        (SMBCLIENT_CONNECTIVITY_EVENT_IDS, map_smb_client_connectivity),
+        (SMBSERVER_EVENT_IDS, map_smb_server),
+        (&["1024"], map_rdp_client),
+        (RDPCONNMANAGER_EVENT_IDS, map_rdp_connmanager),
+        (RDPLOCALSESSION_EVENT_IDS, map_rdp_localsession),
+        (WMI_EVENT_IDS, map_wmi),
+    ];
+    table.iter().find(|(ids, _)| ids.contains(&event_id)).map(|(_, f)| *f)
+}
+
+// ---------------------------------------------------------------------------------------
+// SECURITY
 // ---------------------------------------------------------------------------------------
 pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event, map_security)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            // If there's an error initializing, return empty
-            return vec![];
-        }
+pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
+    let event_id = rec.event_id.clone();
+    let v = |k: &str| rec.f(k);
+    let status = v("Status");
+    let event_type = match event_id.as_str() {
+        "4624" => "SUCCESSFUL_LOGON".to_string(),
+        "4625" => "FAILED_LOGON".to_string(),
+        "4634" => "LOGOFF".to_string(),
+        "4647" => "LOGOFF".to_string(),
+        "4648" => "SUCCESSFUL_LOGON".to_string(),
+        "4768" | "4769" | "4776" => {
+            if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
+        },
+        "4770" => "SUCCESSFUL_LOGON".to_string(),
+        "4771" => "FAILED_LOGON".to_string(),
+        "4778" => "SUCCESSFUL_LOGON".to_string(),
+        "4779" => "LOGOFF".to_string(),
+        "5140" => "SUCCESSFUL_LOGON".to_string(),
+        _ => "CONNECT".to_string(),
     };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) {
-                    Ok(event) => event,
-                    Err(_) => {
-                        continue;
-                    },
-                };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        // Extend the map with ProcessName, Status, SubStatus, TargetLogonId keys.
-                        let mut data_values: HashMap<String, String> = [
-                            ("SubjectUserName".to_string(), String::from("")),
-                            ("SubjectDomainName".to_string(), String::from("")),
-                            ("TargetUserName".to_string(), String::from("")),
-                            ("TargetDomainName".to_string(), String::from("")),
-                            ("LogonType".to_string(), String::from("")),
-                            ("WorkstationName".to_string(), String::from("")),
-                            ("IpAddress".to_string(), String::from("")),
-                            ("ProcessName".to_string(), String::from("")),
-                            ("Status".to_string(), String::from("")),
-                            ("SubStatus".to_string(), String::from("")),
-                            ("TargetLogonId".to_string(), String::from("")),
-                            ("ShareName".to_string(), String::from("")),
-                            ("RelativeTargetName".to_string(), String::from("")),
-                            // 4648 (logged on the SOURCE): the destination
-                            ("TargetServerName".to_string(), String::from("")),
-                            // 4776 uses Workstation, not WorkstationName
-                            ("Workstation".to_string(), String::from("")),
-                            // 4778/4779 (session reconnect/disconnect)
-                            ("AccountName".to_string(), String::from("")),
-                            ("AccountDomain".to_string(), String::from("")),
-                            ("ClientName".to_string(), String::from("")),
-                            ("ClientAddress".to_string(), String::from("")),
-                            ("LogonID".to_string(), String::from("")),
-                            // 5140 carries the user only as the subject
-                            ("SubjectLogonId".to_string(), String::from("")),
-                        ].iter().cloned().collect();
-
-                        if let Some(event_data) = event.EventData {
-                            for data in event_data.Datas {
-                                if let Some(name) = data.Name {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
-                                    }
-                                }
-                            }
-                        }
-
-                        // Classify event_type based on event ID
-                        let status = data_values.get("Status").unwrap().as_str();
-                        let event_type = match event_id.as_str() {
-                            "4624" => "SUCCESSFUL_LOGON".to_string(),
-                            "4625" => "FAILED_LOGON".to_string(),
-                            "4634" => "LOGOFF".to_string(),
-                            "4647" => "LOGOFF".to_string(),
-                            "4648" => "SUCCESSFUL_LOGON".to_string(),
-                            "4768" | "4769" | "4776" => {
-                                if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
-                            },
-                            "4770" => "SUCCESSFUL_LOGON".to_string(),
-                            "4771" => "FAILED_LOGON".to_string(),
-                            "4778" => "SUCCESSFUL_LOGON".to_string(),
-                            "4779" => "LOGOFF".to_string(),
-                            "5140" => "SUCCESSFUL_LOGON".to_string(),
-                            _ => "CONNECT".to_string(),
-                        };
-
-                        // Determine detail column
-                        let share_name = data_values.get("ShareName").unwrap_or(&String::new()).to_string();
-                        let detail = match event_id.as_str() {
-                            "4624" | "4648" => data_values.get("ProcessName").unwrap_or(&String::new()).to_string(),
-                            "4625" => translate_substatus(data_values.get("SubStatus").unwrap_or(&String::new())),
-                            "5140" => share_name,
-                            _ => String::from(""),
-                        };
-
-                        let logon_type = infer_logon_type(&event_id, data_values.get("LogonType").unwrap_or(&String::new()));
-                        let v = |k: &str| data_values.get(k).cloned().unwrap_or_default();
-                        let computer = event.System.Computer.unwrap_or_default();
-                        // Field names differ per event (checked against the
-                        // Windows provider manifests):
-                        //  * 4648 is logged on the SOURCE host; the host it
-                        //    authenticated to is TargetServerName. Reading
-                        //    Computer as destination reversed the edge.
-                        //  * 4776: Workstation.  4778/4779: AccountName,
-                        //    AccountDomain, ClientName, ClientAddress, LogonID.
-                        //  * 5140: the user is the subject.
-                        let (dst, tgt_user, tgt_dom, wks, ip, lid) = match event_id.as_str() {
-                            "4648" => {
-                                let target = v("TargetServerName");
-                                let t = target.trim();
-                                if !t.is_empty() && t != "-" && !t.eq_ignore_ascii_case("localhost") && t != "127.0.0.1" {
-                                    (t.to_string(), v("TargetUserName"), v("TargetDomainName"), computer.clone(), String::new(), v("TargetLogonId"))
-                                } else {
-                                    (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId"))
-                                }
-                            }
-                            "4776" => (computer.clone(), v("TargetUserName"), String::new(), v("Workstation"), String::new(), String::new()),
-                            "4778" | "4779" => (computer.clone(), v("AccountName"), v("AccountDomain"), v("ClientName"), v("ClientAddress"), v("LogonID")),
-                            "5140" => (computer.clone(), v("SubjectUserName"), v("SubjectDomainName"), v("WorkstationName"), v("IpAddress"), v("SubjectLogonId")),
-                            _ => (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId")),
-                        };
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: dst,
-                            event_type,
-                            event_id,
-                            subject_user_name: v("SubjectUserName"),
-                            subject_domain_name: v("SubjectDomainName"),
-                            target_user_name: tgt_user,
-                            target_domain_name: tgt_dom,
-                            logon_type,
-                            workstation_name: wks,
-                            ip_address: strip_ipv4_mapped(&ip),
-                            logon_id: lid,
-                            filename: file.to_string(),
-                            detail,
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
+    let detail = match event_id.as_str() {
+        "4624" | "4648" => v("ProcessName"),
+        "4625" => translate_substatus(&v("SubStatus")),
+        "5140" => v("ShareName"),
+        _ => String::new(),
+    };
+    let logon_type = infer_logon_type(&event_id, &v("LogonType"));
+    let computer = rec.computer.clone();
+    // Field names differ per event (checked against the Windows provider
+    // manifests):
+    //  * 4648 is logged on the SOURCE host; the host it authenticated to is
+    //    TargetServerName. Reading Computer as destination reversed the edge.
+    //  * 4776: Workstation.  4778/4779: AccountName, AccountDomain,
+    //    ClientName, ClientAddress, LogonID.
+    //  * 5140: the user is the subject.
+    let (dst, tgt_user, tgt_dom, wks, ip, lid) = match event_id.as_str() {
+        "4648" => {
+            let target = v("TargetServerName");
+            let t = target.trim();
+            if !t.is_empty() && t != "-" && !t.eq_ignore_ascii_case("localhost") && t != "127.0.0.1" {
+                (t.to_string(), v("TargetUserName"), v("TargetDomainName"), computer.clone(), String::new(), v("TargetLogonId"))
+            } else {
+                (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId"))
+            }
         }
-    }
-    log_data
+        "4776" => (computer.clone(), v("TargetUserName"), String::new(), v("Workstation"), String::new(), String::new()),
+        "4778" | "4779" => (computer.clone(), v("AccountName"), v("AccountDomain"), v("ClientName"), v("ClientAddress"), v("LogonID")),
+        "5140" => (computer.clone(), v("SubjectUserName"), v("SubjectDomainName"), v("WorkstationName"), v("IpAddress"), v("SubjectLogonId")),
+        _ => (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId")),
+    };
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: dst,
+        event_type,
+        event_id,
+        subject_user_name: v("SubjectUserName"),
+        subject_domain_name: v("SubjectDomainName"),
+        target_user_name: tgt_user,
+        target_domain_name: tgt_dom,
+        logon_type,
+        workstation_name: wks,
+        ip_address: strip_ipv4_mapped(&ip),
+        logon_id: lid,
+        filename: file.to_string(),
+        detail,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// SMB SERVER PARSER
+// SMB SERVER (551 / 1009, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_smb_server(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event2, map_smb_server)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
+pub(crate) fn map_smb_server(rec: &WinRec, file: &str) -> Option<LogData> {
+    let event_type = match rec.event_id.as_str() {
+        // 1009: "The server denied anonymous access to the client" (Error).
+        // 551: session auth failure.
+        "1009" | "551" => "FAILED_LOGON".to_string(),
+        _ => "CONNECT".to_string(),
     };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event2 = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let event_type = match event_id.as_str() {
-                            // 1009: "The server denied anonymous access to
-                            // the client" (Error). 551: session auth failure.
-                            "1009" => "FAILED_LOGON".to_string(),
-                            "551" => "FAILED_LOGON".to_string(),
-                            _ => "CONNECT".to_string(),
-                        };
-                        // Newer 551/1009 templates carry no UserName and
-                        // no <UserData><EventData>: never unwrap, a record
-                        // of another shape used to abort the whole run.
-                        let ed = event.UserData.as_ref().and_then(|u| u.EventData.as_ref());
-                        let (user, domain) = split_account(&ed.and_then(|e| e.UserName.clone()).unwrap_or_default());
-                        // ClientName is written as a UNC reference
-                        // (`\\192.0.2.76`); the raw value was landing in
-                        // src_computer with its backslashes and the address
-                        // was never recognised. ClientAddress (a SOCKADDR
-                        // hex dump) is the fallback when the name is empty.
-                        let mut client = strip_ipv4_mapped(&split_unc(&ed.and_then(|e| e.ClientName.clone()).unwrap_or_default()).0);
-                        if client.is_empty() {
-                            client = ed.and_then(|e| e.ClientAddress.as_deref()).and_then(sockaddr_hex_ip).unwrap_or_default();
-                        }
-                        let (workstation_name, ip_address) = source_columns(&client);
-                        let status = ed.and_then(|e| e.Status.clone()).unwrap_or_default();
-                        let detail = if status.is_empty() { String::new() } else { format!("Status {}", status) };
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: event.System.Computer.unwrap_or_default(),
-                            event_type,
-                            event_id,
-                            subject_user_name: event.System.Security.as_ref().and_then(|s| s.UserID.as_ref()).cloned().unwrap_or_default(),
-                            subject_domain_name: String::from(""),
-                            target_user_name: user,
-                            target_domain_name: domain,
-                            logon_type: String::from("3"),
-                            workstation_name,
-                            ip_address,
-                            logon_id: String::from(""),
-                            filename: file.to_string(),
-                            detail,
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
+    // Newer 551/1009 templates carry no UserName and no
+    // <UserData><EventData>: every field is optional.
+    let (user, domain) = split_account(&rec.f("UserName"));
+    // ClientName is written as a UNC reference (`\\192.0.2.76`); the raw
+    // value was landing in src_computer with its backslashes and the address
+    // was never recognised. ClientAddress (a SOCKADDR hex dump) is the
+    // fallback when the name is empty.
+    let mut client = strip_ipv4_mapped(&split_unc(&rec.f("ClientName")).0);
+    if client.is_empty() {
+        client = sockaddr_hex_ip(&rec.f("ClientAddress")).unwrap_or_default();
     }
-    log_data
+    let (workstation_name, ip_address) = source_columns(&client);
+    let status = rec.f("Status");
+    let detail = if status.is_empty() { String::new() } else { format!("Status {}", status) };
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.computer.clone(),
+        event_type,
+        event_id: rec.event_id.clone(),
+        subject_user_name: rec.user_sid.clone(),
+        subject_domain_name: String::new(),
+        target_user_name: user,
+        target_domain_name: domain,
+        logon_type: String::from("3"),
+        workstation_name,
+        ip_address,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// SMB CLIENT PARSER
+// SMB CLIENT (31001, written on the client)
 // ---------------------------------------------------------------------------------------
 pub fn parse_smb_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event, map_smb_client)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
+pub(crate) fn map_smb_client(rec: &WinRec, file: &str) -> Option<LogData> {
+    if !rec.has_event_data {
+        return None;
+    }
+    let (server, share_in_name) = split_unc(&rec.f("ServerName"));
+    let share = {
+        let s = split_unc(&rec.f("ShareName")).1;
+        if s.is_empty() { share_in_name } else { s }
     };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut data_values: HashMap<String, String> = [
-                            ("UserName".to_string(), String::from("")),
-                            ("ServerName".to_string(), String::from("")),
-                            ("ShareName".to_string(), String::from("")),
-                        ].iter().cloned().collect();
-
-                        if let Some(event_data) = event.EventData {
-                            for data in event_data.Datas {
-                                if let Some(name) = data.Name {
-                                    if let Some(data_value) = data_values.get_mut(&name) {
-                                        *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
-                                    }
-                                }
-                            }
-                        } else { continue; }
-
-                        let (server, share_in_name) = split_unc(data_values.get("ServerName").map(|s| s.as_str()).unwrap_or(""));
-                        let share = {
-                            let s = split_unc(data_values.get("ShareName").map(|s| s.as_str()).unwrap_or("")).1;
-                            if s.is_empty() { share_in_name } else { s }
-                        };
-                        let (user, domain) = split_account(data_values.get("UserName").map(|s| s.as_str()).unwrap_or(""));
-                        // written on the CLIENT: the local Computer is the
-                        // source (a name, not an address), the server the
-                        // destination
-                        let (workstation_name, ip_address) = source_columns(event.System.Computer.as_deref().unwrap_or(""));
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: strip_ipv4_mapped(&server),
-                            // 31001 (level Error): the client failed to
-                            // authenticate to the server.
-                            event_type: "FAILED_LOGON".to_string(),
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: user,
-                            target_domain_name: domain,
-                            logon_type: String::from("3"),
-                            workstation_name,
-                            ip_address,
-                            logon_id: String::from(""),
-                            filename: file.to_string(),
-                            detail: share,
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
-    }
-    log_data
+    let (user, domain) = split_account(&rec.f("UserName"));
+    // written on the CLIENT: the local Computer is the source (a name, not
+    // an address), the server the destination
+    let (workstation_name, ip_address) = source_columns(&rec.computer);
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: strip_ipv4_mapped(&server),
+        // 31001 (level Error): the client failed to authenticate to the server.
+        event_type: "FAILED_LOGON".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: user,
+        target_domain_name: domain,
+        logon_type: String::from("3"),
+        workstation_name,
+        ip_address,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: share,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// SMB CLIENT CONNECTIVITY PARSER
+// SMB CLIENT CONNECTIVITY (30803-30808, written on the client)
 // ---------------------------------------------------------------------------------------
 pub fn parse_smb_client_connectivity(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event, map_smb_client_connectivity)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
-    };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut data_values: HashMap<String, String> = [
-                            ("UserName".to_string(), String::from("")),
-                            ("ServerName".to_string(), String::from("")),
-                            ("RemoteAddress".to_string(), String::from("")),
-                            ("Address".to_string(), String::from("")),
-                        ].iter().cloned().collect();
-                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
-                        for data in event_data.Datas {
-                            if let Some(name) = data.Name {
-                                if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
-                                }
-                            }
-                        }
-                        // ServerName is a UNC reference (`\192.0.2.31`,
-                        // and `\192.0.2.31\C$` on 30807, the share
-                        // lost); the SOCKADDR dumps are the fallback when
-                        // it is empty
-                        let (mut server, share) = split_unc(data_values.get("ServerName").map(|s| s.as_str()).unwrap_or(""));
-                        if server.is_empty() {
-                            server = ["RemoteAddress", "Address"].iter()
-                                .filter_map(|k| data_values.get(*k).map(|v| v.as_str()))
-                                .find_map(sockaddr_hex_ip)
-                                .unwrap_or_default();
-                        }
-                        if server.is_empty() { continue; }
-                        let (user, domain) = split_account(data_values.get("UserName").map(|s| s.as_str()).unwrap_or(""));
-                        // written on the CLIENT: the local Computer is the
-                        // source, a name, never an address
-                        let (workstation_name, ip_address) = source_columns(event.System.Computer.as_deref().unwrap_or(""));
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: strip_ipv4_mapped(&server),
-                            event_type: "CONNECT".to_string(),
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: user,
-                            target_domain_name: domain,
-                            logon_type: String::from("3"),
-                            workstation_name,
-                            ip_address,
-                            logon_id: String::from(""),
-                            filename: file.to_string(),
-                            detail: share,
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
+pub(crate) fn map_smb_client_connectivity(rec: &WinRec, file: &str) -> Option<LogData> {
+    if !rec.has_event_data {
+        return None;
     }
-    log_data
+    // ServerName is a UNC reference (`\192.0.2.31`, and `\192.0.2.31\C$` on
+    // 30807, the share lost); the SOCKADDR dumps are the fallback when it is
+    // empty
+    let (mut server, share) = split_unc(&rec.f("ServerName"));
+    if server.is_empty() {
+        server = ["RemoteAddress", "Address"].iter()
+            .map(|k| rec.f(k))
+            .find_map(|v| sockaddr_hex_ip(&v))
+            .unwrap_or_default();
+    }
+    if server.is_empty() {
+        return None;
+    }
+    let (user, domain) = split_account(&rec.f("UserName"));
+    // written on the CLIENT: the local Computer is the source, a name,
+    // never an address
+    let (workstation_name, ip_address) = source_columns(&rec.computer);
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: strip_ipv4_mapped(&server),
+        event_type: "CONNECT".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: user,
+        target_domain_name: domain,
+        logon_type: String::from("3"),
+        workstation_name,
+        ip_address,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: share,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// RDP CLIENT PARSER
+// RDP CLIENT (1024 / 1102, written on the client)
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdp_client(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
+    evtx_rows(file, &lateral_event_ids, build_event, map_rdp_client)
+}
+
+pub(crate) fn map_rdp_client(rec: &WinRec, file: &str) -> Option<LogData> {
+    if !rec.has_event_data {
+        return None;
     }
-
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
-    };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut data_values: HashMap<String, String> = [
-                            ("Value".to_string(), String::from(""))
-                        ].iter().cloned().collect();
-
-                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
-                        for data in event_data.Datas {
-                            if let Some(name) = data.Name {
-                                if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
-                                }
-                            }
-                        }
-
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: data_values.get("Value").unwrap_or(&String::new()).to_string(),
-                            event_type: "CONNECT".to_string(),
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
-                            target_domain_name: String::from(""),
-                            logon_type: String::from("10"),
-                            workstation_name: event.System.Computer.as_deref().unwrap_or("").to_owned(),
-                            ip_address: event.System.Computer.as_deref().unwrap_or("").to_owned(),
-                            logon_id: String::from(""),
-                            filename: file.to_string(),
-                            detail: String::from(""),
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
-    }
-    log_data
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.f("Value"),
+        event_type: "CONNECT".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: rec.user_sid.clone(),
+        target_domain_name: String::new(),
+        logon_type: String::from("10"),
+        workstation_name: rec.computer.clone(),
+        ip_address: rec.computer.clone(),
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: String::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// RDP CONNECTION MANAGER PARSER
+// RDP CONNECTION MANAGER (1149, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdp_connmanager(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    let mut log_data = Vec::new();
-
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing RDP ConnManager {}", file);
-    }
-    let (mut parser, _) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((p, _)) => (p, ()),
-        Err(_) => return log_data,
-    };
-
-    for record in parser.records() {
-        let r = match record {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let xml = r.data.as_str();
-        let event: Event2 = match from_str(&xml) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        // 1) EventID presente y coincidente
-        let event_id = match event.System.EventID {
-            Some(ref id) if lateral_event_ids.contains(&id.as_str()) => id.clone(),
-            _ => continue,
-        };
-
-        // 2) TimeCreated y Computer (salen siempre en System)
-        let time_created = event
-            .System
-            .TimeCreated
-            .SystemTime
-            .unwrap_or_else(|| {
-                if is_debug_mode() {
-                    println!("[DEBUG] Missing TimeCreated in RDP ConnManager record, skipping");
-                }
-                return String::new();
-            });
-        if time_created.is_empty() {
-            continue;
-        }
-
-        let computer = event.System.Computer.unwrap_or_else(|| {
-            if is_debug_mode() {
-                println!("[DEBUG] Missing Computer in RDP ConnManager record, skipping");
-            }
-            String::new()
-        });
-        if computer.is_empty() {
-            continue;
-        }
-
-        // 3) Event 1149 ("Remote Desktop Services: User authentication
-        //    succeeded") stores its data as UserData/EventXML with
-        //    Param1 = user, Param2 = domain, Param3 = source network
-        //    address. Reading UserData/EventData (the legacy SMB shape)
-        //    matched nothing, so every 1149 was skipped. EventData is kept
-        //    as a fallback for any producer that writes the old shape.
-        let (target_user, target_domain, client) = match event.UserData.as_ref() {
-            Some(ud) => {
-                if let Some(x) = ud.EventXML.as_ref().filter(|x| x.Param1.is_some() || x.Param3.is_some()) {
-                    (
-                        x.Param1.clone().unwrap_or_default(),
-                        x.Param2.clone().unwrap_or_default(),
-                        x.Param3.clone().unwrap_or_default(),
-                    )
-                } else if let Some(ed) = ud.EventData.as_ref() {
-                    (ed.UserName.clone().unwrap_or_default(), String::new(), ed.ClientName.clone().unwrap_or_default())
-                } else {
-                    if is_debug_mode() {
-                        println!("[DEBUG] RDP ConnManager record without EventXML/EventData, skipping");
-                    }
-                    continue;
-                }
-            }
-            None => {
-                if is_debug_mode() {
-                    println!("[DEBUG] Missing UserData in RDP ConnManager record, skipping");
-                }
-                continue;
-            }
-        };
-        let client = strip_ipv4_mapped(&client);
-        let is_ip = client.parse::<std::net::IpAddr>().is_ok();
-
-        // Finalmente, construimos el LogData
-        log_data.push(LogData {
-            time_created,
-            computer,
-            event_type: "SUCCESSFUL_LOGON".to_string(),
-            event_id,
-            subject_user_name: String::new(),
-            subject_domain_name: String::new(),
-            target_user_name: target_user,
-            target_domain_name: target_domain,
-            logon_type: "10".into(),
-            workstation_name: if is_ip { String::new() } else { client.clone() },
-            ip_address: if is_ip { client } else { String::new() },
-            logon_id: String::new(),
-            filename: file.to_string(),
-            detail: String::new(),
-        });
-    }
-
-    log_data
+    evtx_rows(file, &lateral_event_ids, build_event2, map_rdp_connmanager)
 }
 
+pub(crate) fn map_rdp_connmanager(rec: &WinRec, file: &str) -> Option<LogData> {
+    if rec.time.is_empty() || rec.computer.is_empty() {
+        return None;
+    }
+    // 1149 ("Remote Desktop Services: User authentication succeeded")
+    // stores its data as UserData/EventXML with Param1 = user, Param2 =
+    // domain, Param3 = source network address. UserData/EventData (the
+    // legacy SMB shape) is kept as a fallback for any producer that writes it.
+    let (target_user, target_domain, client) = if rec.has("Param1") || rec.has("Param3") {
+        (rec.f("Param1"), rec.f("Param2"), rec.f("Param3"))
+    } else if rec.has("UserName") || rec.has("ClientName") {
+        (rec.f("UserName"), String::new(), rec.f("ClientName"))
+    } else {
+        if is_debug_mode() {
+            println!("[DEBUG] RDP ConnManager record without EventXML/EventData, skipping");
+        }
+        return None;
+    };
+    let client = strip_ipv4_mapped(&client);
+    let is_ip = client.parse::<std::net::IpAddr>().is_ok();
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.computer.clone(),
+        event_type: "SUCCESSFUL_LOGON".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: target_user,
+        target_domain_name: target_domain,
+        logon_type: "10".into(),
+        workstation_name: if is_ip { String::new() } else { client.clone() },
+        ip_address: if is_ip { client } else { String::new() },
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: String::new(),
+    })
+}
 
 // ---------------------------------------------------------------------------------------
-// RDP LOCAL SESSION MANAGER PARSER
+// RDP LOCAL SESSION MANAGER (21 / 22 / 24 / 25, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdp_localsession(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event2, map_rdp_localsession)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
+pub(crate) fn map_rdp_localsession(rec: &WinRec, file: &str) -> Option<LogData> {
+    let mut remotedomain = String::new();
+    let mut remoteuser = rec.f("User");
+    if remoteuser.contains('\\') {
+        let parts: Vec<&str> = remoteuser.split('\\').collect();
+        remotedomain = parts[0].to_string();
+        remoteuser = parts[1].to_string();
+    }
+    let event_type = match rec.event_id.as_str() {
+        "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
+        "24" => "LOGOFF".to_string(),
+        _ => "CONNECT".to_string(),
     };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event2 = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut remotedomain = String::from("");
-                        let mut remoteuser = event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.User.as_ref()).cloned().unwrap_or_default();
-
-                        if remoteuser.contains("\\") {
-                            let parts: Vec<&str> = remoteuser.split("\\").collect();
-                            remotedomain = parts[0].to_string();
-                            remoteuser = parts[1].to_string();
-                        }
-
-                        let event_type = match event_id.as_str() {
-                            "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
-                            "24" => "LOGOFF".to_string(),
-                            _ => "CONNECT".to_string(),
-                        };
-                        // Try to extract SessionId for logon_id
-                        // Events 21/22/24/25 carry the session as <SessionID>
-                        // (Param1 does not exist in these templates).
-                        let session_id = event.UserData.as_ref()
-                            .and_then(|ud| ud.EventXML.as_ref())
-                            .and_then(|xml| xml.SessionID.clone().or_else(|| xml.Param1.clone()))
-                            .unwrap_or_default();
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: event.System.Computer.unwrap_or_default(),
-                            event_type,
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: remoteuser,
-                            target_domain_name: remotedomain,
-                            logon_type: String::from("10"),
-                            workstation_name: event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.Address.as_ref()).cloned().unwrap_or_default(),
-                            ip_address: event.UserData.as_ref().and_then(|ud| ud.EventXML.as_ref()).and_then(|xml| xml.Address.as_ref()).cloned().unwrap_or_default(),
-                            logon_id: session_id,
-                            filename: file.to_string(),
-                            detail: String::from(""),
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
-    }
-    log_data
+    // Events 21/22/24/25 carry the session as <SessionID> (Param1 does not
+    // exist in these templates).
+    let session_id = if rec.has("SessionID") { rec.f("SessionID") } else { rec.f("Param1") };
+    let address = rec.f("Address");
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.computer.clone(),
+        event_type,
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: remoteuser,
+        target_domain_name: remotedomain,
+        logon_type: String::from("10"),
+        workstation_name: address.clone(),
+        ip_address: address,
+        logon_id: session_id,
+        filename: file.to_string(),
+        detail: String::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// RDP KORE PARSER
+// RDPCORETS (131, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing {}", file);
+    evtx_rows(file, &lateral_event_ids, build_event, map_rdpkore)
+}
+
+pub(crate) fn map_rdpkore(rec: &WinRec, file: &str) -> Option<LogData> {
+    if !rec.has_event_data {
+        return None;
     }
-
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
-    };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) { Ok(e) => e, Err(_) => continue };
-                if let Some(event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut data_values: HashMap<String, String> = [
-                            ("ClientIP".to_string(), String::from(""))
-                        ].iter().cloned().collect();
-
-                        let event_data = match event.EventData { Some(ed) => ed, None => continue };
-                        for data in event_data.Datas {
-                            if let Some(name) = data.Name {
-                                if let Some(data_value) = data_values.get_mut(&name) {
-                                    *data_value = data.body.as_ref().unwrap_or(&"".to_string()).clone();
-                                }
-                            }
-                        }
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: event.System.Computer.unwrap_or_default(),
-                            event_type: "CONNECT".to_string(),
-                            event_id,
-                            subject_user_name: String::from(""),
-                            subject_domain_name: String::from(""),
-                            target_user_name: String::from(""),
-                            target_domain_name: String::from(""),
-                            logon_type: String::from("10"),
-                            workstation_name: data_values.get("ClientIP").unwrap_or(&String::new()).to_string(),
-                            ip_address: data_values.get("ClientIP").unwrap_or(&String::new()).to_string(),
-                            logon_id: String::from(""),
-                            filename: file.to_string(),
-                            detail: String::from(""),
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
-    }
-    log_data
+    let client = rec.f("ClientIP");
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.computer.clone(),
+        event_type: "CONNECT".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: String::new(),
+        target_domain_name: String::new(),
+        logon_type: String::from("10"),
+        workstation_name: client.clone(),
+        ip_address: client,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: String::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
-// WINRM PARSER (Microsoft-Windows-WinRM/Operational)
-// Event ID 6: WinRM session init on source system — connection field has destination host
+// WINRM (6: WSMan session opened, written on the client)
 // ---------------------------------------------------------------------------------------
 pub fn parse_winrm(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing WinRM {}", file);
+    evtx_rows(file, &lateral_event_ids, build_event, map_winrm)
+}
+
+pub(crate) fn map_winrm(rec: &WinRec, file: &str) -> Option<LogData> {
+    let connection = rec.f("connection");
+    if connection.is_empty() {
+        return None;
     }
-
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
-    };
-
-    for record in parser.records() {
-        match record {
-            Ok(r) => {
-                let data = r.data.as_str();
-                let event: Event = match from_str(&data) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                if let Some(ref event_id) = event.System.EventID {
-                    if lateral_event_ids.contains(&event_id.as_str()) {
-                        let mut connection = String::new();
-
-                        if let Some(ref event_data) = event.EventData {
-                            for data in &event_data.Datas {
-                                if let Some(ref name) = data.Name {
-                                    if name == "connection" {
-                                        connection = data.body.as_ref().unwrap_or(&String::new()).clone();
-                                    }
-                                }
-                            }
-                        }
-
-                        if connection.is_empty() {
-                            continue;
-                        }
-
-                        // Parse destination from connection string
-                        // Format: "hostname/wsman?PSVersion=..." or "http://ip:5985/wsman" or just "hostname/wsman"
-                        let dst_host = extract_host_from_winrm_connection(&connection);
-
-                        // Skip empty, localhost, and self-connections
-                        if dst_host.is_empty() || dst_host.eq_ignore_ascii_case("localhost") || dst_host == "127.0.0.1" || dst_host == "::1" {
-                            continue;
-                        }
-                        let src_host = event.System.Computer.as_deref().unwrap_or("");
-                        let dst_short = dst_host.split('.').next().unwrap_or(&dst_host);
-                        let src_short = src_host.split('.').next().unwrap_or(src_host);
-                        if dst_short.eq_ignore_ascii_case(src_short) {
-                            continue;
-                        }
-
-                        // Event 6 is written on the CLIENT that opened the
-                        // WSMan session: the local Computer is the source,
-                        // the host in the connection string the destination.
-                        // (Writing Computer as dst_computer reversed the edge.)
-                        let src_owned = src_host.to_string();
-                        let src_is_ip = src_owned.parse::<std::net::IpAddr>().is_ok();
-                        log_data.push(LogData {
-                            time_created: event.System.TimeCreated.SystemTime.unwrap_or_default(),
-                            computer: dst_host,
-                            event_type: "CONNECT".to_string(),
-                            event_id: event_id.clone(),
-                            subject_user_name: String::new(),
-                            subject_domain_name: String::new(),
-                            target_user_name: String::new(),
-                            target_domain_name: String::new(),
-                            logon_type: String::new(),
-                            workstation_name: if src_is_ip { String::new() } else { src_owned.clone() },
-                            ip_address: if src_is_ip { src_owned } else { String::new() },
-                            logon_id: String::new(),
-                            filename: file.to_string(),
-                            detail: format!("WinRM: {}", connection),
-                        });
-                    }
-                }
-            },
-            Err(_) => (),
-        }
+    // Format: "hostname/wsman?PSVersion=..." or "http://ip:5985/wsman"
+    let dst_host = extract_host_from_winrm_connection(&connection);
+    // Skip empty, localhost, and self-connections
+    if dst_host.is_empty() || dst_host.eq_ignore_ascii_case("localhost") || dst_host == "127.0.0.1" || dst_host == "::1" {
+        return None;
     }
-    log_data
+    let src_host = rec.computer.as_str();
+    let dst_short = dst_host.split('.').next().unwrap_or(&dst_host);
+    let src_short = src_host.split('.').next().unwrap_or(src_host);
+    if dst_short.eq_ignore_ascii_case(src_short) {
+        return None;
+    }
+    // Event 6 is written on the CLIENT that opened the WSMan session: the
+    // local Computer is the source, the host in the connection string the
+    // destination.
+    let src_owned = src_host.to_string();
+    let src_is_ip = src_owned.parse::<std::net::IpAddr>().is_ok();
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: dst_host,
+        event_type: "CONNECT".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: String::new(),
+        target_domain_name: String::new(),
+        logon_type: String::new(),
+        workstation_name: if src_is_ip { String::new() } else { src_owned.clone() },
+        ip_address: if src_is_ip { src_owned } else { String::new() },
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: format!("WinRM: {}", connection),
+    })
 }
 
 /// Extract hostname or IP from WinRM connection string.
@@ -1467,48 +1298,29 @@ fn extract_host_from_winrm_connection(connection: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// WMI PARSER (Microsoft-Windows-WMI-Activity/Operational)
-// Event ID 5858: WMI client failure — ClientMachine field identifies remote origin
-// Only produces events when ClientMachine != Computer (i.e., remote WMI)
+// WMI-ACTIVITY (5858: WMI client failure, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_wmi(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing WMI {}", file);
-    }
-
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
-    };
-
-    for record in parser.records() {
-        if let Ok(r) = record {
-            if let Some(row) = wmi_row(r.data.as_str(), file, &lateral_event_ids) {
-                log_data.push(row);
-            }
-        }
-    }
-    log_data
+    evtx_rows(file, &lateral_event_ids, build_wmi, map_wmi)
 }
 
-/// One WMI-Activity record (XML) to a row: 5858 written on the SERVER whose
-/// WMI service refused an operation, with the client in `ClientMachine`.
-/// Local clients (the machine itself, by short name) and service accounts
-/// are not lateral movement and give None.
+/// One WMI-Activity record (XML) to a row.
 pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Option<LogData> {
-    let event: EventWMI = from_str(xml).ok()?;
-    let event_id = event.System.EventID.as_ref()?;
-    if !lateral_event_ids.contains(&event_id.as_str()) {
+    let rec = build_wmi(xml)?;
+    if !lateral_event_ids.contains(&rec.event_id.as_str()) {
         return None;
     }
-    let ud = event.UserData.as_ref()?;
-    let client_machine = ud.client_machine().unwrap_or_default();
-    let user = ud.user().unwrap_or_default();
-    let operation = ud.operation().unwrap_or_default();
-    let computer = event.System.Computer.clone().unwrap_or_default();
+    map_wmi(&rec, file)
+}
 
+/// 5858 is written on the SERVER whose WMI service refused an operation,
+/// with the client in `ClientMachine`. Local clients (the machine itself, by
+/// short name) and service accounts are not lateral movement and give None.
+pub(crate) fn map_wmi(rec: &WinRec, file: &str) -> Option<LogData> {
+    let client_machine = rec.f("ClientMachine");
+    let user = rec.f("User");
+    let operation = rec.f("Operation");
+    let computer = rec.computer.clone();
     // Only remote WMI: ClientMachine must differ from Computer, compared by
     // short name (FQDN vs NetBIOS)
     let cm_short = client_machine.split('.').next().unwrap_or(&client_machine);
@@ -1522,10 +1334,10 @@ pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Opti
     }
     let (workstation_name, ip_address) = source_columns(&client_machine);
     Some(LogData {
-        time_created: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
+        time_created: rec.time.clone(),
         computer,
         event_type: "CONNECT".to_string(),
-        event_id: event_id.clone(),
+        event_id: rec.event_id.clone(),
         subject_user_name: String::new(),
         subject_domain_name: String::new(),
         target_user_name: username,
@@ -1544,7 +1356,7 @@ pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Opti
 }
 
 // ---------------------------------------------------------------------------------------
-// SYSMON PARSER (Microsoft-Windows-Sysmon/Operational)
+// SYSMON (Microsoft-Windows-Sysmon/Operational)
 // Event ID 3: network connection detected. The host where Sysmon runs is the
 // LOCAL endpoint (Source*); the peer is Destination*. `Initiated` says whether
 // the local process opened the connection (outbound) or accepted it (inbound):
@@ -1554,111 +1366,79 @@ pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Opti
 // CONNECT edge origin -> destination, with the process + protocol in `detail`.
 // ---------------------------------------------------------------------------------------
 pub fn parse_sysmon(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    if is_debug_mode() {
-        println!("[DEBUG] MASSTIN: Parsing Sysmon {}", file);
-    }
+    evtx_rows(file, &lateral_event_ids, build_event, map_sysmon)
+}
 
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => return vec![],
+pub(crate) fn map_sysmon(rec: &WinRec, file: &str) -> Option<LogData> {
+    if !rec.has_event_data {
+        return None;
+    }
+    let computer = rec.computer.clone();
+    let v = |k: &str| rec.f(k);
+    let initiated = v("Initiated").eq_ignore_ascii_case("true");
+
+    // (origin hostname, origin ip, dest hostname, dest ip, service port)
+    let (origin_host, origin_ip, dest_host, dest_ip, port) = if initiated {
+        (computer.clone(), v("SourceIp"), v("DestinationHostname"), v("DestinationIp"), v("DestinationPort"))
+    } else {
+        (v("DestinationHostname"), v("DestinationIp"), computer.clone(), v("SourceIp"), v("SourcePort"))
     };
 
-    for record in parser.records() {
-        let r = match record { Ok(r) => r, Err(_) => continue };
-        let event: Event = match from_str(r.data.as_str()) { Ok(e) => e, Err(_) => continue };
-        let event_id = match event.System.EventID {
-            Some(ref id) if lateral_event_ids.contains(&id.as_str()) => id.clone(),
-            _ => continue,
-        };
-
-        let mut dv: HashMap<String, String> = [
-            "Image", "User", "Protocol", "Initiated",
-            "SourceIp", "SourceHostname", "SourcePort",
-            "DestinationIp", "DestinationHostname", "DestinationPort",
-        ].iter().map(|k| (k.to_string(), String::new())).collect();
-
-        match event.EventData {
-            Some(ed) => {
-                for d in ed.Datas {
-                    if let Some(name) = d.Name {
-                        if let Some(slot) = dv.get_mut(&name) {
-                            *slot = d.body.unwrap_or_default();
-                        }
-                    }
-                }
-            }
-            None => continue,
-        }
-
-        let computer = event.System.Computer.clone().unwrap_or_default();
-        let v = |k: &str| dv.get(k).cloned().unwrap_or_default();
-        let initiated = v("Initiated").eq_ignore_ascii_case("true");
-
-        // (origin hostname, origin ip, dest hostname, dest ip, service port)
-        let (origin_host, origin_ip, dest_host, dest_ip, port) = if initiated {
-            (computer.clone(), v("SourceIp"), v("DestinationHostname"), v("DestinationIp"), v("DestinationPort"))
-        } else {
-            (v("DestinationHostname"), v("DestinationIp"), computer.clone(), v("SourceIp"), v("SourcePort"))
-        };
-
-        if !SYSMON_LM_PORTS.contains(&port.as_str()) {
-            continue;
-        }
-
-        let dest_ip = strip_ipv4_mapped(&dest_ip);
-        let origin_ip = strip_ipv4_mapped(&origin_ip);
-        let dst_computer = if !dest_host.is_empty() && dest_host != "-" { dest_host } else { dest_ip };
-        if dst_computer.is_empty() {
-            continue;
-        }
-        // origin: a hostname when we have one, otherwise the bare IP
-        let origin_is_ip = origin_host.is_empty() || origin_host == "-";
-        let (src_computer, src_ip) = if origin_is_ip { (String::new(), origin_ip) } else { (origin_host, origin_ip) };
-
-        // drop loopback / empty / self-connections (volume + noise control)
-        let is_local = |s: &str| {
-            s.is_empty() || s == "-" || s == "127.0.0.1" || s == "::1" || s == "0.0.0.0" || s.eq_ignore_ascii_case("localhost")
-        };
-        if is_local(&src_ip) && is_local(&src_computer) {
-            continue;
-        }
-        if (!src_computer.is_empty() && src_computer.eq_ignore_ascii_case(&dst_computer))
-            || (!src_ip.is_empty() && src_ip == dst_computer)
-        {
-            continue;
-        }
-
-        let (domain, user) = match v("User").split_once('\\') {
-            Some((d, u)) => (d.to_string(), u.to_string()),
-            None => (String::new(), v("User")),
-        };
-        let logon_type = match port.as_str() {
-            "3389" | "5900" => "10",
-            "22" => "SSH",
-            _ => "3",
-        }.to_string();
-        let proto = v("Protocol");
-        let image = v("Image");
-
-        log_data.push(LogData {
-            time_created: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
-            computer: dst_computer,
-            event_type: "CONNECT".to_string(),
-            event_id: event_id.clone(),
-            subject_user_name: String::new(),
-            subject_domain_name: String::new(),
-            target_user_name: user,
-            target_domain_name: domain,
-            logon_type,
-            workstation_name: src_computer,
-            ip_address: src_ip,
-            logon_id: String::new(),
-            filename: file.to_string(),
-            detail: format!("Sysmon3 {} {} :{}", proto, image, port),
-        });
+    if !SYSMON_LM_PORTS.contains(&port.as_str()) {
+        return None;
     }
 
-    log_data
+    let dest_ip = strip_ipv4_mapped(&dest_ip);
+    let origin_ip = strip_ipv4_mapped(&origin_ip);
+    let dst_computer = if !dest_host.is_empty() && dest_host != "-" { dest_host } else { dest_ip };
+    if dst_computer.is_empty() {
+        return None;
+    }
+    // origin: a hostname when we have one, otherwise the bare IP
+    let origin_is_ip = origin_host.is_empty() || origin_host == "-";
+    let (src_computer, src_ip) = if origin_is_ip { (String::new(), origin_ip) } else { (origin_host, origin_ip) };
+
+    // drop loopback / empty / self-connections (volume + noise control)
+    let is_local = |s: &str| {
+        s.is_empty() || s == "-" || s == "127.0.0.1" || s == "::1" || s == "0.0.0.0" || s.eq_ignore_ascii_case("localhost")
+    };
+    if is_local(&src_ip) && is_local(&src_computer) {
+        return None;
+    }
+    if (!src_computer.is_empty() && src_computer.eq_ignore_ascii_case(&dst_computer))
+        || (!src_ip.is_empty() && src_ip == dst_computer)
+    {
+        return None;
+    }
+
+    let (domain, user) = match v("User").split_once('\\') {
+        Some((d, u)) => (d.to_string(), u.to_string()),
+        None => (String::new(), v("User")),
+    };
+    let logon_type = match port.as_str() {
+        "3389" | "5900" => "10",
+        "22" => "SSH",
+        _ => "3",
+    }.to_string();
+    let proto = v("Protocol");
+    let image = v("Image");
+
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: dst_computer,
+        event_type: "CONNECT".to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: user,
+        target_domain_name: domain,
+        logon_type,
+        workstation_name: src_computer,
+        ip_address: src_ip,
+        logon_id: String::new(),
+        filename: file.to_string(),
+        detail: format!("Sysmon3 {} {} :{}", proto, image, port),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
