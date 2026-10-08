@@ -12,7 +12,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 |----------|-------------|------------|
 | 4624 | Successful logon | as logged (3 Network and 10 RDP are the lateral ones) |
 | 4625 | Failed logon | as logged |
-| 4634 | Logoff | — |
+| 4634 | Logoff (origin and logon type taken from the 4624 with the same logon ID on that machine) | as its logon |
 | 4647 | User-initiated logoff | — |
 | 4648 | Logon with explicit credentials (RunAs) | — |
 | 4768 | Kerberos TGT request | — |

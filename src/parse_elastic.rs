@@ -139,6 +139,9 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
 
 /// **Filters, sorts and writes the extracted events as CSV**
 fn write_rows(log_data: Vec<LogData>, output: Option<&String>) {
+    // logoffs take the origin of their logon, as parse-windows does
+    let (log_data, filled, dropped) = crate::parse::pair_logoffs(log_data);
+    crate::parse::report_logoff_pairing(filled, dropped);
     // Apply noise filter (--ignore-local / --exclude-*).
     let log_data: Vec<LogData> = log_data
         .into_iter()

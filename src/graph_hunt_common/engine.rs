@@ -1995,7 +1995,12 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             why.push(("destination outside the origin's usual group of hosts (Louvain community)".into(), shared(10)));
         }
         if x[11] > 0.0 {
-            let lt = od.lt_surprise.iter().filter(|(d, _, _)| *d == t.d).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|x| c.lts.name(x.2)).unwrap_or("");
+            // the rarest type; equally rare types are told apart by name, so
+            // the explanation does not depend on hash-map order (it changed
+            // from run to run on the same timeline)
+            let lt = od.lt_surprise.iter().filter(|(d, _, _)| *d == t.d)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then_with(|| c.lts.name(b.2).cmp(c.lts.name(a.2))))
+                .map(|x| c.lts.name(x.2)).unwrap_or("");
             why.push((format!("logon type {} is rare on this destination", lt), matched(11)));
         }
         if x[12] > 0.0 {
