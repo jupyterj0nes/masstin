@@ -110,6 +110,9 @@ impl VhdReader {
                 }
                 let sectors = block_size / 512;
                 let bitmap_bytes = ((sectors + 7) / 8 + 511) / 512 * 512;
+                if (max_entries as u64) * 4 > len {
+                    return Err(format!("dynamic VHD with a BAT of {} entries in a {}-byte file", max_entries, len));
+                }
                 let mut bat = vec![0u8; max_entries * 4];
                 read_at(&mut file, table_offset, &mut bat).map_err(|e| format!("BAT: {}", e))?;
                 let blocks = (0..max_entries)
@@ -277,6 +280,9 @@ impl VhdxReader {
             let gid = &mt[e..e + 16];
             let off = le32(&mt, e + 16) as u64;
             let len = le32(&mt, e + 20) as usize;
+            if len > 1 << 20 {
+                continue;
+            }
             let mut item = vec![0u8; len];
             if read_at(&mut file, meta_off + off, &mut item).is_err() {
                 continue;
@@ -295,6 +301,15 @@ impl VhdxReader {
         }
         if block_size == 0 || virtual_size == 0 {
             return Err("VHDX metadata without block size or virtual size".into());
+        }
+        if !block_size.is_power_of_two() || !(1 << 20..=256 << 20).contains(&block_size)
+            || (sector_size != 512 && sector_size != 4096)
+            || virtual_size > 64u64 << 40
+        {
+            return Err(format!(
+                "damaged VHDX metadata: block size {}, sector size {}, virtual size {}",
+                block_size, sector_size, virtual_size
+            ));
         }
         // BAT: payload entries interleaved with one bitmap entry per chunk
         let chunk_ratio = ((1u64 << 23) * sector_size / block_size).max(1);

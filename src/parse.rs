@@ -1535,7 +1535,11 @@ pub(crate) fn wmi_row(xml: &str, file: &str, lateral_event_ids: &[&str]) -> Opti
         ip_address,
         logon_id: String::new(),
         filename: file.to_string(),
-        detail: if operation.len() > 100 { format!("WMI: {}...", &operation[..100]) } else { format!("WMI: {}", operation) },
+        detail: if operation.chars().count() > 100 {
+            format!("WMI: {}...", operation.chars().take(100).collect::<String>())
+        } else {
+            format!("WMI: {}", operation)
+        },
     })
 }
 

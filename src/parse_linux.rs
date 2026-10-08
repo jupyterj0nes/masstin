@@ -366,8 +366,9 @@ fn extract_hostname_txt(file: &Path) -> Option<String> {
     while rdr.read_line(&mut line).ok()? > 0 {
         if let Some(cap) = line.find("Set hostname to <") {
             // dmesg output
-            if let Some(end) = line[cap..].find('>') {
-                return Some(line[cap + 18..cap + end].trim().to_string());
+            let start = cap + "Set hostname to <".len();
+            if let Some(len) = line[start..].find('>') {
+                return Some(line[start..start + len].trim().to_string());
             }
         }
         if line.starts_with("127.0.0.1") || line.starts_with("::1") {
@@ -534,7 +535,8 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
     // logout of that session
     let mut open: HashMap<String, (String, String, u32)> = HashMap::new();
     while rdr.read_exact(&mut buf).is_ok() {
-        let rec: &UtmpEntry = unsafe { &*(buf.as_ptr() as *const UtmpEntry) };
+        // buf is a Vec<u8> (alignment 1): read the record without assuming alignment
+        let rec: UtmpEntry = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const UtmpEntry) };
         // Only session records matter: USER_PROCESS (login), DEAD_PROCESS
         // (logout) and, in btmp, LOGIN_PROCESS (failed attempt). Boot,
         // runlevel and init records name the kernel or "~" in ut_host and
@@ -672,18 +674,6 @@ fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> 
 }
 
 // ────────────────────────── text log helpers ─────────────────────────────────
-fn open_plain_or_gzip(path: &Path) -> Box<dyn BufRead> {
-    if path
-        .extension()
-        .map(|e| e == "gz")
-        .unwrap_or(false)
-    {
-        let f = File::open(path).unwrap();
-        Box::new(BufReader::new(GzDecoder::new(f)))
-    } else {
-        Box::new(BufReader::new(File::open(path).unwrap()))
-    }
-}
 
 static REPEATED_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"^(.*?)message repeated (\d+) times: \[ ?(.*?) ?\]\s*$"#).unwrap());
@@ -764,7 +754,14 @@ fn parse_secure_or_messages(
         println!("    reading {} (year hint: {}) ...", path.display(), file_year);
     }
 
-    for line in open_plain_or_gzip(path).lines().flatten().flat_map(expand_repeated) {
+    let mut lines = match crate::textlines::open_plain_or_gzip(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
+    for line in (&mut lines).flat_map(expand_repeated) {
         let (when, msg) =
         // ——— RFC3164 legacy syslog: "Mar 16 08:25:22 hostname msg..." ———
         // Used by: /var/log/secure (RHEL/CentOS), /var/log/auth.log (Debian/Ubuntu),
@@ -997,6 +994,9 @@ fn parse_secure_or_messages(
         }
     }
 
+    if let Some(p) = lines.problem(path) {
+        crate::banner::print_warning(&format!("  {}", p));
+    }
     if tracker.pam_closes == 0 && !disconnect_fallback.is_empty() {
         if is_debug_mode() {
             println!("    {}: no pam session lines, using {} 'Disconnected from user' lines as session ends",
@@ -1034,7 +1034,14 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         if u == 4294967295 { return None; }
         Some(passwd.get(&u).cloned().unwrap_or_else(|| format!("uid:{}", u)))
     };
-    for line in open_plain_or_gzip(path).lines().flatten() {
+    let mut lines = match crate::textlines::open_plain_or_gzip(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
+            return Vec::new();
+        }
+    };
+    for line in &mut lines {
         let cap = match AUDIT_RE.captures(&line) {
             Some(c) => c,
             None => continue,
@@ -1073,7 +1080,10 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             }
             None => continue,
         };
-        let ts = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(secs, 0), Utc).to_rfc3339();
+        let ts = match NaiveDateTime::from_timestamp_opt(secs, 0) {
+            Some(t) => DateTime::<Utc>::from_utc(t, Utc).to_rfc3339(),
+            None => continue,
+        };
 
         // Username: acct="..." (USER_AUTH, failed USER_LOGIN — "(unknown)"
         // for non-existent accounts), then the numeric id= / auid= of a
@@ -1189,6 +1199,9 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
                      path.display(), picked.len(), n);
         }
         out.extend(picked);
+    }
+    if let Some(p) = lines.problem(path) {
+        crate::banner::print_warning(&format!("  {}", p));
     }
     out
 }
