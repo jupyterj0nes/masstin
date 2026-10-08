@@ -1,6 +1,7 @@
 name: Functional (real data, three OSes)
 
-# Parses two public EVTX sample sets and runs the hunt on the result, on
+# Parses two public EVTX sample sets and a public OpenSSH log (intact and
+# as a truncated .gz), and runs the hunt on the result, on
 # Linux, Windows and macOS (Apple Silicon natively, and the Intel binary
 # under Rosetta on the same runner), then checks that every OS produced
 # the same timeline byte for byte once the artifact paths are normalised.
@@ -28,6 +29,7 @@ permissions:
 env:
   MITRE_REPO: https://github.com/mdecrevoisier/EVTX-to-MITRE-Attack
   SAMPLES_REPO: https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES
+  LOGHUB_SSH: https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log
 
 jobs:
   run:
@@ -111,6 +113,45 @@ jobs:
           grep -q MAC-SCREENSHARE-OK out/mac.csv || { echo "::error::screensharingd success not classified"; exit 1; }
           grep -q MAC-SSHD-OK out/mac.csv || { echo "::error::sshd success not classified"; exit 1; }
           ! grep -q loginwindow out/mac.csv || { echo "::error::console login was not dropped"; exit 1; }
+
+      - name: parse-linux on a public OpenSSH log, intact and truncated (all three OSes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/masstin
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/masstin.exe
+          # loghub OpenSSH_2k (a real sshd log, host LabSZ, December 2015), laid
+          # out as a collected tree; the logrotate suffix fixes the year, so
+          # every runner dates the RFC3164 lines the same way
+          mkdir -p linux/LabSZ/var/log linux/LabSZ/etc linux-damaged/var/log
+          echo LabSZ > linux/LabSZ/etc/hostname
+          curl -fsSL "$LOGHUB_SSH" -o linux/LabSZ/var/log/secure-20160101
+          "$BIN" -a parse-linux -d linux/LabSZ -o out/linux.csv --overwrite
+          python3 .github/scripts/normalize_timeline.py out/linux.csv LabSZ | tee -a out/hashes.txt
+          n=$(( $(wc -l < out/linux.csv) - 1 ))
+          [ "$n" -gt 1000 ] || { echo "::error::parse-linux expected over 1000 rows from OpenSSH_2k, got $n"; exit 1; }
+          grep -q SSH_SUCCESS out/linux.csv || { echo "::error::no SSH_SUCCESS row"; exit 1; }
+          # the same log as a rotated .gz cut in half (a copy interrupted in
+          # triage): must end with a warning and the rows before the cut,
+          # never spin
+          gzip -c linux/LabSZ/var/log/secure-20160101 > full.gz
+          head -c $(( $(wc -c < full.gz) / 2 )) full.gz > linux-damaged/var/log/secure-20160101.gz
+          rm full.gz
+          python3 - "$BIN" <<'PY'
+          import os, subprocess, sys
+          try:
+              p = subprocess.run([os.path.abspath(sys.argv[1]), '-a', 'parse-linux', '-d', 'linux-damaged', '-o', 'out/linux-damaged.csv', '--overwrite'],
+                                 capture_output=True, text=True, timeout=120)
+          except subprocess.TimeoutExpired:
+              print('::error::parse-linux hung on a truncated .gz'); sys.exit(1)
+          out = p.stdout + p.stderr
+          rows = sum(1 for _ in open('out/linux-damaged.csv', encoding='utf-8')) - 1
+          print(f'truncated .gz: exit {p.returncode}, {rows} rows')
+          if 'read stopped' not in out:
+              print('::error::no warning for the truncated .gz'); sys.exit(1)
+          if rows <= 0:
+              print('::error::no rows recovered before the cut'); sys.exit(1)
+          PY
 
       - name: Build NTFS disk images from the samples and parse them (Windows only)
         if: runner.os == 'Windows'
@@ -225,7 +266,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in mitre.csv.norm samples.csv.norm image.csv.norm vhd.csv.norm; do
+          for f in mitre.csv.norm samples.csv.norm linux.csv.norm image.csv.norm vhd.csv.norm; do
             echo "== $f"
             sha256sum all/*/"$f"
             n=$(sha256sum all/*/"$f" | awk '{print $1}' | sort -u | wc -l)
