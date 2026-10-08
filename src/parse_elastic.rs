@@ -30,19 +30,31 @@ const RDPKORE_EVENT_IDS: &[&str] = &["131"];
 // local functions that construct records can use the short name.
 use crate::parse::LogData;
 
+/// `winlog.event_id`: a number in Winlogbeat 7, a string from 8.0 on.
+fn winlog_event_id(json: &Value) -> Option<i64> {
+    let v = json.get("winlog")?.get("event_id")?;
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 /// **Processes a Winlogbeat JSON file and extracts relevant events**
 fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
     if is_debug_mode() {
         println!("[INFO] Processing Winlogbeat JSON file: {}", file_path);
     }
 
-    let file = File::open(file_path).unwrap();
-    let reader = BufReader::new(file);
     let mut log_data = Vec::new();
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::banner::print_warning(&format!("  cannot open {}: {}", file_path, e));
+            return log_data;
+        }
+    };
+    let mut lines = crate::textlines::EvidenceLines::new(BufReader::new(file));
 
-    for line in reader.lines().flatten() {
+    for line in &mut lines {
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            if let Some(event_id) = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()) {
+            if let Some(event_id) = winlog_event_id(&json) {
                 let event_id_str = event_id.to_string();
 
                 if SECURITY_EVENT_IDS.contains(&event_id_str.as_str()) {
@@ -65,13 +77,16 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
             }
         }
     }
+    if let Some(p) = lines.problem(Path::new(file_path)) {
+        crate::banner::print_warning(&format!("  {}", p));
+    }
 
     log_data
 }
 
 /// **Specific functions to extract data by event type**
 fn parse_security_event(json: &Value, file_path: &str) -> LogData {
-    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
     let ed = json.get("winlog").and_then(|w| w.get("event_data"));
     let status = ed.and_then(|d| d.get("Status")).and_then(|s| s.as_str()).unwrap_or("");
     let sub_status = ed.and_then(|d| d.get("SubStatus")).and_then(|s| s.as_str()).unwrap_or("");
@@ -129,7 +144,7 @@ fn parse_smb_client_event(json: &Value, file_path: &str) -> LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         event_type: "FAILED_LOGON".to_string(), // 31001: client failed to authenticate
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: ed.and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
@@ -148,7 +163,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         event_type: "CONNECT".to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserName")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
@@ -163,7 +178,7 @@ fn parse_smb_client_connectivity_event(json: &Value, file_path: &str) -> LogData
 }
 
 fn parse_smb_server_event(json: &Value, file_path: &str) -> LogData {
-    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
     let event_type = match event_id_str.as_str() {
         "1009" => "FAILED_LOGON".to_string(), // server denied anonymous access
         "551" => "FAILED_LOGON".to_string(),
@@ -192,7 +207,7 @@ fn parse_rdp_client_event(json: &Value, file_path: &str) -> LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         event_type: "CONNECT".to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("UserID")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
@@ -211,7 +226,7 @@ fn parse_rdp_connmanager_event(json: &Value, file_path: &str) -> LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         event_type: "SUCCESSFUL_LOGON".to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: json.get("winlog").and_then(|w| w.get("event_data")).and_then(|d| d.get("Param1")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
@@ -234,7 +249,7 @@ fn parse_rdp_localsession_event(json: &Value, file_path: &str) -> LogData {
         ("".to_string(), remote_user)
     };
 
-    let event_id_str = json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string();
+    let event_id_str = winlog_event_id(&json).unwrap_or(0).to_string();
     let event_type = match event_id_str.as_str() {
         "21" | "22" | "25" => "SUCCESSFUL_LOGON".to_string(),
         "24" => "LOGOFF".to_string(),
@@ -264,7 +279,7 @@ fn parse_rdpkore_event(json: &Value, file_path: &str) -> LogData {
         time_created: json.get("@timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
         computer: json.get("host").and_then(|h| h.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string(),
         event_type: "CONNECT".to_string(),
-        event_id: json.get("winlog").and_then(|w| w.get("event_id")).and_then(|e| e.as_i64()).unwrap_or(0).to_string(),
+        event_id: winlog_event_id(&json).unwrap_or(0).to_string(),
         subject_user_name: "".to_string(),
         subject_domain_name: "".to_string(),
         target_user_name: "".to_string(),
@@ -320,8 +335,14 @@ pub fn parse_events_elastic(files: &Vec<String>, directories: &Vec<String>, outp
     for directory in directories {
         let path = Path::new(directory);
         if path.exists() && path.is_dir() {
-            for entry in std::fs::read_dir(path).unwrap() {
-                let entry = entry.unwrap();
+            let entries = match std::fs::read_dir(path) {
+                Ok(e) => e,
+                Err(e) => {
+                    crate::banner::print_warning(&format!("  cannot list {}: {}", directory, e));
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
                 let file_path = entry.path();
                 if file_path.is_file() {
                     all_files.push(file_path.to_string_lossy().to_string());

@@ -729,10 +729,11 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
     };
     if first == Some(b'[') {
         // `--style json`: a single array; has to be read whole.
-        let mut text = String::new();
-        if reader.read_to_string(&mut text).is_err() {
-            return;
+        let mut bytes = Vec::new();
+        if let Err(e) = reader.read_to_end(&mut bytes) {
+            crate::banner::print_warning(&format!("  {}: read stopped: {}", file, e));
         }
+        let text = String::from_utf8_lossy(&bytes);
         if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text) {
             for v in &items {
                 if let Some(r) = classify_json_value(v, &dst, &file, &mut ss) {
@@ -744,7 +745,8 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
         return;
     }
     // `--style ndjson`: one object per line, streamed.
-    for line in reader.lines().map_while(Result::ok) {
+    let mut lines = crate::textlines::EvidenceLines::new(reader);
+    for line in &mut lines {
         let line = line.trim().trim_end_matches(',');
         if line.is_empty() {
             continue;
@@ -754,6 +756,9 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
                 out.push(r);
             }
         }
+    }
+    if let Some(p) = lines.problem(path) {
+        crate::banner::print_warning(&format!("  {}", p));
     }
     out.extend(pair_screenshare(ss, &dst, &file).0);
 }

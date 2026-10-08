@@ -29,6 +29,8 @@ struct SparseHeader {
 //  Extent types
 // -----------------------------------------------------------------------------
 enum ExtentData {
+    /// `ZERO` extent: no backing file, every read returns zeros.
+    Zero,
     Flat {
         file: File,
         file_offset: u64, // byte offset into the flat file where data starts
@@ -217,18 +219,7 @@ impl VmdkReader {
                 }
                 "ZERO" => {
                     // Zero extent — reads return zeros, no backing file
-                    Extent {
-                        data: ExtentData::Flat {
-                            file: File::open(&extent_path).unwrap_or_else(|_| {
-                                // Zero extents don't need a file — create a dummy
-                                File::open(std::env::temp_dir().join("__masstin_zero")).unwrap_or_else(|_| {
-                                    File::open("/dev/null").unwrap()
-                                })
-                            }),
-                            file_offset: 0,
-                        },
-                        size_bytes: sectors * SECTOR_SIZE,
-                    }
+                    Extent { data: ExtentData::Zero, size_bytes: sectors * SECTOR_SIZE }
                 }
                 _ => {
                     return Err(format!("Unsupported extent type: {}", extent_type));
@@ -290,15 +281,21 @@ impl VmdkReader {
             }
         }
 
-        // tokens: [access, sectors, type, filename, (optional offset)]
-        if tokens.len() < 4 {
+        // tokens: [access, sectors, type, filename, (optional offset)];
+        // a ZERO extent has no filename
+        let is_zero = tokens.get(2).map_or(false, |t| t.eq_ignore_ascii_case("ZERO"));
+        if tokens.len() < 4 && !(is_zero && tokens.len() == 3) {
             return Err(format!("Malformed extent line: {}", line));
         }
 
         let sectors: u64 = tokens[1].parse()
             .map_err(|_| format!("Invalid sector count in extent line: {}", line))?;
+        // a sector count whose byte size does not fit in 64 bits is damage
+        if sectors.checked_mul(SECTOR_SIZE).is_none() {
+            return Err(format!("Sector count out of range in extent line: {}", line));
+        }
         let extent_type = tokens[2].clone();
-        let filename = tokens[3].clone();
+        let filename = tokens.get(3).cloned().unwrap_or_default();
         let flat_offset: u64 = if tokens.len() > 4 {
             tokens[4].parse().unwrap_or(0)
         } else {
@@ -378,7 +375,14 @@ impl VmdkReader {
 
         // Load grain directory into memory
         let num_gd_entries = Self::gd_entry_count(&header);
-        let gd_byte_offset = header.gd_offset * SECTOR_SIZE;
+        let gd_byte_offset = header.gd_offset.saturating_mul(SECTOR_SIZE);
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if (num_gd_entries as u64).saturating_mul(4) > file_len || gd_byte_offset >= file_len {
+            return Err(format!(
+                "Damaged sparse VMDK: grain directory of {} entries at byte {} does not fit in a {}-byte file",
+                num_gd_entries, gd_byte_offset, file_len
+            ));
+        }
 
         file.seek(SeekFrom::Start(gd_byte_offset))
             .map_err(|e| format!("Cannot seek to grain directory: {}", e))?;
@@ -446,6 +450,19 @@ impl VmdkReader {
         ]);
 
         let compressed = (flags & 0x10000) != 0;
+
+        // VMware writes grainSize 128 and numGTEsPerGT 512. Values far
+        // outside that are a damaged header; trusting them divides by zero
+        // or asks for terabytes of memory.
+        if grain_size == 0 || !grain_size.is_power_of_two() || grain_size > 2048 {
+            return Err(format!("Damaged sparse VMDK header: grainSize {}", grain_size));
+        }
+        if num_gte_per_gt == 0 || num_gte_per_gt > 65536 {
+            return Err(format!("Damaged sparse VMDK header: numGTEsPerGT {}", num_gte_per_gt));
+        }
+        if capacity.checked_mul(SECTOR_SIZE).is_none() {
+            return Err(format!("Damaged sparse VMDK header: capacity {} sectors", capacity));
+        }
 
         Ok(SparseHeader {
             version,
@@ -682,6 +699,10 @@ impl Read for VmdkReader {
         let read_len = buf.len().min(remaining_in_extent as usize);
 
         let n = match &mut extent.data {
+            ExtentData::Zero => {
+                buf[..read_len].fill(0);
+                read_len
+            }
             ExtentData::Flat { file, file_offset } => {
                 let fo = *file_offset;
                 Self::read_flat(file, fo, local_offset, &mut buf[..read_len])?
@@ -730,5 +751,48 @@ impl Seek for VmdkReader {
 
         self.position = new_pos as u64;
         Ok(self.position)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A monolithic sparse VMDK of 64 KB whose header carries the given
+    /// capacity, grainSize and numGTEsPerGT, grain directory at sector 1.
+    fn sparse_vmdk(name: &str, capacity: u64, grain: u64, gtes: u32) -> std::path::PathBuf {
+        let mut img = vec![0u8; 65536];
+        img[0..4].copy_from_slice(&SPARSE_MAGIC.to_le_bytes());
+        img[4..8].copy_from_slice(&1u32.to_le_bytes());
+        img[12..20].copy_from_slice(&capacity.to_le_bytes());
+        img[20..28].copy_from_slice(&grain.to_le_bytes());
+        img[44..48].copy_from_slice(&gtes.to_le_bytes());
+        img[56..64].copy_from_slice(&1u64.to_le_bytes());
+        let p = std::env::temp_dir().join(format!("masstin-vmdk-{}-{}.vmdk", name, std::process::id()));
+        std::fs::write(&p, img).unwrap();
+        p
+    }
+
+    #[test]
+    fn damaged_sparse_headers_are_refused_not_trusted() {
+        // numGTEsPerGT = 0 divided by zero on the first read
+        let p = sparse_vmdk("zero-gte", 2048, 128, 0);
+        assert!(VmdkReader::open(p.to_str().unwrap()).is_err());
+        // a petabyte disk with 1-sector grains asked for a giant grain directory
+        let p2 = sparse_vmdk("huge", 1u64 << 41, 1, 1);
+        assert!(VmdkReader::open(p2.to_str().unwrap()).is_err());
+        // a sane header opens
+        let p3 = sparse_vmdk("sane", 2048, 128, 512);
+        assert!(VmdkReader::open(p3.to_str().unwrap()).is_ok());
+        for f in [p, p2, p3] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    #[test]
+    fn zero_extent_without_a_file_name_reads_zeros() {
+        let parts = VmdkReader::parse_extent_line("RW 2048 ZERO").unwrap();
+        assert_eq!(parts.extent_type, "ZERO");
+        assert!(parts.filename.is_empty());
     }
 }

@@ -52,6 +52,7 @@ pub mod filter;
 pub mod vmdk;
 pub mod vhd;
 pub mod timefmt;
+pub mod textlines;
 pub use crate::vmdk::*;
 mod graph_hunt;
 mod graph_hunt_common;
@@ -921,7 +922,8 @@ fn is_winlogbeat_file(file_path: &str) -> bool {
 
     let reader = BufReader::new(file.unwrap());
 
-    for line in reader.lines().flatten() {
+    // the first lines decide; a file that is not Winlogbeat is not read whole
+    for line in crate::textlines::EvidenceLines::new(reader).take(1000) {
         // Try to parse each line as JSON
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
             // Check for some typical Winlogbeat fields
