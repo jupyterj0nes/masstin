@@ -466,18 +466,8 @@ fn carve_from_ewf_with_stall_detection(
                         let chunk_abs_offset = offset + pos as u64;
                         if !chunk_offsets.contains(&chunk_abs_offset) {
                             let chunk_data = buf[pos..pos + EVTX_CHUNK_SIZE].to_vec();
-                            // Parse in a thread with timeout — the evtx crate can enter
-                            // infinite loops on malformed BinXML, which catch_unwind does NOT catch.
-                            let chunk_for_thread = chunk_data.clone();
-                            let (ptx, prx) = std::sync::mpsc::channel();
-                            let phandle = std::thread::spawn(move || {
-                                let result = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| peek_chunk_provider(&chunk_for_thread))
-                                );
-                                let _ = ptx.send(result);
-                            });
-                            match prx.recv_timeout(Duration::from_secs(3)) {
-                                Ok(Ok(Some(provider))) => {
+                            match peek_with_timeout(&chunk_data) {
+                                Peek::Provider(provider) => {
                                     chunks_found += 1;
                                     chunk_offsets.insert(chunk_abs_offset);
                                     if is_debug_mode() {
@@ -486,20 +476,13 @@ fn carve_from_ewf_with_stall_detection(
                                     provider_chunks.entry(provider).or_default().push(chunk_data);
                                     pb.set_message(format!("{:.1}/{:.1} GB | {} chunks found",
                                         (offset + pos as u64) as f64 / 1_073_741_824.0, image_size_gb, chunks_found));
-                                    let _ = phandle.join();
                                 }
-                                Ok(_) => {
-                                    // None or panic — invalid chunk, skip silently
-                                    let _ = phandle.join();
-                                }
-                                Err(_) => {
-                                    // PARSE HUNG — evtx crate infinite loop on malformed BinXML
+                                Peek::Invalid => {}
+                                Peek::Hung => {
                                     crate::banner::print_warning(&format!(
                                         "  [evtx hang] chunk at {:#x} — skipping corrupt BinXML",
                                         chunk_abs_offset
                                     ));
-                                    // Abandon the stuck thread
-                                    std::mem::forget(phandle);
                                     // Mark offset as seen so we don't retry
                                     chunk_offsets.insert(chunk_abs_offset);
                                 }
@@ -711,14 +694,20 @@ fn carve_from_seekable<R: Read + Seek>(
 
                 let chunk_data = buf[pos..pos + EVTX_CHUNK_SIZE].to_vec();
 
-                // Validate: try to peek at the provider from the first record
-                // Use catch_unwind to protect against panics in corrupted chunks
-                let provider_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    peek_chunk_provider(&chunk_data)
-                }));
-                let provider = match provider_result {
-                    Ok(Some(p)) => Some(p),
-                    _ => None,
+                // Validate: peek at the provider from the first record, in a
+                // thread with a time budget (the E01 path had one; this one,
+                // used for VMDK, VHD/VHDX and raw, only caught panics)
+                let provider = match peek_with_timeout(&chunk_data) {
+                    Peek::Provider(p) => Some(p),
+                    Peek::Invalid => None,
+                    Peek::Hung => {
+                        crate::banner::print_warning(&format!(
+                            "  [evtx hang] chunk at {:#x} — skipping corrupt BinXML",
+                            chunk_abs_offset
+                        ));
+                        chunk_offsets.insert(chunk_abs_offset);
+                        None
+                    }
                 };
                 if let Some(provider) = provider {
                     chunks_found += 1;
@@ -805,6 +794,38 @@ fn carve_from_seekable<R: Read + Seek>(
 /// pattern was removed upstream. The new API exposes `record.into_xml()` which
 /// consumes an `EvtxRecord` and returns `SerializedEvtxRecord<String>` with the
 /// rendered XML in the public `.data` field.
+enum Peek {
+    Provider(String),
+    Invalid,
+    Hung,
+}
+
+/// `peek_chunk_provider` in its own thread with a 3-second budget. The
+/// evtx crate can loop forever on malformed BinXML, which catch_unwind does
+/// not stop; a hung thread is abandoned and the chunk reported.
+fn peek_with_timeout(chunk: &[u8]) -> Peek {
+    let data = chunk.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| peek_chunk_provider(&data)));
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(Some(p))) => {
+            let _ = handle.join();
+            Peek::Provider(p)
+        }
+        Ok(_) => {
+            let _ = handle.join();
+            Peek::Invalid
+        }
+        Err(_) => {
+            std::mem::forget(handle);
+            Peek::Hung
+        }
+    }
+}
+
 fn peek_chunk_provider(chunk_data: &[u8]) -> Option<String> {
     // Validate chunk by trying to parse it
     let mut chunk_obj = evtx::EvtxChunkData::new(chunk_data.to_vec(), false).ok()?;
