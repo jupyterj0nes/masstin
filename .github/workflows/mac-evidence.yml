@@ -1,0 +1,158 @@
+name: macOS evidence (real Unified Log with SSH and Screen Sharing logons)
+
+# Manual. Nobody on the project owns a Mac, and no public dataset holds a
+# .logarchive with a persisted SSH or Screen Sharing logon, so the evidence
+# is produced here, on GitHub's macOS runners: Remote Login is switched on,
+# a key login, a wrong password, a non-existent user, a pre-auth touch and a
+# disconnect are made against 127.0.0.1 (and a VNC authentication against
+# screensharingd when the runner allows it), then the Unified Log of that
+# span is collected with `log collect` and exported with `log show`, and
+# masstin parses both. The .logarchive and the export are uploaded as
+# artifacts so they can be kept as fixtures outside the repo.
+#
+# What it answers: whether the sshd `Accepted` / `Failed` lines are
+# persisted to disk on current macOS (they are info-level), under which
+# process name (sshd, sshd-session, sshd-auth), and whether parse-mac turns
+# them into the expected rows from real tracev3 data.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: System
+        run: |
+          sw_vers
+          uname -m
+          ssh -V 2>&1
+          ls /usr/libexec/sshd-session /usr/libexec/sshd-auth 2>/dev/null || true
+          whoami; id -u
+
+      - name: Switch Remote Login (sshd) on
+        run: |
+          sudo systemsetup -setremotelogin on || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          for i in $(seq 1 20); do nc -z 127.0.0.1 22 && break; sleep 1; done
+          nc -z 127.0.0.1 22 && echo "sshd is listening"
+
+      - name: SSH logons against 127.0.0.1
+        run: |
+          set -x
+          date -u +"START %Y-%m-%dT%H:%M:%SZ" | tee "$RUNNER_TEMP/span.txt"
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ci
+          cat ~/.ssh/id_ci.pub >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+          # 1. accepted publickey, a short session, then a disconnect
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/id_ci "$USER@127.0.0.1" 'echo "hello from $(hostname)"; sleep 3'
+          # 2. wrong password for an existing user and 3. a non-existent user
+          cat > "$RUNNER_TEMP/badpw.exp" <<'EXP'
+          set timeout 20
+          set user [lindex $argv 0]
+          spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=1 $user@127.0.0.1 true
+          expect {
+            -re "(?i)password:" { send "definitely-wrong-password\r"; exp_continue }
+            "Permission denied" { exit 0 }
+            eof { exit 0 }
+            timeout { exit 0 }
+          }
+          EXP
+          expect "$RUNNER_TEMP/badpw.exp" "$USER" || true
+          expect "$RUNNER_TEMP/badpw.exp" nosuchuser || true
+          # 4. pre-authentication touches: a port probe and an HTTP banner
+          nc -z -w 2 127.0.0.1 22 || true
+          printf 'HEAD / HTTP/1.0\r\n\r\n' | nc -w 2 127.0.0.1 22 || true
+          # 5. a policy denial would need sshd_config changes; skipped
+          sleep 5
+
+      - name: Screen Sharing (VNC) authentication against screensharingd
+        continue-on-error: true
+        run: |
+          set -x
+          K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$K" -activate -configure -access -on -users "$USER" -privs -all -restart -agent -console || true
+          sudo "$K" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw ci-vnc-pw || true
+          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          for i in $(seq 1 20); do nc -z 127.0.0.1 5900 && break; sleep 1; done
+          nc -z 127.0.0.1 5900 && echo "screensharingd is listening"
+          python3 -m pip install --quiet --user vncdotool
+          VNCDO="$(python3 -m site --user-base)/bin/vncdo"
+          # a correct and a wrong VNC password
+          "$VNCDO" -s 127.0.0.1::5900 -p ci-vnc-pw --timeout 15 expect /dev/null 0 || true
+          "$VNCDO" -s 127.0.0.1::5900 -p wrong-pw --timeout 15 expect /dev/null 0 || true
+          sleep 5
+
+      - name: Collect the Unified Log of that span
+        run: |
+          set -x
+          date -u +"END %Y-%m-%dT%H:%M:%SZ" | tee -a "$RUNNER_TEMP/span.txt"
+          mkdir -p out
+          # the bundle name is the host name masstin writes as destination
+          sudo log collect --last 20m --output "out/MAC-CI.logarchive"
+          sudo chown -R "$USER" out/MAC-CI.logarchive
+          du -sh out/MAC-CI.logarchive
+          # the same span as a log show export, both shapes, sshd and
+          # screensharingd only; and a readable listing for the job log
+          log show --last 20m --info --style ndjson --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd" OR process == "ScreensharingAgent"' > out/MAC-CI.ndjson
+          log show --last 20m --info --style json --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' > out/MAC-CI-array.json
+          echo "== what the Unified Log kept (sshd / screensharingd, info level)"
+          log show --last 20m --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -vE '^Timestamp' | head -200
+          echo "== from the archive itself (what a collected bundle holds)"
+          log show out/MAC-CI.logarchive --info --style compact --predicate 'processImagePath CONTAINS "sshd" OR process == "screensharingd"' | grep -E 'Accepted|Failed|Disconnected|identification|Authentication:' | head -50
+
+      - name: parse-mac on the export and on the .logarchive
+        run: |
+          set -x
+          BIN=target/release/masstin
+          "$BIN" -a parse-mac -f out/MAC-CI.ndjson -o out/mac-ndjson.csv --overwrite --debug
+          "$BIN" -a parse-mac -f out/MAC-CI-array.json -o out/mac-array.csv --overwrite --debug
+          "$BIN" -a parse-mac -d out/MAC-CI.logarchive -o out/mac-logarchive.csv --overwrite --debug 2> out/logarchive-debug.txt || true
+          grep -E 'DEBUG' out/logarchive-debug.txt | head -60
+          echo "== ndjson rows";      cat out/mac-ndjson.csv
+          echo "== logarchive rows";  cat out/mac-logarchive.csv
+
+      - name: Upload the evidence (keep it as a fixture outside the repo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-evidence-${{ matrix.os }}
+          path: |
+            out/MAC-CI.logarchive
+            out/MAC-CI.ndjson
+            out/MAC-CI-array.json
+            out/*.csv
+            out/logarchive-debug.txt
+          retention-days: 14
+
+      - name: Check what parse-mac extracted
+        run: |
+          rows() { echo $(( $(wc -l < "$1") - 1 )); }
+          n_nd=$(rows out/mac-ndjson.csv); n_ar=$(rows out/mac-array.csv); n_la=$(rows out/mac-logarchive.csv)
+          echo "rows: ndjson=$n_nd array=$n_ar logarchive=$n_la"
+          [ "$n_nd" -eq "$n_ar" ] || { echo "::error::ndjson and json array exports disagree ($n_nd vs $n_ar)"; exit 1; }
+          grep -q MAC-SSHD-OK   out/mac-ndjson.csv || { echo "::error::no SSH success row from the log show export"; exit 1; }
+          grep -q MAC-SSHD-FAIL out/mac-ndjson.csv || { echo "::error::no SSH failure row from the log show export"; exit 1; }
+          grep -q MAC-SSHD-OK   out/mac-logarchive.csv || { echo "::error::the .logarchive holds no persisted SSH success: info-level sshd lines are not written to disk on this macOS"; exit 1; }
+          grep -q MAC-SCREENSHARE out/mac-ndjson.csv && echo "Screen Sharing rows present" || echo "::warning::no Screen Sharing row (screensharingd may not accept VNC on a headless runner)"
+          echo "parse-mac extracted real SSH logons from a real macOS Unified Log"
