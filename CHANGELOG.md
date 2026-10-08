@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Build:** one TLS stack. `reqwest` (the Cortex XDR client) uses rustls with the operating system's root certificates, like the graph database driver, instead of OpenSSL / SChannel: the Linux build no longer needs OpenSSL, and a corporate CA installed in the system store is still trusted. Not yet exercised against a live Cortex tenant.
+- **Build:** `serde_yaml` (deprecated upstream) replaced by its maintained fork `serde_yaml_ng` for the custom rules; the 13 rules give byte-identical output on their samples. The unused `mbrman` dependency is gone. `notatin` accepts any `nom` from 6 up but builds only with 7; the lockfile pins it and the builds use `--locked`.
+- **CI:** the functional workflow runs `parse-linux` on a public OpenSSH log (loghub OpenSSH_2k) on the three operating systems, requires the same timeline from each, and checks that the same log as a `.gz` cut in half ends with a warning and the rows before the cut. `filter.rs` has unit tests. The manual macOS debug shell no longer asks for the retired paid Intel runner: the Intel binary is built on Apple Silicon and runs under Rosetta.
+
 ## v1.3.0 — 2026-10-08
 
 ### macOS, and evidence that is damaged

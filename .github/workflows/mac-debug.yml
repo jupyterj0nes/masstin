@@ -22,13 +22,15 @@ on:
 jobs:
   shell:
     name: Debug shell on macOS ${{ inputs.arch }}
-    runs-on: ${{ inputs.arch == 'arm64' && 'macos-latest' || 'macos-13-large' }}
+    runs-on: macos-latest
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.arch == 'x86_64' && 'x86_64-apple-darwin' || '' }}
 
       - name: Environment info
         run: |
@@ -39,8 +41,17 @@ jobs:
           df -h .
           echo "Repo checkout at: $GITHUB_WORKSPACE"
 
+      # x86_64: the Intel binary is built on the Apple Silicon runner and
+      # runs there under Rosetta (the Intel runner image is retired, and the
+      # larger Intel runners are paid), as in functional.yml
       - name: Build masstin (release)
-        run: cargo build --release
+        run: |
+          if [ "${{ inputs.arch }}" = "x86_64" ]; then
+            cargo build --release --locked --target x86_64-apple-darwin
+            echo "Intel binary: target/x86_64-apple-darwin/release/masstin (runs under Rosetta)"
+          else
+            cargo build --release --locked
+          fi
 
       - name: Open tmate SSH session
         uses: mxschmitt/action-tmate@v3

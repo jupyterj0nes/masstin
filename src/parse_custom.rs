@@ -246,7 +246,7 @@ fn load_rules_from_path(path: &Path) -> Result<Vec<CompiledRuleFile>, String> {
 fn load_single_rule_file(path: &Path) -> Result<RuleFile, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-    serde_yaml::from_str::<RuleFile>(&text)
+    serde_yaml_ng::from_str::<RuleFile>(&text)
         .map_err(|e| format!("YAML parse error in {}: {}", path.display(), e))
 }
 
