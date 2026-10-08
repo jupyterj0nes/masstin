@@ -96,8 +96,9 @@ jobs:
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           for i in $(seq 1 20); do nc -z 127.0.0.1 5900 && break; sleep 1; done
           nc -z 127.0.0.1 5900 && echo "screensharingd is listening"
-          python3 -m pip install --quiet --user vncdotool
-          VNCDO="$(python3 -m site --user-base)/bin/vncdo"
+          # the runner's python is externally managed (PEP 668): use a venv
+          python3 -m venv "$RUNNER_TEMP/vnc" && "$RUNNER_TEMP/vnc/bin/pip" install --quiet vncdotool
+          VNCDO="$RUNNER_TEMP/vnc/bin/vncdo"
           # a correct and a wrong VNC password
           "$VNCDO" -s 127.0.0.1::5900 -p ci-vnc-pw --timeout 15 expect /dev/null 0 || true
           "$VNCDO" -s 127.0.0.1::5900 -p wrong-pw --timeout 15 expect /dev/null 0 || true
@@ -153,6 +154,8 @@ jobs:
           [ "$n_nd" -eq "$n_ar" ] || { echo "::error::ndjson and json array exports disagree ($n_nd vs $n_ar)"; exit 1; }
           grep -q MAC-SSHD-OK   out/mac-ndjson.csv || { echo "::error::no SSH success row from the log show export"; exit 1; }
           grep -q MAC-SSHD-FAIL out/mac-ndjson.csv || { echo "::error::no SSH failure row from the log show export"; exit 1; }
+          grep -q MAC-SSHD-PREAUTH out/mac-ndjson.csv || { echo "::error::no SSH pre-auth CONNECT row from the log show export"; exit 1; }
+          grep -q MAC-SSHD-LOGOFF out/mac-ndjson.csv || { echo "::error::no SSH LOGOFF row from the log show export"; exit 1; }
           grep -q MAC-SSHD-OK   out/mac-logarchive.csv || { echo "::error::the .logarchive holds no persisted SSH success: info-level sshd lines are not written to disk on this macOS"; exit 1; }
           grep -q MAC-SCREENSHARE out/mac-ndjson.csv && echo "Screen Sharing rows present" || echo "::warning::no Screen Sharing row (screensharingd may not accept VNC on a headless runner)"
           echo "parse-mac extracted real SSH logons from a real macOS Unified Log"

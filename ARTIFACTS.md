@@ -97,7 +97,7 @@ The macOS Unified Log, read by `parse-mac`. A `.logarchive` bundle (`sudo log co
 
 | Source | Type | What it captures |
 |--------|------|-----------------|
-| `*.logarchive` (`Persist/*.tracev3` + `dsc` / `uuidtext` + `timesync`) | Binary (Unified Log) | `sshd` / `sshd-session` SSH logons and `screensharingd` Screen Sharing / Apple Remote Desktop logons |
+| `*.logarchive` (`Persist/*.tracev3` + `dsc` / `uuidtext` + `timesync`) | Binary (Unified Log) | `sshd` / `sshd-session` / `sshd-auth` SSH logons and `screensharingd` Screen Sharing / Apple Remote Desktop logons. Validated on real Sonoma and Sequoia bundles (`mac-evidence.yml`) |
 | `log show --style ndjson` / `json` export | Text (JSON) | The same `sshd` and `screensharingd` events, resolved off the host |
 
 What `parse-mac` writes, per row: `SUCCESSFUL_LOGON` (sshd `Accepted`, screensharingd `Authentication: SUCCEEDED`), `FAILED_LOGON` (sshd `Failed` including `invalid user` and `not allowed because`, screensharingd `Authentication: FAILED`), `LOGOFF` (sshd `Disconnected from user`) and `CONNECT` (sshd pre-authentication touches). `logon_type` is `SSH` or `ScreenSharing`; the destination is the Mac being analysed, the source address goes to `src_ip` (or `src_computer` for a resolved name). Unified Log timestamps (nanoseconds since the epoch) and `log show` timestamps are converted to ISO UTC. Console logins (`loginwindow`), `sudo` and `su` are host-local, not lateral movement, and are dropped.
