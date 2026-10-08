@@ -253,6 +253,147 @@ jobs:
             out/vhd.csv.norm
             out/hashes.txt
 
+  graph:
+    name: Loaders and graph hunts (Neo4j, Memgraph)
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5.26.31-community
+        env:
+          NEO4J_AUTH: neo4j/masstin-ci-2026
+        ports: ['7687:7687']
+      memgraph:
+        image: memgraph/memgraph:3.13.1
+        ports: ['7688:7687']
+    env:
+      NEO4J_PASSWORD: masstin-ci-2026
+      CUTOFF: '2021-01-01 00:00:00'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Cache the sample sets
+        id: samples
+        uses: actions/cache@v4
+        with:
+          path: samples
+          key: evtx-samples-v1
+
+      - name: Fetch the sample sets
+        if: steps.samples.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p samples
+          git clone -q --depth 1 "$MITRE_REPO" samples/EVTX-to-MITRE-Attack
+          git clone -q --depth 1 "$SAMPLES_REPO" samples/EVTX-ATTACK-SAMPLES
+          rm -rf samples/*/.git
+
+      - name: Bolt driver, and wait for both databases
+        shell: bash
+        run: |
+          python3 -m pip install --quiet neo4j==5.28.1
+          python3 - <<'PY'
+          import os, time
+          from neo4j import GraphDatabase
+          targets = [("neo4j", "bolt://localhost:7687", ("neo4j", os.environ["NEO4J_PASSWORD"])),
+                     ("memgraph", "bolt://localhost:7688", ("", ""))]
+          for name, uri, auth in targets:
+              for i in range(90):
+                  try:
+                      with GraphDatabase.driver(uri, auth=auth) as d:
+                          d.verify_connectivity()
+                      print(f"{name} up after {i * 2} s"); break
+                  except Exception as e:
+                      time.sleep(2)
+              else:
+                  raise SystemExit(f"{name} did not come up")
+          PY
+
+      - name: Load both databases and hunt on each
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/masstin
+          mkdir -p out
+          "$BIN" -a parse-windows -d samples/EVTX-to-MITRE-Attack -o out/mitre.csv --overwrite --silent
+          "$BIN" -a graph-hunt-csv -f out/mitre.csv --investigation-from "$CUTOFF" -o out/hunt-csv.csv --overwrite
+          "$BIN" -a load-neo4j -f out/mitre.csv --database localhost:7687 --user neo4j --ungrouped
+          "$BIN" -a graph-hunt-neo4j --database bolt://localhost:7687 --user neo4j --investigation-from "$CUTOFF" -o out/hunt-neo4j.csv --overwrite
+          "$BIN" -a load-memgraph -f out/mitre.csv --database localhost:7688 --ungrouped
+          "$BIN" -a graph-hunt --database bolt://localhost:7688 --investigation-from "$CUTOFF" -o out/hunt-memgraph.csv --overwrite
+
+      - name: Same graph in both databases, same hunt from all three paths
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv, os, sys
+          from neo4j import GraphDatabase
+          def counts(uri, auth):
+              with GraphDatabase.driver(uri, auth=auth) as d, d.session() as s:
+                  n = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+                  r = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+                  return n, r
+          neo = counts("bolt://localhost:7687", ("neo4j", os.environ["NEO4J_PASSWORD"]))
+          mg = counts("bolt://localhost:7688", ("", ""))
+          print(f"neo4j nodes/edges: {neo}   memgraph nodes/edges: {mg}")
+          if neo != mg or neo[1] == 0:
+              print("::error::the two loaders built different graphs (or none)"); sys.exit(1)
+          def hunt(p):
+              with open(p, encoding="utf-8", newline="") as f:
+                  rows = list(csv.reader(f))
+              drop = rows[0].index("cypher_snippet")
+              return [r[:drop] + r[drop + 1:] for r in rows]
+          a, b, c = hunt("out/hunt-csv.csv"), hunt("out/hunt-neo4j.csv"), hunt("out/hunt-memgraph.csv")
+          print(f"hunt rows: csv {len(a) - 1}, neo4j {len(b) - 1}, memgraph {len(c) - 1}")
+          for name, x in (("graph-hunt-neo4j", b), ("graph-hunt (Memgraph)", c)):
+              if x != a:
+                  diff = next(i for i in range(min(len(a), len(x))) if a[i] != x[i]) if len(a) == len(x) else "row count"
+                  print(f"::error::{name} differs from graph-hunt-csv (first difference: {diff})"); sys.exit(1)
+          print("graph-hunt-csv, graph-hunt-neo4j and graph-hunt agree")
+          PY
+
+      - name: Merge two host nodes in each database
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/masstin
+          python3 - "$BIN" <<'PY'
+          import os, subprocess, sys
+          from neo4j import GraphDatabase
+          bin_ = sys.argv[1]
+          dbs = [("neo4j", "bolt://localhost:7687", ("neo4j", os.environ["NEO4J_PASSWORD"]), "merge-neo4j-nodes", "localhost:7687", ["--user", "neo4j"]),
+                 ("memgraph", "bolt://localhost:7688", ("", ""), "merge-memgraph-nodes", "localhost:7688", [])]
+          for name, uri, auth, action, addr, extra in dbs:
+              with GraphDatabase.driver(uri, auth=auth) as d, d.session() as s:
+                  hosts = [r["n"] for r in s.run("MATCH (h:host)-[r]-() RETURN h.name AS n, count(r) AS c ORDER BY c DESC, n LIMIT 2")]
+                  old, new = hosts[1], hosts[0]
+                  before = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+                  old_deg = s.run("MATCH (h:host {name: $n})-[r]-() RETURN count(r) AS c", n=old).single()["c"]
+              subprocess.run([bin_, "-a", action, "--database", addr, *extra, "--old-node", old, "--new-node", new], check=True, timeout=300)
+              with GraphDatabase.driver(uri, auth=auth) as d, d.session() as s:
+                  gone = s.run("MATCH (h:host {name: $n}) RETURN count(h) AS c", n=old).single()["c"] == 0
+                  after = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+              print(f"{name}: merged {old} ({old_deg} edges) into {new}; edges {before} -> {after}; old node gone: {gone}")
+              if not gone or after != before:
+                  print(f"::error::{action} did not move every edge or left the old node"); sys.exit(1)
+          PY
+
+      - name: Upload the hunts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-hunts
+          path: out/hunt-*.csv
+          retention-days: 7
+
   compare:
     name: Same output on every OS
     needs: [run, image]

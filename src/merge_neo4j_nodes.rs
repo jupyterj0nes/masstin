@@ -26,7 +26,11 @@ pub async fn merge_neo4j_nodes(
     crate::banner::print_phase_detail("Old node:", old_name);
     crate::banner::print_phase_detail("New node:", new_name);
 
-    let pass = rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap();
+    // as load-neo4j and graph-hunt-neo4j: $NEO4J_PASSWORD, else a prompt
+    let pass = match std::env::var("NEO4J_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap_or_default(),
+    };
     let config = match ConfigBuilder::default().uri(database).user(user).password(&pass).db(db).build() {
         Ok(c) => c,
         Err(e) => {
