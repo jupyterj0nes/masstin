@@ -1,0 +1,4 @@
+# Text files are stored with LF in the repository whatever the machine
+# that commits them (a commit from a Windows checkout without core.autocrlf
+# once stored a whole source file with CRLF). Git detects binaries.
+* text=auto
