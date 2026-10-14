@@ -2262,11 +2262,23 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
         let root = match path.components().position(|c| c.as_os_str() == "[root]") {
             Some(idx) => path.components().take(idx).collect::<PathBuf>(),
             None => {
-                let mut cur = path.parent().unwrap_or(Path::new("/"));
-                while cur.parent().is_some() && cur.file_name() != Some(OsStr::new("log")) {
-                    cur = cur.parent().unwrap();
+                let mut found_log = false;
+                let mut temp = path.parent().unwrap_or(Path::new("/"));
+                let mut root_cand = temp;
+                while temp.parent().is_some() {
+                    if temp.file_name() == Some(OsStr::new("log")) {
+                        found_log = true;
+                        root_cand = temp.parent().and_then(|p| p.parent()).unwrap_or(temp);
+                        break;
+                    }
+                    temp = temp.parent().unwrap();
                 }
-                cur.parent().unwrap_or(cur).to_path_buf()
+                if found_log {
+                    root_cand.to_path_buf()
+                } else {
+                    // Direct/flat per-host layout: path is .../<hostname>/<logfile>
+                    path.parent().unwrap_or(Path::new("/")).to_path_buf()
+                }
             }
         };
         let mut dst_host = root2host
@@ -2290,6 +2302,19 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
                             break;
                         }
                     }
+                }
+            }
+        }
+
+        // Final fallback: use the directory name itself if it is not a generic name
+        if dst_host == "unknown" || dst_host == "C:" || dst_host.len() <= 2 {
+            if let Some(folder_name) = root.file_name().and_then(|n| n.to_str()) {
+                if !folder_name.is_empty() && folder_name != "log" && folder_name != "var" && folder_name != "/" {
+                    crate::banner::print_info(&format!(
+                        "Hostname identified: {} (from directory name)", folder_name
+                    ));
+                    dst_host = folder_name.to_string();
+                    root2host.insert(root.clone(), dst_host.clone());
                 }
             }
         }
