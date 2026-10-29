@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockcarve"
+version = "0.1.0"
+dependencies = [
+ "walkdir",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,6 +1544,7 @@ dependencies = [
 name = "masstin"
 version = "1.3.3"
 dependencies = [
+ "blockcarve",
  "chrono",
  "chrono-tz",
  "clap",
