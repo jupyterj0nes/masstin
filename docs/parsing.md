@@ -27,13 +27,13 @@ Rule of thumb:
 - **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
 - **Linux logs / UAC triage** → `parse-linux`; **macOS `.logarchive` or `log show` JSON** → `parse-mac`; **any other text / JSON log** → `parse-custom` with a YAML rule
 
-In all three, any EVTX whose `Provider.Name` matches a channel masstin knows (Security-Auditing, SMBServer, SMBClient, TerminalServices-*, RdpCoreTS, WinRM, WMI-Activity, Sysmon) is parsed — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, and extracts from third-party tooling all route correctly.
+In all three, an EVTX whose name is not one of the canonical ones is read record by record, each routed by its own `<Channel>` (Security, SMBServer, SmbClient, TerminalServices-*, RdpCoreTS / RdpCoreCDV, WinRM, WMI-Activity, Sysmon, OpenSSH; by provider when a record carries no channel) — regardless of the filename. Archived logs (`Security-YYYY-MM-DD-HH-MM-SS.evtx`), operator-renamed copies, carved files, extracts from third-party tooling, and a collector's `ForwardedEvents.evtx` holding the Security of many hosts next to other channels all route correctly.
 
 ## Parse Windows: Generate a lateral movement timeline
 
 Parses Windows EVTX files and UAL databases from directories or individual files, extracting lateral movement events and merging them into a single chronological CSV. Supports compressed triage packages directly — masstin recursively decompresses and identifies all EVTX files, handling archived logs with duplicate filenames.
 
-EVTX dispatch happens by `Provider.Name` read from the XML, not by filename, so files that do not follow the canonical Windows naming scheme — `Security-<YYYY-MM-DD-HH-MM-SS>.evtx` produced by the "Archive the log when full" retention policy, operator-renamed files, extracts from third-party tooling — are still routed to the right parser. If you want strict canonical-only matching for speed on a huge noisy tree, point `-d` directly at the `winevt/Logs` folder and the walker only opens `.evtx` and `.zip` anyway.
+EVTX dispatch happens by the `<Channel>` of each record read from the XML, not by filename, so files that do not follow the canonical Windows naming scheme — `Security-<YYYY-MM-DD-HH-MM-SS>.evtx` produced by the "Archive the log when full" retention policy, operator-renamed files, extracts from third-party tooling, a Windows Event Forwarding collector's `ForwardedEvents.evtx` — are still routed to the right parser, record by record, so a file that mixes channels is read whole. If you want strict canonical-only matching for speed on a huge noisy tree, point `-d` directly at the `winevt/Logs` folder and the walker only opens `.evtx` and `.zip` anyway.
 
 > **Note:** The legacy command `parse` is still supported as an alias for backwards compatibility.
 
@@ -491,11 +491,12 @@ Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux 
 
 | Source | Event IDs | What it tracks | Article |
 |--------|-----------|---------------|---------|
-| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140 | Logons, logoffs (a 4634 / 4647 names no origin: it takes the origin of the 4624 with the same logon ID on that machine, the latest one before it; a logoff whose logon is not in the evidence is not written and is counted), Kerberos, NTLM, RDP reconnect, share access | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
+| **Security.evtx** | 4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4776, 4778, 4779, 5140, 5145 | Logons, logoffs (a 4634 / 4647 names no origin: it takes the origin of the 4624 with the same logon ID on that machine, the latest one before it; a logoff whose logon is not in the evidence is not written and is counted), Kerberos (4769 / 4770 name the service the ticket was issued for in `detail`), NTLM, RDP reconnect, share access (5145, Detailed File Share, is collapsed to one row per session on a share, the first object in `detail`) | [Read more →](https://weinvestigateanything.com/en/artifacts/security-evtx-lateral-movement/) |
 | **TerminalServices-LocalSessionManager** | 21, 22, 24, 25 | RDP session lifecycle | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
 | **TerminalServices-RDPClient** | 1024, 1102 | Outgoing RDP connections | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
 | **TerminalServices-RemoteConnectionManager** | 1149 | Incoming RDP accepted | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
-| **RdpCoreTS** | 131 | RDP transport negotiation | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **RdpCoreTS / RdpCoreCDV** | 131, 140 | TCP connection accepted from a client (the address:port it writes is reduced to the address); NLA failure "user name or password is not correct" with the client address, a `FAILED_LOGON` | [Read more →](https://weinvestigateanything.com/en/artifacts/terminal-services-evtx/) |
+| **OpenSSH/Operational** | 4, 3 | Windows' sshd: `Accepted`, `Failed`, `Invalid user`, policy denials, session ends and pre-auth touches from the `payload`, read with the parse-linux regexes; `logon_type` `SSH`, the sshd process in `logon_id` | |
 | **SMBServer/Security** | 1009, 551 | SMB server connections and auth | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
 | **SMBClient/Security** | 31001 | SMB client share access | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |
 | **SMBClient/Connectivity** | 30803-30808 | SMB connectivity and share events | [Read more →](https://weinvestigateanything.com/en/artifacts/smb-evtx-events/) |

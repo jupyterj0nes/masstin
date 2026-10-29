@@ -90,6 +90,7 @@ fn rec_from_json(json: &Value) -> Option<(String, WinRec)> {
         },
         computer,
         user_sid: text(w.get("user").and_then(|u| u.get("identifier"))),
+        pid: w.get("process").and_then(|p| p.get("pid")).map(|p| p.to_string().trim_matches('"').to_string()).unwrap_or_default(),
         fields,
         has_event_data: ed.is_some(),
     }))
