@@ -12,8 +12,6 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader, Read},
-    mem,
-    os::raw::{c_char, c_int, c_short},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -22,38 +20,72 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc, Datelike};
 use crate::parse::is_debug_mode; // global flag set by --debug
 
 // ────────────────────────── utmp constants ───────────────────────────────────
-const EMPTY: c_short = 0;
-const RUN_LVL: c_short = 1;
-const BOOT_TIME: c_short = 2;
-const NEW_TIME: c_short = 3;
-const OLD_TIME: c_short = 4;
-const INIT_PROCESS: c_short = 5;
-const LOGIN_PROCESS: c_short = 6;
-const USER_PROCESS: c_short = 7;
-const DEAD_PROCESS: c_short = 8;
-const ACCOUNTING: c_short = 9;
+const EMPTY: i16 = 0;
+const RUN_LVL: i16 = 1;
+const BOOT_TIME: i16 = 2;
+const NEW_TIME: i16 = 3;
+const OLD_TIME: i16 = 4;
+const INIT_PROCESS: i16 = 5;
+const LOGIN_PROCESS: i16 = 6;
+const USER_PROCESS: i16 = 7;
+const DEAD_PROCESS: i16 = 8;
+const ACCOUNTING: i16 = 9;
 
-// ────────────────────────── utmp struct (on-disk) ────────────────────────────
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TimeVal32 {
-    tv_sec: i32,
-    tv_usec: i32,
+// ────────────────────────── utmp record (on-disk) ────────────────────────────
+// glibc's struct utmp: ut_type (i16 at 0), ut_pid (i32 at 4), ut_line
+// (32 bytes at 8), ut_id (4 at 40), ut_user (32 at 44), ut_host (256 at
+// 76), ut_exit (4 at 332), then the session id and the time. Two sizes:
+//   * 384 bytes where __WORDSIZE_TIME64_COMPAT32 is set (x86_64): a 32-bit
+//     ut_session at 336, a 32-bit tv_sec at 340 and tv_usec at 344;
+//   * 400 bytes on the other 64-bit ports (aarch64, riscv64, ppc64le,
+//     s390x): padding at 336, a long ut_session at 340, a 16-byte timeval
+//     with tv_sec at 348.
+// Reading a Graviton or Raspberry Pi wtmp with the x86_64 size gave
+// garbage from the second record on.
+const UTMP_SIZE_COMPAT32: usize = 384;
+const UTMP_SIZE_TIME64: usize = 400;
+/// One record: (ut_type, ut_pid, ut_line, ut_user, ut_host, tv_sec).
+fn utmp_record(rec: &[u8], time64: bool) -> (i16, u32, String, String, String, i64) {
+    let ut_type = i16::from_le_bytes([rec[0], rec[1]]);
+    let pid = i32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]).max(0) as u32;
+    let line = c_chars(&rec[8..40]);
+    let user = c_chars(&rec[44..76]);
+    let host = c_chars(&rec[76..332]);
+    let secs = if time64 {
+        i64::from_le_bytes(rec[348..356].try_into().unwrap())
+    } else {
+        u32::from_le_bytes(rec[340..344].try_into().unwrap()) as i64
+    };
+    (ut_type, pid, line, user, host, secs)
 }
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UtmpEntry {
-    ut_type: c_short,
-    ut_pid: c_int,
-    ut_line: [c_char; 32],
-    ut_id: [c_char; 4],
-    ut_user: [c_char; 32],
-    ut_host: [c_char; 256],
-    ut_exit: [u8; 4],
-    ut_session: c_int,
-    ut_tv: TimeVal32,
-    ut_addr_v6: [u32; 4],
-    _reserved: [u8; 20],
+
+fn printable(s: &str) -> bool {
+    s.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+/// The record size of a utmp / wtmp / btmp file, and whether its time is
+/// 64-bit: the size under which the most leading records read as records
+/// (a known type, a time before 2100, printable line and user). Ties go to
+/// the size that divides the file, then to the x86_64 one. None when the
+/// file reads as neither.
+pub(crate) fn utmp_layout(data: &[u8]) -> Option<(usize, bool)> {
+    let score = |size: usize, time64: bool| -> usize {
+        let mut ok = 0usize;
+        for rec in data.chunks_exact(size).take(32) {
+            let (t, _, line, user, _, secs) = utmp_record(rec, time64);
+            if !(EMPTY..=ACCOUNTING).contains(&t) || !(0..=4_102_444_800).contains(&secs) || !printable(&line) || !printable(&user) {
+                break;
+            }
+            ok += 1;
+        }
+        ok
+    };
+    let candidates = [(UTMP_SIZE_COMPAT32, false), (UTMP_SIZE_TIME64, true)];
+    let best = candidates
+        .iter()
+        .map(|&(size, t64)| (score(size, t64), data.len() % size == 0, size, t64))
+        .max_by_key(|&(s, divides, size, _)| (s, divides, std::cmp::Reverse(size)))?;
+    if best.0 == 0 { None } else { Some((best.2, best.3)) }
 }
 
 // ────────────────────────── helper regexes ───────────────────────────────────
@@ -96,20 +128,21 @@ pub(crate) static PREAUTH_NOIDENT_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"Did not receive identification string from (\S+)"#).unwrap());
 pub(crate) static PREAUTH_BADPROTO_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"Bad protocol version identification .* from (\S+)"#).unwrap());
+// The source is whatever sshd wrote: an address, or a name when the host
+// resolves clients (`UseDNS yes`), as in the Accepted / Failed lines.
 pub(crate) static PREAUTH_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(invalid|authenticating) user (\S+)\s+)?([0-9A-Fa-f][0-9A-Fa-f:.]*)\b.*\[preauth\]"#).unwrap()
+    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(invalid|authenticating) user (\S+)\s+)?(\S+).*\[preauth\]"#).unwrap()
+});
+pub(crate) static PREAUTH_PORT_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:Connection closed by|Connection reset by)\s+(\S+)\s+port\s+\d+"#).unwrap()
+});
+pub(crate) static PREAUTH_TIMEOUT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?:Timeout before authentication for connection from\s+|drop connection .*? from \[)([^\]\s,:]+)"#).unwrap()
 });
 
 /// "Invalid user admin from 203.0.113.9 [port 4242]": sshd names an
 /// account that does not exist on the host. The account may contain
 /// spaces (scanners send " 0101"). Captures: 1 user, 2 source.
-pub(crate) static PREAUTH_PORT_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Connection closed by|Connection reset by)\s+([0-9A-Fa-f][0-9A-Fa-f:.]*)\s+port\s+\d+"#).unwrap()
-});
-pub(crate) static PREAUTH_TIMEOUT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Timeout before authentication for connection from\s+|drop connection .*? from \[)([0-9A-Fa-f][0-9A-Fa-f:.]*)"#).unwrap()
-});
-
 pub(crate) static INVALID_USER_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?:^|: )Invalid user (.*?) from (\S+?)(?: port \d+)?\s*$"#).unwrap());
 
@@ -188,12 +221,18 @@ pub(crate) fn preauth_touch(msg: &str) -> Option<(String, String)> {
         return Some((clean(&c[1]), "preauth-closed".into()));
     }
     if let Some(c) = PREAUTH_CLOSED_RE.captures(msg) {
+        let src = clean(&c[3]);
+        // "Read from socket failed: Connection reset by peer [preauth]"
+        // names no source
+        if src.is_empty() || src.eq_ignore_ascii_case("peer") {
+            return None;
+        }
         let d = match (c.get(1).map(|k| k.as_str()), c.get(2)) {
             (Some("invalid"), Some(u)) => format!("preauth-closed invalid-user={}", u.as_str()),
             (_, Some(u)) => format!("preauth-closed user={}", u.as_str()),
             _ => "preauth-closed".into(),
         };
-        return Some((clean(&c[3]), d));
+        return Some((src, d));
     }
     None
 }
@@ -288,9 +327,9 @@ static RFC3164_RE: Lazy<Regex> = Lazy::new(|| {
 });
 
 // ────────────────────────── utils ────────────────────────────────────────────
-fn c_chars(b: &[c_char]) -> String {
-    let v: Vec<u8> = b.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-    String::from_utf8_lossy(&v).trim().to_owned()
+fn c_chars(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).trim().to_owned()
 }
 fn looks_like_ip(s: &str) -> bool {
     IPV4_RE.is_match(s) || IPV6_COLON.is_match(s)
@@ -599,7 +638,28 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
     } else {
         Box::new(BufReader::new(file))
     };
-    let mut buf = vec![0u8; mem::size_of::<UtmpEntry>()];
+    let mut data = Vec::new();
+    if let Err(e) = rdr.read_to_end(&mut data) {
+        eprintln!("[ERROR] cannot read {}: {}", path.display(), e);
+        if data.is_empty() {
+            return res;
+        }
+    }
+    let (rec_size, time64) = match utmp_layout(&data) {
+        Some(l) => l,
+        None => {
+            if !data.is_empty() {
+                crate::banner::print_warning(&format!(
+                    "  {}: not a utmp record layout masstin knows ({} bytes), skipped",
+                    path.display(), data.len()
+                ));
+            }
+            return res;
+        }
+    };
+    if is_debug_mode() && time64 {
+        println!("    {}: 400-byte records (64-bit time, aarch64 / riscv64 / ppc64le layout)", path.display());
+    }
     let fname = path.display().to_string();
     let base_lower = path
         .file_name()
@@ -611,25 +671,22 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
     // so that the DEAD_PROCESS record (which carries neither) becomes a
     // logout of that session
     let mut open: HashMap<String, (String, String, u32)> = HashMap::new();
-    while rdr.read_exact(&mut buf).is_ok() {
-        // buf is a Vec<u8> (alignment 1): read the record without assuming alignment
-        let rec: UtmpEntry = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const UtmpEntry) };
+    for rec in data.chunks_exact(rec_size) {
+        let (ut_type, pid, line, user, host, secs) = utmp_record(rec, time64);
         // Only session records matter: USER_PROCESS (login), DEAD_PROCESS
         // (logout) and, in btmp, LOGIN_PROCESS (failed attempt). Boot,
         // runlevel and init records name the kernel or "~" in ut_host and
         // would otherwise pass the "has a source" filter below.
-        if !(rec.ut_type == USER_PROCESS || rec.ut_type == DEAD_PROCESS || (is_btmp && rec.ut_type == LOGIN_PROCESS)) {
+        if !(ut_type == USER_PROCESS || ut_type == DEAD_PROCESS || (is_btmp && ut_type == LOGIN_PROCESS)) {
             continue;
         }
-        let ts = NaiveDateTime::from_timestamp(rec.ut_tv.tv_sec as i64, 0);
+        let ts = match NaiveDateTime::from_timestamp_opt(secs, 0) {
+            Some(t) => t,
+            None => continue,
+        };
         let when = DateTime::<Utc>::from_utc(ts, Utc).to_rfc3339();
 
-        let user = c_chars(&rec.ut_user);
-        let host = c_chars(&rec.ut_host);
-        let line = c_chars(&rec.ut_line);
-        let pid = rec.ut_pid.max(0) as u32;
-
-        if !is_btmp && rec.ut_type == DEAD_PROCESS {
+        if !is_btmp && ut_type == DEAD_PROCESS {
             // logout: user, host and pid come from the login of the same
             // terminal in this file; a logout whose login rotated away is
             // not attributable and is dropped
@@ -679,14 +736,56 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
 }
 
 // ────────────────────────── lastlog ──────────────────────────────────────────
-// /var/log/lastlog: one fixed 292-byte slot per uid (glibc: i32 ll_time,
-// char ll_line[32], char ll_host[256]), indexed by uid. It records the LAST
+// /var/log/lastlog: one fixed slot per uid (glibc: ll_time, char
+// ll_line[32], char ll_host[256]), indexed by uid. It records the LAST
 // login of every account that ever logged in — including accounts whose
 // activity predates every surviving wtmp / secure rotation — so it is often
 // the only trace of a dormant account's origin host. The uid → name map
 // comes from the collected /etc/passwd; unknown uids (directory users) are
-// reported as `uid:<n>`.
-const LASTLOG_RECORD: usize = 292;
+// reported as `uid:<n>`. The slot is 292 bytes with a 32-bit ll_time
+// (x86_64, __WORDSIZE_TIME64_COMPAT32) and 296 with a 64-bit one
+// (aarch64 and the other 64-bit ports).
+const LASTLOG_RECORD_COMPAT32: usize = 292;
+const LASTLOG_RECORD_TIME64: usize = 296;
+
+/// One slot: (ll_time, ll_line, ll_host).
+fn lastlog_record(rec: &[u8]) -> (i64, String, String) {
+    let (secs, body) = if rec.len() == LASTLOG_RECORD_TIME64 {
+        (i64::from_le_bytes(rec[0..8].try_into().unwrap()), &rec[8..])
+    } else {
+        (u32::from_le_bytes(rec[0..4].try_into().unwrap()) as i64, &rec[4..])
+    };
+    (secs, c_chars(&body[..32]), c_chars(&body[32..288]))
+}
+
+/// The slot size of a lastlog file: the size under which the most
+/// non-empty leading slots read as slots (a time before 2100, printable
+/// line and host); ties go to the size that divides the file, then to the
+/// x86_64 one. None when the file reads as neither.
+pub(crate) fn lastlog_layout(data: &[u8]) -> Option<usize> {
+    let score = |size: usize| -> usize {
+        let mut ok = 0usize;
+        for rec in data.chunks_exact(size) {
+            let (secs, line, host) = lastlog_record(rec);
+            if secs == 0 && line.is_empty() && host.is_empty() {
+                continue;
+            }
+            if !(0..=4_102_444_800).contains(&secs) || !printable(&line) || !printable(&host) {
+                break;
+            }
+            ok += 1;
+            if ok == 64 {
+                break;
+            }
+        }
+        ok
+    };
+    let best = [LASTLOG_RECORD_COMPAT32, LASTLOG_RECORD_TIME64]
+        .iter()
+        .map(|&size| (score(size), data.len() % size == 0, size))
+        .max_by_key(|&(s, divides, size)| (s, divides, std::cmp::Reverse(size)))?;
+    if best.0 == 0 && !best.1 { None } else { Some(best.2) }
+}
 
 fn load_passwd(root: &Path) -> HashMap<u32, String> {
     let mut map = HashMap::new();
@@ -715,19 +814,25 @@ fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> 
             return out;
         }
     };
-    if data.len() % LASTLOG_RECORD != 0 {
-        if is_debug_mode() {
-            println!("    lastlog {}: size {} is not a multiple of {} — unknown layout, skipped",
-                     path.display(), data.len(), LASTLOG_RECORD);
+    let rec_size = match lastlog_layout(&data) {
+        Some(s) => s,
+        None => {
+            if !data.is_empty() {
+                crate::banner::print_warning(&format!(
+                    "  {}: not a lastlog slot layout masstin knows ({} bytes), skipped",
+                    path.display(), data.len()
+                ));
+            }
+            return out;
         }
-        return out;
+    };
+    if is_debug_mode() && rec_size == LASTLOG_RECORD_TIME64 {
+        println!("    {}: 296-byte slots (64-bit time, aarch64 / riscv64 / ppc64le layout)", path.display());
     }
     let fname = path.display().to_string();
-    for (uid, rec) in data.chunks_exact(LASTLOG_RECORD).enumerate() {
-        let secs = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as i64;
+    for (uid, rec) in data.chunks_exact(rec_size).enumerate() {
+        let (secs, line, host) = lastlog_record(rec);
         if secs == 0 { continue; }
-        let line = String::from_utf8_lossy(rec[4..36].split(|&b| b == 0).next().unwrap_or(&[])).trim().to_string();
-        let host = String::from_utf8_lossy(rec[36..292].split(|&b| b == 0).next().unwrap_or(&[])).trim().to_string();
         // Console logins carry no host; nothing to plot on the graph.
         if host.is_empty() { continue; }
         let when = match NaiveDateTime::from_timestamp_opt(secs, 0) {
@@ -768,6 +873,22 @@ fn expand_repeated(line: String) -> Vec<String> {
         }
         None => vec![line],
     }
+}
+
+/// `2026-09-25T10:11:12+0200` (journalctl `-o short-iso`, which writes
+/// the offset without a colon) → `2026-09-25T10:11:12+02:00`, the RFC 3339
+/// form chrono reads. Any other stamp is returned as it is.
+pub(crate) fn iso_offset_with_colon(stamp: &str) -> String {
+    let b = stamp.as_bytes();
+    let n = b.len();
+    if n >= 5
+        && (b[n - 5] == b'+' || b[n - 5] == b'-')
+        && b[n - 4..].iter().all(|c| c.is_ascii_digit())
+        && stamp.contains('T')
+    {
+        return format!("{}:{}", &stamp[..n - 2], &stamp[n - 2..]);
+    }
+    stamp.to_string()
 }
 
 fn parse_timestamp_syslog(fragment: &str, default_year: i32) -> Option<String> {
@@ -862,7 +983,7 @@ fn parse_secure_or_messages(
         // time-zone guessing.
         else if line.len() > 20 && line.as_bytes()[4] == b'-' && line.as_bytes()[10] == b'T' {
             match line.split_once(' ') {
-                Some((stamp, rest)) => match DateTime::parse_from_rfc3339(stamp) {
+                Some((stamp, rest)) => match DateTime::parse_from_rfc3339(&iso_offset_with_colon(stamp)) {
                     Ok(dt) => {
                         let msg = rest.split_once(' ').map(|(_, m)| m).unwrap_or("");
                         // whole seconds, like every other Linux source
@@ -993,7 +1114,8 @@ fn parse_secure_or_messages(
         //      end of the file (invalid_users_as_failures)
         if let Some(cap) = INVALID_USER_RE.captures(&msg) {
             let src = cap[2].to_string();
-            if !filter_ip || looks_like_ip(&src) {
+            // an address or a resolved name, as the Accepted / Failed lines
+            if !filter_ip || !src.is_empty() {
                 out.push(RawEvt {
                     ts_rfc3339:  when.clone(),
                     user:        cap[1].trim().to_string(),
@@ -1013,7 +1135,7 @@ fn parse_secure_or_messages(
         //     user column stays empty on purpose — an announced user name
         //     is not an authenticated identity; it goes in the detail.
         if let Some((src, kind)) = preauth_touch(&msg) {
-            if !filter_ip || looks_like_ip(&src) {
+            if !filter_ip || !src.is_empty() {
                 out.push(RawEvt {
                     ts_rfc3339:  when.clone(),
                     user:        String::new(),
@@ -2500,5 +2622,82 @@ mod repeated_tests {
         assert_eq!(&PREAUTH_PORT_CLOSED_RE.captures("Connection closed by 203.0.113.86 port 23048").unwrap()[1], "203.0.113.86");
         assert!(PREAUTH_TIMEOUT_RE.is_match("Timeout before authentication for connection from 203.0.113.86 to 192.0.2.12, pid = 770043"));
         assert!(PREAUTH_TIMEOUT_RE.is_match("drop connection #0 from [203.0.113.86]:40399 on [192.0.2.12]:22 penalty: exceeded LoginGraceTime"));
+        assert_eq!(&PREAUTH_TIMEOUT_RE.captures("drop connection #0 from [203.0.113.86]:40399 on [192.0.2.12]:22 penalty: exceeded LoginGraceTime").unwrap()[1], "203.0.113.86");
+    }
+
+    #[test]
+    fn preauth_sources_may_be_names_and_never_peer() {
+        use super::preauth_touch;
+        // a host with UseDNS yes writes the resolved name, as in Accepted / Failed
+        assert_eq!(preauth_touch("Connection closed by invalid user admin ws07.corp.example port 4242 [preauth]"),
+                   Some(("ws07.corp.example".into(), "preauth-closed invalid-user=admin".into())));
+        assert_eq!(preauth_touch("Received disconnect from 2001:db8::7 port 51000:11: Bye Bye [preauth]"),
+                   Some(("2001:db8::7".into(), "preauth-closed".into())));
+        assert_eq!(preauth_touch("Received disconnect from 203.0.113.9: 11: disconnected by user [preauth]"),
+                   Some(("203.0.113.9".into(), "preauth-closed".into())));
+        assert_eq!(preauth_touch("Read from socket failed: Connection reset by peer [preauth]"), None);
+        assert_eq!(preauth_touch("Disconnected from user alice 203.0.113.9 port 51000"), None);
+    }
+
+    #[test]
+    fn short_iso_offsets_get_their_colon() {
+        use super::iso_offset_with_colon;
+        assert_eq!(iso_offset_with_colon("2026-09-25T10:11:12+0200"), "2026-09-25T10:11:12+02:00");
+        assert_eq!(iso_offset_with_colon("2026-09-25T10:11:12.123456-0500"), "2026-09-25T10:11:12.123456-05:00");
+        assert_eq!(iso_offset_with_colon("2026-09-25T10:11:12+02:00"), "2026-09-25T10:11:12+02:00");
+        assert_eq!(iso_offset_with_colon("2026-09-25T10:11:12Z"), "2026-09-25T10:11:12Z");
+        assert!(chrono::DateTime::parse_from_rfc3339(&iso_offset_with_colon("2026-09-25T10:11:12+0200")).is_ok());
+    }
+
+    /// A utmp record of either glibc size: USER_PROCESS, pid 4242, line
+    /// pts/0, user alice, host 10.0.0.5, time 2026-01-01T08:00:00Z.
+    fn utmp_bytes(size: usize) -> Vec<u8> {
+        let mut r = vec![0u8; size];
+        r[0..2].copy_from_slice(&7i16.to_le_bytes());
+        r[4..8].copy_from_slice(&4242i32.to_le_bytes());
+        r[8..13].copy_from_slice(b"pts/0");
+        r[44..49].copy_from_slice(b"alice");
+        r[76..84].copy_from_slice(b"10.0.0.5");
+        let secs: i64 = 1_767_254_400;
+        if size == 400 {
+            r[348..356].copy_from_slice(&secs.to_le_bytes());
+        } else {
+            r[340..344].copy_from_slice(&(secs as u32).to_le_bytes());
+        }
+        r
+    }
+
+    #[test]
+    fn utmp_layout_is_detected_per_file() {
+        use super::{utmp_layout, utmp_record};
+        let x86: Vec<u8> = (0..5).flat_map(|_| utmp_bytes(384)).collect();
+        assert_eq!(utmp_layout(&x86), Some((384, false)));
+        let arm: Vec<u8> = (0..5).flat_map(|_| utmp_bytes(400)).collect();
+        assert_eq!(utmp_layout(&arm), Some((400, true)));
+        let (t, pid, line, user, host, secs) = utmp_record(&arm[400..800], true);
+        assert_eq!((t, pid, line.as_str(), user.as_str(), host.as_str(), secs), (7, 4242, "pts/0", "alice", "10.0.0.5", 1_767_254_400));
+        assert_eq!(utmp_layout(b"not a utmp file at all, just text that is long enough to try"), None);
+        assert_eq!(utmp_layout(&[]), None);
+    }
+
+    #[test]
+    fn lastlog_layout_is_detected_per_file() {
+        use super::{lastlog_layout, lastlog_record};
+        let slot = |size: usize, secs: i64| {
+            let mut r = vec![0u8; size];
+            let body = if size == 296 { r[0..8].copy_from_slice(&secs.to_le_bytes()); 8 } else { r[0..4].copy_from_slice(&(secs as u32).to_le_bytes()); 4 };
+            r[body..body + 5].copy_from_slice(b"pts/1");
+            r[body + 32..body + 40].copy_from_slice(b"10.0.0.9");
+            r
+        };
+        let mut x86 = vec![0u8; 292 * 1000];
+        x86[292 * 1000..].copy_from_slice(&[]);
+        x86.extend(slot(292, 1_767_254_400));
+        assert_eq!(lastlog_layout(&x86), Some(292));
+        let mut arm = vec![0u8; 296 * 1000];
+        arm.extend(slot(296, 1_767_254_400));
+        assert_eq!(lastlog_layout(&arm), Some(296));
+        let (secs, line, host) = lastlog_record(&arm[296 * 1000..]);
+        assert_eq!((secs, line.as_str(), host.as_str()), (1_767_254_400, "pts/1", "10.0.0.9"));
     }
 }

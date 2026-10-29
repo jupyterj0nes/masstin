@@ -110,6 +110,66 @@ pub(crate) fn source_columns(host: &str) -> (String, String) {
     if h.parse::<std::net::IpAddr>().is_ok() { (String::new(), h) } else { (h, String::new()) }
 }
 
+/// `10.0.0.5:51234` → `10.0.0.5`, `[2001:db8::1]:3389` → `2001:db8::1`,
+/// `srv01:3389` → `srv01`. A value without a port, or a bare IPv6, is
+/// returned as it is. RdpCoreTS 131 writes the client as address:port.
+pub(crate) fn strip_port(v: &str) -> String {
+    let t = v.trim();
+    if let Some(rest) = t.strip_prefix('[') {
+        if let Some(i) = rest.find(']') {
+            return rest[..i].to_string();
+        }
+    }
+    if let Some((host, port)) = t.rsplit_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && !host.contains(':') {
+            return host.to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Text of the first `<tag>` element of an event's XML (`<EventID>4624`,
+/// `<Channel>Security`), without deserialising the record: enough to pick
+/// its family. Empty when the element is missing or self-closing.
+fn xml_tag_text(xml: &str, tag: &str) -> String {
+    let open = format!("<{}", tag);
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open) {
+        let start = from + i + open.len();
+        match xml[start..].chars().next() {
+            Some('>') | Some(' ') | Some('\t') | Some('\n') | Some('\r') => {}
+            _ => { from = start; continue; }
+        }
+        let gt = match xml[start..].find('>') { Some(g) => start + g, None => return String::new() };
+        if xml[..gt].ends_with('/') {
+            return String::new();
+        }
+        return xml[gt + 1..].split("</").next().unwrap_or("").trim().to_string();
+    }
+    String::new()
+}
+
+/// The channels a provider writes the events masstin reads to, for a
+/// record that carries no `<Channel>` (old exports). Ids do not overlap
+/// between the two SMB client channels.
+fn channels_for_provider(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "Microsoft-Windows-Security-Auditing" => &["Security"],
+        "Microsoft-Windows-SMBServer" => &["Microsoft-Windows-SMBServer/Security"],
+        "Microsoft-Windows-SMBClient" => &["Microsoft-Windows-SmbClient/Security", "Microsoft-Windows-SmbClient/Connectivity"],
+        "Microsoft-Windows-TerminalServices-ClientActiveXCore" => &["Microsoft-Windows-TerminalServices-RDPClient/Operational"],
+        "Microsoft-Windows-TerminalServices-RemoteConnectionManager" => &["Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"],
+        "Microsoft-Windows-TerminalServices-LocalSessionManager" => &["Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"],
+        "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS" => &["Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational"],
+        "Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV" => &["Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV/Operational"],
+        "Microsoft-Windows-WinRM" => &["Microsoft-Windows-WinRM/Operational"],
+        "Microsoft-Windows-WMI-Activity" => &["Microsoft-Windows-WMI-Activity/Operational"],
+        "Microsoft-Windows-Sysmon" => &["Microsoft-Windows-Sysmon/Operational"],
+        "OpenSSH" => &["OpenSSH/Operational"],
+        _ => &[],
+    }
+}
+
 pub(crate) fn strip_ipv4_mapped(ip: &str) -> String {
     if let Some(v4) = ip.strip_prefix("::ffff:") {
         return v4.to_string();
@@ -148,21 +208,28 @@ pub fn translate_substatus(code: &str) -> String {
 }
 
 // Event IDs for various logs
-// 5145 intentionally excluded: it fires on every file access inside an
-// already-established SMB session (50+ events per connection) and adds no
-// lateral-movement information beyond what 5140 already captures — the pivot
-// (src→dst, user, share) is the same. Including it burns volume without
-// adding edges to the graph.
-const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140"];
+// 5145 (Detailed File Share) fires on every object access inside an SMB
+// session, 50+ per connection, and is a subcategory of its own: a domain
+// can audit it without 5140 (File Share), and then it is the only trace of
+// the share connection. It is read and collapsed to one row per
+// (destination, logon ID, origin, share) per file, see `collapse_5145`.
+const SECURITY_EVENT_IDS: &[&str] = &["4624","4625","4634","4647","4648","4768","4769","4770","4771","4776","4778","4779","5140","5145"];
 const SMBCLIENT_EVENT_IDS: &[&str] = &["31001"];
 const SMBCLIENT_CONNECTIVITY_EVENT_IDS: &[&str] = &["30803","30804","30805","30806","30807","30808"];
 const SMBSERVER_EVENT_IDS: &[&str] = &["1009","551"];
 const RDPCLIENT_EVENT_IDS: &[&str] = &["1024","1102"];
 const RDPCONNMANAGER_EVENT_IDS: &[&str] = &["1149"];
 const RDPLOCALSESSION_EVENT_IDS: &[&str] = &["21","22","24","25"];
-const RDPKORE_EVENT_IDS: &[&str] = &["131"];
+// RdpCoreTS (and RdpCoreCDV on Windows 10/11 hosts): 131 is the accepted
+// TCP connection, 140 the NLA failure ("failed because the user name or
+// password is not correct") with the client address.
+const RDPKORE_EVENT_IDS: &[&str] = &["131","140"];
 const WINRM_EVENT_IDS: &[&str] = &["6"];
 const WMI_EVENT_IDS: &[&str] = &["5858"];
+// OpenSSH/Operational: Windows' sshd writes the OpenSSH text ("Accepted
+// password for alice from 10.0.0.5 port 51234 ssh2") as `payload` of event
+// 4 (information) and 3 (error); parse-linux's regexes read it.
+const OPENSSH_EVENT_IDS: &[&str] = &["3","4"];
 // Sysmon Operational. Only Event ID 3 (network connection) is lateral-movement
 // relevant; process/pipe/file/registry events are tool-attribution territory,
 // out of masstin's scope.
@@ -710,6 +777,10 @@ pub(crate) struct WinRec {
     pub computer: String,
     /// System/Security/@UserID (Winlogbeat: `winlog.user.identifier`)
     pub user_sid: String,
+    /// System/Execution/@ProcessID (Winlogbeat: `winlog.process.pid`): the
+    /// process that wrote the event. OpenSSH's sshd runs one process per
+    /// connection, so it ties the lines of one connection together.
+    pub pid: String,
     /// EventData `<Data Name=..>` values and the UserData leaves, by name.
     /// A key is present only when the event carried that element.
     pub fields: HashMap<String, String>,
@@ -747,6 +818,7 @@ fn rec_from_event(event: &Event) -> Option<WinRec> {
         time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
         computer: event.System.Computer.clone().unwrap_or_default(),
         user_sid: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
+        pid: event.System.Execution.as_ref().and_then(|e| e.ProcessID.clone()).unwrap_or_default(),
         fields,
         has_event_data,
     })
@@ -775,6 +847,7 @@ fn rec_from_event2(event: &Event2) -> Option<WinRec> {
         time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
         computer: event.System.Computer.clone().unwrap_or_default(),
         user_sid: event.System.Security.as_ref().and_then(|s| s.UserID.clone()).unwrap_or_default(),
+        pid: event.System.Execution.as_ref().and_then(|e| e.ProcessID.clone()).unwrap_or_default(),
         fields,
         has_event_data: false,
     })
@@ -827,38 +900,49 @@ fn build_wmi(xml: &str) -> Option<WinRec> {
         time: event.System.TimeCreated.SystemTime.clone().unwrap_or_default(),
         computer: event.System.Computer.clone().unwrap_or_default(),
         user_sid: String::new(),
+        pid: String::new(),
         fields,
         has_event_data: false,
     })
 }
 
 type MapFn = fn(&WinRec, &str) -> Option<LogData>;
+type BuildFn = fn(&str) -> Option<WinRec>;
 
-/// The mapping for an event of `channel` (the EVTX channel name, as
-/// Winlogbeat writes it in `winlog.channel`), or None when masstin does not
-/// read that event. Event ids are only unique within a channel (1102 is an
-/// RDP client event and also "audit log cleared" in Security; 6 and 3 exist
-/// in many channels), so the channel decides the family.
-pub(crate) fn mapper_for_channel(channel: &str, event_id: &str) -> Option<MapFn> {
+/// The reader (XML shape) and the mapping for an event of `channel` (the
+/// EVTX channel name, as Winlogbeat writes it in `winlog.channel`), or None
+/// when masstin does not read that event. Event ids are only unique within
+/// a channel (1102 is an RDP client event and also "audit log cleared" in
+/// Security; 6, 4 and 3 exist in many channels), so the channel decides the
+/// family.
+pub(crate) fn family_for_channel(channel: &str, event_id: &str) -> Option<(BuildFn, MapFn)> {
     let c = channel.to_ascii_lowercase();
-    let table: [(&str, &[&str], MapFn); 11] = [
-        ("security", SECURITY_EVENT_IDS, map_security),
-        ("microsoft-windows-smbserver/", SMBSERVER_EVENT_IDS, map_smb_server),
-        ("microsoft-windows-smbclient/security", SMBCLIENT_EVENT_IDS, map_smb_client),
-        ("microsoft-windows-smbclient/connectivity", SMBCLIENT_CONNECTIVITY_EVENT_IDS, map_smb_client_connectivity),
-        ("microsoft-windows-terminalservices-rdpclient/", RDPCLIENT_EVENT_IDS, map_rdp_client),
-        ("microsoft-windows-terminalservices-remoteconnectionmanager/", RDPCONNMANAGER_EVENT_IDS, map_rdp_connmanager),
-        ("microsoft-windows-terminalservices-localsessionmanager/", RDPLOCALSESSION_EVENT_IDS, map_rdp_localsession),
-        ("microsoft-windows-remotedesktopservices-rdpcorets/", RDPKORE_EVENT_IDS, map_rdpkore),
-        ("microsoft-windows-winrm/", WINRM_EVENT_IDS, map_winrm),
-        ("microsoft-windows-wmi-activity/", WMI_EVENT_IDS, map_wmi),
-        ("microsoft-windows-sysmon/", SYSMON_EVENT_IDS, map_sysmon),
+    let table: [(&str, &[&str], BuildFn, MapFn); 13] = [
+        ("security", SECURITY_EVENT_IDS, build_event, map_security),
+        ("microsoft-windows-smbserver/", SMBSERVER_EVENT_IDS, build_event2, map_smb_server),
+        ("microsoft-windows-smbclient/security", SMBCLIENT_EVENT_IDS, build_event, map_smb_client),
+        ("microsoft-windows-smbclient/connectivity", SMBCLIENT_CONNECTIVITY_EVENT_IDS, build_event, map_smb_client_connectivity),
+        ("microsoft-windows-terminalservices-rdpclient/", RDPCLIENT_EVENT_IDS, build_event, map_rdp_client),
+        ("microsoft-windows-terminalservices-remoteconnectionmanager/", RDPCONNMANAGER_EVENT_IDS, build_event2, map_rdp_connmanager),
+        ("microsoft-windows-terminalservices-localsessionmanager/", RDPLOCALSESSION_EVENT_IDS, build_event2, map_rdp_localsession),
+        ("microsoft-windows-remotedesktopservices-rdpcorets/", RDPKORE_EVENT_IDS, build_event, map_rdpkore),
+        ("microsoft-windows-remotedesktopservices-rdpcorecdv/", RDPKORE_EVENT_IDS, build_event, map_rdpkore),
+        ("microsoft-windows-winrm/", WINRM_EVENT_IDS, build_event, map_winrm),
+        ("microsoft-windows-wmi-activity/", WMI_EVENT_IDS, build_wmi, map_wmi),
+        ("microsoft-windows-sysmon/", SYSMON_EVENT_IDS, build_event, map_sysmon),
+        ("openssh/", OPENSSH_EVENT_IDS, build_event, map_openssh),
     ];
     table.iter()
-        .find(|(prefix, ids, _)| {
+        .find(|(prefix, ids, _, _)| {
             (if *prefix == "security" { c == "security" } else { c.starts_with(prefix) }) && ids.contains(&event_id)
         })
-        .map(|(_, _, f)| *f)
+        .map(|(_, _, b, m)| (*b, *m))
+}
+
+/// The mapping alone, for readers that build the record themselves
+/// (Winlogbeat documents).
+pub(crate) fn mapper_for_channel(channel: &str, event_id: &str) -> Option<MapFn> {
+    family_for_channel(channel, event_id).map(|(_, m)| m)
 }
 
 /// For records that do not say their channel (old exports): the event ids
@@ -882,7 +966,44 @@ pub(crate) fn mapper_for_id(event_id: &str) -> Option<MapFn> {
 // SECURITY
 // ---------------------------------------------------------------------------------------
 pub fn parse_security_log(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
-    evtx_rows(file, &lateral_event_ids, build_event, map_security)
+    collapse_5145(evtx_rows(file, &lateral_event_ids, build_event, map_security))
+}
+
+/// The share of a 5140 / 5145 detail: `\\*\ADMIN$` of
+/// `\\*\ADMIN$\System32\cmd.exe` (the share reference is always
+/// `\\<server>\<share>`, three separators in).
+fn share_of_detail(detail: &str) -> &str {
+    let mut seps = 0;
+    for (i, c) in detail.char_indices() {
+        if c == '\\' || c == '/' {
+            seps += 1;
+            if seps == 4 {
+                return &detail[..i];
+            }
+        }
+    }
+    detail
+}
+
+/// 5145 is written once per object accessed inside an SMB session; the
+/// lateral-movement fact is the session on the share. Keep the first 5145
+/// per (destination, logon ID, origin, share) of one file, drop the rest.
+pub(crate) fn collapse_5145(rows: Vec<LogData>) -> Vec<LogData> {
+    let mut seen: std::collections::HashSet<(String, String, String, String, String)> = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|r| {
+            if r.event_id != "5145" {
+                return true;
+            }
+            seen.insert((
+                r.computer.to_ascii_lowercase(),
+                r.logon_id.to_ascii_lowercase(),
+                r.ip_address.clone(),
+                r.workstation_name.to_ascii_lowercase(),
+                share_of_detail(&r.detail).to_ascii_lowercase(),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
@@ -902,13 +1023,22 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
         "4771" => "FAILED_LOGON".to_string(),
         "4778" => "SUCCESSFUL_LOGON".to_string(),
         "4779" => "LOGOFF".to_string(),
-        "5140" => "SUCCESSFUL_LOGON".to_string(),
+        "5140" | "5145" => "SUCCESSFUL_LOGON".to_string(),
         _ => "CONNECT".to_string(),
     };
     let detail = match event_id.as_str() {
         "4624" | "4648" => v("ProcessName"),
         "4625" => translate_substatus(&v("SubStatus")),
         "5140" => v("ShareName"),
+        // the object as a path on the share: `\\*\ADMIN$\System32\cmd.exe`
+        "5145" => {
+            let share = v("ShareName");
+            let target = v("RelativeTargetName");
+            if target.is_empty() || target == "-" { share } else { format!("{}\\{}", share.trim_end_matches('\\'), target) }
+        }
+        // the service the ticket was issued for: the real destination of
+        // the move (the row's destination is the KDC)
+        "4769" | "4770" => v("ServiceName"),
         _ => String::new(),
     };
     let logon_type = infer_logon_type(&event_id, &v("LogonType"));
@@ -932,7 +1062,7 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
         }
         "4776" => (computer.clone(), v("TargetUserName"), String::new(), v("Workstation"), String::new(), String::new()),
         "4778" | "4779" => (computer.clone(), v("AccountName"), v("AccountDomain"), v("ClientName"), v("ClientAddress"), v("LogonID")),
-        "5140" => (computer.clone(), v("SubjectUserName"), v("SubjectDomainName"), v("WorkstationName"), v("IpAddress"), v("SubjectLogonId")),
+        "5140" | "5145" => (computer.clone(), v("SubjectUserName"), v("SubjectDomainName"), v("WorkstationName"), v("IpAddress"), v("SubjectLogonId")),
         _ => (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId")),
     };
     Some(LogData {
@@ -1095,9 +1225,11 @@ pub(crate) fn map_rdp_client(rec: &WinRec, file: &str) -> Option<LogData> {
     if !rec.has_event_data {
         return None;
     }
+    // written on the CLIENT: the local Computer is the source, a name
+    let (workstation_name, ip_address) = source_columns(&rec.computer);
     Some(LogData {
         time_created: rec.time.clone(),
-        computer: rec.f("Value"),
+        computer: strip_port(&rec.f("Value")),
         event_type: "CONNECT".to_string(),
         event_id: rec.event_id.clone(),
         subject_user_name: String::new(),
@@ -1105,8 +1237,8 @@ pub(crate) fn map_rdp_client(rec: &WinRec, file: &str) -> Option<LogData> {
         target_user_name: rec.user_sid.clone(),
         target_domain_name: String::new(),
         logon_type: String::from("10"),
-        workstation_name: rec.computer.clone(),
-        ip_address: rec.computer.clone(),
+        workstation_name,
+        ip_address,
         logon_id: String::new(),
         filename: file.to_string(),
         detail: String::new(),
@@ -1181,7 +1313,8 @@ pub(crate) fn map_rdp_localsession(rec: &WinRec, file: &str) -> Option<LogData> 
     // Events 21/22/24/25 carry the session as <SessionID> (Param1 does not
     // exist in these templates).
     let session_id = if rec.has("SessionID") { rec.f("SessionID") } else { rec.f("Param1") };
-    let address = rec.f("Address");
+    // Address is the client's address, or "LOCAL" for a console session
+    let (workstation_name, ip_address) = source_columns(&strip_ipv4_mapped(&rec.f("Address")));
     Some(LogData {
         time_created: rec.time.clone(),
         computer: rec.computer.clone(),
@@ -1192,8 +1325,8 @@ pub(crate) fn map_rdp_localsession(rec: &WinRec, file: &str) -> Option<LogData> 
         target_user_name: remoteuser,
         target_domain_name: remotedomain,
         logon_type: String::from("10"),
-        workstation_name: address.clone(),
-        ip_address: address,
+        workstation_name,
+        ip_address,
         logon_id: session_id,
         filename: file.to_string(),
         detail: String::new(),
@@ -1201,33 +1334,216 @@ pub(crate) fn map_rdp_localsession(rec: &WinRec, file: &str) -> Option<LogData> 
 }
 
 // ---------------------------------------------------------------------------------------
-// RDPCORETS (131, written on the server)
+// RDPCORETS / RDPCORECDV (131 / 140, written on the server)
 // ---------------------------------------------------------------------------------------
 pub fn parse_rdpkore(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
     evtx_rows(file, &lateral_event_ids, build_event, map_rdpkore)
 }
 
+/// 131: "The server accepted a new TCP connection from client
+/// <ClientIP>", written as address:port. 140: "A connection from the
+/// client computer with an IP address of <IPString> failed because the
+/// user name or password is not correct": the NLA failure, often the only
+/// trace of an RDP brute force when 4625 carries no address.
 pub(crate) fn map_rdpkore(rec: &WinRec, file: &str) -> Option<LogData> {
     if !rec.has_event_data {
         return None;
     }
-    let client = rec.f("ClientIP");
+    let (event_type, client) = match rec.event_id.as_str() {
+        "140" => ("FAILED_LOGON", rec.f("IPString")),
+        _ => ("CONNECT", rec.f("ClientIP")),
+    };
+    let client = strip_ipv4_mapped(&strip_port(&client));
+    if client.is_empty() {
+        return None;
+    }
+    let (workstation_name, ip_address) = source_columns(&client);
     Some(LogData {
         time_created: rec.time.clone(),
         computer: rec.computer.clone(),
-        event_type: "CONNECT".to_string(),
+        event_type: event_type.to_string(),
         event_id: rec.event_id.clone(),
         subject_user_name: String::new(),
         subject_domain_name: String::new(),
         target_user_name: String::new(),
         target_domain_name: String::new(),
         logon_type: String::from("10"),
-        workstation_name: client.clone(),
-        ip_address: client,
+        workstation_name,
+        ip_address,
         logon_id: String::new(),
         filename: file.to_string(),
-        detail: String::new(),
+        detail: if rec.event_id == "140" { "NLA: user name or password not correct".to_string() } else { String::new() },
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// OPENSSH/OPERATIONAL (3 / 4, written on the server: Windows' sshd)
+// ---------------------------------------------------------------------------------------
+pub fn parse_openssh(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
+    pair_openssh(evtx_rows(file, &lateral_event_ids, build_event, map_openssh))
+}
+
+/// The `payload` of an OpenSSH event is the OpenSSH log text, read with
+/// the parse-linux regexes: `Accepted <method> for <user> from <src>`,
+/// `Failed ...`, `Invalid user ...`, policy denials, session ends and
+/// pre-authentication touches. The destination is the machine that wrote
+/// the event, the logon id its sshd process (one per connection).
+pub(crate) fn map_openssh(rec: &WinRec, file: &str) -> Option<LogData> {
+    use crate::parse_linux::{preauth_touch, INVALID_USER_RE, SSH_DISCONNECT_RE, SSH_FAIL_RE, SSH_NOTALLOWED_RE, SSH_OK_RE};
+    if !rec.has_event_data {
+        return None;
+    }
+    let msg = rec.f("payload");
+    let msg = msg.trim();
+    let (event_type, user, src, detail) = if let Some(c) = SSH_FAIL_RE.captures(msg) {
+        // "Failed none" is the client asking which methods are allowed
+        if &c[1] == "none" {
+            return None;
+        }
+        let invalid = if c.get(2).is_some() { " invalid-user" } else { "" };
+        ("FAILED_LOGON", c[3].to_string(), c[4].to_string(), format!("ssh/{}{}", &c[1], invalid))
+    } else if let Some(c) = SSH_OK_RE.captures(msg) {
+        ("SUCCESSFUL_LOGON", c[2].to_string(), c[3].to_string(), format!("ssh/{}", &c[1]))
+    } else if let Some(c) = SSH_NOTALLOWED_RE.captures(msg) {
+        ("FAILED_LOGON", c[1].to_string(), c[2].to_string(), "ssh/not-allowed".to_string())
+    } else if let Some(c) = INVALID_USER_RE.captures(msg) {
+        // resolved per connection by `pair_openssh`
+        ("FAILED_LOGON", c[1].trim().to_string(), c[2].to_string(), "ssh/invalid-user".to_string())
+    } else if let Some(c) = SSH_DISCONNECT_RE.captures(msg).filter(|_| !msg.contains("[preauth]")) {
+        ("LOGOFF", c[1].to_string(), c[2].to_string(), "ssh/disconnected".to_string())
+    } else if let Some((src, kind)) = preauth_touch(msg) {
+        ("CONNECT", String::new(), src, format!("ssh/{}", kind))
+    } else if let Some(c) = OPENSSH_BARE_DISCONNECT_RE.captures(msg) {
+        // Windows' sshd ends an authenticated session with the bare
+        // "Received disconnect from <src> port <n>:11: ..." and
+        // "Disconnected from <src> port <n>" (no user, no [preauth]):
+        // `pair_openssh` turns it into the LOGOFF of the Accepted with the
+        // same process, else into a pre-authentication close
+        ("CONNECT", String::new(), c[1].to_string(), "ssh/preauth-closed".to_string())
+    } else if let Some(c) = OPENSSH_BANNER_RE.captures(msg) {
+        ("CONNECT", String::new(), c[1].to_string(), "ssh/preauth-bad-proto".to_string())
+    } else {
+        return None;
+    };
+    let src = strip_ipv4_mapped(&src);
+    if src.is_empty() {
+        return None;
+    }
+    let (workstation_name, ip_address) = source_columns(&src);
+    Some(LogData {
+        time_created: rec.time.clone(),
+        computer: rec.computer.clone(),
+        event_type: event_type.to_string(),
+        event_id: rec.event_id.clone(),
+        subject_user_name: String::new(),
+        subject_domain_name: String::new(),
+        target_user_name: user,
+        target_domain_name: String::new(),
+        logon_type: String::from("SSH"),
+        workstation_name,
+        ip_address,
+        logon_id: rec.pid.clone(),
+        filename: file.to_string(),
+        detail,
+    })
+}
+
+/// Windows' sshd session ends, without user or `[preauth]` tag (seen on
+/// Server 2019, OpenSSH for Windows 8.x): captures the source.
+static OPENSSH_BARE_DISCONNECT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"^(?:Received disconnect from|Disconnected from)\s+(\S+)\s+port\s+\d+").unwrap()
+});
+/// "banner exchange: Connection from <src> port <n>: invalid format": a
+/// client that sent no SSH banner (OpenSSH 8.5+ wording).
+static OPENSSH_BANNER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"banner exchange: Connection from (\S+) port \d+: invalid format").unwrap()
+});
+
+/// Per sshd process (one per connection):
+///  * as `parse_linux::invalid_users_as_failures`, a connection that named
+///    an account that does not exist is one failed logon. When it also
+///    logged `Failed <method> for invalid user`, that row is the failure
+///    and the announcement is dropped; when it logged no outcome, the
+///    first announcement (the `Invalid user` line, else a pre-auth close
+///    naming the invalid user) is the failure and the connection's other
+///    pre-auth rows go with it;
+///  * a close logged by a process that had an `Accepted` is the end of
+///    that session: one LOGOFF with the session's account (Windows' sshd
+///    writes "Disconnected from <src> port <n>" without the user), the
+///    other close lines of the process dropped.
+/// Rows without a process id are taken one by one.
+pub(crate) fn pair_openssh(rows: Vec<LogData>) -> Vec<LogData> {
+    use std::collections::{HashMap, HashSet};
+    let key = |r: &LogData| (r.computer.to_ascii_lowercase(), r.logon_id.clone());
+    let announced = |r: &LogData| r.detail == "ssh/invalid-user" || r.detail.starts_with("ssh/preauth-closed invalid-user=");
+    let outcome = |r: &LogData| (r.event_type == "FAILED_LOGON" || r.event_type == "SUCCESSFUL_LOGON") && r.detail != "ssh/invalid-user";
+    let is_close = |r: &LogData| r.event_type == "CONNECT" && r.detail.starts_with("ssh/preauth-closed");
+    let mut has_outcome: HashSet<(String, String)> = HashSet::new();
+    // the account of the Accepted per process, and the index of the last
+    // close line of that process (the session's end)
+    let mut accepted: HashMap<(String, String), String> = HashMap::new();
+    let mut last_close: HashMap<(String, String), usize> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if r.logon_id.is_empty() {
+            continue;
+        }
+        if outcome(r) {
+            has_outcome.insert(key(r));
+        }
+        if r.event_type == "SUCCESSFUL_LOGON" {
+            accepted.entry(key(r)).or_insert_with(|| r.target_user_name.clone());
+        }
+        if is_close(r) {
+            last_close.insert(key(r), i);
+        }
+    }
+    let rows: Vec<LogData> = rows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, mut r)| {
+            if r.logon_id.is_empty() || !is_close(&r) {
+                return Some(r);
+            }
+            let user = match accepted.get(&key(&r)) {
+                Some(u) => u.clone(),
+                None => return Some(r),
+            };
+            if last_close.get(&key(&r)) != Some(&i) {
+                return None;
+            }
+            r.event_type = "LOGOFF".to_string();
+            r.target_user_name = user;
+            r.detail = "ssh/disconnected".to_string();
+            Some(r)
+        })
+        .collect();
+    let mut first: HashMap<(String, String), usize> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if announced(r) && !r.logon_id.is_empty() && !has_outcome.contains(&key(r)) {
+            first.entry(key(r)).or_insert(i);
+        }
+    }
+    let converted: HashSet<(String, String)> = first.keys().cloned().collect();
+    let keep_idx: HashSet<usize> = first.values().copied().collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, mut r) in rows.into_iter().enumerate() {
+        let is_announcement = announced(&r);
+        if keep_idx.contains(&i) || (is_announcement && r.logon_id.is_empty()) {
+            if r.event_type == "CONNECT" {
+                r.target_user_name = r.detail.split("invalid-user=").nth(1).unwrap_or("").to_string();
+            }
+            r.event_type = "FAILED_LOGON".to_string();
+            r.detail = "ssh/invalid-user".to_string();
+            out.push(r);
+        } else if r.detail == "ssh/invalid-user" {
+            // the connection logged its own Failed line, or a later repeat
+        } else if r.event_type == "CONNECT" && converted.contains(&key(&r)) {
+            // the same connection, now a failed logon
+        } else {
+            out.push(r);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1442,61 +1758,44 @@ pub(crate) fn map_sysmon(rec: &WinRec, file: &str) -> Option<LogData> {
 }
 
 // ---------------------------------------------------------------------------------------
-// UNKNOWN PARSER (AUTODETECT PROVIDER)
+// UNKNOWN FILE NAME: EVERY RECORD BY ITS CHANNEL
 // ---------------------------------------------------------------------------------------
+/// An EVTX whose name says nothing (an archived `Security-2024-...evtx`,
+/// a renamed copy, a carved file, a collector's `ForwardedEvents.evtx` with
+/// the Security of many hosts next to other channels): each record is
+/// routed by its own `<Channel>` (by provider when it has none), so a file
+/// with one record, or with several families, is read whole. The file used
+/// to be routed by the provider of its second record only.
 pub fn parse_unknown(file: &str) -> Vec<LogData> {
+    if is_debug_mode() {
+        println!("[DEBUG] MASSTIN: Parsing {} by channel", file);
+    }
     let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
-        Ok((parser, log_data)) => (parser, log_data),
-        Err(_) => {
-            return vec![];
-        }
+        Ok(p) => p,
+        Err(_) => return vec![],
     };
-
-    let mut provider = String::from("");
-    if let Some(Ok(r)) = parser.records().nth(1) {
-        let data = r.data.as_str();
-        if let Ok(event) = from_str::<Event>(&data) {
-            provider = event.System.Provider.Name.unwrap_or_default();
+    for record in parser.records() {
+        let r = match record { Ok(r) => r, Err(_) => continue };
+        let xml = r.data.as_str();
+        let event_id = xml_tag_text(xml, "EventID");
+        if event_id.is_empty() {
+            continue;
+        }
+        let channel = xml_tag_text(xml, "Channel");
+        let family = if channel.is_empty() {
+            let provider = from_str::<Event>(xml).ok().and_then(|e| e.System.Provider.Name).unwrap_or_default();
+            channels_for_provider(&provider).iter().find_map(|c| family_for_channel(c, &event_id))
+        } else {
+            family_for_channel(&channel, &event_id)
+        };
+        let (build, map) = match family { Some(f) => f, None => continue };
+        if let Some(rec) = build(xml) {
+            if let Some(row) = map(&rec, file) {
+                log_data.push(row);
+            }
         }
     }
-
-    match provider.as_str() {
-        "Microsoft-Windows-Security-Auditing" => {
-            log_data = parse_security_log(file, SECURITY_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-SMBServer" => {
-            log_data = parse_smb_server(file, SMBSERVER_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-SMBClient" => {
-            // the Security (31001) and Connectivity (30803-30808) channels
-            // share this provider; their event ids do not overlap
-            log_data = parse_smb_client(file, SMBCLIENT_EVENT_IDS.to_vec());
-            log_data.extend(parse_smb_client_connectivity(file, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec()));
-        },
-        "Microsoft-Windows-TerminalServices-ClientActiveXCore" => {
-            log_data = parse_rdp_client(file, RDPCLIENT_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-TerminalServices-RemoteConnectionManager" => {
-            log_data = parse_rdp_connmanager(file, RDPCONNMANAGER_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-TerminalServices-LocalSessionManager" => {
-            log_data = parse_rdp_localsession(file, RDPLOCALSESSION_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS" => {
-            log_data = parse_rdpkore(file, RDPKORE_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-WinRM" => {
-            log_data = parse_winrm(file, WINRM_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-WMI-Activity" => {
-            log_data = parse_wmi(file, WMI_EVENT_IDS.to_vec())
-        },
-        "Microsoft-Windows-Sysmon" => {
-            log_data = parse_sysmon(file, SYSMON_EVENT_IDS.to_vec())
-        },
-        _ => (),
-    }
-    log_data
+    pair_openssh(collapse_5145(log_data))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1778,15 +2077,15 @@ fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {
             if !crate::filter::should_keep_record(&item) {
                 continue;
             }
-            // logon_id and detail are part of the identity: Windows writes
-            // two 4624 in the same microsecond for a split-token admin
-            // logon (different TargetLogonId), and several 5140 for
-            // different shares at once. VSS copies of a live event are
-            // still collapsed because every field matches.
-            let key = format!("{}|{}|{}|{}|{}|{}|{}|{}",
+            // logon_id, the origin name and detail are part of the
+            // identity: Windows writes two 4624 in the same microsecond for
+            // a split-token admin logon (different TargetLogonId), and
+            // several 5140 for different shares at once. VSS copies of a
+            // live event are still collapsed because every field matches.
+            let key = format!("{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 item.time_created, item.computer, item.event_id,
                 item.event_type, item.target_user_name, item.ip_address,
-                item.logon_id, item.detail);
+                item.workstation_name, item.logon_id, item.detail);
             if seen.insert(key) {
                 deduped.push(item);
             }
@@ -2065,8 +2364,12 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
         "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx" => {
             parse_rdp_localsession(&file_origin, RDPLOCALSESSION_EVENT_IDS.to_vec())
         },
-        "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational.evtx" => {
+        "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS%4Operational.evtx"
+        | "Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV%4Operational.evtx" => {
             parse_rdpkore(&file_origin, RDPKORE_EVENT_IDS.to_vec())
+        },
+        "OpenSSH%4Operational.evtx" => {
+            parse_openssh(&file_origin, OPENSSH_EVENT_IDS.to_vec())
         },
         "Microsoft-Windows-SmbClient%4Connectivity.evtx" => {
             parse_smb_client_connectivity(&file_origin, SMBCLIENT_CONNECTIVITY_EVENT_IDS.to_vec())
@@ -2370,6 +2673,13 @@ struct System {
     EventID: Option<String>,
     Computer: Option<String>,
     Security: Option<Security>,
+    Execution: Option<Execution>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+struct Execution {
+    #[serde(rename = "@ProcessID")]
+    ProcessID: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -2540,5 +2850,127 @@ mod tests {
         assert!(wmi_row(&local, "f.evtx", &["5858"]).is_none());
         let svc = WMI_5858.replace(r"CORP\alice", r"NT AUTHORITY\SYSTEM");
         assert!(wmi_row(&svc, "f.evtx", &["5858"]).is_none());
+    }
+
+    #[test]
+    fn ports_are_dropped_from_client_addresses() {
+        assert_eq!(strip_port("194.61.24.102:39550"), "194.61.24.102");
+        assert_eq!(strip_port("[2001:db8::1]:3389"), "2001:db8::1");
+        assert_eq!(strip_port("fe80::1"), "fe80::1");
+        assert_eq!(strip_port("srv01:3389"), "srv01");
+        assert_eq!(strip_port("10.0.0.5"), "10.0.0.5");
+        assert_eq!(strip_port(""), "");
+    }
+
+    #[test]
+    fn tag_text_picks_the_family_fields_without_deserialising() {
+        let xml = "<Event><System><Provider Name='X'/><EventID Qualifiers='0'>4624</EventID><Channel>Security</Channel><Correlation/></System></Event>";
+        assert_eq!(xml_tag_text(xml, "EventID"), "4624");
+        assert_eq!(xml_tag_text(xml, "Channel"), "Security");
+        assert_eq!(xml_tag_text(xml, "Correlation"), "");
+        assert_eq!(xml_tag_text("<EventIDx>1</EventIDx>", "EventID"), "");
+        assert_eq!(xml_tag_text("<a>1</a>", "EventID"), "");
+    }
+
+    /// A record as a Windows OpenSSH server writes it (fields from a real
+    /// record of the public EVTX-to-MITRE set, names replaced).
+    fn openssh_xml(pid: u32, payload: &str) -> String {
+        format!("<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='OpenSSH' Guid='{{C4B57D35-0636-4BC3-A262-370F249F9802}}'/><EventID>4</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime='2021-05-21T20:43:22.562971Z'/><EventRecordID>24</EventRecordID><Correlation/><Execution ProcessID='{}' ThreadID='4344'/><Channel>OpenSSH/Operational</Channel><Computer>fs01.corp.example</Computer><Security UserID='S-1-5-18'/></System><EventData><Data Name='process'>sshd</Data><Data Name='payload'>{}</Data></EventData></Event>", pid, payload)
+    }
+
+    #[test]
+    fn openssh_payloads_are_ssh_rows_on_the_windows_host() {
+        let (build, map) = family_for_channel("OpenSSH/Operational", "4").expect("OpenSSH is a family");
+        let row = |pid: u32, payload: &str| map(&build(&openssh_xml(pid, payload)).unwrap(), "f.evtx");
+        let ok = row(4332, "Accepted password for admmig from 10.23.23.9 port 56605 ssh2").unwrap();
+        assert_eq!((ok.event_type.as_str(), ok.computer.as_str(), ok.target_user_name.as_str(), ok.ip_address.as_str(), ok.logon_type.as_str(), ok.logon_id.as_str(), ok.detail.as_str()),
+                   ("SUCCESSFUL_LOGON", "fs01.corp.example", "admmig", "10.23.23.9", "SSH", "4332", "ssh/password"));
+        let failed = row(4332, "Failed password for admmig from 10.23.23.9 port 56605 ssh2").unwrap();
+        assert_eq!((failed.event_type.as_str(), failed.workstation_name.as_str()), ("FAILED_LOGON", ""));
+        assert!(row(4332, "Failed none for admmig from 10.23.23.9 port 56605 ssh2").is_none());
+        let pre = row(988, "Connection closed by authenticating user admmig 10.23.23.9 port 56589 [preauth]").unwrap();
+        assert_eq!((pre.event_type.as_str(), pre.target_user_name.as_str(), pre.detail.as_str()), ("CONNECT", "", "ssh/preauth-closed user=admmig"));
+        let off = row(4332, "Disconnected from user admmig 10.23.23.9 port 56605").unwrap();
+        assert_eq!(off.event_type, "LOGOFF");
+        assert!(row(4332, "Server listening on :: port 22.").is_none());
+        // the same file name routes through parselog, the channel through parse_unknown
+        assert!(family_for_channel("Security", "4").is_none());
+    }
+
+    #[test]
+    fn openssh_invalid_user_connections_are_one_failed_logon() {
+        let (build, map) = family_for_channel("OpenSSH/Operational", "4").unwrap();
+        let row = |pid: u32, payload: &str| map(&build(&openssh_xml(pid, payload)).unwrap(), "f.evtx").unwrap();
+        let rows = vec![
+            // a key-only exchange: no Failed line ever comes
+            row(100, "Invalid user admin from 10.23.23.9 port 1000"),
+            row(100, "Connection closed by invalid user admin 10.23.23.9 port 1000 [preauth]"),
+            // a password guess: the Failed line is the failure
+            row(200, "Invalid user test from 10.23.23.9 port 1001"),
+            row(200, "Failed password for invalid user test from 10.23.23.9 port 1001 ssh2"),
+        ];
+        let out = pair_openssh(rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].event_type.as_str(), out[0].target_user_name.as_str(), out[0].detail.as_str(), out[0].logon_id.as_str()),
+                   ("FAILED_LOGON", "admin", "ssh/invalid-user", "100"));
+        assert_eq!((out[1].target_user_name.as_str(), out[1].detail.as_str()), ("test", "ssh/password invalid-user"));
+    }
+
+    /// Lines as Windows Server 2019's sshd writes them (one process per
+    /// connection, from a RangeForge lab): the session end carries no user.
+    #[test]
+    fn openssh_windows_session_ends_take_the_account_of_their_accepted() {
+        let (build, map) = family_for_channel("OpenSSH/Operational", "4").unwrap();
+        let row = |pid: u32, payload: &str| map(&build(&openssh_xml(pid, payload)).unwrap(), "f.evtx").unwrap();
+        let rows = vec![
+            row(4604, "Accepted publickey for Administrator from 35.235.248.226 port 46625 ssh2: ED25519 SHA256:abc"),
+            row(4604, "Received disconnect from 35.235.248.226 port 46625:11: disconnected by user"),
+            row(4604, "Disconnected from 35.235.248.226 port 46625"),
+            // an IAP health probe: a close with no Accepted stays a touch
+            row(2220, "Connection closed by 35.235.248.224 port 39001 [preauth]"),
+            row(2224, "banner exchange: Connection from 35.235.247.32 port 35445: invalid format"),
+        ];
+        let out = pair_openssh(rows);
+        let v: Vec<(&str, &str, &str, &str)> = out.iter().map(|r| (r.event_type.as_str(), r.target_user_name.as_str(), r.detail.as_str(), r.logon_id.as_str())).collect();
+        assert_eq!(v, vec![
+            ("SUCCESSFUL_LOGON", "Administrator", "ssh/publickey", "4604"),
+            ("LOGOFF", "Administrator", "ssh/disconnected", "4604"),
+            ("CONNECT", "", "ssh/preauth-closed", "2220"),
+            ("CONNECT", "", "ssh/preauth-bad-proto", "2224"),
+        ]);
+        assert_eq!(out[1].ip_address, "35.235.248.226");
+    }
+
+    #[test]
+    fn rdpcore_131_and_140_name_the_client_address() {
+        let xml = |id: &str, name: &str, value: &str| format!("<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-RemoteDesktopServices-RdpCoreTS'/><EventID>{}</EventID><TimeCreated SystemTime='2020-09-19T03:20:25.469636Z'/><Channel>Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational</Channel><Computer>DC01.corp.example</Computer></System><EventData><Data Name='{}'>{}</Data></EventData></Event>", id, name, value);
+        let (build, map) = family_for_channel("Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV/Operational", "131").expect("CDV is routed like TS");
+        let r = map(&build(&xml("131", "ClientIP", "194.61.24.102:39550")).unwrap(), "f.evtx").unwrap();
+        assert_eq!((r.event_type.as_str(), r.ip_address.as_str(), r.workstation_name.as_str(), r.logon_type.as_str()), ("CONNECT", "194.61.24.102", "", "10"));
+        let (build, map) = family_for_channel("Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational", "140").unwrap();
+        let r = map(&build(&xml("140", "IPString", "194.61.24.102")).unwrap(), "f.evtx").unwrap();
+        assert_eq!((r.event_type.as_str(), r.ip_address.as_str(), r.computer.as_str()), ("FAILED_LOGON", "194.61.24.102", "DC01.corp.example"));
+    }
+
+    #[test]
+    fn detailed_share_access_is_one_row_per_session_on_a_share() {
+        let row = |t: &str, lid: &str, ip: &str, detail: &str| LogData {
+            time_created: t.into(), computer: "FS01".into(), event_type: "SUCCESSFUL_LOGON".into(), event_id: "5145".into(),
+            subject_user_name: "alice".into(), subject_domain_name: "CORP".into(),
+            target_user_name: "alice".into(), target_domain_name: "CORP".into(), logon_type: "3".into(),
+            workstation_name: String::new(), ip_address: ip.into(), logon_id: lid.into(),
+            filename: "Security.evtx".into(), detail: detail.into(),
+        };
+        let rows = vec![
+            row("2026-01-01T08:00:00Z", "0x1", "10.0.0.5", r"\\*\ADMIN$\System32\cmd.exe"),
+            row("2026-01-01T08:00:01Z", "0x1", "10.0.0.5", r"\\*\ADMIN$\System32\svc.exe"),
+            row("2026-01-01T08:00:02Z", "0x1", "10.0.0.5", r"\\*\IPC$\svcctl"),
+            row("2026-01-01T09:00:00Z", "0x2", "10.0.0.5", r"\\*\ADMIN$\System32\cmd.exe"),
+        ];
+        let out = collapse_5145(rows);
+        let details: Vec<&str> = out.iter().map(|r| r.detail.as_str()).collect();
+        assert_eq!(details, vec![r"\\*\ADMIN$\System32\cmd.exe", r"\\*\IPC$\svcctl", r"\\*\ADMIN$\System32\cmd.exe"]);
+        assert_eq!(share_of_detail(r"\\*\ADMIN$\System32\cmd.exe"), r"\\*\ADMIN$");
+        assert_eq!(share_of_detail(r"\\*\IPC$"), r"\\*\IPC$");
     }
 }

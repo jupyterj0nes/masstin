@@ -70,9 +70,10 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
         // Fast reject: we only care about sshd-origin entries here.
         let comm = entry.fields.get("_COMM").map(|s| s.to_string());
         let syslog_id = entry.fields.get("SYSLOG_IDENTIFIER").map(|s| s.to_string());
-        // OpenSSH 9.8 and later run each connection in `sshd-session`
-        let is_sshd = matches!(comm.as_deref(), Some("sshd") | Some("sshd-session"))
-            || matches!(syslog_id.as_deref(), Some("sshd") | Some("sshd-session"));
+        // OpenSSH 9.8 and later run each connection in `sshd-session`, and
+        // OpenSSH 10 authenticates in `sshd-auth`: every sshd-* process
+        let is_sshd = comm.as_deref().map_or(false, |c| c.starts_with("sshd"))
+            || syslog_id.as_deref().map_or(false, |c| c.starts_with("sshd"));
         if !is_sshd {
             continue;
         }

@@ -104,7 +104,9 @@ pub async fn parse_cortex_evtx_forensics_data(
     // parse-windows (src/parse.rs constants) so that `parse-cortex-evtx-forensics`
     // covers exactly the same lateral-movement surface as `parse-windows`:
     //   Security:       4624,4625,4634,4647,4648,4768,4769,4770,4771,4776,4778,4779,5140
-    //                   (5145 intentionally excluded — see SECURITY_EVENT_IDS in parse.rs)
+    //                   (5145, which parse-windows reads collapsed per session, is not
+    //                   queried here: one record per object accessed, and the
+    //                   extraction below has no per-session collapse)
     //   SMB Client:     31001
     //   SMB Client Conn:30803-30808
     //   SMB Server:     1009,551

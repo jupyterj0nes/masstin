@@ -23,6 +23,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | 4778 | RDP session reconnected | 10 |
 | 4779 | RDP session disconnected | 10 |
 | 5140 | Network share accessed | 3 |
+| 5145 | Network share object accessed (Detailed File Share): one row per session on a share, the first object accessed in `detail` as `\\*\ADMIN$\System32\cmd.exe`; the only trace of a share connection on domains that audit this subcategory without 5140 | 3 |
 
 ### Terminal Services
 
@@ -37,7 +38,8 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | RDPClient/Operational | 1024 | RDP client session initiation |
 | RDPClient/Operational | 1102 | RDP client connection |
 | RemoteConnectionManager/Operational | 1149 | Incoming RDP connection accepted |
-| RdpCoreTS/Operational | 131 | RDP transport security negotiation |
+| RdpCoreTS/Operational, RdpCoreCDV/Operational | 131 | The server accepted a TCP connection from the client (`CONNECT`; the client is written as address:port, the port is dropped) |
+| RdpCoreTS/Operational, RdpCoreCDV/Operational | 140 | The connection failed because the user name or password is not correct (`FAILED_LOGON` at the NLA stage, with the client address: the trace of an RDP brute force when 4625 carries none) |
 
 ### SMB (Server Message Block)
 
@@ -64,6 +66,12 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | WinRM/Operational | 6 | WSMan session initiation on the source host (destination in `connection` field) |
 | WMI-Activity/Operational | 5858 | WMI client failure with `ClientMachine` field identifying remote origin |
 
+### OpenSSH (Windows sshd)
+
+| Log Source | Event ID | Description |
+|------------|----------|-------------|
+| OpenSSH/Operational | 4, 3 | The OpenSSH log text in `payload`, read with the parse-linux regexes: `Accepted <method>` (`SUCCESSFUL_LOGON`), `Failed <method>`, `Invalid user`, `not allowed because` (`FAILED_LOGON`), `Disconnected from user` (`LOGOFF`), pre-authentication touches (`CONNECT`). `logon_type` is `SSH`, `logon_id` the sshd process of the connection, the method in `detail`. A connection that named a non-existent account and logged no `Failed` line is one `FAILED_LOGON`, as on Linux; the bare `Disconnected from <src> port <n>` Windows writes at the end of a session is the `LOGOFF` of the `Accepted` of the same process |
+
 ### Sysmon
 
 | Log Source | Event ID | Description |
@@ -85,6 +93,8 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | `wtmp` | Binary | Historical login/logout/boot records |
 | `btmp` | Binary | Failed login attempts |
 | `lastlog` | Binary | Last login per user |
+
+The binary files are read in both glibc layouts: 384-byte utmp records and 292-byte lastlog slots (x86_64) and the 400 / 296-byte ones of aarch64, riscv64, ppc64le and s390x (64-bit time); the layout is detected per file.
 | `uac-<host>-<os>-<stamp>.tar.gz` | Archive | UAC (Unix-like Artifacts Collector) triages, streamed selectively; nested zip / tar.gz combinations walked |
 
 What `parse-linux` writes, per row: `SSH_SUCCESS` / `SSH_FAILED` (sshd lines, journald, auditd `USER_LOGIN`; a connection that named a non-existent account with `Invalid user` is a `SSH_FAILED` with detail `invalid-user` even when it logged no `Failed` line), `LOGIN` / `FAILED_LOGIN` (wtmp / btmp), `LASTLOG`, `SSH_PREAUTH` (`CONNECT` rows for connections that ended before authenticating), `SSH_CONNECT` (`CONNECT` rows for sshd started by xinetd) and `LOGOUT` (`LOGOFF` rows paired with their login). `logon_id` carries the sshd process id on every row that has one, the same on a login and on its LOGOFF. RFC3164 syslog timestamps are converted from the host's local zone to UTC; auditd records of a connection already in the sshd log are dropped, paired by pid.
