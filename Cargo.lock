@@ -289,9 +289,9 @@ dependencies = [
 
 [[package]]
 name = "blockcarve"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d09378265fd84ed9ec6009e96e6178b3317959d3dbc8bed65b03b8f7fb586749"
+checksum = "9cae4e609db8924cdab9751b57475fade9da2b30642f4f81412efb6837943717"
 dependencies = [
  "walkdir",
 ]

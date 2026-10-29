@@ -4,27 +4,25 @@
 //   Each ##SERVER#SHARE subkey under MountPoints2 indicates the user
 //   connected to a remote share — with LastWriteTime as timestamp.
 //
-//   The hive is read with nt_hive2 (the reader faramir uses): a dirty hive
-//   gets its .LOG1/.LOG2 applied, every entry verified by its Marvin32 hashes.
-//   Deleted ##SERVER#SHARE keys are recovered from the free cells of the
-//   replayed hive with blockcarve::hive_cells (the walker faramir and caarea
-//   share), so a connection the user removed from Explorer still shows up.
+//   A dirty hive first gets its .LOG1/.LOG2 replayed in memory with
+//   blockcarve::hive_logs (shared with faramir and caarea): new-format entries
+//   verified by their Marvin32 hashes, old Windows 7/8 DIRT logs too. The
+//   result is read with nt_hive2. Deleted ##SERVER#SHARE keys are recovered
+//   from the free cells of the replayed hive with blockcarve::hive_cells, so
+//   a connection the user removed from Explorer still shows up.
 // =============================================================================
 
-use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
-use nt_hive2::transactionlog::TransactionLog;
-use nt_hive2::{CleanHive, ContainsHive, Hive, HiveParseMode, SubPath};
+use nt_hive2::{CleanHive, Hive, HiveParseMode, SubPath};
 
 use crate::parse::LogData;
 
 const MOUNTPOINTS2_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2";
-const BASE_BLOCK_SIZE: usize = 4096;
 
-type HiveFile = Hive<BufReader<File>, CleanHive>;
+type HiveImage = Hive<Cursor<Vec<u8>>, CleanHive>;
 
 /// Parse all NTUSER.DAT files in a directory and extract MountPoints2 entries.
 /// Files should be named: username_NTUSER.DAT
@@ -69,65 +67,23 @@ pub fn parse_mountpoints(ntuser_dir: &Path, src_hostname: &str) -> Vec<LogData> 
     events
 }
 
-/// Opens a hive and, when it is dirty, applies its `.LOG1` / `.LOG2`. A log that cannot be
-/// read or applied leaves the hive in its on-disk state rather than failing.
-fn open_hive(path: &Path) -> Result<HiveFile, String> {
+/// Reads a hive and replays its `.LOG` / `.LOG1` / `.LOG2` when it is dirty. Returns the bytes
+/// (base block and bins, marked clean once replayed) and the nt_hive2 view over them. A hive
+/// whose logs are missing or unusable is read in its on-disk state.
+fn open_hive(path: &Path) -> Result<(Vec<u8>, HiveImage), String> {
     let label = path.display().to_string();
-    let open = || -> Result<_, String> {
-        let file = File::open(path).map_err(|e| format!("{label}: {e}"))?;
-        match catch_unwind(AssertUnwindSafe(|| Hive::new(BufReader::new(file), HiveParseMode::NormalWithBaseBlock))) {
-            Ok(Ok(h)) => Ok(h),
-            Ok(Err(e)) => Err(format!("{label}: {e}")),
-            Err(_) => Err(format!("{label}: the hive reader panicked")),
-        }
-    };
-    let hive = open()?;
-    if !is_dirty(path) {
-        return Ok(hive.treat_hive_as_clean());
+    let raw = std::fs::read(path).map_err(|e| format!("{label}: {e}"))?;
+    let replay = blockcarve::hive_logs::replay_beside(path, &raw);
+    if crate::parse::is_debug_mode() && !replay.outcome.applied() && blockcarve::hive_logs::is_dirty(&raw) {
+        eprintln!("[DEBUG] MountPoints2: {label}: transaction logs not applied ({:?}), using the on-disk state", replay.outcome);
     }
-    let logs: Vec<TransactionLog> = ["LOG1", "LOG2"]
-        .iter()
-        .filter_map(|ext| File::open(format!("{}.{}", path.display(), ext)).ok())
-        .filter_map(|f| TransactionLog::try_from(f).ok())
-        .collect();
-    if logs.is_empty() {
-        return Ok(hive.treat_hive_as_clean());
+    let bytes = replay.data.into_owned();
+    let reader = Cursor::new(bytes.clone());
+    match catch_unwind(AssertUnwindSafe(|| Hive::new(reader, HiveParseMode::NormalWithBaseBlock))) {
+        Ok(Ok(h)) => Ok((bytes, h.treat_hive_as_clean())),
+        Ok(Err(e)) => Err(format!("{label}: {e}")),
+        Err(_) => Err(format!("{label}: the hive reader panicked")),
     }
-    let replayed = catch_unwind(AssertUnwindSafe(move || -> Result<HiveFile, String> {
-        // each added log nests the type, so the one- and two-log cases are spelled out
-        let mut iter = logs.into_iter();
-        let first = iter.next().expect("non-empty");
-        let with_first = hive.with_transaction_log(first).map_err(|e| e.to_string())?;
-        match iter.next() {
-            Some(second) => Ok(with_first.with_transaction_log(second).map_err(|e| e.to_string())?.apply_logs()),
-            None => Ok(with_first.apply_logs()),
-        }
-    }));
-    match replayed {
-        Ok(Ok(h)) => Ok(h),
-        _ => {
-            if crate::parse::is_debug_mode() {
-                eprintln!("[DEBUG] MountPoints2: {label}: transaction logs not applied, using the on-disk state");
-            }
-            Ok(open()?.treat_hive_as_clean())
-        }
-    }
-}
-
-/// Primary and secondary sequence numbers differ: the latest changes may be in the logs.
-fn is_dirty(path: &Path) -> bool {
-    let mut header = [0u8; 12];
-    File::open(path).and_then(|mut f| f.read_exact(&mut header)).is_ok() && header[4..8] != header[8..12]
-}
-
-/// Bytes of the (replayed) hive: base block followed by the hive bins.
-fn hive_bytes(hive: &mut HiveFile) -> Option<Vec<u8>> {
-    let mut buf = Cursor::new(Vec::new());
-    hive.write_baseblock(&mut buf).ok()?;
-    buf.seek(SeekFrom::Start(BASE_BLOCK_SIZE as u64)).ok()?;
-    hive.seek(SeekFrom::Start(0)).ok()?;
-    std::io::copy(hive, &mut buf).ok()?;
-    Some(buf.into_inner())
 }
 
 /// `##SERVER#SHARE` -> (`\\SERVER\SHARE`, `SERVER`), for network share keys only.
@@ -169,7 +125,7 @@ fn event(timestamp: String, server: &str, unc_path: &str, username: &str, src_ho
 /// Parse a single NTUSER.DAT and extract MountPoints2 remote share entries, live and deleted.
 fn parse_single_ntuser(path: &Path, username: &str, src_hostname: &str) -> Result<Vec<LogData>, String> {
     let mut events = Vec::new();
-    let mut hive = open_hive(path)?;
+    let (bytes, mut hive) = open_hive(path)?;
     let dat_path_str = path.to_string_lossy().to_string();
 
     // Live keys
@@ -193,7 +149,7 @@ fn parse_single_ntuser(path: &Path, username: &str, src_hostname: &str) -> Resul
     }
 
     // Deleted keys still in free cells of the replayed hive
-    if let Some(scan) = hive_bytes(&mut hive).as_deref().and_then(blockcarve::hive_cells::scan) {
+    if let Some(scan) = blockcarve::hive_cells::scan(&bytes) {
         for dk in &scan.deleted_keys {
             let parent = dk.path_tail().rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
             if !parent.to_ascii_lowercase().ends_with("\\mountpoints2") && !parent.eq_ignore_ascii_case("MountPoints2") {
@@ -284,5 +240,33 @@ mod tests {
         }
         assert!(events.iter().any(|e| !e.detail.contains("deleted")), "live share keys");
         assert!(events.iter().any(|e| e.detail.contains("deleted")), "deleted share keys");
+    }
+
+    /// Same fixture: the hive bins replayed by blockcarve match the ones nt_hive2's own log
+    /// applier produces from the same `.LOG1` / `.LOG2`.
+    #[test]
+    fn replay_matches_nt_hive2_on_real_hive() {
+        use nt_hive2::transactionlog::TransactionLog;
+        use nt_hive2::ContainsHive;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let Ok(dir) = std::env::var("MASSTIN_MP2_FIXTURE") else { return };
+        let mut files = Vec::new();
+        collect_ntuser_files(Path::new(&dir), &mut files);
+        let path = files.first().expect("an *_NTUSER.DAT in the fixture");
+        let (ours, _) = open_hive(path).unwrap();
+
+        let file = std::fs::File::open(path).unwrap();
+        let hive = Hive::new(std::io::BufReader::new(file), HiveParseMode::NormalWithBaseBlock).unwrap();
+        let log = |ext: &str| TransactionLog::try_from(std::fs::File::open(format!("{}.{ext}", path.display())).unwrap()).unwrap();
+        let mut theirs = hive.with_transaction_log(log("LOG1")).unwrap().with_transaction_log(log("LOG2")).unwrap().apply_logs();
+        let mut bins = Vec::new();
+        theirs.seek(SeekFrom::Start(0)).unwrap();
+        theirs.read_to_end(&mut bins).unwrap();
+
+        let n = bins.len().min(ours.len() - 4096);
+        assert!(n > 0);
+        assert_eq!(&ours[4096..4096 + n], &bins[..n], "replayed hive bins differ");
+        println!("{n} bytes of hive bins identical");
     }
 }
