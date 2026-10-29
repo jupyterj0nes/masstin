@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.3.4 — 2026-10-29
+
+### Deleted shares come back, and every event is read by its channel
+
+MountPoints2 is read with nt_hive2 and the hive's transaction logs are replayed first (Windows 7 / 8 logs included), so a share the user removed is recovered from the free cells. An EVTX with an unknown name, a forwarded-events collector among them, is read record by record by channel, and 5145, OpenSSH/Operational and RdpCoreTS 140 are read.
 
 - `parse-image` / `parse-massive`: **MountPoints2 is read with nt_hive2, and deleted share keys come back.** The NTUSER.DAT reader was `notatin`, which only builds with `nom` 7 and needed a pinned lockfile. It is now `nt_hive2` (the reader faramir uses). A dirty hive first gets its `.LOG1` / `.LOG2` replayed in memory with `blockcarve::hive_logs`, the replay faramir and caarea share: every new-format entry checked by its Marvin32 hashes and applied in sequence order, and the old-format logs of Windows 7 / 8, which nt_hive2 does not read, applied too. On the lab hive the replayed bins are identical to nt_hive2's own log applier, byte for byte. A `##SERVER#SHARE` key the user removed is recovered from the free cells of the replayed hive with `blockcarve::hive_cells` (the walker faramir and caarea share) and written with `(deleted key, recovered from a free hive cell)` in `detail`. Checked on a RangeForge lab hive with two shares mapped and a third deleted: the three come out, the deleted one with the time it was created. The project now builds on stable (`rust-toolchain.toml`), as the CI already did: binrw's macros, pulled in by nt_hive2, panic on recent nightlies.
 - `carve-image`: **the EVTX carver runs on the shared blockcarve crate.** EWF goes through the guarded reader that abandons a stuck read and reopens, `--skip-offsets` serves zeros for the listed windows, and every chunk passes its header and data CRC32 before the provider peek.
