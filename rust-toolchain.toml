@@ -1,0 +1,4 @@
+[toolchain]
+# binrw's proc-macros (pulled in by nt_hive2) panic on recent nightlies;
+# the project builds and tests on stable.
+channel = "stable"

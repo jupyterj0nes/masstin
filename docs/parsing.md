@@ -504,7 +504,7 @@ Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux 
 | **WMI-Activity/Operational** | 5858 | Remote WMI execution — source machine from ClientMachine field (destination system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **Sysmon/Operational** | 3 | Network connections on lateral-movement service ports (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986); direction from `Initiated`, initiating process in `detail` | |
 | **Scheduled Tasks XML** | — | Remotely registered tasks detected via Author field (MACHINE\user) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
-| **MountPoints2 (NTUSER.DAT)** | — | Remote share connections from each user's registry (##SERVER#SHARE with LastWriteTime) | [Read more →](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
+| **MountPoints2 (NTUSER.DAT)** | — | Remote share connections from each user's registry (##SERVER#SHARE with LastWriteTime); transaction logs applied, deleted share keys recovered from free hive cells | [Read more →](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
 
 ## UAL (User Access Logging)
 
