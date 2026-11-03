@@ -286,6 +286,20 @@ pub struct Cli {
     #[arg(long)]
     report: Option<String>,
 
+    /// For `graph-hunt-csv`: do not write the hunt's verdict into the
+    /// timeline. By default every timeline given with -f is rewritten in
+    /// place with its `hunt`, `hunt_q` and `hunt_why` columns filled
+    /// (`verdict` and `notes` are kept); with this flag the timeline is
+    /// left untouched and only -o / --report are written.
+    #[arg(long)]
+    no_annotate: bool,
+
+    /// For `merge` / `graph-hunt-csv`: an earlier timeline whose `verdict`
+    /// and `notes` are copied onto the rows with the same 14 event columns
+    /// (after the evidence was parsed again, for instance).
+    #[arg(long)]
+    carry_marks: Option<String>,
+
     /// For `graph-hunt` / `graph-hunt-neo4j`: reconstruct the incident from
     /// known-bad seeds (comma-separated host names, IPs or accounts). The
     /// report gets a first section with every hop the seeds took in the
@@ -454,6 +468,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.output.as_ref(),
                 config.start_time.as_ref(),
                 config.end_time.as_ref(),
+                config.carry_marks.as_ref(),
             )?;
         }
         ActionType::ParserElastic => {
@@ -595,6 +610,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
                 config.sigma.as_deref(),
+                !config.no_annotate,
+                config.carry_marks.as_deref(),
             );
         }
         ActionType::GraphHuntNeo4j => {

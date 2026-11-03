@@ -107,8 +107,6 @@ struct ResolvedEdge {
 
 const EDGE_BATCH: usize = 5_000;
 
-const OLD_HEADER: &str = "time_created,dst_computer,event_id,subject_user_name,subject_domain_name,target_user_name,target_domain_name,logon_type,src_computer,src_ip,process,log_filename";
-const NEW_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
 
 /// Log family of a `log_filename` value (`archive.tar.gz:[root]/var/log/
 /// secure-20260830.gz` -> `secure`; any EVTX -> `evtx`).
@@ -151,21 +149,21 @@ struct Indices {
     logon_id: usize,
 }
 
+/// Column positions for the layout the header announces (12, 14 or 19
+/// columns, see csv_out::Layout); None when it is not a masstin timeline.
 fn parse_indices(header: &str) -> Option<Indices> {
-    if header == NEW_HEADER {
-        Some(Indices {
+    use crate::csv_out::Layout;
+    match Layout::of(header)? {
+        Layout::V14 | Layout::V19 => Some(Indices {
             dst: 1, event_type: 2, log_source: 13, event_id: 3, subject_user: 9, subject_domain: 10,
             target_user: 5, target_domain: 6, logon_type: 4,
             src_computer: 7, src_ip: 8, logon_id: 11,
-        })
-    } else if header == OLD_HEADER {
-        Some(Indices {
+        }),
+        Layout::V12 => Some(Indices {
             dst: 1, event_type: NONE_COL, log_source: 11, event_id: 2, subject_user: 3, subject_domain: 4,
             target_user: 5, target_domain: 6, logon_type: 7,
             src_computer: 8, src_ip: 9, logon_id: NONE_COL,
-        })
-    } else {
-        None
+        }),
     }
 }
 
@@ -274,8 +272,10 @@ fn clean_row(
     // log_filename is reduced to its log family (secure, wtmp, audit,
     // Security.evtx ...) and kept as the edge's `log_source`, so
     // graph-hunt can tell which sources cover which period.
-    let fam_owned = log_source_family(row.last().copied().unwrap_or(""));
-    if let Some(last) = row.last_mut() { *last = fam_owned; }
+    // (the log file is not the last column since the analysis tail exists)
+    if row.len() <= idx.log_source { return RowOutcome::Filtered; }
+    let fam_owned = log_source_family(row[idx.log_source]);
+    row[idx.log_source] = fam_owned;
 
     // dst_computer
     if let Some(ip) = extract_leading_ip(row[idx.dst]) {
@@ -1005,7 +1005,8 @@ pub async fn load_neo4j(
 
 #[cfg(test)]
 mod ip_tests {
-    use super::{extract_leading_ip, looks_like_ip};
+    use super::{clean_row, extract_leading_ip, looks_like_ip, parse_indices, RowOutcome, NONE_COL};
+    use std::collections::HashSet;
 
     #[test]
     fn ipv6_and_hex_names() {
@@ -1021,5 +1022,28 @@ mod ip_tests {
         assert_eq!(extract_leading_ip("[2001:db8::1]"), Some("2001:db8::1"));
         assert_eq!(extract_leading_ip("SRV01"), None);
         assert_eq!(extract_leading_ip("DEADBEEF"), None);
+    }
+
+    #[test]
+    fn every_timeline_layout_gives_its_column_positions() {
+        let v19 = parse_indices(crate::csv_out::HEADER).unwrap();
+        let v14 = parse_indices(crate::csv_out::HEADER_14).unwrap();
+        assert_eq!((v19.dst, v19.src_ip, v19.log_source, v19.logon_id), (1, 8, 13, 11));
+        assert_eq!((v14.dst, v14.src_ip, v14.log_source, v14.logon_id), (1, 8, 13, 11));
+        let v12 = parse_indices(crate::csv_out::HEADER_12).unwrap();
+        assert_eq!((v12.dst, v12.src_ip, v12.log_source, v12.logon_id), (1, 9, 11, NONE_COL));
+        assert!(parse_indices("rank,significant").is_none());
+        // the log file is read by position, not as the last column: a
+        // 19-column row ends with the analyst's notes
+        let idx = v19;
+        let local: HashSet<&str> = ["LOCAL", "-", ""].into_iter().collect();
+        let line = "2026-01-05T10:00:00Z,SRV01,SUCCESSFUL_LOGON,4624,10,alice,CORP,WS01,10.0.0.5,,,0x1,,Security.evtx,significant,1.0e-3,why,benign,my notes";
+        match clean_row(line, &idx, &local, None, None) {
+            RowOutcome::Cleaned(row) => {
+                assert_eq!(row[13], "evtx");
+                assert_eq!(row[18], "MY NOTES");
+            }
+            _ => panic!("row filtered"),
+        }
     }
 }

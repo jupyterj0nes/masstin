@@ -37,7 +37,8 @@
 //
 //  The destination of every row is this Mac; the source is the client that
 //  connected (an address for SSH and Screen Sharing). The CSV stays the
-//  14-column lateral-movement timeline — no new columns, no host-local rows.
+//  lateral-movement timeline (csv_out::HEADER) — no columns of its own, no
+//  host-local rows.
 //
 //  Not yet covered (roadmap, see docs/parsing.md): smbd share connections
 //  (the Unified Log message format is not documented reliably enough to parse

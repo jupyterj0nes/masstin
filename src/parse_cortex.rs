@@ -747,7 +747,7 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     let mut wtr = WriterBuilder::new().from_path(filename)?;
 
     // Write header row
-    wtr.write_record(FINAL_COLUMNS)?;
+    wtr.write_record(FINAL_COLUMNS.iter().copied().chain(crate::csv_out::TAIL_COLUMNS.iter().copied()))?;
 
     // Process each record and write the resulting row. Applies the global
     // noise filter (--ignore-local / --exclude-*) by reconstructing a
@@ -776,7 +776,7 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
                 continue;
             }
         }
-        wtr.write_record(&processed)?;
+        wtr.write_record(processed.iter().map(|s| s.as_str()).chain(std::iter::repeat("").take(crate::csv_out::TAIL_COLUMNS.len())))?;
     }
 
     wtr.flush()?;

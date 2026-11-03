@@ -1565,9 +1565,8 @@ fn print_coverage(rows: &[&RawEvt]) {
 /// Used when no Linux events match, so downstream merge steps in parse-image /
 /// parse-massive find a valid (empty) file instead of erroring with ENOENT.
 fn write_empty_csv(output: Option<&String>) {
-    let header = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename\n";
     if let Some(path) = output {
-        let _ = std::fs::write(path, header);
+        let _ = crate::csv_out::write_empty_timeline(path);
     }
 }
 
@@ -1781,7 +1780,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             _ => "CONNECT",
         }
     };
-    let header = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename\n";
+    let header = format!("{}\n", crate::csv_out::HEADER);
 
     let mut sink: Box<dyn std::io::Write> = match output {
         Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p).unwrap())),
@@ -1801,7 +1800,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
         // same on the login and on the LOGOFF row that closes it
         let logon_id = if r.pid != 0 { r.pid.to_string() } else { String::new() };
         let line = format!(
-            "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",{},{},{}\n",
+            "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",{},{},{}{}\n",
             q(&r.ts_rfc3339),
             q(&r.dst_host),
             event_type(&r.evt),
@@ -1812,6 +1811,7 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             q(&logon_id),
             q(&r.tty_or_proc),
             q(&r.filename),
+            crate::csv_out::EMPTY_TAIL,
         );
         sink.write_all(line.as_bytes()).unwrap();
     }

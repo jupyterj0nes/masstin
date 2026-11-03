@@ -422,7 +422,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         // Merge both CSVs into the final output (deduplicated, sorted by time_created)
         crate::banner::print_info("Merging Windows + Linux timelines...");
         let merge_files_list = vec![win_tmp_str.clone(), linux_tmp_str.clone()];
-        match crate::merge::merge_files(&merge_files_list, output, None, None) {
+        match crate::merge::merge_files(&merge_files_list, output, None, None, None) {
             Ok(()) => {
                 crate::banner::print_phase_result("Merged Windows + Linux timeline generated");
             }

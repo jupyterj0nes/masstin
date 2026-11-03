@@ -16,16 +16,16 @@
 </div>
 
 <div align="center">
-  <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples: banner, discovery, per-folder breakdown and the 14-column CSV"/>
+  <img src="resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples: banner, discovery, per-folder breakdown and the timeline CSV"/>
   <br>
-  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the 14-column timeline at the end.</em>
+  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the timeline at the end.</em>
 </div>
 
 ## What it does
 
 An incident leaves logins in a dozen places: Security.evtx on fifty Windows hosts, `wtmp` and `auth.log` on the Linux side, UAL databases nobody remembers, EDR exports, a VPN concentrator. Masstin reads all of them and answers one question: **who logged in where, with what, and when.**
 
-- **Parse anything into one timeline.** Forensic images (E01, VMDK, VHD/VHDX, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, macOS Unified Logs (`.logarchive`), Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same 14-column CSV. [Parsing →](docs/parsing.md)
+- **Parse anything into one timeline.** Forensic images (E01, VMDK, VHD/VHDX, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, macOS Unified Logs (`.logarchive`), Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same CSV: 14 columns that describe the event and five that the hunt and the analyst fill. [Parsing →](docs/parsing.md)
 - **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
 - **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
 
@@ -44,6 +44,7 @@ Download the binary for your platform from the [Releases page](https://github.co
 masstin -a parse-massive -d /evidence/case-2026-03 -o timeline.csv
 
 # 2. Hunt: what happened after the cutoff that this network had never done before?
+#    Every row of timeline.csv gets its verdict (hunt, hunt_q, hunt_why); hunt.csv is the table by connection
 masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00:00" \
         --report hunt.md -o hunt.csv
 
@@ -70,7 +71,7 @@ masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungr
 | **Feeds** | Winlogbeat JSON, Cortex XDR network connections and forensic EVTX, Mordor / OTRF Security-Datasets. |
 | **Anything else** | `parse-custom` with a YAML rule: csv, regex, key=value and JSON extractors. Ships with rules for Palo Alto, Cisco, Fortinet, Check Point, OpenVPN, Squid, Zscaler ZPA, Cloudflare Access and Mordor. [Custom parsers →](docs/custom-parsers.md) |
 
-The full artifact list with the fields taken from each event is in [ARTIFACTS.md](ARTIFACTS.md). The 14 columns are described in [docs/csv-format.md](docs/csv-format.md).
+The full artifact list with the fields taken from each event is in [ARTIFACTS.md](ARTIFACTS.md). The columns are described in [docs/csv-format.md](docs/csv-format.md).
 
 ## How graph-hunt decides
 

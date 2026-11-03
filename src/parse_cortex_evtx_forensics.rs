@@ -595,7 +595,7 @@ fn get_timestamp(record: &Value) -> Option<i64> {
 fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result<(), Box<dyn Error>> {
     let mut wtr = WriterBuilder::new().from_path(filename)?;
     // Write header
-    wtr.write_record(FINAL_COLUMNS)?;
+    wtr.write_record(FINAL_COLUMNS.iter().copied().chain(crate::csv_out::TAIL_COLUMNS.iter().copied()))?;
 
     // Process each record. Applies the global noise filter
     // (--ignore-local / --exclude-*) by reconstructing a minimal LogData
@@ -624,7 +624,7 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
                 continue;
             }
         }
-        wtr.write_record(&row)?;
+        wtr.write_record(row.iter().map(|s| s.as_str()).chain(std::iter::repeat("").take(crate::csv_out::TAIL_COLUMNS.len())))?;
     }
     wtr.flush()?;
     Ok(())

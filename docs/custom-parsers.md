@@ -1,6 +1,6 @@
 # Masstin custom parsers — schema specification
 
-Masstin's `parse-custom` action parses arbitrary text logs (VPN, firewall, proxy, etc.) using **YAML rule files** and feeds the results into the same 14-column CSV timeline used by the rest of masstin. This document is the complete reference for the YAML schema.
+Masstin's `parse-custom` action parses arbitrary text logs (VPN, firewall, proxy, etc.) using **YAML rule files** and feeds the results into the same CSV timeline used by the rest of masstin (14 event fields and the analysis tail, see [csv-format.md](csv-format.md)). This document is the complete reference for the YAML schema.
 
 For the community-contributed rule library, see [`rules/`](../rules/).
 For background and a worked example, see the blog post [masstin custom parsers](https://weinvestigateanything.com/en/tools/masstin-custom-parsers/).
@@ -33,7 +33,7 @@ masstin -a parse-custom --rules rule.yaml -f log.log --dry-run
 masstin -a parse-custom --rules rule.yaml -f log.log -o out.csv --debug
 ```
 
-The output CSV has the same 14 columns as any other masstin timeline, so you can `merge` it with EVTX, UAL or carved data and load the combined timeline into Neo4j/Memgraph.
+The output CSV has the same 19 columns as any other masstin timeline (the 14 event fields below and the empty analysis tail), so you can `merge` it with EVTX, UAL or carved data, hunt on it and load the combined timeline into Neo4j/Memgraph.
 
 ---
 

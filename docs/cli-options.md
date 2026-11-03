@@ -36,6 +36,8 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--alpha` | `graph-hunt*` and loaders: false discovery rate for Benjamini-Hochberg (default 0.05), the only chosen number |
 | `--only-detectors` / `--skip-detectors` | `graph-hunt*`: comma-separated signal names to run exclusively or to drop (mutually exclusive) |
 | `--report FILE.md` | `graph-hunt*`: also write the analyst report, one story per origin with a significant connection |
+| `--no-annotate` | `graph-hunt-csv`: leave the timeline untouched. By default every `-f` timeline is rewritten in place with `hunt`, `hunt_q` and `hunt_why` filled (`verdict` and `notes` kept) |
+| `--carry-marks FILE.csv` | `merge` / `graph-hunt-csv`: copy `verdict` and `notes` from an earlier timeline onto the rows with the same 14 event columns |
 | `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account`; the report opens with the reconstructed chain. Requires `--report` |
 | `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
 | `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |
