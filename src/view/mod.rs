@@ -11,6 +11,7 @@ mod app;
 mod layout;
 mod query;
 mod store;
+mod views;
 
 pub struct Options {
     pub files: Vec<String>,

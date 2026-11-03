@@ -5,9 +5,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::store::{Edge, Pattern, Store, H_BASELINE, H_CANDIDATE, H_HABITUAL, H_NOT_EVALUATED, H_SIGNIFICANT};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum View {
     /// the connections the hunt marked significant or candidate
     Findings,
@@ -19,7 +21,8 @@ pub enum View {
 
 /// The analyst's filter. Text fields hold what was typed; `compile`
 /// turns them into patterns and times once per query.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Filter {
     pub view: View,
     pub around: String,
@@ -182,12 +185,48 @@ impl GEdge {
     }
 }
 
+/// What a host looks like from its traffic, for the shapes by role.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    /// receives Kerberos ticket traffic (4768 / 4769 / 4770 / 4771)
+    DomainController,
+    /// an address outside the private ranges
+    External,
+    /// mostly a destination
+    Server,
+    /// mostly an origin
+    Workstation,
+    Other,
+}
+
+impl Role {
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::DomainController => "domain controller",
+            Role::External => "external address",
+            Role::Server => "server",
+            Role::Workstation => "workstation",
+            Role::Other => "host",
+        }
+    }
+}
+
+/// Whether an address is outside RFC 1918 / link-local / loopback space.
+pub fn is_public_ip(s: &str) -> bool {
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])),
+        Ok(std::net::IpAddr::V6(v6)) => !(v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80),
+        Err(_) => false,
+    }
+}
+
 pub struct GNode {
     pub host: u32,
     pub inn: u64,
     pub out: u64,
     pub hunt_rank: u8,
     pub first_event: usize,
+    pub role: Role,
 }
 
 pub struct GraphView {
@@ -320,15 +359,33 @@ impl GraphView {
         }
         // nodes
         let mut hosts: HashMap<u32, GNode> = HashMap::new();
+        let mut kerberos: HashSet<u32> = HashSet::new();
         for g in &edges {
-            let n = hosts.entry(g.src).or_insert(GNode { host: g.src, inn: 0, out: 0, hunt_rank: 255, first_event: usize::MAX });
+            let n = hosts.entry(g.src).or_insert(GNode { host: g.src, inn: 0, out: 0, hunt_rank: 255, first_event: usize::MAX, role: Role::Other });
             n.out += g.count;
             n.hunt_rank = n.hunt_rank.min(hunt_rank(g.hunt));
             n.first_event = n.first_event.min(g.first_event);
-            let n = hosts.entry(g.dst).or_insert(GNode { host: g.dst, inn: 0, out: 0, hunt_rank: 255, first_event: usize::MAX });
+            let n = hosts.entry(g.dst).or_insert(GNode { host: g.dst, inn: 0, out: 0, hunt_rank: 255, first_event: usize::MAX, role: Role::Other });
             n.inn += g.count;
             n.hunt_rank = n.hunt_rank.min(hunt_rank(g.hunt));
             n.first_event = n.first_event.min(g.first_event);
+            if g.event_ids.iter().any(|&k| matches!(s.event_ids.name(k), "4768" | "4769" | "4770" | "4771")) {
+                kerberos.insert(g.dst);
+            }
+        }
+        for n in hosts.values_mut() {
+            let name = s.hosts.name(n.host);
+            n.role = if kerberos.contains(&n.host) {
+                Role::DomainController
+            } else if is_public_ip(name) {
+                Role::External
+            } else if n.inn >= 5 && n.inn >= 3 * n.out {
+                Role::Server
+            } else if n.out > n.inn {
+                Role::Workstation
+            } else {
+                Role::Other
+            };
         }
         let mut nodes: Vec<GNode> = hosts.into_values().collect();
         nodes.sort_by_key(|n| n.host);
