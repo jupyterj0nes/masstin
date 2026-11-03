@@ -5,9 +5,9 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv`. Aliases: `parse` (parse-windows), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
+| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` \| `view`. Aliases: `parse` (parse-windows), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
-| `-f, --file` | Individual files (repeatable): EVTX, `.mdb`, E01, VMDK, VHD/VHDX, dd/raw for the Windows and image actions; Winlogbeat JSON for `parser-elastic`; `.logarchive` or `log show` JSON for `parse-mac`; any text or JSON log for `parse-custom`; masstin CSVs for `merge`, the loaders and `graph-hunt-csv` |
+| `-f, --file` | Individual files (repeatable): EVTX, `.mdb`, E01, VMDK, VHD/VHDX, dd/raw for the Windows and image actions; Winlogbeat JSON for `parser-elastic`; `.logarchive` or `log show` JSON for `parse-mac`; any text or JSON log for `parse-custom`; masstin CSVs for `merge`, the loaders, `graph-hunt-csv` and `view` |
 | `-o, --output` | Output file path. Without it the timeline goes to stdout |
 | `--database` | Graph database URL (e.g., `localhost:7687`) |
 | `-u, --user` | Database user. Required by `load-neo4j` and `merge-neo4j-nodes`; `graph-hunt-neo4j` defaults to `neo4j`; optional (empty) on the Memgraph actions |
@@ -38,6 +38,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--report FILE.md` | `graph-hunt*`: also write the analyst report, one story per origin with a significant connection |
 | `--no-annotate` | `graph-hunt-csv`: leave the timeline untouched. By default every `-f` timeline is rewritten in place with `hunt`, `hunt_q` and `hunt_why` filled (`verdict` and `notes` kept) |
 | `--carry-marks FILE.csv` | `merge` / `graph-hunt-csv`: copy `verdict` and `notes` from an earlier timeline onto the rows with the same 14 event columns |
+| `--focus HOST` | `view`: open on the neighbourhood of this host (name or IP, `*` wildcards) instead of the hunt's findings; `--start-time` / `--end-time` bound the window |
 | `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account`; the report opens with the reconstructed chain. Requires `--report` |
 | `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
 | `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |

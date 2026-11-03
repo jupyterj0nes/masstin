@@ -27,7 +27,7 @@ An incident leaves logins in a dozen places: Security.evtx on fifty Windows host
 
 - **Parse anything into one timeline.** Forensic images (E01, VMDK, VHD/VHDX, dd) with VSS recovery and EVTX carving, KAPE / Velociraptor / UAC / Cortex triages, loose EVTX, Linux logs including binary journald, macOS Unified Logs (`.logarchive`), Winlogbeat JSON, Cortex XDR, and any text or JSON log through a YAML rule. Every source lands in the same CSV: 14 columns that describe the event and five that the hunt and the analyst fill. [Parsing →](docs/parsing.md)
 - **Hunt with statistics, not thresholds.** `graph-hunt` splits the timeline at a cutoff, measures every window connection against the network's own baseline and reports what survives a false-discovery-rate test. The only number you choose is the FDR. It explains each finding in words, classes it the way the Hopper paper does, reconstructs chains from a seed and writes an analyst report. [graph-hunt →](docs/graph-hunt.md)
-- **See it as a graph.** Load the timeline into Neo4j or Memgraph in seconds, with IP ↔ hostname unification, session pairing and a Cypher catalogue for temporal path reconstruction. [Graph databases →](docs/graph-databases.md)
+- **See it as a graph, in masstin's own window.** `masstin -a view` draws the timeline the way Neo4j Browser would (hosts as circles, accounts on the edges, IP ↔ hostname unification), with the hunt's states on it, neighbourhoods, a replay in time order and the analyst's marks written back into the CSV. No database to install. [The viewer →](docs/viewer.md) · Neo4j / Memgraph remain an export with a Cypher catalogue for temporal paths. [Graph databases →](docs/graph-databases.md)
 
 <div align="center">
   <img src="resources/demo-graph.gif" alt="Memgraph Lab on a masstin timeline: the hour of the intrusion, then the temporal path query between the attacker's IP and the workstation"/>
@@ -52,7 +52,10 @@ masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00
 masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00:00" \
         --seed 10.10.1.50 --report hunt.md -o hunt.csv
 
-# 4. Optional: load the graph and look at it
+# 4. Look at it: the graph in a window, the hunt's states on it, marks written back into the CSV
+masstin -a view -f timeline.csv
+
+# 5. Optional: export the graph to Neo4j or Memgraph
 masstin -a load-memgraph -f timeline.csv --database bolt://localhost:7687 --ungrouped
 ```
 
@@ -99,7 +102,8 @@ The design, the assumptions and the limits are in [docs/graph-hunt-statistics.md
 | Every `parse-*` action, noise filtering, triage detection, carving, merge | [docs/parsing.md](docs/parsing.md) |
 | graph-hunt: options, output columns, report, seeds, Sigma corroboration, detection quality | [docs/graph-hunt.md](docs/graph-hunt.md) |
 | Statistics behind the hunt | [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md) |
-| Loading into Neo4j / Memgraph, visualisation, query catalogue | [docs/graph-databases.md](docs/graph-databases.md) · [Cypher queries](neo4j-resources/cypher_queries.md) |
+| The viewer: filters, neighbourhoods, marks, replay | [docs/viewer.md](docs/viewer.md) |
+| Exporting to Neo4j / Memgraph, query catalogue | [docs/graph-databases.md](docs/graph-databases.md) · [Cypher queries](neo4j-resources/cypher_queries.md) |
 | Custom parsers (YAML rules) | [docs/custom-parsers.md](docs/custom-parsers.md) |
 | Every command-line option | [docs/cli-options.md](docs/cli-options.md) |
 | Artifacts and fields | [ARTIFACTS.md](ARTIFACTS.md) |

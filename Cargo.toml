@@ -19,7 +19,7 @@ serde_json = "1.0"
 walkdir = "2.3.2"
 neo4rs = "0.6.0"
 futures = "0.3.28"
-tokio = { version = "1.28", features = ["macros"] }
+tokio = { version = "1.28", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 rpassword = "7.2.0"
 csv = "1.2.1"
 indicatif = "0.17.3"
@@ -43,4 +43,10 @@ systemd-journal-reader = "0.1.1"
 tar = "0.4"
 chrono-tz = "0.10"
 macos-unifiedlogs = "0.7"
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = { version = "0.37", optional = true }
 
+[features]
+# the built-in graph viewer (`-a view`, a native window); off for a parser-only binary
+default = ["ui"]
+ui = ["dep:eframe", "dep:egui"]

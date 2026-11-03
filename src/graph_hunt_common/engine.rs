@@ -361,7 +361,7 @@ const LOCAL_SOURCES: [&str; 9] = ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", 
 
 /// Upper-case short name of a host (`SRV01.CORP.EXAMPLE` -> `SRV01`),
 /// kept fully qualified when two FQDNs of the corpus share the short name.
-fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
+pub(crate) fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
     let u = v.to_uppercase();
     if u.contains('.') && !looks_like_ip(&u) {
         let s = u.split('.').next().unwrap_or("");
@@ -376,7 +376,7 @@ fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
 /// type, class), or None when the row names no usable origin or its
 /// origin is its destination. The same function keys the corpus rows and
 /// finds a row's connection again when the timeline is annotated.
-fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) -> Option<(String, String, String, u8)> {
+pub(crate) fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) -> Option<(String, String, String, u8)> {
     let is_local = |v: &str| LOCAL_SOURCES.contains(&v);
     let sc = p[7].trim();
     let si = p[8].trim();
@@ -401,6 +401,41 @@ fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) -> Option<(
 /// 2023 has no event_type and is not read here).
 fn timeline_header_ok(header: &str) -> bool {
     matches!(crate::csv_out::Layout::of(header), Some(crate::csv_out::Layout::V14) | Some(crate::csv_out::Layout::V19))
+}
+
+/// Short host names shared by different FQDNs in these timelines (kept
+/// fully qualified wherever rows are keyed), as `corpus_from_csv` finds
+/// them; for a reader that keys rows the same way without building a corpus.
+pub(crate) fn ambiguous_short_names(files: &[String]) -> std::io::Result<HashSet<String>> {
+    use std::io::BufRead;
+    let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in files {
+        let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+        let mut lines = rd.lines();
+        let header = lines.next().transpose()?.unwrap_or_default();
+        let layout = match crate::csv_out::Layout::of(&header) {
+            Some(l) => l,
+            None => continue,
+        };
+        let idx = layout.base_indices();
+        let cols: Vec<usize> = [1usize, 7, 8].iter().filter_map(|&k| idx[k]).collect();
+        for line in lines {
+            let line = line?;
+            let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
+            split_csv_into(&line, &mut p);
+            for &col in &cols {
+                if let Some(v) = p.get(col) {
+                    let v = v.to_uppercase();
+                    if v.contains('.') && !looks_like_ip(&v) {
+                        if let Some(short) = v.split('.').next() {
+                            fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(fqdn_by_short.into_iter().filter(|(_, s)| s.len() > 1).map(|(k, _)| k).collect())
 }
 
 /// Build the corpus from masstin timeline CSVs (14 event columns, with or
@@ -1024,7 +1059,7 @@ fn state_name(st: u8) -> &'static str {
 
 /// Byte length of the first 14 fields of a CSV line (the event columns),
 /// quotes honoured; None when the line has fewer.
-fn base_prefix_len(line: &str) -> Option<usize> {
+pub(crate) fn base_prefix_len(line: &str) -> Option<usize> {
     let b = line.as_bytes();
     let mut in_q = false;
     let mut fields = 1usize;
@@ -1058,7 +1093,7 @@ fn base_prefix_len(line: &str) -> Option<usize> {
 /// Rename `tmp` over `path`. Windows refuses while another program has the
 /// file open (a case tool with the timeline loaded), so it is retried for
 /// a few seconds before giving up.
-fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     let mut last = None;
     for attempt in 0..12 {
         match std::fs::rename(tmp, path) {
