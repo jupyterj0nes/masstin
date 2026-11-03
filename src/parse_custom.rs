@@ -701,7 +701,7 @@ fn write_csv(path: &str, records: &[LogData]) -> Result<(), String> {
     //   time_created, dst_computer, event_type, event_id, logon_type,
     //   target_user_name, target_domain_name, src_computer, src_ip,
     //   subject_user_name, subject_domain_name, logon_id, detail, log_filename,
-    //   hunt, hunt_q, hunt_why, verdict, notes
+    //   hunt, hunt_score, hunt_why, verdict, notes
     //
     // LogData struct uses historical field names internally; the mapping is:
     //   LogData.computer          → dst_computer

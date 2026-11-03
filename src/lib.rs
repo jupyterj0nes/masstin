@@ -290,7 +290,7 @@ pub struct Cli {
 
     /// For `graph-hunt-csv`: do not write the hunt's verdict into the
     /// timeline. By default every timeline given with -f is rewritten in
-    /// place with its `hunt`, `hunt_q` and `hunt_why` columns filled
+    /// place with its `hunt`, `hunt_score` and `hunt_why` columns filled
     /// (`verdict` and `notes` are kept); with this flag the timeline is
     /// left untouched and only -o / --report are written.
     #[arg(long)]

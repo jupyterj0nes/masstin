@@ -31,12 +31,12 @@ For the complete Event ID mapping, see [CSV Format and Event Classification](htt
 | Column | Written by | Values |
 |--------|-----------|--------|
 | `hunt` | `graph-hunt-csv` | What the hunt made of the row's connection (see below) |
-| `hunt_q` | `graph-hunt-csv` | The connection's q-value (false discovery rate); `1` for a habitual connection; empty when there is no test |
+| `hunt_score` | `graph-hunt-csv` | How rare the connection is, an integer from 0 to 100 (see below); `0` for a habitual connection; empty when there is no test |
 | `hunt_why` | `graph-hunt-csv` | Why the connection is unusual, in words; the Hopper class is its first clause |
 | `verdict` | the analyst (the viewer, a case tool, or by hand) | `suspicious`, `confirmed`, `benign`, or empty |
 | `notes` | the analyst | Free text (`#tags` welcome) |
 
-`graph-hunt-csv` writes the hunt's verdict into every row of the timeline it reads, in place (a temporary file is renamed over the original once complete). The hunt's unit is the connection (origin, destination, account, result, day), so every row of the same connection on the same day carries the same `hunt`, `hunt_q` and `hunt_why`. The six states of `hunt`:
+`graph-hunt-csv` writes the hunt's verdict into every row of the timeline it reads, in place (a temporary file is renamed over the original once complete). The hunt's unit is the connection (origin, destination, account, result, day), so every row of the same connection on the same day carries the same `hunt`, `hunt_score` and `hunt_why`. The six states of `hunt`:
 
 | `hunt` | Meaning |
 |--------|---------|
@@ -49,7 +49,20 @@ For the complete Event ID mapping, see [CSV Format and Event Classification](htt
 
 A `LOGOFF` is not a connection: it takes the state of the login it closes, found by logon ID on the same destination (empty when that login is not in the timeline).
 
-Running the hunt again overwrites `hunt`, `hunt_q` and `hunt_why`; `verdict` and `notes` are kept as they are. `--no-annotate` leaves the timeline untouched. When the evidence is parsed again, `--carry-marks old.csv` (on `merge` and on `graph-hunt-csv`) copies `verdict` and `notes` from the earlier timeline onto every row with the same 14 event columns.
+**`hunt_score`** is the test's q-value (the false discovery rate of calling the connection new) turned into a number people can read and filter: `-10 · log10(q)`, rounded, capped at 100. It only grows as the connection gets rarer; ten points are one order of magnitude.
+
+| `hunt_score` | q | Read as |
+|---|---|---|
+| 0 | 1 | no rarer than chance (every `habitual` row, and a new connection the data cannot tell from chance) |
+| 13 | 0.05 | one in twenty (the default `--alpha`: `significant` starts here) |
+| 20 | 0.01 | one in a hundred |
+| 30 | 0.001 | one in a thousand |
+| 60 | 10⁻⁶ | one in a million |
+| 100 | ≤ 10⁻¹⁰ | one in ten thousand million, or rarer |
+
+`hunt_score >= 30` in a spreadsheet filter keeps what is rarer than one in a thousand. The exact q-values stay in the hunt's own output (`-o`). Timelines annotated by the first build of the tail carried the raw q-value under the name `hunt_q`; every reader converts them, and the next hunt or mark rewrites the column under its name.
+
+Running the hunt again overwrites `hunt`, `hunt_score` and `hunt_why`; `verdict` and `notes` are kept as they are. `--no-annotate` leaves the timeline untouched. When the evidence is parsed again, `--carry-marks old.csv` (on `merge` and on `graph-hunt-csv`) copies `verdict` and `notes` from the earlier timeline onto every row with the same 14 event columns.
 
 ## Older layouts
 

@@ -93,7 +93,8 @@ pub struct Edge {
     pub event_id: u32,
     pub why: u32,
     pub line: u32,
-    pub hunt_q: f32,
+    /// `hunt_score`, 0 to 100; NaN when the row carries none
+    pub score: f32,
     pub file: u16,
     pub result: u8,
     pub hunt: u8,
@@ -199,6 +200,7 @@ impl Store {
             rd.read_line(&mut header)?;
             let layout = Layout::of(&header).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: not a masstin timeline", path)))?;
             let idx = layout.base_indices();
+            let header_has_q = csv_out::header_has_q(&header);
             let first_edge = edges.len() as u32;
             let mut offsets: Vec<u64> = Vec::new();
             let mut pos = header.len() as u64;
@@ -245,9 +247,9 @@ impl Store {
                 let src_is_ip = sc.is_empty() || sc == "-" || crate::load_neo4j::looks_like_ip(sc);
                 let src = host_of(&origin, &mut hosts);
                 let dst = host_of(&dest, &mut hosts);
-                let (hunt, hunt_q, why, verdict) = if layout == Layout::V19 && p.len() >= 19 {
+                let (hunt, score, why, verdict) = if layout == Layout::V19 && p.len() >= 19 {
                     let h = hunt_code(p[14].trim());
-                    let q: f32 = p[15].trim().parse().unwrap_or(f32::NAN);
+                    let q: f32 = csv_out::score_of_text(&p[15], header_has_q).map(|s| s as f32).unwrap_or(f32::NAN);
                     let w = whys.id(p[16].trim());
                     let v = verdict_code(p[17].trim());
                     let n = p[18].trim();
@@ -267,7 +269,7 @@ impl Store {
                     event_id: event_ids.id(b[3].trim()),
                     why,
                     line: line_no,
-                    hunt_q,
+                    score,
                     file: fi as u16,
                     result: result_code(b[2].trim()),
                     hunt,
@@ -411,6 +413,7 @@ impl Store {
                 let mut header = String::new();
                 rd.read_line(&mut header)?;
                 let layout = Layout::of(&header).unwrap_or(Layout::V14);
+                let header_has_q = csv_out::header_has_q(&header);
                 w.write_all(csv_out::HEADER.as_bytes())?;
                 w.write_all(b"\n")?;
                 let mut pos: u64 = csv_out::HEADER.len() as u64 + 1;
@@ -437,7 +440,8 @@ impl Store {
                                 } else {
                                     (g(17), g(18))
                                 };
-                                format!("{}{}", &line[..k], csv_out::tail(&g(14), &g(15), &g(16), &v, &n))
+                                let score = if header_has_q { csv_out::score_of_text(&g(15), true).map(|s| s.to_string()).unwrap_or_default() } else { g(15) };
+                                format!("{}{}", &line[..k], csv_out::tail(&g(14), &score, &g(16), &v, &n))
                             }
                             None => line.to_string(),
                         }
@@ -565,14 +569,42 @@ mod tests {
     }
 
     #[test]
+    fn store_converts_the_raw_q_of_the_first_tail() {
+        // a timeline annotated on 2026-11-02/03 carries `hunt_q` with the raw
+        // q-value: it is read as a score and rewritten as one on the first mark
+        let path = std::env::temp_dir().join(format!("masstin-store-q-{}.csv", std::process::id()));
+        let body = [
+            csv_out::HEADER_19_Q.to_string(),
+            row(5, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", ",habitual,1,nothing new,,"),
+            row(5, 10, "10.0.0.9", "SRV01", "mallory", "SUCCESSFUL_LOGON", ",significant,1.000e-3,origin never seen before,,"),
+        ]
+        .join("
+");
+        std::fs::write(&path, format!("{}
+", body)).unwrap();
+        let p = path.to_string_lossy().to_string();
+        let mut s = Store::load(&[p.clone()], 0.05).unwrap();
+        assert_eq!(s.edges.len(), 2);
+        assert!((s.edges[0].score - 0.0).abs() < 1e-6);
+        assert!((s.edges[1].score - 30.0).abs() < 1e-6);
+        s.mark(&[(0, 1)], verdict_code("suspicious"), "").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], csv_out::HEADER);
+        assert!(lines[1].ends_with(",habitual,0,nothing new,,"), "{}", lines[1]);
+        assert!(lines[2].ends_with(",significant,30,origin never seen before,suspicious,"), "{}", lines[2]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn store_reads_edges_and_writes_marks_back() {
         let path = std::env::temp_dir().join(format!("masstin-store-{}.csv", std::process::id()));
         let body = [
             csv_out::HEADER.to_string(),
-            row(5, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", ",habitual,1,nothing new,,"),
-            row(5, 10, "10.0.0.9", "SRV01", "mallory", "SUCCESSFUL_LOGON", ",significant,1.000e-3,origin never seen before,,"),
+            row(5, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", ",habitual,0,nothing new,,"),
+            row(5, 10, "10.0.0.9", "SRV01", "mallory", "SUCCESSFUL_LOGON", ",significant,30,origin never seen before,,"),
             row(5, 11, "127.0.0.1", "SRV01", "system", "SUCCESSFUL_LOGON", ",,,,,"),
-            row(5, 12, "SRV01", "WS02", "mallory", "FAILED_LOGON", ",candidate,2.000e-1,new,benign,seen it"),
+            row(5, 12, "SRV01", "WS02", "mallory", "FAILED_LOGON", ",candidate,7,new,benign,seen it"),
         ]
         .join("\n");
         std::fs::write(&path, format!("{}\n", body)).unwrap();
@@ -587,7 +619,7 @@ mod tests {
         assert_eq!(s.out_adj.of(srv).len(), 1);
         let e = &s.edges[1];
         assert_eq!(e.hunt, H_SIGNIFICANT);
-        assert!((e.hunt_q - 0.001).abs() < 1e-6);
+        assert!((e.score - 30.0).abs() < 1e-6);
         assert_eq!(s.whys.name(e.why), "origin never seen before");
         assert_eq!(s.edges[2].verdict, verdict_code("benign"));
         assert_eq!(s.notes.get(&(0, 3)).map(|x| x.as_str()), Some("seen it"));
@@ -602,7 +634,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], csv_out::HEADER);
-        assert!(lines[2].ends_with(",significant,1.000e-3,origin never seen before,suspicious,\"pivot, check SRV01\""), "{}", lines[2]);
+        assert!(lines[2].ends_with(",significant,30,origin never seen before,suspicious,\"pivot, check SRV01\""), "{}", lines[2]);
         assert!(lines[4].ends_with(",benign,seen it"), "{}", lines[4]);
         assert!(lines[3].ends_with(",,,,,"), "{}", lines[3]);
         // the rows are still found at their new offsets

@@ -937,7 +937,7 @@ impl Viewer {
                 fmt_time(e.first),
                 fmt_time(e.last),
                 e.hunt,
-                e.hunt_q,
+                e.score,
                 self.store.whys.name(e.why).to_string(),
                 e.verdict(),
                 e.logon_types.iter().map(|&k| self.store.logon_types.name(k).to_string()).collect::<Vec<_>>().join(", "),
@@ -955,7 +955,7 @@ impl Viewer {
                 let c = hunt_color(hunt).unwrap_or(MUTED);
                 ui.label(egui::RichText::new(HUNT_NAMES[hunt as usize]).strong().color(c));
                 if !q.is_nan() {
-                    ui.label(egui::RichText::new(format!("q = {:.2e}", q)).color(MUTED));
+                    ui.label(egui::RichText::new(format!("score {} · {}", q as u8, crate::csv_out::score_words(q as u8))).color(MUTED)).on_hover_text("hunt_score: how rare the connection is, 0 to 100 (-10 log10 of its q-value)");
                 }
             });
             ui.label(why);

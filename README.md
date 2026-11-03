@@ -50,7 +50,7 @@ Download the binary for your platform from the [Releases page](https://github.co
 masstin -a parse-massive -d /evidence/case-2026-03 -o timeline.csv
 
 # 2. Hunt: what happened after the cutoff that this network had never done before?
-#    Every row of timeline.csv gets its verdict (hunt, hunt_q, hunt_why); hunt.csv is the table by connection
+#    Every row of timeline.csv gets its verdict (hunt, hunt_score, hunt_why); hunt.csv is the table by connection
 masstin -a graph-hunt-csv -f timeline.csv --investigation-from "2026-03-15 00:00:00" \
         --report hunt.md -o hunt.csv
 

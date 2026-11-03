@@ -1,7 +1,7 @@
 //! The timeline CSV: its layouts and the direct writer.
 //!
 //! Every parse action writes the same 19 columns: the 14 that describe
-//! the event, then the analysis tail (`hunt`, `hunt_q`, `hunt_why`,
+//! the event, then the analysis tail (`hunt`, `hunt_score`, `hunt_why`,
 //! written by graph-hunt; `verdict`, `notes`, written by the analyst),
 //! empty until something fills it. The tail is the same in caarea,
 //! faramir and allymacb, so a case tool maps it once for every CSV.
@@ -44,13 +44,18 @@ pub(crate) const BASE_COLUMNS: [&str; 14] = [
 ];
 
 /// The analysis tail: the hunt's verdict on the row and the analyst's.
-pub(crate) const TAIL_COLUMNS: [&str; 5] = ["hunt", "hunt_q", "hunt_why", "verdict", "notes"];
+pub(crate) const TAIL_COLUMNS: [&str; 5] = ["hunt", "hunt_score", "hunt_why", "verdict", "notes"];
 
 /// Number of columns every writer produces.
 pub(crate) const COLUMNS: usize = 19;
 
 /// The header every writer produces: the 14 event columns and the tail.
-pub(crate) const HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename,hunt,hunt_q,hunt_why,verdict,notes";
+pub(crate) const HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename,hunt,hunt_score,hunt_why,verdict,notes";
+
+/// The 19-column header of the first days of the tail (2026-11-02/03),
+/// when the second column of the tail was the raw q-value. Same
+/// positions; readers convert the value with [`score_of_text`].
+pub(crate) const HEADER_19_Q: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename,hunt,hunt_q,hunt_why,verdict,notes";
 
 /// The 14-column header written until v1.3.4.
 pub(crate) const HEADER_14: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
@@ -91,7 +96,7 @@ impl Layout {
         let h = header.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']);
         let h: String = h.split(',').map(|c| c.trim().trim_matches('"')).collect::<Vec<_>>().join(",");
         match h.as_str() {
-            HEADER => Some(Layout::V19),
+            HEADER | HEADER_19_Q => Some(Layout::V19),
             HEADER_14 => Some(Layout::V14),
             HEADER_12 => Some(Layout::V12),
             _ => None,
@@ -159,11 +164,71 @@ pub(crate) fn qt(s: &str) -> String {
 }
 
 /// The tail of a row, from its five values.
-pub(crate) fn tail(hunt: &str, hunt_q: &str, hunt_why: &str, verdict: &str, notes: &str) -> String {
-    if hunt.is_empty() && hunt_q.is_empty() && hunt_why.is_empty() && verdict.is_empty() && notes.is_empty() {
+pub(crate) fn tail(hunt: &str, hunt_score: &str, hunt_why: &str, verdict: &str, notes: &str) -> String {
+    if hunt.is_empty() && hunt_score.is_empty() && hunt_why.is_empty() && verdict.is_empty() && notes.is_empty() {
         return EMPTY_TAIL.to_string();
     }
-    format!(",{},{},{},{},{}", qt(hunt), qt(hunt_q), qt(hunt_why), qt(verdict), qt(notes))
+    format!(",{},{},{},{},{}", qt(hunt), qt(hunt_score), qt(hunt_why), qt(verdict), qt(notes))
+}
+
+/// Top of the `hunt_score` scale.
+pub(crate) const SCORE_MAX: u8 = 100;
+
+/// The `hunt_score` of a q-value: how rare the connection is, 0 to 100,
+/// on the Phred scale (`-10 log10 q`, rounded): 0 is a connection no
+/// rarer than chance (q = 1), 13 is one in twenty, 20 one in a hundred,
+/// 30 one in a thousand, 60 one in a million, 100 one in ten thousand
+/// million or rarer. None for NaN (no test).
+pub(crate) fn score_of(q: f64) -> Option<u8> {
+    if q.is_nan() {
+        return None;
+    }
+    if q <= 0.0 {
+        return Some(SCORE_MAX);
+    }
+    let s = (-10.0 * q.log10()).round();
+    Some(s.clamp(0.0, SCORE_MAX as f64) as u8)
+}
+
+/// The `hunt_score` written in a column: a score as written by this
+/// version, or a raw q-value from a timeline annotated with the
+/// `hunt_q` header, converted. None when empty or not a number.
+pub(crate) fn score_of_text(s: &str, header_has_q: bool) -> Option<u8> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if header_has_q {
+        return s.parse::<f64>().ok().and_then(score_of);
+    }
+    s.parse::<f64>().ok().map(|v| v.round().clamp(0.0, SCORE_MAX as f64) as u8)
+}
+
+/// Whether a header line is the one with the raw q-value in the tail.
+pub(crate) fn header_has_q(header: &str) -> bool {
+    header.contains("hunt_q")
+}
+
+/// How rare a score is, in words, for a pane or a tooltip.
+pub(crate) fn score_words(score: u8) -> String {
+    if score == 0 {
+        return "no rarer than chance".to_string();
+    }
+    if score >= SCORE_MAX {
+        return "one in ten thousand million or rarer".to_string();
+    }
+    let n = 10f64.powf(score as f64 / 10.0);
+    // two significant figures, with separators
+    let mag = 10f64.powi(n.log10().floor() as i32 - 1).max(1.0);
+    let r = (n / mag).round() * mag;
+    let r = r.round() as u64;
+    let mut digits = r.to_string();
+    let mut out = String::new();
+    while digits.len() > 3 {
+        let rest = digits.split_off(digits.len() - 3);
+        out = format!(",{}{}", rest, out);
+    }
+    format!("one in {}{}", digits, out)
 }
 
 /// Identity of a row across runs: FNV-1a over its 14 event columns. The
@@ -295,6 +360,29 @@ mod tests {
     #[test]
     fn layout_is_read_from_the_header() {
         assert_eq!(Layout::of(HEADER), Some(Layout::V19));
+        assert_eq!(Layout::of(HEADER_19_Q), Some(Layout::V19));
+        assert!(header_has_q(HEADER_19_Q) && !header_has_q(HEADER));
+    }
+
+    #[test]
+    fn score_scale() {
+        assert_eq!(score_of(f64::NAN), None);
+        assert_eq!(score_of(1.0), Some(0));
+        assert_eq!(score_of(0.05), Some(13));
+        assert_eq!(score_of(0.01), Some(20));
+        assert_eq!(score_of(1e-3), Some(30));
+        assert_eq!(score_of(1e-6), Some(60));
+        assert_eq!(score_of(1e-12), Some(100));
+        assert_eq!(score_of(0.0), Some(100));
+        assert_eq!(score_of_text("", false), None);
+        assert_eq!(score_of_text("30", false), Some(30));
+        assert_eq!(score_of_text("1.000e-3", true), Some(30));
+        assert_eq!(score_of_text("1", true), Some(0));
+        assert_eq!(score_words(0), "no rarer than chance");
+        assert_eq!(score_words(13), "one in 20");
+        assert_eq!(score_words(30), "one in 1,000");
+        assert_eq!(score_words(60), "one in 1,000,000");
+        assert_eq!(score_words(100), "one in ten thousand million or rarer");
         assert_eq!(Layout::of(HEADER_14), Some(Layout::V14));
         assert_eq!(Layout::of(HEADER_12), Some(Layout::V12));
         assert_eq!(Layout::of(&format!("\u{feff}{}\r\n", HEADER)), Some(Layout::V19));
