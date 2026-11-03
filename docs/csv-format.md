@@ -62,6 +62,14 @@ A `LOGOFF` is not a connection: it takes the state of the login it closes, found
 
 `hunt_score >= 30` in a spreadsheet filter keeps what is rarer than one in a thousand. The exact q-values stay in the hunt's own output (`-o`). Timelines annotated by the first build of the tail carried the raw q-value under the name `hunt_q`; every reader converts them, and the next hunt or mark rewrites the column under its name.
 
+### The same tail in caarea, faramir and allymacb
+
+The five columns, the six words of `hunt`, the three of `verdict` and the scale of `hunt_score` are the same in the four tools, so a case tool maps the tail once. masstin only tests; the others also run **static rules** (a known-bad pattern, with no probability behind it), and a row must say which of the two spoke:
+
+- **The state comes from the strongest evidence.** A high rule gives `significant`, a medium rule `candidate`, a low rule leaves the statistical state as it is. When a test and a rule both speak, the stronger state wins. No other word goes into `hunt`: not `alert`, `review`, `suspicious` (that is the analyst's word, in `verdict`), `malicious` or `anomalous`.
+- **`hunt_why` names the source.** A rule's clause begins with its id and level, `rule H1001 (high): …`; a test's clause is in words, as above (in masstin, the Hopper class first). When both fired, the rule's clause comes first, the clauses separated by `; `. A reader that wants only the rules filters `hunt_why` on `rule `; one that wants only the statistics, on its absence.
+- **`hunt_score` is rarity in the four tools.** A test contributes `-10 · log10(q)`. A rule contributes the same scale measured, not chosen: how often the pattern fires on stock, clean hosts (one in a hundred and twenty-eight is 21 points; a pattern that never fired on the stock rows measured is 90). Contributions add, capped at 100. A rule's own catalogue score (a 0 to 100 of the author's confidence) is not a `hunt_score` and does not go into the column.
+
 Running the hunt again overwrites `hunt`, `hunt_score` and `hunt_why`; `verdict` and `notes` are kept as they are. `--no-annotate` leaves the timeline untouched. When the evidence is parsed again, `--carry-marks old.csv` (on `merge` and on `graph-hunt-csv`) copies `verdict` and `notes` from the earlier timeline onto every row with the same 14 event columns.
 
 ## Older layouts
