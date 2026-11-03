@@ -60,6 +60,24 @@ On a connection: **suspicious**, **confirmed**, **benign** or **clear**, plus no
 
 The bar at the bottom runs the rows of the view in time order: hosts and connections appear when their first event happens. **Play** / **Pause**, the speed in rows per second, the slider to scrub, **All** to show everything again.
 
+## Presentation and recording
+
+**Present** plays the view as a story, full window: each connection draws itself from origin to destination in its turn, the host it reaches pops in, a clock shows the moment, a caption at the bottom says what happened (`14:54:24 · admin-hacker · 10.23.123.11 -> ROOTDC1 (+9 more)`), a counter says where you are. Space pauses, Left / Right step, Home restarts, Esc leaves.
+
+**Story…** is the editor, saved as `<timeline>.story.json` next to the timeline:
+
+- a step is one row, or every row within *group rows within* seconds of the first (a spray over twenty hosts in three seconds is one step, not twenty);
+- **timing**: the same seconds per step, or the real gaps compressed by a factor and clamped between a minimum and a maximum (so two days between two hops are felt without waiting);
+- a **pause on significant** connections, a **hold** at the end, **fade older** edges, the clock, the caption and the counter on or off, a **title**;
+- **anonymise**: HOST-01, user-02, 10.x.x.3, consistent through the story, for a talk;
+- **per step**: its own seconds, a pause after it, its own caption, skip, emphasis (a glow and a framed caption). Click a step's number to see the graph at that moment.
+
+**Record…** writes the story as it is shown: every frame is a screenshot of the window while the story plays, at 10 to 60 frames per second, in the window's size or at 1280 x 720 / 1920 x 1080 (the window is resized for the recording). Formats: **GIF** (animated), **PNG frames** (a folder), **MP4** when `ffmpeg` is on the PATH (H.264, plays in PowerPoint and Keynote). The file goes next to the timeline. Leave the window alone while it records; the encoding runs afterwards on its own thread.
+
+## Driving it from outside
+
+`MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p) and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr.
+
 ## Building without it
 
 The viewer is behind the `ui` feature, on by default. `cargo build --no-default-features` gives a parser-only binary without the window stack.
