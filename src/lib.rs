@@ -57,6 +57,8 @@ pub use crate::vmdk::*;
 mod graph_hunt;
 mod graph_hunt_common;
 mod graph_hunt_neo4j;
+#[cfg(feature = "ui")]
+mod view;
 
 // -----------------------------------------------------------------------------
 //   Command-line interface struct
@@ -300,6 +302,11 @@ pub struct Cli {
     #[arg(long)]
     carry_marks: Option<String>,
 
+    /// For `view`: open on the neighbourhood of this host (name or IP,
+    /// `*` wildcards) instead of the hunt's findings.
+    #[arg(long)]
+    focus: Option<String>,
+
     /// For `graph-hunt` / `graph-hunt-neo4j`: reconstruct the incident from
     /// known-bad seeds (comma-separated host names, IPs or accounts). The
     /// report gets a first section with every hop the seeds took in the
@@ -374,6 +381,8 @@ enum ActionType {
     /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.
     #[value(alias = "graph-hunt-csv")]
     GraphHuntCsv,
+    /// Open the graph viewer (a window) on timeline CSVs (-f): the lateral-movement graph with its hunt states, filters, neighbourhoods, a replay in time order and the analyst's marks, written back into the CSV. --focus HOST opens on a host's neighbourhood; --start-time / --end-time bound the window.
+    View,
 }
 
 // -----------------------------------------------------------------------------
@@ -596,6 +605,23 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             )
             .await;
         }
+        ActionType::View => {
+            #[cfg(feature = "ui")]
+            {
+                let opts = crate::view::Options {
+                    files: config.file.clone(),
+                    alpha: config.alpha,
+                    focus: config.focus.clone(),
+                    start: config.start_time.clone(),
+                    end: config.end_time.clone(),
+                };
+                crate::view::run(opts)?;
+            }
+            #[cfg(not(feature = "ui"))]
+            {
+                return Err(Box::from("this masstin was built without the `ui` feature: `-a view` is not available"));
+            }
+        }
         ActionType::GraphHuntCsv => {
             crate::graph_hunt::graph_hunt_csv(
                 &config.file,
@@ -806,6 +832,11 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                 return Err(String::from(
                     "--skip-detectors and --only-detectors are mutually exclusive.",
                 ));
+            }
+        }
+        ActionType::View => {
+            if config.file.is_empty() {
+                return Err(String::from("For view you must specify at least one timeline CSV with -f."));
             }
         }
         ActionType::GraphHuntCsv => {

@@ -33,7 +33,7 @@ For the complete Event ID mapping, see [CSV Format and Event Classification](htt
 | `hunt` | `graph-hunt-csv` | What the hunt made of the row's connection (see below) |
 | `hunt_q` | `graph-hunt-csv` | The connection's q-value (false discovery rate); `1` for a habitual connection; empty when there is no test |
 | `hunt_why` | `graph-hunt-csv` | Why the connection is unusual, in words; the Hopper class is its first clause |
-| `verdict` | the analyst | `suspicious`, `confirmed`, `benign`, or empty |
+| `verdict` | the analyst (the viewer, a case tool, or by hand) | `suspicious`, `confirmed`, `benign`, or empty |
 | `notes` | the analyst | Free text (`#tags` welcome) |
 
 `graph-hunt-csv` writes the hunt's verdict into every row of the timeline it reads, in place (a temporary file is renamed over the original once complete). The hunt's unit is the connection (origin, destination, account, result, day), so every row of the same connection on the same day carries the same `hunt`, `hunt_q` and `hunt_why`. The six states of `hunt`:

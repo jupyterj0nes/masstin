@@ -39,6 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Linux libraries for the viewer window (eframe)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
