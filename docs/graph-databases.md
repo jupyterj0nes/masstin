@@ -1,5 +1,7 @@
 # Graph databases: Neo4j and Memgraph
 
+> Since v1.4.0 none of this is needed to see or question the graph: `masstin -a view` draws it in a window of its own, with paths, cones, the usual questions, marks and a recordable replay ([docs/viewer.md](viewer.md)). Loading into Neo4j or Memgraph is an export for whoever wants Browser, Bloom or Lab, or Cypher of their own.
+
 Loading a timeline, grouped vs ungrouped, IP ↔ hostname unification, loader internals, visualisation and the query catalogue. Back to the [README](../README.md).
 
 ## Load into graph database

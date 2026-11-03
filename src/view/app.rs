@@ -15,6 +15,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec
 use super::layout::{Layout, V2};
 use super::query::{fmt_time, hunt_rank, Filter, GEdge, GraphView, Role, View};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
+use super::paths::{self, Path, PathQuery};
 use super::present::{self, Anonymiser, Format, Step, StepOverride, Story, Timing};
 use super::views::{builtin_views, palette_color, Caption, ColorBy, Field, Rule, SavedView, Shape, Style, ViewsFile};
 use super::Options;
@@ -149,6 +150,28 @@ pub struct Viewer {
     ffmpeg: Option<bool>,
     auto: Vec<String>,
     auto_next: std::time::Instant,
+    // paths, cones, questions
+    show_paths: bool,
+    show_questions: bool,
+    path_origin: String,
+    path_dest: String,
+    path_hops: usize,
+    path_gap_h: f32,
+    path_max: usize,
+    path_results: [bool; 4],
+    path_skip_machine: bool,
+    path_found: Vec<Path>,
+    path_msg: String,
+    overlay: Option<Overlay>,
+}
+
+/// What the canvas shows instead of the filter's selection: the edges of
+/// a path or a cone, with a word under each host.
+struct Overlay {
+    title: String,
+    edges: Vec<u32>,
+    labels: HashMap<u32, String>,
+    hops: HashMap<u32, usize>,
 }
 
 /// A recording in progress: one screenshot per frame, streamed to the
@@ -261,6 +284,18 @@ impl Viewer {
             ffmpeg: None,
             auto: std::env::var("MASSTIN_VIEW_AUTO").ok().map(|v| v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()).unwrap_or_default(),
             auto_next: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            show_paths: false,
+            show_questions: false,
+            path_origin: String::new(),
+            path_dest: String::new(),
+            path_hops: 6,
+            path_gap_h: 24.0,
+            path_max: 50,
+            path_results: [true, false, false, false],
+            path_skip_machine: true,
+            path_found: Vec::new(),
+            path_msg: String::new(),
+            overlay: None,
         };
         v.requery(true);
         v
@@ -279,7 +314,10 @@ impl Viewer {
                 self.remembered.insert(n.host, *p);
             }
         }
-        self.graph = GraphView::build(&self.store, &self.filter);
+        self.graph = match &self.overlay {
+            Some(o) => GraphView::from_edges(&self.store, &self.filter, o.edges.clone()),
+            None => GraphView::build(&self.store, &self.filter),
+        };
         let g = &self.graph;
         let max_traffic = g.nodes.iter().map(|n| n.inn + n.out).max().unwrap_or(1).max(1) as f32;
         let radii: Vec<f32> = g.nodes.iter().map(|n| 20.0 + 10.0 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln()).collect();
@@ -299,6 +337,9 @@ impl Viewer {
             format!("{} connections drawn of {}", g.edges.len(), g.connections),
             format!("{} rows", g.events.len()),
         ];
+        if let Some(o) = &self.overlay {
+            parts.insert(0, o.title.clone());
+        }
         if g.truncated {
             parts.push("limit reached: narrow the filters or raise the limit".into());
         }
@@ -668,6 +709,17 @@ impl Viewer {
             if ui.selectable_label(self.show_rules, format!("Rules ({})", n_rules)).on_hover_text("condition -> colour, width, size, shape, dashes, glow, hide; first match wins").clicked() {
                 self.show_rules = !self.show_rules;
             }
+            ui.separator();
+            if ui.selectable_label(self.show_paths, "Paths…").on_hover_text("Time-respecting paths between two hosts, and what a host could reach (or be reached from)").clicked() {
+                self.show_paths = !self.show_paths;
+            }
+            if ui.selectable_label(self.show_questions, "Questions…").on_hover_text("Fan-out, fan-in, shared accounts, failures then success, first appearances, PageRank and betweenness of the view").clicked() {
+                self.show_questions = !self.show_questions;
+            }
+            if self.overlay.is_some() && ui.button("Back to the view").clicked() {
+                self.overlay = None;
+                self.requery(false);
+            }
         });
         if style_changed {
             self.persist();
@@ -819,6 +871,16 @@ impl Viewer {
                 self.draft.view = View::All;
                 self.draft.host = name.clone();
                 self.requery(false);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Paths from here").clicked() {
+                self.path_origin = name.clone();
+                self.show_paths = true;
+            }
+            if ui.button("Paths to here").clicked() {
+                self.path_dest = name.clone();
+                self.show_paths = true;
             }
         });
         if self.selected != Some(Sel::Node(i)) {
@@ -1448,6 +1510,12 @@ impl Viewer {
                     painter.text(p, Align2::CENTER_CENTER, caption, FontId::proportional(font_size), dim(Color32::from_rgb(20, 24, 30), alpha));
                 }
             }
+            if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
+                let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * self.style.font_scale).clamp(8.0, 14.0)), ACCENT);
+                let rr = Rect::from_center_size(Pos2::new(p.x, p.y + r + 10.0 + galley.size().y / 2.0), galley.size() + Vec2::new(8.0, 3.0));
+                painter.rect_filled(rr, CornerRadius::same(3), dim(CAPTION_BG, alpha));
+                painter.galley(rr.min + Vec2::new(4.0, 1.5), galley, ACCENT);
+            }
         }
 
         // ── hover tooltip ──
@@ -1551,6 +1619,289 @@ impl Viewer {
             Some(job) => {
                 painter.text(Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0), Align2::LEFT_BOTTOM, format!("recording frame {} / {} at {} fps", job.next, job.total, job.fps), FontId::proportional(11.0), MUTED);
             }
+        }
+    }
+
+    // ───────────────────────── paths, cones, questions ─────────────────────────
+
+    /// The host a typed name means: an exact name or alias first, else the
+    /// first pattern match.
+    fn host_named(&self, text: &str) -> Option<u32> {
+        let t = text.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let up = t.to_uppercase();
+        if let Some(h) = self.store.hosts.get(&up) {
+            return Some(h);
+        }
+        if let Some((h, _)) = self.store.aliases.iter().enumerate().find(|(_, al)| al.iter().any(|a| a.eq_ignore_ascii_case(t))) {
+            return Some(h as u32);
+        }
+        self.store.hosts_matching(&Pattern::parse_list(t)).into_iter().next()
+    }
+
+    fn path_query(&self, origin: u32, dest: u32) -> PathQuery {
+        PathQuery {
+            origin,
+            dest,
+            from: super::query::parse_time(&self.filter.from),
+            to: super::query::parse_time(&self.filter.to),
+            max_hops: self.path_hops.max(1),
+            max_gap: (self.path_gap_h.max(0.01) * 3600.0) as i64,
+            max_paths: self.path_max.max(1),
+            results: self.path_results,
+            skip_machine_accounts: self.path_skip_machine,
+        }
+    }
+
+    fn run_paths(&mut self) {
+        let (Some(o), Some(d)) = (self.host_named(&self.path_origin), self.host_named(&self.path_dest)) else {
+            self.path_msg = "name an origin and a destination the timeline knows".into();
+            return;
+        };
+        let q = self.path_query(o, d);
+        self.path_found = paths::find_paths(&self.store, &q);
+        if self.path_found.is_empty() {
+            self.path_msg = format!("no time-respecting path from {} to {} within {} hops and {:.1} h per hop", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, self.path_gap_h);
+            return;
+        }
+        self.path_msg = format!("{} path(s), shortest first", self.path_found.len());
+        let all: Vec<u32> = self.path_found.iter().flat_map(|p| p.edges.iter().copied()).collect();
+        let hops = self.hops_along(&self.path_found);
+        let labels = hops.iter().map(|(h, k)| (*h, if *k == 0 { "origin".to_string() } else { format!("hop {}", k) })).collect();
+        self.set_overlay(format!("{} path(s) {} -> {}", self.path_found.len(), self.store.hosts.name(o), self.store.hosts.name(d)), all, labels, hops);
+    }
+
+    fn hops_along(&self, found: &[Path]) -> HashMap<u32, usize> {
+        let mut hops: HashMap<u32, usize> = HashMap::new();
+        for p in found {
+            if let Some(&first) = p.edges.first() {
+                hops.entry(self.store.edges[first as usize].src).or_insert(0);
+            }
+            for (k, &ei) in p.edges.iter().enumerate() {
+                let e = &self.store.edges[ei as usize];
+                hops.entry(e.dst).and_modify(|x| *x = (*x).min(k + 1)).or_insert(k + 1);
+            }
+        }
+        hops
+    }
+
+    fn show_one_path(&mut self, i: usize) {
+        if let Some(p) = self.path_found.get(i).cloned() {
+            let hops = self.hops_along(std::slice::from_ref(&p));
+            let labels = p.edges.iter().enumerate().map(|(k, &ei)| {
+                let e = &self.store.edges[ei as usize];
+                (e.dst, format!("hop {} · {}", k + 1, &fmt_time(e.t)[11..16]))
+            }).chain(std::iter::once((self.store.edges[p.edges[0] as usize].src, "origin".to_string()))).collect();
+            self.set_overlay(format!("path {} of {}", i + 1, self.path_found.len()), p.edges.clone(), labels, hops);
+        }
+    }
+
+    fn run_cone(&mut self, forward: bool) {
+        let field = if forward { self.path_origin.clone() } else { self.path_dest.clone() };
+        let Some(h) = self.host_named(&field) else {
+            self.path_msg = if forward { "name the origin of the cone".into() } else { "name the destination of the cone".into() };
+            return;
+        };
+        let q = self.path_query(h, h);
+        let reach = if forward {
+            paths::forward_cone(&self.store, h, q.from.unwrap_or(self.store.t_min), &q)
+        } else {
+            paths::backward_cone(&self.store, h, q.to.unwrap_or(self.store.t_max), &q)
+        };
+        let edges: Vec<u32> = reach.values().filter_map(|r| r.via).collect();
+        let labels: HashMap<u32, String> = reach.iter().map(|(host, r)| (*host, if r.hop == 0 { (if forward { "origin" } else { "destination" }).to_string() } else { format!("hop {} · {}", r.hop, &fmt_time(r.t)[5..16]) })).collect();
+        let hops: HashMap<u32, usize> = reach.iter().map(|(host, r)| (*host, r.hop)).collect();
+        self.path_found.clear();
+        self.path_msg = format!("{} host(s) {} {} within {} hops", reach.len().saturating_sub(1), if forward { "reachable from" } else { "that could reach" }, self.store.hosts.name(h), q.max_hops);
+        if edges.is_empty() {
+            return;
+        }
+        self.set_overlay(format!("{} {}", if forward { "reach of" } else { "ways into" }, self.store.hosts.name(h)), edges, labels, hops);
+    }
+
+    fn set_overlay(&mut self, title: String, edges: Vec<u32>, labels: HashMap<u32, String>, hops: HashMap<u32, usize>) {
+        self.overlay = Some(Overlay { title, edges, labels, hops });
+        self.requery(true);
+        self.arrange_by_hops();
+    }
+
+    /// Hosts in columns by hop, pinned, so a path reads left to right.
+    fn arrange_by_hops(&mut self) {
+        let Some(o) = &self.overlay else { return };
+        let mut per_hop: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, n) in self.graph.nodes.iter().enumerate() {
+            let k = o.hops.get(&n.host).copied().unwrap_or(0);
+            per_hop.entry(k).or_default().push(i);
+        }
+        for (k, idx) in per_hop {
+            let n = idx.len() as f32;
+            for (j, i) in idx.into_iter().enumerate() {
+                let y = (j as f32 - (n - 1.0) / 2.0) * 110.0;
+                self.layout.pos[i] = V2::new(k as f32 * 240.0, y);
+                self.layout.fixed[i] = true;
+            }
+        }
+        self.layout.stop();
+        self.fit_pending = true;
+    }
+
+    fn paths_window(&mut self, ctx: &egui::Context) {
+        if !self.show_paths {
+            return;
+        }
+        let mut open = true;
+        let mut find = false;
+        let mut cone: Option<bool> = None;
+        let mut pick: Option<usize> = None;
+        egui::Window::new("Paths").open(&mut open).default_width(560.0).resizable(true).show(ctx, |ui| {
+            ui.label(egui::RichText::new("A path is a chain of logins where every hop happens after the previous one and no later than the gap allowed; no host is entered twice. The cones say what a host could reach from the window's start, or what could have reached it by the window's end.").color(MUTED));
+            egui::Grid::new("paths-form").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Origin");
+                let r = ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.path_origin).hint_text("host or IP"));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    find = true;
+                }
+                ui.label("Destination");
+                let r = ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.path_dest).hint_text("host or IP"));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    find = true;
+                }
+                ui.end_row();
+                ui.label("Max hops");
+                ui.add(egui::DragValue::new(&mut self.path_hops).range(1..=12));
+                ui.label("Max gap per hop (h)");
+                ui.add(egui::DragValue::new(&mut self.path_gap_h).range(0.05..=24.0 * 90.0).speed(0.5).fixed_decimals(1));
+                ui.end_row();
+                ui.label("Max paths");
+                ui.add(egui::DragValue::new(&mut self.path_max).range(1..=2000).speed(1));
+                ui.label("Hops are");
+                ui.horizontal(|ui| {
+                    for (i, name) in RESULT_NAMES.iter().enumerate() {
+                        if ui.add(egui::Button::selectable(self.path_results[i], *name)).clicked() {
+                            self.path_results[i] = !self.path_results[i];
+                        }
+                    }
+                    ui.checkbox(&mut self.path_skip_machine, "no machine accounts");
+                });
+                ui.end_row();
+            });
+            ui.label(egui::RichText::new(format!("Time window: the bar's From / To ({} → {})", if self.filter.from.is_empty() { "start" } else { &self.filter.from }, if self.filter.to.is_empty() { "end" } else { &self.filter.to })).small().color(MUTED));
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("Find paths").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
+                    find = true;
+                }
+                if ui.button("Reach from origin").on_hover_text("earliest-arrival cone forward in time").clicked() {
+                    cone = Some(true);
+                }
+                if ui.button("Ways into destination").on_hover_text("cone backward in time").clicked() {
+                    cone = Some(false);
+                }
+                if self.overlay.is_some() && ui.button("Back to the view").clicked() {
+                    self.overlay = None;
+                    self.path_found.clear();
+                    self.path_msg.clear();
+                    self.requery(false);
+                }
+            });
+            if !self.path_msg.is_empty() {
+                ui.label(egui::RichText::new(&self.path_msg).color(if self.path_found.is_empty() && self.overlay.is_none() { CANDIDATE } else { TEXT }));
+            }
+            if !self.path_found.is_empty() {
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, p) in self.path_found.iter().enumerate() {
+                        let mut text = String::new();
+                        if let Some(&first) = p.edges.first() {
+                            text.push_str(self.store.hosts.name(self.store.edges[first as usize].src));
+                        }
+                        for &ei in &p.edges {
+                            let e = &self.store.edges[ei as usize];
+                            let u = self.store.users.name(e.user);
+                            text.push_str(&format!("  -({}{})->  {}", if u.is_empty() { "?" } else { u }, &fmt_time(e.t)[10..16].replace(' ', " "), self.store.hosts.name(e.dst)));
+                        }
+                        let span = p.span(&self.store);
+                        let label = format!("{}.  {} hop(s) · {}  ·  {}", i + 1, p.hops(), if span >= 3600 { format!("{:.1} h", span as f32 / 3600.0) } else { format!("{} min", span / 60) }, text);
+                        if ui.add(egui::Button::new(egui::RichText::new(label).small()).frame(false).wrap()).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            }
+        });
+        if find {
+            self.run_paths();
+        }
+        if let Some(f) = cone {
+            self.run_cone(f);
+        }
+        if let Some(i) = pick {
+            self.show_one_path(i);
+        }
+        if !open {
+            self.show_paths = false;
+        }
+    }
+
+    fn questions_window(&mut self, ctx: &egui::Context) {
+        if !self.show_questions {
+            return;
+        }
+        let mut open = true;
+        let mut focus: Option<String> = None;
+        egui::Window::new("Questions about this view").open(&mut open).default_width(720.0).default_height(560.0).resizable(true).show(ctx, |ui| {
+            ui.label(egui::RichText::new(format!("Over the {} rows the view holds. Click a host to open its neighbourhood.", self.graph.events.len())).color(MUTED));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let qs = paths::questions(&self.store, &self.graph.events, 10);
+                for (qi, q) in qs.iter().enumerate() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(q.title).strong());
+                    egui::Grid::new(("q", qi)).striped(true).spacing([12.0, 3.0]).show(ui, |ui| {
+                        for c in q.columns {
+                            ui.label(egui::RichText::new(c).small().color(MUTED));
+                        }
+                        ui.end_row();
+                        for (a, b, c) in &q.rows {
+                            if ui.add(egui::Button::new(egui::RichText::new(a).small()).frame(false)).clicked() {
+                                focus = Some(a.split(" -> ").next().unwrap_or(a).to_string());
+                            }
+                            ui.label(egui::RichText::new(b).small());
+                            ui.label(egui::RichText::new(c).small());
+                            ui.end_row();
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Centrality (PageRank, betweenness, distinct in / out)").strong());
+                let ranks = paths::ranking(&self.store, &self.graph.events);
+                egui::Grid::new("rank").striped(true).spacing([12.0, 3.0]).show(ui, |ui| {
+                    for c in ["host", "pagerank", "betweenness", "in", "out"] {
+                        ui.label(egui::RichText::new(c).small().color(MUTED));
+                    }
+                    ui.end_row();
+                    for r in ranks.iter().take(15) {
+                        let n = self.store.hosts.name(r.host).to_string();
+                        if ui.add(egui::Button::new(egui::RichText::new(&n).small()).frame(false)).clicked() {
+                            focus = Some(n.clone());
+                        }
+                        ui.label(egui::RichText::new(format!("{:.4}", r.pagerank)).small());
+                        ui.label(egui::RichText::new(format!("{:.4}", r.betweenness)).small());
+                        ui.label(egui::RichText::new(r.inn.to_string()).small());
+                        ui.label(egui::RichText::new(r.out.to_string()).small());
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if let Some(h) = focus {
+            self.overlay = None;
+            self.draft.view = View::Around;
+            self.draft.around = h;
+            self.requery(false);
+        }
+        if !open {
+            self.show_questions = false;
         }
     }
 
@@ -1814,7 +2165,24 @@ impl Viewer {
             "story" => self.show_story = true,
             "rules" => self.show_rules = true,
             "fit" => self.fit_pending = true,
+            "questions" => self.show_questions = true,
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            other if other.starts_with("paths=") => {
+                let spec = &other["paths=".len()..];
+                let mut it = spec.splitn(3, ':');
+                self.path_origin = it.next().unwrap_or("").to_string();
+                self.path_dest = it.next().unwrap_or("").to_string();
+                if let Some(g) = it.next().and_then(|g| g.parse::<f32>().ok()) {
+                    self.path_gap_h = g;
+                }
+                self.show_paths = true;
+                self.run_paths();
+            }
+            other if other.starts_with("cone=") => {
+                self.path_origin = other["cone=".len()..].to_string();
+                self.show_paths = true;
+                self.run_cone(true);
+            }
             other => {
                 if let Some(spec) = other.strip_prefix("record=") {
                     let parts: Vec<&str> = spec.split(':').collect();
@@ -2110,5 +2478,7 @@ impl eframe::App for Viewer {
         self.save_popup(&ctx);
         self.story_window(&ctx);
         self.export_window(&ctx);
+        self.paths_window(&ctx);
+        self.questions_window(&ctx);
     }
 }
