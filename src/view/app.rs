@@ -13,8 +13,9 @@ use std::collections::{HashMap, HashSet};
 use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 use super::layout::{Layout, V2};
-use super::query::{fmt_time, hunt_rank, Filter, GraphView, View};
-use super::store::{Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
+use super::query::{fmt_time, hunt_rank, Filter, GEdge, GraphView, Role, View};
+use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
+use super::views::{builtin_views, palette_color, Caption, ColorBy, Field, Rule, SavedView, Shape, Style, ViewsFile};
 use super::Options;
 
 // ───────────────────────────── palette ──────────────────────────────────────
@@ -118,8 +119,16 @@ pub struct Viewer {
     playing: bool,
     rate: f32,
     acc: f32,
-    show_edge_captions: bool,
     last_frame: std::time::Instant,
+    // style and saved views
+    style: Style,
+    views_path: std::path::PathBuf,
+    saved: Vec<SavedView>,
+    builtin: Vec<SavedView>,
+    preset: String,
+    show_rules: bool,
+    show_save: bool,
+    save_name: String,
 }
 
 impl Viewer {
@@ -161,6 +170,10 @@ impl Viewer {
         if filter.view == View::All && store.edges.len() > 200_000 && filter.from.is_empty() {
             filter.from = fmt_time(store.t_max - 86_400);
         }
+        let views_path = ViewsFile::path_for(&opts.files[0]);
+        let vf = ViewsFile::load(&views_path);
+        let style = vf.last_style.clone().unwrap_or_default();
+        let builtin = builtin_views(store.t_max);
         let mut v = Viewer {
             store,
             files: opts.files,
@@ -185,8 +198,15 @@ impl Viewer {
             playing: false,
             rate: 4.0,
             acc: 0.0,
-            show_edge_captions: true,
             last_frame: std::time::Instant::now(),
+            style,
+            views_path,
+            saved: vf.views,
+            builtin,
+            preset: String::new(),
+            show_rules: false,
+            show_save: false,
+            save_name: String::new(),
         };
         v.requery(true);
         v
@@ -414,9 +434,89 @@ impl Viewer {
                     d.verdict[i] = !d.verdict[i];
                 }
             }
-            ui.separator();
-            ui.checkbox(&mut self.show_edge_captions, "accounts on edges");
         });
+        let mut style_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("View").color(MUTED));
+            let mut pick: Option<SavedView> = None;
+            egui::ComboBox::from_id_salt("preset").selected_text(if self.preset.is_empty() { "presets…" } else { self.preset.as_str() }).width(220.0).show_ui(ui, |ui| {
+                ui.label(egui::RichText::new("BUILT IN").small().color(MUTED));
+                for v in &self.builtin {
+                    if ui.selectable_label(self.preset == v.name, &v.name).clicked() {
+                        pick = Some(v.clone());
+                    }
+                }
+                if !self.saved.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("SAVED").small().color(MUTED));
+                    for v in &self.saved {
+                        if ui.selectable_label(self.preset == v.name, &v.name).clicked() {
+                            pick = Some(v.clone());
+                        }
+                    }
+                }
+            });
+            if let Some(v) = pick {
+                self.preset = v.name.clone();
+                self.draft = v.filter.clone();
+                if self.saved.iter().any(|x| x.name == v.name) {
+                    self.style = v.style.clone();
+                    style_changed = true;
+                }
+                self.requery(false);
+            }
+            if ui.button("Save view…").on_hover_text("Keep the current filter and style under a name, next to the timeline").clicked() {
+                self.show_save = true;
+                if self.save_name.is_empty() {
+                    self.save_name = self.preset.clone();
+                }
+            }
+            if self.saved.iter().any(|x| x.name == self.preset) && ui.button("Delete view").clicked() {
+                let name = self.preset.clone();
+                self.saved.retain(|x| x.name != name);
+                self.preset.clear();
+                style_changed = true;
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Colour by").color(MUTED));
+            egui::ComboBox::from_id_salt("colorby").selected_text(self.style.color_by.label()).show_ui(ui, |ui| {
+                for c in ColorBy::ALL {
+                    if ui.selectable_value(&mut self.style.color_by, c, c.label()).changed() {
+                        style_changed = true;
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("On edges").color(MUTED));
+            egui::ComboBox::from_id_salt("caption").selected_text(self.style.caption.label()).show_ui(ui, |ui| {
+                for c in Caption::ALL {
+                    if ui.selectable_value(&mut self.style.caption, c, c.label()).changed() {
+                        style_changed = true;
+                    }
+                }
+            });
+            if ui.checkbox(&mut self.style.shapes_by_role, "shapes by role").on_hover_text("hexagon: domain controller · square: server · circle: workstation · diamond: external address").changed() {
+                style_changed = true;
+            }
+            ui.label(egui::RichText::new("Hosts").color(MUTED));
+            if ui.add(egui::DragValue::new(&mut self.style.node_scale).range(0.4..=2.5).speed(0.02).fixed_decimals(1)).changed() {
+                style_changed = true;
+            }
+            ui.label(egui::RichText::new("Edges").color(MUTED));
+            if ui.add(egui::DragValue::new(&mut self.style.edge_scale).range(0.3..=3.0).speed(0.02).fixed_decimals(1)).changed() {
+                style_changed = true;
+            }
+            ui.label(egui::RichText::new("Text").color(MUTED));
+            if ui.add(egui::DragValue::new(&mut self.style.font_scale).range(0.6..=2.0).speed(0.02).fixed_decimals(1)).changed() {
+                style_changed = true;
+            }
+            let n_rules = self.style.rules.iter().filter(|r| r.enabled).count();
+            if ui.selectable_label(self.show_rules, format!("Rules ({})", n_rules)).on_hover_text("condition -> colour, width, size, shape, dashes, glow, hide; first match wins").clicked() {
+                self.show_rules = !self.show_rules;
+            }
+        });
+        if style_changed {
+            self.persist();
+        }
         if apply {
             self.requery(false);
         }
@@ -688,6 +788,218 @@ impl Viewer {
         }
     }
 
+    // ───────────────────────── style ─────────────────────────
+
+    fn persist(&self) {
+        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()) };
+        if let Err(e) = vf.save(&self.views_path) {
+            eprintln!("masstin: cannot save {}: {}", self.views_path.display(), e);
+        }
+    }
+
+    fn save_popup(&mut self, ctx: &egui::Context) {
+        if !self.show_save {
+            return;
+        }
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new("Save view").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label("The current filter and style, under a name, in the views file next to the timeline.");
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.save_name).desired_width(260.0));
+                r.request_focus();
+            });
+            ui.label(egui::RichText::new(self.views_path.to_string_lossy()).small().color(MUTED));
+            ui.horizontal(|ui| {
+                let name = self.save_name.trim().to_string();
+                let exists = self.saved.iter().any(|v| v.name == name);
+                if ui.add_enabled(!name.is_empty(), egui::Button::new(if exists { "Replace" } else { "Save" })).clicked() {
+                    self.saved.retain(|v| v.name != name);
+                    self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style.clone() });
+                    self.saved.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    self.preset = name;
+                    self.persist();
+                    done = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    done = true;
+                }
+            });
+        });
+        if done || !open {
+            self.show_save = false;
+        }
+    }
+
+    fn rules_window(&mut self, ctx: &egui::Context) {
+        if !self.show_rules {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new("Style rules").open(&mut open).default_width(760.0).resizable(true).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Each rule: a field and a pattern (contains, * wildcards, ! not, commas for several; empty = everything), then the look it gives. The first rule that matches an edge or a host wins; rules on host and hunt also apply to hosts.").color(MUTED));
+            let mut remove: Option<usize> = None;
+            let mut swap: Option<(usize, usize)> = None;
+            let n = self.style.rules.len();
+            egui::Grid::new("rules").striped(true).min_col_width(30.0).show(ui, |ui| {
+                for h in ["on", "field", "pattern", "colour", "width", "size", "shape", "dashed", "glow", "hide", ""] {
+                    ui.label(egui::RichText::new(h).small().color(MUTED));
+                }
+                ui.end_row();
+                for i in 0..n {
+                    let r = &mut self.style.rules[i];
+                    changed |= ui.checkbox(&mut r.enabled, "").changed();
+                    egui::ComboBox::from_id_salt(("field", i)).selected_text(r.field.label()).width(90.0).show_ui(ui, |ui| {
+                        for f in Field::ALL {
+                            changed |= ui.selectable_value(&mut r.field, f, f.label()).changed();
+                        }
+                    });
+                    changed |= ui.add_sized([170.0, 20.0], egui::TextEdit::singleline(&mut r.pattern).hint_text("adm*, !*$")).changed();
+                    let mut has_color = r.color.is_some();
+                    if ui.checkbox(&mut has_color, "").changed() {
+                        r.color = if has_color { Some([255, 196, 84]) } else { None };
+                        changed = true;
+                    }
+                    if let Some(c) = &mut r.color {
+                        changed |= ui.color_edit_button_srgb(c).changed();
+                    }
+                    changed |= ui.add(egui::DragValue::new(&mut r.width).range(0.2..=6.0).speed(0.05).fixed_decimals(1)).changed();
+                    changed |= ui.add(egui::DragValue::new(&mut r.size).range(0.3..=3.0).speed(0.05).fixed_decimals(1)).changed();
+                    egui::ComboBox::from_id_salt(("shape", i)).selected_text(r.shape.map(|s| s.label()).unwrap_or("-")).width(80.0).show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut r.shape, None, "-").changed();
+                        for sh in Shape::ALL {
+                            changed |= ui.selectable_value(&mut r.shape, Some(sh), sh.label()).changed();
+                        }
+                    });
+                    changed |= ui.checkbox(&mut r.dashed, "").changed();
+                    changed |= ui.checkbox(&mut r.glow, "").changed();
+                    changed |= ui.checkbox(&mut r.hide, "").changed();
+                    ui.horizontal(|ui| {
+                        if i > 0 && ui.small_button("up").clicked() {
+                            swap = Some((i, i - 1));
+                        }
+                        if i + 1 < n && ui.small_button("down").clicked() {
+                            swap = Some((i, i + 1));
+                        }
+                        if ui.small_button("x").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            if let Some((a, b)) = swap {
+                self.style.rules.swap(a, b);
+                changed = true;
+            }
+            if let Some(i) = remove {
+                self.style.rules.remove(i);
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+ rule").clicked() {
+                    self.style.rules.push(Rule::default());
+                    changed = true;
+                }
+                if ui.button("+ account in colour").on_hover_text("colour every edge of one account").clicked() {
+                    self.style.rules.push(Rule { field: Field::User, pattern: "jdoe".into(), color: Some([255, 196, 84]), width: 1.6, ..Default::default() });
+                    changed = true;
+                }
+                if ui.button("+ hide machine accounts").clicked() {
+                    self.style.rules.push(Rule { field: Field::User, pattern: "*$".into(), color: None, hide: true, ..Default::default() });
+                    changed = true;
+                }
+                if ui.button("+ fade benign").clicked() {
+                    self.style.rules.push(Rule { field: Field::Verdict, pattern: "benign".into(), color: Some([90, 96, 110]), width: 0.6, ..Default::default() });
+                    changed = true;
+                }
+                if ui.button("+ domain controllers as hexagons").clicked() {
+                    self.style.rules.push(Rule { field: Field::Host, pattern: "*DC*".into(), color: Some([201, 144, 192]), shape: Some(Shape::Hexagon), size: 1.3, ..Default::default() });
+                    changed = true;
+                }
+            });
+        });
+        if changed {
+            self.persist();
+        }
+        if !open {
+            self.show_rules = false;
+        }
+    }
+
+    /// Patterns of the enabled rules, compiled once per frame.
+    fn compiled_rules(&self) -> Vec<(usize, Vec<Pattern>)> {
+        self.style.rules.iter().enumerate().filter(|(_, r)| r.enabled).map(|(i, r)| (i, Pattern::parse_list(&r.pattern))).collect()
+    }
+
+    fn rule_hits_edge(&self, rule: &Rule, pats: &[Pattern], e: &GEdge) -> bool {
+        let s = &self.store;
+        match rule.field {
+            Field::Host => [e.src, e.dst].iter().any(|&h| s.aliases[h as usize].iter().any(|a| Pattern::any(pats, a))),
+            Field::User => e.users.iter().any(|&u| Pattern::any(pats, s.users.name(u))),
+            Field::LogonType => e.logon_types.iter().any(|&k| Pattern::any(pats, s.logon_types.name(k))),
+            Field::EventId => e.event_ids.iter().any(|&k| Pattern::any(pats, s.event_ids.name(k))),
+            Field::Result => Pattern::any(pats, RESULT_NAMES[e.result as usize]),
+            Field::Hunt => Pattern::any(pats, if HUNT_NAMES[e.hunt as usize].is_empty() { "none" } else { HUNT_NAMES[e.hunt as usize] }),
+            Field::Verdict => Pattern::any(pats, if e.verdict() == 0 { "none" } else { VERDICT_NAMES[e.verdict() as usize] }),
+        }
+    }
+
+    fn rule_hits_node(&self, rule: &Rule, pats: &[Pattern], i: usize) -> bool {
+        let n = &self.graph.nodes[i];
+        match rule.field {
+            Field::Host => self.store.aliases[n.host as usize].iter().any(|a| Pattern::any(pats, a)),
+            Field::Hunt => Pattern::any(pats, match n.hunt_rank {
+                0 => "significant",
+                1 => "candidate",
+                2 => "not_evaluated",
+                3 => "habitual",
+                4 => "baseline",
+                _ => "none",
+            }),
+            _ => false,
+        }
+    }
+
+    /// Base colour of an edge for the chosen "colour by".
+    fn edge_base_color(&self, e: &GEdge) -> Color32 {
+        let c3 = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+        match self.style.color_by {
+            ColorBy::Result => hunt_color(e.hunt).unwrap_or_else(|| result_color(e.result)),
+            ColorBy::User => match e.user {
+                Some(u) => c3(palette_color(u)),
+                None => EDGE_OK,
+            },
+            ColorBy::LogonType => e.logon_types.first().map(|&k| c3(palette_color(k))).unwrap_or(EDGE_OK),
+            ColorBy::Hunt => hunt_color(e.hunt).unwrap_or(match e.hunt {
+                super::store::H_HABITUAL => EDGE_OK,
+                super::store::H_BASELINE => EDGE_LOGOFF,
+                super::store::H_NOT_EVALUATED => Color32::from_rgb(120, 130, 150),
+                _ => Color32::from_rgb(80, 86, 98),
+            }),
+            ColorBy::Verdict => verdict_color(e.verdict()).unwrap_or(Color32::from_rgb(90, 96, 110)),
+        }
+    }
+
+    fn edge_caption(&self, e: &GEdge) -> String {
+        let user = || match e.user {
+            Some(u) => self.store.users.name(u).to_string(),
+            None => format!("{} accounts", e.users.len()),
+        };
+        let time = || fmt_time(e.first)[11..16].to_string();
+        let text = match self.style.caption {
+            Caption::None => String::new(),
+            Caption::User => user(),
+            Caption::Time => time(),
+            Caption::LogonType => e.logon_types.iter().map(|&k| self.store.logon_types.name(k)).collect::<Vec<_>>().join(", "),
+            Caption::UserTime => format!("{} · {}", user(), time()),
+            Caption::Count => format!("{} event(s)", e.count),
+        };
+        if text.chars().count() > 26 { format!("{}…", text.chars().take(25).collect::<String>()) } else { text }
+    }
+
     // ───────────────────────── UI: canvas ─────────────────────────
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -796,6 +1108,7 @@ impl Viewer {
         let z = self.zoom;
 
         // ── edges ──
+        let rules = self.compiled_rules();
         let geom = self.edge_geometry();
         let max_count = self.graph.edges.iter().map(|e| e.count).max().unwrap_or(1).max(1) as f32;
         for (k, e) in self.graph.edges.iter().enumerate() {
@@ -808,14 +1121,31 @@ impl Viewer {
             let pc = self.to_screen(canvas, ctrl);
             let lit = lit_edges.contains(&k);
             let alpha = if dimmed && !lit { 0.12 } else { 1.0 };
-            let base = (1.2 + 3.0 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln()) * z.sqrt();
-            let color = hunt_color(e.hunt).unwrap_or_else(|| result_color(e.result));
-            let width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.8 } else { base };
+            let base = (1.2 + 3.0 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln()) * z.sqrt() * self.style.edge_scale;
+            let mut color = self.edge_base_color(e);
+            let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.8 } else { base };
+            let mut dashed = e.result == R_LOGOFF || e.result == R_CONNECT;
+            let mut glow = false;
+            if let Some((ri, _)) = rules.iter().find(|(ri, pats)| self.rule_hits_edge(&self.style.rules[*ri], pats, e)) {
+                let r = &self.style.rules[*ri];
+                if r.hide {
+                    continue;
+                }
+                if let Some(c) = r.color {
+                    color = Color32::from_rgb(c[0], c[1], c[2]);
+                }
+                width *= r.width;
+                dashed |= r.dashed;
+                glow = r.glow;
+            }
+            if glow {
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 10.0 * z.sqrt(), dim(color, 0.22 * alpha)) });
+            }
             if let Some(vc) = verdict_color(e.verdict()) {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 7.0 * z.sqrt(), dim(vc, 0.35 * alpha)) });
             }
             let stroke_color = if lit && self.selected == Some(Sel::Edge(k)) { ACCENT } else { dim(color, alpha) };
-            if e.result == R_LOGOFF || e.result == R_CONNECT {
+            if dashed {
                 // dotted: short dashes along the curve
                 let steps = ((pa - pb).length() / (6.0 * z.sqrt().max(0.6))).clamp(4.0, 200.0) as usize;
                 for s in 0..steps {
@@ -837,18 +1167,11 @@ impl Viewer {
             let right = tip - dir * size - dir.rot90() * size * 0.5;
             painter.add(egui::Shape::convex_polygon(vec![tip, left, right], stroke_color, Stroke::NONE));
             // the account on the edge, like Neo4j's relationship caption
-            if self.show_edge_captions && (z > 0.6 || lit) && (pa - pb).length() > 90.0 {
-                let caption = match e.user {
-                    Some(u) => {
-                        let s = self.store.users.name(u);
-                        if s.is_empty() { String::new() } else { s.to_string() }
-                    }
-                    None => format!("{} accounts", e.users.len()),
-                };
-                let caption: String = if caption.chars().count() > 22 { format!("{}…", caption.chars().take(21).collect::<String>()) } else { caption };
+            if self.style.caption != Caption::None && (z > 0.6 || lit) && (pa - pb).length() > 90.0 {
+                let caption = self.edge_caption(e);
                 if !caption.is_empty() {
                     let mid = bez(pa, pc, pb, 0.5);
-                    let font = FontId::proportional((10.0 * z.sqrt()).clamp(8.0, 13.0));
+                    let font = FontId::proportional((10.0 * z.sqrt() * self.style.font_scale).clamp(7.0, 16.0));
                     let galley = painter.layout_no_wrap(caption, font, dim(TEXT, alpha));
                     let r = Rect::from_center_size(mid, galley.size() + Vec2::new(8.0, 3.0));
                     painter.rect_filled(r, CornerRadius::same(3), dim(CAPTION_BG, alpha));
@@ -863,25 +1186,64 @@ impl Viewer {
                 continue;
             }
             let p = self.to_screen(canvas, self.layout.pos[i]);
-            let r = self.layout.radius[i] * z;
-            if !canvas.expand(r).contains(p) {
+            let mut r = self.layout.radius[i] * z * self.style.node_scale;
+            if !canvas.expand(r * 2.0).contains(p) {
                 continue;
             }
             let name = self.store.hosts.name(n.host);
             let is_ip = crate::load_neo4j::looks_like_ip(name);
             let lit = lit_nodes.contains(&i);
             let alpha = if dimmed && !lit { 0.18 } else { 1.0 };
-            let (fill, ring) = if is_ip { (IP_FILL, IP_RING) } else { (HOST_FILL, HOST_RING) };
+            let (mut fill, mut ring) = if self.style.shapes_by_role {
+                match n.role {
+                    Role::DomainController => (Color32::from_rgb(201, 144, 192), Color32::from_rgb(160, 100, 150)),
+                    Role::External => (IP_FILL, IP_RING),
+                    Role::Server => (Color32::from_rgb(76, 142, 218), Color32::from_rgb(50, 105, 175)),
+                    _ => if is_ip { (IP_FILL, IP_RING) } else { (HOST_FILL, HOST_RING) },
+                }
+            } else if is_ip {
+                (IP_FILL, IP_RING)
+            } else {
+                (HOST_FILL, HOST_RING)
+            };
+            let mut shape = if self.style.shapes_by_role {
+                match n.role {
+                    Role::DomainController => Shape::Hexagon,
+                    Role::External => Shape::Diamond,
+                    Role::Server => Shape::Square,
+                    _ => Shape::Circle,
+                }
+            } else {
+                Shape::Circle
+            };
+            let mut glow = false;
+            if let Some((ri, _)) = rules.iter().filter(|(ri, _)| self.style.rules[*ri].field.on_nodes()).find(|(ri, pats)| self.rule_hits_node(&self.style.rules[*ri], pats, i)) {
+                let rule = &self.style.rules[*ri];
+                if rule.hide {
+                    continue;
+                }
+                if let Some(c) = rule.color {
+                    fill = Color32::from_rgb(c[0], c[1], c[2]);
+                    ring = Color32::from_rgb((c[0] as f32 * 0.75) as u8, (c[1] as f32 * 0.75) as u8, (c[2] as f32 * 0.75) as u8);
+                }
+                if let Some(sh) = rule.shape {
+                    shape = sh;
+                }
+                r *= rule.size;
+                glow = rule.glow;
+            }
             let ring = if n.hunt_rank == 0 { SIGNIFICANT } else { ring };
             let selected = self.selected == Some(Sel::Node(i));
-            if selected || self.hovered == Some(Sel::Node(i)) {
-                painter.circle_filled(p, r + 6.0, dim(if selected { ACCENT } else { Color32::WHITE }, 0.25));
+            if glow {
+                draw_shape(&painter, shape, p, r + 9.0 * z.sqrt(), dim(fill, 0.22 * alpha), None);
             }
-            painter.circle_filled(p, r, dim(fill, alpha));
-            painter.circle_stroke(p, r, Stroke::new((2.5 * z).clamp(1.0, 4.0) * if n.hunt_rank == 0 { 1.8 } else { 1.0 }, dim(ring, alpha)));
+            if selected || self.hovered == Some(Sel::Node(i)) {
+                draw_shape(&painter, shape, p, r + 6.0, dim(if selected { ACCENT } else { Color32::WHITE }, 0.25), None);
+            }
+            draw_shape(&painter, shape, p, r, dim(fill, alpha), Some(Stroke::new((2.5 * z).clamp(1.0, 4.0) * if n.hunt_rank == 0 { 1.8 } else { 1.0 }, dim(ring, alpha))));
             if r > 8.0 {
                 let chars = name.chars().count().max(1) as f32;
-                let wanted = (11.0 * z.sqrt()).clamp(7.0, 14.0);
+                let wanted = (11.0 * z.sqrt() * self.style.font_scale).clamp(7.0, 18.0);
                 let fits = (r * 1.8) / (chars * 0.56);
                 let font_size = wanted.min(fits).max(6.5);
                 let max_chars = ((r * 1.8) / (font_size * 0.56)).floor().max(3.0) as usize;
@@ -920,18 +1282,10 @@ impl Viewer {
             painter.galley(r.min + Vec2::new(7.0, 3.0), galley, Color32::from_rgb(20, 24, 30));
             x += r.width() + 6.0;
         }
-        let mut per_result = [0usize; 4];
-        for e in &self.graph.edges {
-            per_result[e.result as usize] += 1;
-        }
         let mut x = canvas.left() + 12.0;
         let y = y + 30.0;
-        for (i, n) in per_result.iter().enumerate() {
-            if *n == 0 {
-                continue;
-            }
-            let c = result_color(i as u8);
-            let galley = painter.layout_no_wrap(format!("{} ({})", RESULT_NAMES[i], n), FontId::proportional(11.0), TEXT);
+        for (text, c, n) in self.legend_chips() {
+            let galley = painter.layout_no_wrap(format!("{} ({})", text, n), FontId::proportional(11.0), TEXT);
             let r = Rect::from_min_size(Pos2::new(x, y), galley.size() + Vec2::new(14.0, 6.0));
             painter.rect_filled(r, CornerRadius::same(12), Color32::from_rgb(44, 48, 58));
             painter.rect_stroke(r, CornerRadius::same(12), Stroke::new(1.5, c), egui::StrokeKind::Inside);
@@ -994,7 +1348,7 @@ impl Viewer {
                 continue;
             }
             let c = self.to_screen(canvas, self.layout.pos[i]);
-            let r = self.layout.radius[i] * self.zoom;
+            let r = self.layout.radius[i] * self.zoom * self.style.node_scale;
             let d = (c - p).length();
             if d <= r + 2.0 && best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, Sel::Node(i)));
@@ -1022,6 +1376,67 @@ impl Viewer {
             }
         }
         best.map(|(_, s)| s)
+    }
+}
+
+impl Viewer {
+    /// The chips under the host chips: the categories of the current
+    /// "colour by", most frequent first.
+    fn legend_chips(&self) -> Vec<(String, Color32, usize)> {
+        let c3 = |c: [u8; 3]| Color32::from_rgb(c[0], c[1], c[2]);
+        let mut counts: HashMap<(String, [u8; 4]), usize> = HashMap::new();
+        for e in &self.graph.edges {
+            let (text, color) = match self.style.color_by {
+                ColorBy::Result => (RESULT_NAMES[e.result as usize].to_string(), result_color(e.result)),
+                ColorBy::User => match e.user {
+                    Some(u) => (self.store.users.name(u).to_string(), c3(palette_color(u))),
+                    None => ("several accounts".to_string(), EDGE_OK),
+                },
+                ColorBy::LogonType => match e.logon_types.first() {
+                    Some(&k) => (format!("type {}", self.store.logon_types.name(k)), c3(palette_color(k))),
+                    None => ("no type".to_string(), EDGE_OK),
+                },
+                ColorBy::Hunt => ((if HUNT_NAMES[e.hunt as usize].is_empty() { "not hunted" } else { HUNT_NAMES[e.hunt as usize] }).to_string(), self.edge_base_color(e)),
+                ColorBy::Verdict => ((if e.verdict() == 0 { "unmarked" } else { VERDICT_NAMES[e.verdict() as usize] }).to_string(), self.edge_base_color(e)),
+            };
+            *counts.entry((text, color.to_array())).or_insert(0) += 1;
+        }
+        let mut v: Vec<(String, Color32, usize)> = counts.into_iter().map(|((t, c), n)| (t, Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3]), n)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(10);
+        v
+    }
+}
+
+/// A host's shape: circle, rounded square, diamond or hexagon of
+/// "radius" `r`, filled, with an optional ring.
+fn draw_shape(painter: &egui::Painter, shape: Shape, c: Pos2, r: f32, fill: Color32, ring: Option<Stroke>) {
+    match shape {
+        Shape::Circle => {
+            painter.circle_filled(c, r, fill);
+            if let Some(s) = ring {
+                painter.circle_stroke(c, r, s);
+            }
+        }
+        Shape::Square => {
+            let rect = Rect::from_center_size(c, Vec2::splat(r * 1.8));
+            let cr = CornerRadius::same((r * 0.3).clamp(2.0, 40.0) as u8);
+            painter.rect_filled(rect, cr, fill);
+            if let Some(s) = ring {
+                painter.rect_stroke(rect, cr, s, egui::StrokeKind::Inside);
+            }
+        }
+        Shape::Diamond => {
+            let pts = vec![Pos2::new(c.x, c.y - r * 1.15), Pos2::new(c.x + r * 1.15, c.y), Pos2::new(c.x, c.y + r * 1.15), Pos2::new(c.x - r * 1.15, c.y)];
+            painter.add(egui::Shape::convex_polygon(pts, fill, ring.unwrap_or(Stroke::NONE)));
+        }
+        Shape::Hexagon => {
+            let pts: Vec<Pos2> = (0..6).map(|k| {
+                let a = std::f32::consts::PI / 3.0 * k as f32 + std::f32::consts::PI / 6.0;
+                Pos2::new(c.x + r * 1.1 * a.cos(), c.y + r * 1.1 * a.sin())
+            }).collect();
+            painter.add(egui::Shape::convex_polygon(pts, fill, ring.unwrap_or(Stroke::NONE)));
+        }
     }
 }
 
@@ -1064,5 +1479,7 @@ impl eframe::App for Viewer {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.details(ui));
         });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
+        self.rules_window(&ctx);
+        self.save_popup(&ctx);
     }
 }

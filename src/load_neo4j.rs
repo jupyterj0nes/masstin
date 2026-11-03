@@ -806,7 +806,8 @@ pub async fn load_neo4j(
                 };
                 if let Some(t) = crate::graph_hunt_common::parse_ts(&edge.time) {
                     let t = t.and_utc().timestamp();
-                    let raw_file = crate::graph_hunt_common::engine::csv_fields(&line).pop().unwrap_or_default();
+                    // the log file by its column: the analysis tail follows it since v1.4.0
+                    let raw_file = crate::graph_hunt_common::engine::csv_fields(&line).get(idx.log_source).cloned().unwrap_or_default();
                     let e = file_spans.entry((edge.destination.clone(), raw_file)).or_insert((t, t));
                     if t < e.0 { e.0 = t; }
                     if t > e.1 { e.1 = t; }
