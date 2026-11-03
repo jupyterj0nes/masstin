@@ -15,6 +15,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec
 use super::layout::{Layout, V2};
 use super::query::{fmt_time, hunt_rank, Filter, GEdge, GraphView, Role, View};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
+use super::present::{self, Anonymiser, Format, Step, StepOverride, Story, Timing};
 use super::views::{builtin_views, palette_color, Caption, ColorBy, Field, Rule, SavedView, Shape, Style, ViewsFile};
 use super::Options;
 
@@ -129,6 +130,39 @@ pub struct Viewer {
     show_rules: bool,
     show_save: bool,
     save_name: String,
+    // presentation and recording
+    story: Story,
+    story_path: std::path::PathBuf,
+    steps: Vec<Step>,
+    step_of_event: Vec<usize>,
+    presenting: bool,
+    present_t: f32,
+    present_playing: bool,
+    show_story: bool,
+    anon: Anonymiser,
+    show_export: bool,
+    export_fps: u32,
+    export_format: Format,
+    export_size: usize,
+    export_name: String,
+    export: Option<ExportJob>,
+    ffmpeg: Option<bool>,
+    auto: Vec<String>,
+    auto_next: std::time::Instant,
+}
+
+/// A recording in progress: one screenshot per frame, streamed to the
+/// encoder on its thread.
+struct ExportJob {
+    fps: u32,
+    out: std::path::PathBuf,
+    total: usize,
+    next: usize,
+    waiting: bool,
+    rx: std::sync::mpsc::Receiver<(usize, std::sync::Arc<egui::ColorImage>)>,
+    tx: std::sync::mpsc::Sender<(usize, std::sync::Arc<egui::ColorImage>)>,
+    restore: Option<Vec2>,
+    rec: present::Recorder,
 }
 
 impl Viewer {
@@ -174,6 +208,8 @@ impl Viewer {
         let vf = ViewsFile::load(&views_path);
         let style = vf.last_style.clone().unwrap_or_default();
         let builtin = builtin_views(store.t_max);
+        let story_path = Story::path_for(&opts.files[0]);
+        let story = Story::load(&story_path);
         let mut v = Viewer {
             store,
             files: opts.files,
@@ -207,6 +243,24 @@ impl Viewer {
             show_rules: false,
             show_save: false,
             save_name: String::new(),
+            story,
+            story_path,
+            steps: Vec::new(),
+            step_of_event: Vec::new(),
+            presenting: false,
+            present_t: 0.0,
+            present_playing: false,
+            show_story: false,
+            anon: Anonymiser::new(),
+            show_export: false,
+            export_fps: 30,
+            export_format: Format::Gif,
+            export_size: 0,
+            export_name: String::new(),
+            export: None,
+            ffmpeg: None,
+            auto: std::env::var("MASSTIN_VIEW_AUTO").ok().map(|v| v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()).unwrap_or_default(),
+            auto_next: std::time::Instant::now() + std::time::Duration::from_secs(2),
         };
         v.requery(true);
         v
@@ -248,6 +302,7 @@ impl Viewer {
         if g.truncated {
             parts.push("limit reached: narrow the filters or raise the limit".into());
         }
+        self.rebuild_steps();
         self.status = parts.join("  ·  ");
         self.fit_pending = true;
     }
@@ -256,7 +311,8 @@ impl Viewer {
         if let Some((lo, hi)) = self.layout.bounds() {
             let w = (hi.x - lo.x).max(50.0) + 80.0;
             let h = (hi.y - lo.y).max(50.0) + 80.0;
-            self.zoom = (canvas.width() / w).min(canvas.height() / h).clamp(0.05, 1.0);
+            let max_zoom = if self.presenting { 1.8 } else { 1.0 };
+            self.zoom = (canvas.width() / w).min(canvas.height() / h).clamp(0.05, max_zoom);
             self.cam = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
         }
     }
@@ -273,12 +329,111 @@ impl Viewer {
 
     // ───────────────────────── replay ─────────────────────────
 
+    fn rebuild_steps(&mut self) {
+        let events: Vec<(i64, String, bool)> = self.graph.events.iter().map(|&ei| {
+            let e = &self.store.edges[ei as usize];
+            (e.t, format!("{}:{}", e.file, e.line), e.hunt == super::store::H_SIGNIFICANT)
+        }).collect();
+        self.steps = present::build_steps(&events, &self.story);
+        self.step_of_event = vec![usize::MAX; self.graph.events.len()];
+        for (k, st) in self.steps.iter().enumerate() {
+            for ev in st.from..st.to {
+                self.step_of_event[ev] = k;
+            }
+        }
+    }
+
+    fn save_story(&self) {
+        if let Err(e) = self.story.save(&self.story_path) {
+            eprintln!("masstin: cannot save {}: {}", self.story_path.display(), e);
+        }
+    }
+
+    /// How much of the view is revealed: events fully shown, and the
+    /// range of events being drawn right now with its progress.
+    fn reveal(&self) -> (usize, Option<(usize, usize, f32)>) {
+        if !self.presenting {
+            return (self.cursor, None);
+        }
+        match present::at(&self.steps, self.present_t) {
+            None => (0, None),
+            Some((k, p)) => {
+                let st = &self.steps[k];
+                if p >= 1.0 {
+                    (st.to, None)
+                } else {
+                    (st.from, Some((st.from, st.to, p)))
+                }
+            }
+        }
+    }
+
+    /// The step a presentation is in, if any.
+    fn current_step(&self) -> Option<usize> {
+        if !self.presenting {
+            return None;
+        }
+        present::at(&self.steps, self.present_t).map(|(k, _)| k)
+    }
+
     fn edge_visible(&self, i: usize) -> bool {
-        self.graph.edges[i].first_event < self.cursor
+        let (done, drawing) = self.reveal();
+        let f = self.graph.edges[i].first_event;
+        f < done || drawing.map_or(false, |(a, b, _)| f >= a && f < b)
+    }
+
+    /// 0..1 while an edge is being drawn in a presentation, 1 when whole.
+    fn edge_progress(&self, i: usize) -> f32 {
+        let (done, drawing) = self.reveal();
+        let f = self.graph.edges[i].first_event;
+        if f < done {
+            return 1.0;
+        }
+        drawing.map(|(_, _, p)| p).unwrap_or(1.0)
     }
 
     fn node_visible(&self, i: usize) -> bool {
-        self.graph.nodes[i].first_event < self.cursor
+        let (done, drawing) = self.reveal();
+        let f = self.graph.nodes[i].first_event;
+        f < done || drawing.map_or(false, |(a, b, p)| f >= a && f < b && p > 0.45)
+    }
+
+    /// A host's name as shown (a stand-in when the story is anonymised).
+    fn host_label(&self, host: u32) -> String {
+        let name = self.store.hosts.name(host).to_string();
+        if self.presenting && self.story.anonymise {
+            let is_ip = crate::load_neo4j::looks_like_ip(&name);
+            self.anon.host(host, is_ip)
+        } else {
+            name
+        }
+    }
+
+    fn user_label(&self, user: u32) -> String {
+        if self.presenting && self.story.anonymise {
+            self.anon.user(user)
+        } else {
+            self.store.users.name(user).to_string()
+        }
+    }
+
+    fn start_presentation(&mut self) {
+        self.rebuild_steps();
+        self.presenting = true;
+        self.present_t = 0.0;
+        self.present_playing = true;
+        self.selected = None;
+        self.hovered = None;
+        self.anon = Anonymiser::new();
+        self.layout.stop();
+        // the canvas is the whole window now: frame the graph again
+        self.fit_pending = true;
+    }
+
+    fn stop_presentation(&mut self) {
+        self.presenting = false;
+        self.present_playing = false;
+        self.cursor = self.graph.events.len();
     }
 
     // ───────────────────────── rows & marks ─────────────────────────
@@ -544,7 +699,7 @@ impl Viewer {
                 }
             });
             let mut c = self.cursor;
-            ui.spacing_mut().slider_width = (ui.available_width() - 340.0).max(200.0);
+            ui.spacing_mut().slider_width = (ui.available_width() - 500.0).max(160.0);
             ui.add(egui::Slider::new(&mut c, 0..=n.max(1)).show_value(false));
             if c != self.cursor {
                 self.cursor = c;
@@ -561,6 +716,16 @@ impl Viewer {
             if ui.button("All").clicked() {
                 self.cursor = n;
                 self.playing = false;
+            }
+            ui.separator();
+            if ui.add(egui::Button::new(egui::RichText::new("Present").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).on_hover_text("Play the story full screen (Esc leaves)").clicked() {
+                self.start_presentation();
+            }
+            if ui.selectable_label(self.show_story, "Story…").on_hover_text("Timing, captions, per-step settings, recording").clicked() {
+                self.show_story = !self.show_story;
+                if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                    eprintln!("[view] story window: {}", self.show_story);
+                }
             }
         });
     }
@@ -984,8 +1149,9 @@ impl Viewer {
     }
 
     fn edge_caption(&self, e: &GEdge) -> String {
+        let anonym = self.presenting && self.story.anonymise;
         let user = || match e.user {
-            Some(u) => self.store.users.name(u).to_string(),
+            Some(u) => if anonym { self.anon.user(u) } else { self.store.users.name(u).to_string() },
             None => format!("{} accounts", e.users.len()),
         };
         let time = || fmt_time(e.first)[11..16].to_string();
@@ -1117,10 +1283,27 @@ impl Viewer {
             }
             let (a, b, ctrl) = geom[k];
             let pa = self.to_screen(canvas, a);
-            let pb = self.to_screen(canvas, b);
-            let pc = self.to_screen(canvas, ctrl);
+            let pb_full = self.to_screen(canvas, b);
+            let pc_full = self.to_screen(canvas, ctrl);
+            let progress = self.edge_progress(k);
+            // while a presentation draws the edge, the curve grows from the origin
+            let (pb, pc) = if progress < 1.0 {
+                let pm = bez(pa, pc_full, pb_full, progress);
+                let cm = Pos2::new(pa.x + (pc_full.x - pa.x) * progress, pa.y + (pc_full.y - pa.y) * progress);
+                (pm, cm)
+            } else {
+                (pb_full, pc_full)
+            };
             let lit = lit_edges.contains(&k);
-            let alpha = if dimmed && !lit { 0.12 } else { 1.0 };
+            let mut alpha = if dimmed && !lit { 0.12 } else { 1.0 };
+            if self.presenting && self.story.fade_old {
+                if let (Some(cur), Some(&st)) = (self.current_step(), self.step_of_event.get(e.first_event)) {
+                    if st != usize::MAX && cur > st + 8 {
+                        alpha *= 0.3;
+                    }
+                }
+            }
+            let emphasised = self.presenting && self.step_of_event.get(e.first_event).and_then(|&st| self.steps.get(st)).map_or(false, |st| st.emphasis || (st.significant && progress < 1.0));
             let base = (1.2 + 3.0 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln()) * z.sqrt() * self.style.edge_scale;
             let mut color = self.edge_base_color(e);
             let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.8 } else { base };
@@ -1138,8 +1321,8 @@ impl Viewer {
                 dashed |= r.dashed;
                 glow = r.glow;
             }
-            if glow {
-                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 10.0 * z.sqrt(), dim(color, 0.22 * alpha)) });
+            if glow || emphasised || progress < 1.0 {
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 10.0 * z.sqrt(), dim(color, if progress < 1.0 { 0.45 } else { 0.22 } * alpha)) });
             }
             if let Some(vc) = verdict_color(e.verdict()) {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 7.0 * z.sqrt(), dim(vc, 0.35 * alpha)) });
@@ -1160,6 +1343,9 @@ impl Viewer {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width, stroke_color) });
             }
             // arrowhead at the destination's rim
+            if progress < 1.0 {
+                continue;
+            }
             let dir = (pb - bez(pa, pc, pb, 0.92)).normalized();
             let size = (7.0 + width * 1.5).min(16.0) * z.sqrt().max(0.5);
             let tip = pb;
@@ -1190,10 +1376,20 @@ impl Viewer {
             if !canvas.expand(r * 2.0).contains(p) {
                 continue;
             }
-            let name = self.store.hosts.name(n.host);
-            let is_ip = crate::load_neo4j::looks_like_ip(name);
+            let raw_name = self.store.hosts.name(n.host).to_string();
+            let is_ip = crate::load_neo4j::looks_like_ip(&raw_name);
+            let shown_name = if self.presenting && self.story.anonymise { self.anon.host(n.host, is_ip) } else { raw_name.clone() };
+            let name = shown_name.as_str();
             let lit = lit_nodes.contains(&i);
             let alpha = if dimmed && !lit { 0.18 } else { 1.0 };
+            // a host that has just appeared in a presentation pops a little
+            if self.presenting {
+                if let (_, Some((a, b, p))) = self.reveal() {
+                    if n.first_event >= a && n.first_event < b {
+                        r *= 1.0 + 0.35 * (1.0 - ((p - 0.45) / 0.55).clamp(0.0, 1.0));
+                    }
+                }
+            }
             let (mut fill, mut ring) = if self.style.shapes_by_role {
                 match n.role {
                     Role::DomainController => (Color32::from_rgb(201, 144, 192), Color32::from_rgb(160, 100, 150)),
@@ -1293,7 +1489,402 @@ impl Viewer {
             x += r.width() + 6.0;
         }
         // zoom hint, bottom right
-        painter.text(Pos2::new(canvas.right() - 10.0, canvas.bottom() - 8.0), Align2::RIGHT_BOTTOM, format!("{:.0} %", self.zoom * 100.0), FontId::proportional(11.0), MUTED);
+        if !self.presenting {
+            painter.text(Pos2::new(canvas.right() - 10.0, canvas.bottom() - 8.0), Align2::RIGHT_BOTTOM, format!("{:.0} %", self.zoom * 100.0), FontId::proportional(11.0), MUTED);
+        } else {
+            self.presentation_overlays(&painter, canvas);
+        }
+    }
+
+    fn presentation_overlays(&mut self, painter: &egui::Painter, canvas: Rect) {
+        let fs = self.style.font_scale;
+        if !self.story.title.is_empty() {
+            painter.text(Pos2::new(canvas.center().x, canvas.top() + 16.0), Align2::CENTER_TOP, &self.story.title, FontId::proportional(22.0 * fs), TEXT);
+        }
+        let cur = self.current_step();
+        if let Some(k) = cur {
+            let st = self.steps[k].clone();
+            if self.story.show_clock {
+                let t = fmt_time(st.t);
+                let galley = painter.layout_no_wrap(t, FontId::monospace(20.0 * fs), TEXT);
+                let r = Rect::from_min_size(Pos2::new(canvas.right() - galley.size().x - 26.0, canvas.top() + 12.0), galley.size() + Vec2::new(16.0, 8.0));
+                painter.rect_filled(r, CornerRadius::same(6), CAPTION_BG);
+                painter.galley(r.min + Vec2::new(8.0, 4.0), galley, TEXT);
+            }
+            if self.story.show_counter {
+                painter.text(Pos2::new(canvas.right() - 12.0, canvas.bottom() - 10.0), Align2::RIGHT_BOTTOM, format!("{} / {}", k + 1, self.steps.len()), FontId::proportional(12.0 * fs), MUTED);
+            }
+            if self.story.show_caption {
+                let text = match &st.caption {
+                    Some(c) => c.clone(),
+                    None => {
+                        let ei = self.graph.events[st.from] as usize;
+                        let e = self.store.edges[ei];
+                        let src = self.host_label(e.src);
+                        let dst = self.host_label(e.dst);
+                        let user = self.user_label(e.user);
+                        let n = st.to - st.from;
+                        let more = if n > 1 { format!("  (+{} more)", n - 1) } else { String::new() };
+                        format!("{}  ·  {}  ·  {}  ->  {}{}", &fmt_time(e.t)[11..], if user.is_empty() { "(no account)".to_string() } else { user }, src, dst, more).replace("  ·  (no account)", "")
+                    }
+                };
+                let galley = painter.layout_no_wrap(text, FontId::proportional(18.0 * fs), TEXT);
+                let r = Rect::from_center_size(Pos2::new(canvas.center().x, canvas.bottom() - 34.0), galley.size() + Vec2::new(28.0, 14.0));
+                painter.rect_filled(r, CornerRadius::same(8), Color32::from_rgba_premultiplied(24, 26, 31, 225));
+                if st.significant || st.emphasis {
+                    painter.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.5, if st.significant { SIGNIFICANT } else { ACCENT }), egui::StrokeKind::Inside);
+                }
+                painter.galley(r.min + Vec2::new(14.0, 7.0), galley, TEXT);
+            }
+        }
+        match &self.export {
+            None => {
+                painter.text(Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0), Align2::LEFT_BOTTOM, "Space pause  ·  Left / Right step  ·  Esc leave", FontId::proportional(11.0), MUTED);
+            }
+            Some(job) if job.rec.finishing() => {
+                let galley = painter.layout_no_wrap(format!("finishing {} frames in {}…", job.total, job.out.display()), FontId::proportional(16.0), TEXT);
+                let r = Rect::from_center_size(canvas.center(), galley.size() + Vec2::new(40.0, 24.0));
+                painter.rect_filled(r, CornerRadius::same(8), Color32::from_rgba_premultiplied(24, 26, 31, 235));
+                painter.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+                painter.galley(r.min + Vec2::new(20.0, 12.0), galley, TEXT);
+            }
+            Some(job) => {
+                painter.text(Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0), Align2::LEFT_BOTTOM, format!("recording frame {} / {} at {} fps", job.next, job.total, job.fps), FontId::proportional(11.0), MUTED);
+            }
+        }
+    }
+
+    // ───────────────────────── story editor & export ─────────────────────────
+
+    fn story_window(&mut self, ctx: &egui::Context) {
+        if !self.show_story {
+            return;
+        }
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] story window drawn, {} steps", self.steps.len());
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut start = false;
+        let mut preview: Option<usize> = None;
+        egui::Window::new("Story").open(&mut open).default_width(820.0).default_height(560.0).resizable(true).show(ctx, |ui| {
+            ui.label(egui::RichText::new("The view replayed in time order, one step per row (or per burst of rows close in time). Every setting here is saved next to the timeline; Present plays it full screen, Record writes it as a video.").color(MUTED));
+            egui::Grid::new("story-globals").num_columns(6).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Title");
+                changed |= ui.add_sized([260.0, 20.0], egui::TextEdit::singleline(&mut self.story.title).hint_text("shown at the top")).changed();
+                ui.label("Timing");
+                egui::ComboBox::from_id_salt("timing").selected_text(match self.story.timing { Timing::Fixed => "same time per step", Timing::Compressed => "real gaps, compressed" }).show_ui(ui, |ui| {
+                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Fixed, "same time per step").changed();
+                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Compressed, "real gaps, compressed").changed();
+                });
+                ui.label("Seconds per step");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.step_secs).range(0.1..=20.0).speed(0.05).fixed_decimals(2)).changed();
+                ui.end_row();
+                ui.label("Compress by");
+                changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.compress).range(1.0..=100000.0).speed(10.0)).on_hover_text("real seconds between rows divided by this").changed();
+                ui.label("Gap min / max (s)");
+                ui.horizontal(|ui| {
+                    changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.min_gap).range(0.05..=10.0).speed(0.05).fixed_decimals(2)).changed();
+                    changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.max_gap).range(0.1..=60.0).speed(0.1).fixed_decimals(1)).changed();
+                });
+                ui.label("Group rows within (s)");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.group_secs).range(0.0..=3600.0).speed(0.5).fixed_decimals(1)).on_hover_text("rows this close in time appear together as one step").changed();
+                ui.end_row();
+                ui.label("Pause on significant (s)");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.pause_significant).range(0.0..=30.0).speed(0.1).fixed_decimals(1)).changed();
+                ui.label("Hold the end (s)");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.hold_end).range(0.0..=60.0).speed(0.1).fixed_decimals(1)).changed();
+                ui.label("");
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut self.story.fade_old, "fade older").changed();
+                    changed |= ui.checkbox(&mut self.story.show_clock, "clock").changed();
+                    changed |= ui.checkbox(&mut self.story.show_caption, "caption").changed();
+                    changed |= ui.checkbox(&mut self.story.show_counter, "counter").changed();
+                    changed |= ui.checkbox(&mut self.story.anonymise, "anonymise").on_hover_text("HOST-01, user-02, 10.x.x.3: consistent stand-ins for a talk").changed();
+                });
+                ui.end_row();
+            });
+            if changed {
+                self.rebuild_steps();
+            }
+            let total = present::total_secs(&self.steps, &self.story);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("Present").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
+                    start = true;
+                }
+                if ui.button("Record…").clicked() {
+                    self.show_export = true;
+                    if self.export_name.is_empty() {
+                        let stem = std::path::Path::new(&self.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
+                        self.export_name = format!("{}-story", stem);
+                    }
+                }
+                ui.label(egui::RichText::new(format!("{} steps · {} rows · {:.0} s", self.steps.len(), self.graph.events.len(), total)).color(MUTED));
+                ui.label(egui::RichText::new(self.story_path.to_string_lossy()).small().color(MUTED));
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("STEPS   (click a row to see the graph at that moment; a blank duration means the global one)").small().color(MUTED));
+            let n_steps = self.steps.len();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("steps").striped(true).num_columns(9).spacing([8.0, 4.0]).show(ui, |ui| {
+                    for h in ["#", "time", "what", "s", "pause", "caption", "skip", "emph", ""] {
+                        ui.label(egui::RichText::new(h).small().color(MUTED));
+                    }
+                    ui.end_row();
+                    for k in 0..n_steps {
+                        let st = self.steps[k].clone();
+                        let ei = self.graph.events[st.from] as usize;
+                        let e = self.store.edges[ei];
+                        let what = format!("{} -> {} as {}{}", self.store.hosts.name(e.src), self.store.hosts.name(e.dst), self.store.users.name(e.user), if st.to - st.from > 1 { format!(" (+{})", st.to - st.from - 1) } else { String::new() });
+                        if ui.add(egui::Button::new(egui::RichText::new(format!("{}", k + 1)).small()).frame(false)).clicked() {
+                            preview = Some(k);
+                        }
+                        ui.label(egui::RichText::new(&fmt_time(st.t)[5..]).small().monospace());
+                        let mut rt = egui::RichText::new(if what.chars().count() > 46 { format!("{}…", what.chars().take(45).collect::<String>()) } else { what.clone() }).small();
+                        if st.significant {
+                            rt = rt.color(SIGNIFICANT);
+                        }
+                        ui.label(rt).on_hover_text(what);
+                        let ov = self.story.steps.entry(st.key.clone()).or_default();
+                        let mut secs = ov.secs.unwrap_or(0.0);
+                        if ui.add(egui::DragValue::new(&mut secs).range(0.0..=60.0).speed(0.05).fixed_decimals(2)).changed() {
+                            ov.secs = if secs <= 0.0 { None } else { Some(secs) };
+                            changed = true;
+                        }
+                        changed |= ui.add(egui::DragValue::new(&mut ov.pause_after).range(0.0..=60.0).speed(0.1).fixed_decimals(1)).changed();
+                        let mut cap = ov.caption.clone().unwrap_or_default();
+                        if ui.add_sized([220.0, 20.0], egui::TextEdit::singleline(&mut cap).hint_text("own caption")).changed() {
+                            ov.caption = if cap.trim().is_empty() { None } else { Some(cap) };
+                            changed = true;
+                        }
+                        changed |= ui.checkbox(&mut ov.skip, "").changed();
+                        changed |= ui.checkbox(&mut ov.emphasis, "").changed();
+                        if *ov == StepOverride::default() {
+                            self.story.steps.remove(&st.key);
+                        }
+                        ui.label("");
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if changed {
+            self.rebuild_steps();
+            self.save_story();
+        }
+        if let Some(k) = preview {
+            if k < self.steps.len() {
+                self.presenting = false;
+                self.cursor = self.steps[k].to;
+            }
+        }
+        if start {
+            self.start_presentation();
+        }
+        if !open {
+            self.show_story = false;
+        }
+    }
+
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.show_export {
+            return;
+        }
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = Some(present::ffmpeg_available());
+        }
+        let ffmpeg = self.ffmpeg.unwrap_or(false);
+        let mut open = true;
+        let mut start = false;
+        egui::Window::new("Record the story").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(egui::RichText::new("Every frame is a screenshot of this window while the story plays, so the file shows exactly what you see. Leave the window alone while it records.").color(MUTED));
+            ui.horizontal(|ui| {
+                ui.label("Format");
+                for f in [Format::Gif, Format::Png, Format::Mp4] {
+                    let enabled = f != Format::Mp4 || ffmpeg;
+                    if ui.add_enabled(enabled, egui::Button::selectable(self.export_format == f, f.label())).on_disabled_hover_text("ffmpeg was not found on the PATH; record PNG frames and encode them yourself, or install ffmpeg").clicked() {
+                        self.export_format = f;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Frames per second");
+                for f in [10u32, 15, 24, 30, 60] {
+                    if ui.add(egui::Button::selectable(self.export_fps == f, f.to_string())).clicked() {
+                        self.export_fps = f;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                for (i, name) in ["this window", "1280 x 720", "1920 x 1080"].iter().enumerate() {
+                    if ui.add(egui::Button::selectable(self.export_size == i, *name)).clicked() {
+                        self.export_size = i;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("File");
+                ui.add(egui::TextEdit::singleline(&mut self.export_name).desired_width(240.0));
+                let ext = match self.export_format {
+                    Format::Gif => ".gif",
+                    Format::Png => "/ (a folder of frames)",
+                    Format::Mp4 => ".mp4",
+                };
+                ui.label(egui::RichText::new(format!("{}  next to the timeline", ext)).color(MUTED));
+            });
+            let total = present::total_secs(&self.steps, &self.story);
+            let frames = (total * self.export_fps as f32).ceil() as usize;
+            ui.label(egui::RichText::new(format!("{:.0} s · {} frames", total, frames)).color(MUTED));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.export_name.trim().is_empty() && !self.steps.is_empty(), egui::Button::new(egui::RichText::new("Record").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
+                    start = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.show_export = false;
+                }
+            });
+        });
+        if !open {
+            self.show_export = false;
+        }
+        if start {
+            self.start_export(ctx);
+        }
+    }
+
+    /// Begin recording the story with the export settings.
+    fn start_export(&mut self, ctx: &egui::Context) {
+        self.show_export = false;
+        self.show_story = false;
+        self.rebuild_steps();
+        if self.export_name.trim().is_empty() {
+            let stem = std::path::Path::new(&self.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
+            self.export_name = format!("{}-story", stem);
+        }
+        let dir = std::path::Path::new(&self.files[0]).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let name = self.export_name.trim().to_string();
+        let out = match self.export_format {
+            Format::Gif => dir.join(format!("{}.gif", name)),
+            Format::Png => dir.join(name),
+            Format::Mp4 => dir.join(format!("{}.mp4", name)),
+        };
+        let total = present::total_secs(&self.steps, &self.story);
+        let frames = ((total * self.export_fps as f32).ceil() as usize).max(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let restore = match self.export_size {
+            1 => Some(Vec2::new(1280.0, 720.0)),
+            2 => Some(Vec2::new(1920.0, 1080.0)),
+            _ => None,
+        };
+        let current = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        if let Some(size) = restore {
+            let ppp = ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size / ppp));
+        }
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] recording {} frames at {} fps to {}", frames, self.export_fps, out.display());
+        }
+        let rec = present::Recorder::start(self.export_fps, self.export_format, out.clone());
+        self.export = Some(ExportJob { fps: self.export_fps, out, total: frames, next: 0, waiting: false, rx, tx, restore: if restore.is_some() { current } else { None }, rec });
+        self.start_presentation();
+        self.present_playing = false;
+    }
+
+    /// `MASSTIN_VIEW_AUTO="story,record=gif:10:0,quit"`: actions run one
+    /// per second once the window is up, for tests and demos. Actions:
+    /// present, story, rules, fit, record=FORMAT:FPS:SIZE (gif | png | mp4;
+    /// size 0 window, 1 720p, 2 1080p), quit.
+    fn autopilot(&mut self, ctx: &egui::Context) {
+        if self.auto.is_empty() || self.export.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now < self.auto_next {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        self.auto_next = now + std::time::Duration::from_secs(1);
+        let cmd = self.auto.remove(0);
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] auto: {}", cmd);
+        }
+        match cmd.as_str() {
+            "present" => self.start_presentation(),
+            "story" => self.show_story = true,
+            "rules" => self.show_rules = true,
+            "fit" => self.fit_pending = true,
+            "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            other => {
+                if let Some(spec) = other.strip_prefix("record=") {
+                    let parts: Vec<&str> = spec.split(':').collect();
+                    self.export_format = match parts.first().copied().unwrap_or("gif") {
+                        "png" => Format::Png,
+                        "mp4" => Format::Mp4,
+                        _ => Format::Gif,
+                    };
+                    self.export_fps = parts.get(1).and_then(|f| f.parse().ok()).unwrap_or(15);
+                    self.export_size = parts.get(2).and_then(|f| f.parse().ok()).unwrap_or(0);
+                    self.start_export(ctx);
+                } else {
+                    eprintln!("masstin: unknown MASSTIN_VIEW_AUTO action '{}'", other);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Drive a recording: one frame per repaint, screenshot taken after
+    /// the frame is drawn, encoding at the end.
+    fn export_step(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.export.as_mut() else { return };
+        if let Some(result) = job.rec.result() {
+            let restore = job.restore;
+            self.export = None;
+            self.stop_presentation();
+            if let Some(size) = restore {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            self.status = match result {
+                Ok(m) => format!("Recorded: {}", m),
+                Err(e) => format!("Recording failed: {}", e),
+            };
+            if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                eprintln!("[view] {}", self.status);
+            }
+            return;
+        }
+        if job.waiting {
+            match job.rx.try_recv() {
+                Ok((i, img)) => {
+                    if i == job.next {
+                        job.rec.push(img);
+                        job.next += 1;
+                        job.waiting = false;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if job.rec.finishing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        if !job.waiting {
+            if job.next >= job.total {
+                job.rec.finish();
+            } else {
+                // the frame about to be drawn
+                self.present_t = job.next as f32 / job.fps as f32;
+                let tx = job.tx.clone();
+                let idx = job.next;
+                job.waiting = true;
+                ctx.request_screenshot(move |img| {
+                    let _ = tx.send((idx, img));
+                });
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// Start, end (on the rims) and control point of every edge, in
@@ -1473,6 +2064,42 @@ impl eframe::App for Viewer {
             }
             ctx.request_repaint();
         }
+        self.autopilot(&ctx);
+        if self.export.is_some() {
+            self.export_step(&ctx);
+        } else if self.presenting {
+            if self.present_playing {
+                self.present_t += dt;
+                let total = present::total_secs(&self.steps, &self.story);
+                if self.present_t >= total {
+                    self.present_t = total;
+                    self.present_playing = false;
+                }
+                ctx.request_repaint();
+            }
+            let (space, left, right, esc, home) = ctx.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Home)));
+            if space {
+                self.present_playing = !self.present_playing;
+            }
+            if esc {
+                self.stop_presentation();
+            }
+            if home {
+                self.present_t = 0.0;
+            }
+            if right || left {
+                let cur = present::at(&self.steps, self.present_t).map(|(k, _)| k).unwrap_or(0);
+                let k = if right { (cur + 1).min(self.steps.len().saturating_sub(1)) } else { cur.saturating_sub(1) };
+                if let Some(st) = self.steps.get(k) {
+                    self.present_t = st.start + st.dur;
+                }
+                ctx.request_repaint();
+            }
+        }
+        if self.presenting {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
+            return;
+        }
         egui::Panel::top("filters").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.filter_bar(ui));
         egui::Panel::bottom("time").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.time_bar(ui));
         egui::Panel::right("details").default_size(400.0).resizable(true).frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(12))).show(ui, |ui| {
@@ -1481,5 +2108,7 @@ impl eframe::App for Viewer {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
         self.rules_window(&ctx);
         self.save_popup(&ctx);
+        self.story_window(&ctx);
+        self.export_window(&ctx);
     }
 }
