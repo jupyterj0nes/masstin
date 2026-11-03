@@ -481,7 +481,12 @@ Full technical breakdown: [EVTX carving article](https://weinvestigateanything.c
 
 ```bash
 masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv
+
+# the evidence parsed again: keep the analyst's verdict / notes of the earlier timeline
+masstin -a merge -f timeline1.csv -f timeline2.csv -o merged.csv --carry-marks merged-before.csv
 ```
+
+Timelines of every layout (12, 14 or 19 columns) are read; the output has the 19, sorted on the instant, without duplicates. A row's `hunt*`, `verdict` and `notes` travel with it, and when the same event comes once with them and once without, they are kept.
 
 
 ## Supported artifacts at a glance

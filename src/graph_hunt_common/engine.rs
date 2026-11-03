@@ -169,10 +169,19 @@ struct Corpus {
     rows: Vec<RawRow>,
     /// edge rows whose time could not be parsed (ignored, reported)
     bad_ts: usize,
+    /// short host names shared by different FQDNs in the CSV, kept fully
+    /// qualified (empty for a graph pull); needed to key a CSV row again
+    ambiguous: HashSet<String>,
+}
+
+impl Corpus {
+    fn empty() -> Corpus {
+        Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0, ambiguous: HashSet::new() }
+    }
 }
 
 async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
-    let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+    let mut c = Corpus::empty();
     c.lids.id("");
     let aggregated = format!(
         "(coalesce(r.event_id, '') = 'SSH_PREAUTH' OR (coalesce(r.event_type, '') = 'FAILED_LOGON' AND type(r) IN {na}))",
@@ -335,8 +344,6 @@ pub(crate) fn split_csv(line: &str) -> Vec<String> {
     v.into_iter().map(|c| c.into_owned()).collect()
 }
 
-const CSV_HEADER: &str = "time_created,dst_computer,event_type,event_id,logon_type,target_user_name,target_domain_name,src_computer,src_ip,subject_user_name,subject_domain_name,logon_id,detail,log_filename";
-
 fn account_type(user: &str) -> String {
     let stripped = user.split('@').next().unwrap_or(user);
     let mut s: String = stripped.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
@@ -349,15 +356,60 @@ fn account_type(user: &str) -> String {
     s.to_uppercase()
 }
 
-/// Build the corpus from masstin timeline CSVs (14-column layout). Two
-/// passes: the first finds short host names shared by different FQDNs and
-/// the log-file spans of every destination, the second builds the rows;
-/// pre-auth touches and unnamed failures are aggregated per day as the
-/// graph pull does.
+/// Values of `src_computer` / `src_ip` that name no machine.
+const LOCAL_SOURCES: [&str; 9] = ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "-", "", " "];
+
+/// Upper-case short name of a host (`SRV01.CORP.EXAMPLE` -> `SRV01`),
+/// kept fully qualified when two FQDNs of the corpus share the short name.
+fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
+    let u = v.to_uppercase();
+    if u.contains('.') && !looks_like_ip(&u) {
+        let s = u.split('.').next().unwrap_or("");
+        if !s.is_empty() && !ambiguous.contains(s) {
+            return s.to_string();
+        }
+    }
+    u
+}
+
+/// What a timeline row is to the hunt: (origin, destination, account
+/// type, class), or None when the row names no usable origin or its
+/// origin is its destination. The same function keys the corpus rows and
+/// finds a row's connection again when the timeline is annotated.
+fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) -> Option<(String, String, String, u8)> {
+    let is_local = |v: &str| LOCAL_SOURCES.contains(&v);
+    let sc = p[7].trim();
+    let si = p[8].trim();
+    let origin = if !is_local(sc) && !(looks_like_ip(sc) && sc == si) {
+        short_name(sc, ambiguous)
+    } else if !is_local(si) {
+        short_name(si, ambiguous)
+    } else {
+        return None;
+    };
+    let dest = short_name(p[1].trim(), ambiguous);
+    if dest.is_empty() || origin.eq_ignore_ascii_case(&dest) {
+        return None;
+    }
+    let acct = account_type(p[5].trim());
+    let cls = class_of(p[2].trim(), p[3].trim(), &acct);
+    Some((origin, dest, acct, cls))
+}
+
+/// Whether the timeline header is one the hunt reads: the 14 event
+/// columns, with or without the analysis tail (the 12-column layout of
+/// 2023 has no event_type and is not read here).
+fn timeline_header_ok(header: &str) -> bool {
+    matches!(crate::csv_out::Layout::of(header), Some(crate::csv_out::Layout::V14) | Some(crate::csv_out::Layout::V19))
+}
+
+/// Build the corpus from masstin timeline CSVs (14 event columns, with or
+/// without the analysis tail). Two passes: the first finds short host
+/// names shared by different FQDNs and the log-file spans of every
+/// destination, the second builds the rows; pre-auth touches and unnamed
+/// failures are aggregated per day as the graph pull does.
 fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
     use std::io::BufRead;
-    let local: HashSet<&str> = ["LOCAL", "127.0.0.1", "::1", "::", "0.0.0.0", "DEFAULT_VALUE", "-", "", " "].into_iter().collect();
-    let is_local = |v: &str| local.contains(v);
     let mut notes = Vec::new();
     // pass 1: FQDN ambiguity and coverage spans per (destination, family)
     let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
@@ -368,7 +420,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
         let mut lines = rd.lines();
         let header = lines.next().transpose()?.unwrap_or_default();
-        if header.trim_end_matches(['\r', '\n']) != CSV_HEADER {
+        if !timeline_header_ok(&header) {
             bad_header.push(f.clone());
             continue;
         }
@@ -399,21 +451,14 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
         }
     }
     if !bad_header.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not a masstin 14-column timeline: {}", bad_header.join(", "))));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("not a masstin timeline (14 or 19 columns): {}", bad_header.join(", "))));
     }
     let ambiguous: HashSet<String> = fqdn_by_short.into_iter().filter(|(_, s)| s.len() > 1).map(|(k, _)| k).collect();
-    let short = |v: &str| -> String {
-        let u = v.to_uppercase();
-        if u.contains('.') && !looks_like_ip(&u) {
-            let s = u.split('.').next().unwrap_or("");
-            if !s.is_empty() && !ambiguous.contains(s) {
-                return s.to_string();
-            }
-        }
-        u
-    };
+    let short = |v: &str| short_name(v, &ambiguous);
     // pass 2: rows
-    let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::with_capacity(n_lines), bad_ts: 0 };
+    let mut c = Corpus::empty();
+    c.rows.reserve(n_lines);
+    c.ambiguous = ambiguous.clone();
     c.lids.id("");
     let mut agg: HashMap<(u32, u32, u32, u32, u32, i32), (u64, i64)> = HashMap::new();
     let mut dropped = 0usize;
@@ -435,26 +480,15 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
                     continue;
                 }
             };
-            let sc = p[7].trim();
-            let si = p[8].trim();
-            let origin = if !is_local(sc) && !(looks_like_ip(sc) && sc == si) {
-                short(sc)
-            } else if !is_local(si) {
-                short(si)
-            } else {
-                dropped += 1;
-                continue;
+            let (origin, dest, acct, cls) = match row_key(&p, &ambiguous) {
+                Some(k) => k,
+                None => {
+                    dropped += 1;
+                    continue;
+                }
             };
-            let dest = short(p[1].trim());
-            if dest.is_empty() || origin.eq_ignore_ascii_case(&dest) {
-                dropped += 1;
-                continue;
-            }
-            let acct = account_type(p[5].trim());
             let et: &str = p[2].trim();
-            let eid: &str = p[3].trim();
             let fam = crate::load_neo4j::log_source_family(&p[13]);
-            let cls = class_of(et, eid, &acct);
             let o = c.nodes.id(&origin);
             let d = c.nodes.id(&dest);
             let a = c.accts.id(&acct);
@@ -825,6 +859,8 @@ struct Conn {
     chain: String,
     campaign: String,
     evaluable: bool,
+    /// OK / FAIL / PRE, to find a timeline row's connection again
+    cls: u8,
     /// origin, destination and account ids and the novelty flags, for the report
     oid: u32,
     did: u32,
@@ -856,7 +892,7 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
         corpus.accts.names.len(),
         clock.elapsed().as_secs_f64()
     ));
-    run_with(corpus, dialect, cfg, output, report_path, clock);
+    run_with(corpus, dialect, cfg, output, report_path, clock, None);
 }
 
 /// The hunt straight from masstin timeline CSVs, no graph database: the
@@ -864,7 +900,7 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
 /// conventions (short upper-case host names unless two FQDNs share one,
 /// local sources dropped, accounts as relationship types, log-file
 /// coverage spans per destination).
-pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>) {
+pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, annotate: Option<Annotate>) {
     let clock = std::time::Instant::now();
     crate::banner::print_phase("3", "4", "Reading the timeline CSV...");
     let (corpus, notes) = match corpus_from_csv(files) {
@@ -884,10 +920,17 @@ pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Opti
         corpus.accts.names.len(),
         clock.elapsed().as_secs_f64()
     ));
-    run_with(corpus, dialect, cfg, output, report_path, clock);
+    run_with(corpus, dialect, cfg, output, report_path, clock, annotate);
 }
 
-fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, clock: std::time::Instant) {
+/// What `run_csv` does with the timeline files once the hunt is done.
+pub struct Annotate<'a> {
+    pub files: &'a [String],
+    /// an earlier timeline whose verdict / notes are copied by row hash
+    pub carry_marks: Option<&'a str>,
+}
+
+fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, clock: std::time::Instant, annotate: Option<Annotate>) {
     if corpus.bad_ts > 0 {
         crate::banner::print_phase_detail("Warning:", &format!("{} edge row(s) with an unparseable time ignored", corpus.bad_ts));
     }
@@ -907,13 +950,17 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         }
         h
     };
-    let (rows, summary_lines, alpha, stories, seed, ents) = analyse(corpus, dialect, cfg, &hits);
+    let (rows, summary_lines, alpha, stories, seed, ents) = analyse(&mut corpus, dialect, cfg, &hits);
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
-    if let Err(e) = write_csv(&rows, alpha, output, &ents, dialect) {
-        eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
-        return;
+    // with the timeline annotated, no -o means no findings table (it used
+    // to go to stdout, which is where the summary goes)
+    if output.is_some() || annotate.is_none() {
+        if let Err(e) = write_csv(&rows, alpha, output, &ents, dialect) {
+            eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
+            return;
+        }
     }
     if let Some(path) = report_path {
         let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
@@ -933,7 +980,282 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
             Err(e) => eprintln!("Masstin - Error: cannot write report: {}", e),
         }
     }
+    if let Some(a) = annotate {
+        match annotate_timelines(a.files, &corpus, &ents, &rows, alpha, cfg, a.carry_marks) {
+            Ok(lines) => {
+                for l in lines {
+                    crate::banner::print_phase_detail("Timeline:", &l);
+                }
+            }
+            Err(e) => eprintln!("Masstin - Error: cannot write the hunt into the timeline: {}", e),
+        }
+    }
     crate::banner::print_phase_detail("Done:", &format!("{} rows in {:.1}s", rows.len(), clock.elapsed().as_secs_f64()));
+}
+
+// ───────────────────────── timeline annotation ──────────────────────────────
+//
+// The hunt's unit is the connection (origin, destination, account, result,
+// day); a timeline row belongs to exactly one, found again with the key
+// the corpus rows were built with. The row's `hunt` column says what the
+// hunt made of that connection, `hunt_q` its q-value and `hunt_why` its
+// explanation. A session end (LOGOFF) is not a connection: it takes the
+// state of the login it closes, found by logon ID on the same
+// destination. The 14 event columns are copied byte for byte; `verdict`
+// and `notes` are kept (or copied from an earlier timeline by row hash).
+
+const ST_NONE: u8 = 0;
+const ST_SIGNIFICANT: u8 = 1;
+const ST_CANDIDATE: u8 = 2;
+const ST_HABITUAL: u8 = 3;
+const ST_NOT_EVALUATED: u8 = 4;
+const ST_BASELINE: u8 = 5;
+
+fn state_name(st: u8) -> &'static str {
+    match st {
+        ST_SIGNIFICANT => crate::csv_out::HUNT_SIGNIFICANT,
+        ST_CANDIDATE => crate::csv_out::HUNT_CANDIDATE,
+        ST_HABITUAL => crate::csv_out::HUNT_HABITUAL,
+        ST_NOT_EVALUATED => crate::csv_out::HUNT_NOT_EVALUATED,
+        ST_BASELINE => crate::csv_out::HUNT_BASELINE,
+        _ => "",
+    }
+}
+
+/// Byte length of the first 14 fields of a CSV line (the event columns),
+/// quotes honoured; None when the line has fewer.
+fn base_prefix_len(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut in_q = false;
+    let mut fields = 1usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                if in_q && i + 1 < b.len() && b[i + 1] == b'"' {
+                    i += 1;
+                } else {
+                    in_q = !in_q;
+                }
+            }
+            b',' if !in_q => {
+                if fields == 14 {
+                    return Some(i);
+                }
+                fields += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if fields == 14 {
+        Some(b.len())
+    } else {
+        None
+    }
+}
+
+/// Rename `tmp` over `path`. Windows refuses while another program has the
+/// file open (a case tool with the timeline loaded), so it is retried for
+/// a few seconds before giving up.
+fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..12 {
+        match std::fs::rename(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(250 * (attempt + 1)));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "rename failed")))
+}
+
+/// Write the hunt's verdict on every row of the timeline files, in place.
+/// Returns one summary line per file.
+fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Conn], alpha: f64, cfg: &Settings, carry_marks: Option<&str>) -> std::io::Result<Vec<String>> {
+    use std::io::{BufRead, Write};
+    let cutoff_day = day_of(cfg.cutoff.timestamp());
+    let end_ts = cfg.end.map(|e| e.timestamp());
+    // connection -> its row in the findings
+    let mut by_key: HashMap<(u32, u32, u32, u8, i32), usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        by_key.entry((r.oid, r.did, r.aid, r.cls, r.day)).or_insert(i);
+    }
+    let state_of = |i: usize| -> u8 {
+        let r = &rows[i];
+        if !r.evaluable {
+            ST_NOT_EVALUATED
+        } else if r.group == 3 {
+            ST_HABITUAL
+        } else if r.q <= alpha {
+            ST_SIGNIFICANT
+        } else {
+            ST_CANDIDATE
+        }
+    };
+    let marks = match carry_marks {
+        Some(p) => Some(crate::csv_out::Marks::load(p)?),
+        None => None,
+    };
+    let mut summary = Vec::new();
+    for f in files {
+        let layout = {
+            let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+            let header = rd.lines().next().transpose()?.unwrap_or_default();
+            match crate::csv_out::Layout::of(&header) {
+                Some(l) => l,
+                None => continue,
+            }
+        };
+        let has_tail = layout == crate::csv_out::Layout::V19;
+        // pass A: the state of every line; logins by (destination, logon
+        // ID) for the session ends
+        let mut states: Vec<(u8, u32)> = Vec::new();
+        let mut logins: HashMap<(u32, String), (u8, u32)> = HashMap::new();
+        let mut pending: Vec<(usize, u32, String)> = Vec::new();
+        {
+            let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+            for line in rd.lines().skip(1) {
+                let line = line?;
+                let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
+                split_csv_into(&line, &mut p);
+                let n = states.len();
+                states.push((ST_NONE, u32::MAX));
+                if p.len() < 14 {
+                    continue;
+                }
+                let t = match parse_ts(&p[0]) {
+                    Some(x) => x.and_utc().timestamp(),
+                    None => continue,
+                };
+                let (origin, dest, acct, cls) = match row_key(&p, &c.ambiguous) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let day = day_of(t);
+                if day < cutoff_day {
+                    states[n] = (ST_BASELINE, u32::MAX);
+                    continue;
+                }
+                if let Some(e) = end_ts {
+                    if t > e {
+                        continue;
+                    }
+                }
+                let de = match c.nodes.map.get(&dest) {
+                    Some(&d) => ents.of_node[d as usize],
+                    None => continue,
+                };
+                let lid = p[11].trim();
+                if cls == OTHER {
+                    if p[2].trim() == "LOGOFF" && !lid.is_empty() {
+                        pending.push((n, de, lid.to_string()));
+                    }
+                    continue;
+                }
+                let oe = match c.nodes.map.get(&origin) {
+                    Some(&o) => ents.of_node[o as usize],
+                    None => continue,
+                };
+                let a = match c.accts.map.get(&acct) {
+                    Some(&a) => a,
+                    None => continue,
+                };
+                if let Some(&i) = by_key.get(&(oe, de, a, cls, day)) {
+                    let st = (state_of(i), i as u32);
+                    states[n] = st;
+                    if cls == OK && !lid.is_empty() {
+                        logins.insert((de, lid.to_string()), st);
+                    }
+                }
+            }
+        }
+        let mut inherited = 0usize;
+        for (n, de, lid) in pending {
+            if let Some(&st) = logins.get(&(de, lid)) {
+                states[n] = st;
+                inherited += 1;
+            }
+        }
+        // pass B: the file again, with its tail
+        let path = std::path::Path::new(f);
+        let tmp = path.with_extension(format!("{}.masstin-tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("csv")));
+        let mut carried = 0usize;
+        {
+            let rd = std::io::BufReader::new(std::fs::File::open(f)?);
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+            w.write_all(crate::csv_out::HEADER.as_bytes())?;
+            w.write_all(b"\n")?;
+            for (n, line) in rd.lines().skip(1).enumerate() {
+                let line = line?;
+                let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    continue;
+                }
+                let (st, idx) = states.get(n).copied().unwrap_or((ST_NONE, u32::MAX));
+                let (base, mut verdict, mut notes) = if has_tail {
+                    match base_prefix_len(line) {
+                        Some(k) => {
+                            split_csv_into(line, &mut p);
+                            let v = p.get(17).map(|s| s.to_string()).unwrap_or_default();
+                            let nt = p.get(18).map(|s| s.to_string()).unwrap_or_default();
+                            (&line[..k], v, nt)
+                        }
+                        None => (line, String::new(), String::new()),
+                    }
+                } else {
+                    (line, String::new(), String::new())
+                };
+                if verdict.is_empty() && notes.is_empty() {
+                    if let Some(m) = &marks {
+                        split_csv_into(base, &mut p);
+                        if p.len() >= 14 {
+                            if let Some((v, nt)) = m.get(&p[..14]) {
+                                verdict = v.clone();
+                                notes = nt.clone();
+                                carried += 1;
+                            }
+                        }
+                    }
+                }
+                let (hq, why): (String, &str) = if idx != u32::MAX {
+                    let r = &rows[idx as usize];
+                    let hq = if st == ST_HABITUAL { "1".to_string() } else { fmt_p(r.q) };
+                    (hq, r.why.as_str())
+                } else {
+                    (String::new(), "")
+                };
+                w.write_all(base.as_bytes())?;
+                w.write_all(crate::csv_out::tail(state_name(st), &hq, why, &verdict, &notes).as_bytes())?;
+                w.write_all(b"\n")?;
+            }
+            w.flush()?;
+        }
+        if let Err(e) = replace_file(&tmp, path) {
+            return Err(std::io::Error::new(e.kind(), format!("{}: cannot replace the file ({}); the annotated copy is {}", f, e, tmp.display())));
+        }
+        let count = |s: u8| states.iter().filter(|(x, _)| *x == s).count();
+        summary.push(format!(
+            "{}: {} rows written with the hunt: {} significant, {} candidate, {} habitual, {} not evaluated, {} baseline, {} outside the hunt ({} session end(s) took their login's state{})",
+            f,
+            states.len(),
+            count(ST_SIGNIFICANT),
+            count(ST_CANDIDATE),
+            count(ST_HABITUAL),
+            count(ST_NOT_EVALUATED),
+            count(ST_BASELINE),
+            count(ST_NONE),
+            inherited,
+            match &marks {
+                Some(m) => format!("; {} row(s) took their verdict / notes from the earlier timeline, {} marked rows there", carried, m.len()),
+                None => String::new(),
+            }
+        ));
+    }
+    Ok(summary)
 }
 
 struct Entities {
@@ -1106,8 +1428,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
     out
 }
 
-fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>, Entities) {
-    let c = &mut c;
+fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>, Entities) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
     let (ents, res) = build_entities(&*c, alpha);
@@ -2080,6 +2401,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
             evaluable: true,
+            cls: t.cls,
             oid: t.o,
             did: t.d,
             aid: t.a,
@@ -2113,6 +2435,7 @@ fn analyse(mut c: Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sigm
             chain: String::new(),
             campaign: campaign_of.get(&t.o).cloned().unwrap_or_default(),
             evaluable: false,
+            cls: t.cls,
             oid: t.o,
             did: t.d,
             aid: t.a,
@@ -2774,7 +3097,7 @@ mod tests {
     }
     /// Build a corpus from (day, hour, origin, destination, account, event_type) rows.
     fn corpus(rows: &[(i32, i64, &str, &str, &str, &str)]) -> Corpus {
-        let mut c = Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0 };
+        let mut c = Corpus::empty();
         c.lids.id("");
         for (day, hour, o, d, a, et) in rows {
             let eid = if *et == "CONNECT" { "SSH_PREAUTH" } else { "" };
@@ -2830,9 +3153,9 @@ mod tests {
             rows.push((21, 13, "C", s.as_str(), "V", "SUCCESSFUL_LOGON"));
             rows.push((21, 14, "D", s.as_str(), "V", "SUCCESSFUL_LOGON"));
         }
-        let c = corpus(&rows);
+        let mut c = corpus(&rows);
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, lines, _alpha, _stories, _seed, _) = analyse(c, &super::super::NEO4J, &cfg, &[]);
+        let (out, lines, _alpha, _stories, _seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
         let camp = |o: &str| out.iter().find(|r| r.origin == o).map(|r| r.campaign.clone()).unwrap_or_default();
         assert!(camp("A").contains("with B"), "A: {:?}", camp("A"));
         assert!(camp("B").contains("with A"), "B: {:?}", camp("B"));
@@ -2861,9 +3184,9 @@ mod tests {
         }
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
-        let c = corpus(&rows);
+        let mut c = corpus(&rows);
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, _lines, _alpha, stories, seed, _) = analyse(c, &super::super::NEO4J, &cfg, &[]);
+        let (out, _lines, _alpha, stories, seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
         let r = seed.expect("seed reconstruction");
@@ -2878,7 +3201,7 @@ mod tests {
         // seeding by the account that switched (A2, owned by X, used by B)
         // finds the B -> C login directly
         let cfg2 = Settings { seeds: vec!["a2".into()], ..cfg };
-        let (_, _, _, _, seed2, _) = analyse(corpus(&rows), &super::super::NEO4J, &cfg2, &[]);
+        let (_, _, _, _, seed2, _) = analyse(&mut corpus(&rows), &super::super::NEO4J, &cfg2, &[]);
         let r = seed2.expect("seed reconstruction");
         assert_eq!(r.hops.len(), 1);
         assert_eq!((r.hops[0].depth, r.hops[0].origin.as_str(), r.hops[0].dest.as_str()), (1, "B", "C"));
@@ -2927,14 +3250,14 @@ mod tests {
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         rows.push((21, 12, "B", "C", "A2", "LOGOFF"));
-        let c = corpus(&rows);
+        let mut c = corpus(&rows);
         let day21 = 21 * 86_400;
         let hits = vec![
             sigma::SigmaHit { t: day21 + 11 * 3600 + 1800, host: "c.corp.local".into(), title: "PsExec Service Installation".into(), level: "high".into(), tags: String::new() },
             sigma::SigmaHit { t: day21 + 13 * 3600, host: "C".into(), title: "Something later".into(), level: String::new(), tags: String::new() },
         ];
         let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
-        let (out, lines, _, _, _, _) = analyse(c, &super::super::NEO4J, &cfg, &hits);
+        let (out, lines, _, _, _, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &hits);
         assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
         assert!(bc.why.contains("Sigma: 1 rule(s) fired on C while the session was open"), "{}", bc.why);
@@ -2984,4 +3307,104 @@ mod tests {
         assert_eq!(f[13], "secure");
     }
 
+    #[test]
+    fn base_prefix_covers_the_14_event_columns() {
+        let base = "t,d,SUCCESSFUL_LOGON,4624,10,u,D,w,ip,s,S,0x1,\"a,b\",f";
+        assert_eq!(base_prefix_len(base), Some(base.len()));
+        let with_tail = format!("{},significant,1.0e-3,\"why, with comma\",,", base);
+        assert_eq!(&with_tail[..base_prefix_len(&with_tail).unwrap()], base);
+        assert_eq!(base_prefix_len("a,b,c"), None);
+    }
+
+    fn hunt_settings(cutoff: &str) -> Settings {
+        Settings {
+            cutoff: chrono::DateTime::parse_from_rfc3339(cutoff).unwrap().with_timezone(&chrono::Utc),
+            end: None,
+            alpha: 0.05,
+            only: HashSet::new(),
+            skip: HashSet::new(),
+            seeds: Vec::new(),
+            seed_from: None,
+            seed_to: None,
+            sigma: Vec::new(),
+        }
+    }
+
+    fn login(day: u32, hour: u32, src: &str, dst: &str, user: &str, et: &str, lid: &str) -> String {
+        format!("2026-01-{:02}T{:02}:00:00Z,{},{},4624,3,{},CORP,,{},,,{},,Security.evtx", day, hour, dst, et, user, src, lid)
+    }
+
+    fn tmp_path(name: &str) -> String {
+        std::env::temp_dir().join(format!("masstin-annot-{}-{}", std::process::id(), name)).to_string_lossy().to_string()
+    }
+
+    /// The hunt written into the timeline: every row gets the state of
+    /// its connection, a session end that of its login, rows without an
+    /// origin nothing, baseline days `baseline`; the analyst's columns
+    /// survive, a second run changes nothing.
+    #[test]
+    fn timeline_rows_take_the_state_of_their_connection() {
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        // ten baseline days: WS01 -> SRV01 as alice, every day
+        for d in 1..=10 {
+            lines.push(format!("{}{}", login(d, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "0x10"), crate::csv_out::EMPTY_TAIL));
+        }
+        // the window day: the habitual login, a never-seen origin with a
+        // new account, its session end, a row with no origin
+        lines.push(format!("{}{}", login(11, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "0x11"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{},,,,benign,known jump", login(11, 10, "10.0.0.99", "SRV01", "mallory", "SUCCESSFUL_LOGON", "0x99")));
+        lines.push(format!("{}{}", login(11, 11, "10.0.0.99", "SRV01", "mallory", "LOGOFF", "0x99"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 12, "127.0.0.1", "SRV01", "system", "SUCCESSFUL_LOGON", "0x3e7"), crate::csv_out::EMPTY_TAIL));
+        let path = tmp_path("tl.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let files = vec![path.clone()];
+        let cfg = hunt_settings("2026-01-11T00:00:00Z");
+        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<Vec<String>> = text.lines().map(|l| csv_fields(l)).collect();
+        assert_eq!(rows[0].join(","), crate::csv_out::HEADER);
+        assert_eq!(rows.len(), 1 + 10 + 4);
+        for r in &rows[1..=10] {
+            assert_eq!(r[14], "baseline", "{:?}", r);
+            assert_eq!(r[15], "");
+        }
+        let habitual = &rows[11];
+        assert_eq!(habitual[14], "habitual");
+        assert_eq!(habitual[15], "1");
+        let new_origin = &rows[12];
+        assert!(new_origin[14] == "significant" || new_origin[14] == "candidate", "{:?}", new_origin);
+        assert!(!new_origin[15].is_empty());
+        assert!(new_origin[16].contains("origin never seen before"), "{}", new_origin[16]);
+        assert_eq!(new_origin[17], "benign");
+        assert_eq!(new_origin[18], "known jump");
+        let logoff = &rows[13];
+        assert_eq!(logoff[2], "LOGOFF");
+        assert_eq!(&logoff[14..17], &new_origin[14..17]);
+        let local = &rows[14];
+        assert!(local[14..].iter().all(|s| s.is_empty()), "{:?}", local);
+
+        // the same hunt again on the annotated file: identical bytes
+        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        // a 14-column copy of the same events, with the marks carried
+        // from the annotated file
+        let fresh = tmp_path("fresh.csv");
+        let body: Vec<String> = rows.iter().map(|r| {
+            let base: Vec<String> = r[..14].iter().map(|s| crate::csv_out::q(s)).collect();
+            base.join(",")
+        }).collect();
+        let mut body14 = body.clone();
+        body14[0] = crate::csv_out::HEADER_14.to_string();
+        std::fs::write(&fresh, format!("{}\n", body14.join("\n"))).unwrap();
+        let files2 = vec![fresh.clone()];
+        run_csv(&files2, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files2, carry_marks: Some(&path) }));
+        let again: Vec<Vec<String>> = std::fs::read_to_string(&fresh).unwrap().lines().map(|l| csv_fields(l)).collect();
+        assert_eq!(again[12][17], "benign");
+        assert_eq!(again[12][18], "known jump");
+        assert_eq!(again[12][14], new_origin[14]);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fresh);
+    }
 }

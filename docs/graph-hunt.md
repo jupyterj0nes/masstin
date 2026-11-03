@@ -45,7 +45,9 @@ The full design, with the reasons behind each choice, is in [docs/graph-hunt-sta
 
 ### Output
 
-One row per connection, most unusual first:
+**In the timeline.** `graph-hunt-csv` writes its verdict into the timeline it reads: every row gets `hunt` (`significant`, `candidate`, `habitual`, `not_evaluated`, `baseline`, or empty for a row that did not enter the hunt), `hunt_q` and `hunt_why`, in place; `verdict` and `notes`, the analyst's columns, are kept. A session end takes the state of the login it closes. The states are defined in [csv-format.md](csv-format.md#the-analysis-tail). `--no-annotate` leaves the timeline as it is; `--carry-marks old.csv` copies `verdict` / `notes` from an earlier timeline of the same evidence. Without `-o`, nothing else is written.
+
+**The findings table** (`-o findings.csv`, one row per connection, most unusual first; what the Neo4j and Memgraph hunts write):
 
 `rank, significant, p_value, q_value, day, first_seen_utc, last_seen_utc, origin, destination, account, result, events, logs, signature, why_unusual, evidence, chain, campaign, cypher_snippet`
 
