@@ -58,7 +58,7 @@ These are the questions the Cypher catalogue of the Neo4j export used to answer 
 ## The pane
 
 - A **host**: its names, events in and out, every connection it has in the view (click one to open it), *Expand around* and *Only this host*.
-- A **connection**: the account(s), result, number of events, first and last time, logon types and event IDs, the hunt's state with its q-value and explanation, and the rows behind it (first 300) with their event columns.
+- A **connection**: the account(s), result, number of events, first and last time, logon types and event IDs, the hunt's state with its score (0 to 100, how rare: 30 is one in a thousand) and explanation, and the rows behind it (first 300) with their event columns.
 
 ## Marks
 

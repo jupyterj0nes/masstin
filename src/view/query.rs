@@ -166,7 +166,8 @@ pub struct GEdge {
     pub first: i64,
     pub last: i64,
     pub hunt: u8,
-    pub hunt_q: f32,
+    /// `hunt_score`, 0 to 100; NaN when the hunt gave none
+    pub score: f32,
     pub why: u32,
     pub verdicts: [u32; 4],
     pub logon_types: Vec<u32>,
@@ -280,13 +281,13 @@ impl GraphView {
         let mut agg: HashMap<(u32, u32, u32, u8), Agg> = HashMap::new();
         for &ei in &selected {
             let e = &s.edges[ei as usize];
-            let a = agg.entry((e.src, e.dst, e.user, e.result)).or_insert(Agg { count: 0, first: e.t, last: e.t, hunt: e.hunt, q: e.hunt_q, why: e.why, verdicts: [0; 4], lts: HashSet::new(), eids: HashSet::new(), src_is_ip: e.src_is_ip, rows: Vec::new() });
+            let a = agg.entry((e.src, e.dst, e.user, e.result)).or_insert(Agg { count: 0, first: e.t, last: e.t, hunt: e.hunt, q: e.score, why: e.why, verdicts: [0; 4], lts: HashSet::new(), eids: HashSet::new(), src_is_ip: e.src_is_ip, rows: Vec::new() });
             a.count += 1;
             a.first = a.first.min(e.t);
             a.last = a.last.max(e.t);
-            if hunt_rank(e.hunt) < hunt_rank(a.hunt) || (e.hunt == a.hunt && e.hunt_q < a.q) {
+            if hunt_rank(e.hunt) < hunt_rank(a.hunt) || (e.hunt == a.hunt && e.score > a.q) {
                 a.hunt = e.hunt;
-                a.q = e.hunt_q;
+                a.q = e.score;
                 a.why = e.why;
             }
             a.verdicts[e.verdict as usize] += 1;
@@ -312,7 +313,7 @@ impl GraphView {
             if idx.len() <= Self::FOLD_ABOVE {
                 continue;
             }
-            let mut g = GEdge { src, dst, user: None, users: Vec::new(), result, count: 0, first: i64::MAX, last: i64::MIN, hunt: 0, hunt_q: f32::NAN, why: 0, verdicts: [0; 4], logon_types: Vec::new(), event_ids: Vec::new(), src_is_ip: false, rows: Vec::new(), first_event: usize::MAX };
+            let mut g = GEdge { src, dst, user: None, users: Vec::new(), result, count: 0, first: i64::MAX, last: i64::MIN, hunt: 0, score: f32::NAN, why: 0, verdicts: [0; 4], logon_types: Vec::new(), event_ids: Vec::new(), src_is_ip: false, rows: Vec::new(), first_event: usize::MAX };
             let mut lts = HashSet::new();
             let mut eids = HashSet::new();
             let mut first = true;
@@ -323,9 +324,9 @@ impl GraphView {
                 g.count += a.count;
                 g.first = g.first.min(a.first);
                 g.last = g.last.max(a.last);
-                if first || hunt_rank(a.hunt) < hunt_rank(g.hunt) || (a.hunt == g.hunt && a.q < g.hunt_q) {
+                if first || hunt_rank(a.hunt) < hunt_rank(g.hunt) || (a.hunt == g.hunt && a.q > g.score) {
                     g.hunt = a.hunt;
-                    g.hunt_q = a.q;
+                    g.score = a.q;
                     g.why = a.why;
                 }
                 first = false;
@@ -347,7 +348,7 @@ impl GraphView {
             if folded.contains(&i) {
                 continue;
             }
-            edges.push(GEdge { src, dst, user: Some(user), users: vec![user], result, count: a.count, first: a.first, last: a.last, hunt: a.hunt, hunt_q: a.q, why: a.why, verdicts: a.verdicts, logon_types: a.lts.into_iter().collect(), event_ids: a.eids.into_iter().collect(), src_is_ip: a.src_is_ip, rows: a.rows, first_event: usize::MAX });
+            edges.push(GEdge { src, dst, user: Some(user), users: vec![user], result, count: a.count, first: a.first, last: a.last, hunt: a.hunt, score: a.q, why: a.why, verdicts: a.verdicts, logon_types: a.lts.into_iter().collect(), event_ids: a.eids.into_iter().collect(), src_is_ip: a.src_is_ip, rows: a.rows, first_event: usize::MAX });
         }
         for g in &mut edges {
             g.logon_types.sort_by_key(|&i| s.logon_types.name(i).to_string());

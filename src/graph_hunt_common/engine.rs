@@ -1033,7 +1033,8 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
 // The hunt's unit is the connection (origin, destination, account, result,
 // day); a timeline row belongs to exactly one, found again with the key
 // the corpus rows were built with. The row's `hunt` column says what the
-// hunt made of that connection, `hunt_q` its q-value and `hunt_why` its
+// hunt made of that connection, `hunt_score` how rare it is (0 to 100,
+// `-10 log10 q`, see `csv_out::score_of`) and `hunt_why` its
 // explanation. A session end (LOGOFF) is not a connection: it takes the
 // state of the login it closes, found by logon ID on the same
 // destination. The 14 event columns are copied byte for byte; `verdict`
@@ -1258,7 +1259,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
                 }
                 let (hq, why): (String, &str) = if idx != u32::MAX {
                     let r = &rows[idx as usize];
-                    let hq = if st == ST_HABITUAL { "1".to_string() } else { fmt_p(r.q) };
+                    let hq = if st == ST_HABITUAL { "0".to_string() } else { crate::csv_out::score_of(r.q).map(|s| s.to_string()).unwrap_or_default() };
                     (hq, r.why.as_str())
                 } else {
                     (String::new(), "")
@@ -3406,10 +3407,11 @@ mod tests {
         }
         let habitual = &rows[11];
         assert_eq!(habitual[14], "habitual");
-        assert_eq!(habitual[15], "1");
+        assert_eq!(habitual[15], "0");
         let new_origin = &rows[12];
         assert!(new_origin[14] == "significant" || new_origin[14] == "candidate", "{:?}", new_origin);
-        assert!(!new_origin[15].is_empty());
+        let score: u8 = new_origin[15].parse().expect("hunt_score is an integer");
+        assert!(score <= 100, "{}", score);
         assert!(new_origin[16].contains("origin never seen before"), "{}", new_origin[16]);
         assert_eq!(new_origin[17], "benign");
         assert_eq!(new_origin[18], "known jump");
