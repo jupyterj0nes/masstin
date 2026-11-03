@@ -81,6 +81,10 @@ pub fn find_paths(s: &Store, q: &PathQuery) -> Vec<Path> {
     let mut budget = 2_000_000usize;
     dfs(s, q, q.origin, q.from.unwrap_or(i64::MIN), q.to.unwrap_or(i64::MAX), &mut visited, &mut chain, &mut out, &mut budget);
     out.sort_by(|a, b| a.hops().cmp(&b.hops()).then_with(|| a.span(s).cmp(&b.span(s))).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)));
+    // the same route with the same accounts (two rows of one logon, a
+    // retry a second later) is one path: the earliest stays
+    let mut seen: HashSet<Vec<(u32, u32, u32)>> = HashSet::new();
+    out.retain(|p| seen.insert(p.edges.iter().map(|&ei| { let e = &s.edges[ei as usize]; (e.src, e.dst, e.user) }).collect()));
     out.truncate(q.max_paths);
     out
 }
@@ -319,6 +323,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("masstin-paths-{}.csv", std::process::id()));
         let lines = vec![
             csv_out::HEADER.to_string(),
+            row(1, 9, "10.0.0.5", "WS01", "alice", "SUCCESSFUL_LOGON"),
             row(1, 9, "10.0.0.5", "WS01", "alice", "SUCCESSFUL_LOGON"),
             row(1, 10, "WS01", "SRV01", "alice", "SUCCESSFUL_LOGON"),
             row(1, 11, "SRV01", "DC01", "admin", "SUCCESSFUL_LOGON"),
