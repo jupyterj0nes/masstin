@@ -9,6 +9,7 @@
 
 mod app;
 mod layout;
+mod paths;
 mod present;
 mod query;
 mod store;

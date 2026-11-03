@@ -47,6 +47,14 @@ The third row of the bar:
 - **Hosts / Edges / Text**: scales.
 - **Rules (n)**: the style rules window. A rule is a field (host, account, logon type, event id, result, hunt, verdict) and a pattern (same syntax as the filters; empty matches everything), then the look it gives: colour, edge width, host size, shape, dashed, glow, hide. The first rule that matches wins; rules on host and hunt also apply to hosts. Buttons add the usual ones: one account in colour, hide machine accounts, fade what was marked benign, domain controllers as hexagons. Rules are saved with the style.
 
+## Paths, cones and questions
+
+**Paths…** finds the time-respecting paths between two hosts: a chain of logins where every hop happens after the previous one and no later than the gap allowed (hours; 24 by default), no host entered twice, up to a number of hops, inside the bar's time window. Hops are successful logons by default; failures, touches and logoffs can count too, and machine accounts are left out unless asked. The paths come shortest first, each as `A -(account HH:MM)-> B -(…)-> C`; clicking one draws it alone, the hosts in columns by hop with the time of each arrival. *Reach from origin* draws the earliest-arrival cone (every host a chain of logins could have reached from the origin, with the hop and the time it was first reached); *Ways into destination* the same backwards. *Paths from here* / *Paths to here* on a host fill the form. *Back to the view* returns to the filter's graph.
+
+**Questions…** answers, over the rows of the current view: the origins reaching the most destinations, the destinations reached from the most origins, the accounts used from several origins, the connections where failures were followed by a logon, the hosts and accounts seen latest for the first time, and the centrality of every host (PageRank, betweenness, distinct in / out). Click a host to open its neighbourhood.
+
+These are the questions the Cypher catalogue of the Neo4j export used to answer (`neo4j-resources/cypher_queries.md`), without a database.
+
 ## The pane
 
 - A **host**: its names, events in and out, every connection it has in the view (click one to open it), *Expand around* and *Only this host*.

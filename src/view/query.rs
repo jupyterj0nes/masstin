@@ -252,6 +252,18 @@ impl GraphView {
 
     pub fn build(s: &Store, f: &Filter) -> GraphView {
         let selected = f.select(s);
+        Self::from_selection(s, f, selected)
+    }
+
+    /// A view of these store edges (a path, a cone), in time order.
+    pub fn from_edges(s: &Store, f: &Filter, mut edges: Vec<u32>) -> GraphView {
+        edges.sort_unstable();
+        edges.dedup();
+        edges.sort_by_key(|&ei| (s.edges[ei as usize].t, ei));
+        Self::from_selection(s, f, edges)
+    }
+
+    fn from_selection(s: &Store, f: &Filter, selected: Vec<u32>) -> GraphView {
         struct Agg {
             count: u64,
             first: i64,
