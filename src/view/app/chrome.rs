@@ -805,8 +805,8 @@ impl Viewer {
             }
             let clock = [(60.0, "1 min/s"), (600.0, "10 min/s"), (3600.0, "1 h/s"), (6.0 * 3600.0, "6 h/s"), (24.0 * 3600.0, "1 day/s"), (7.0 * 24.0 * 3600.0, "1 week/s")];
             let current = match self.rate_secs {
-                None => format!("{} rows/s", self.rate as u32),
-                Some(s) => clock.iter().find(|(v, _)| (*v - s).abs() < 0.5).map(|(_, l)| l.to_string()).unwrap_or_else(|| format!("{:.0} s/s", s)),
+                None => if (self.rate - self.rate.round()).abs() < 0.05 { format!("{} rows/s", self.rate.round() as u32) } else { format!("{:.1} rows/s", self.rate) },
+                Some(s) => clock.iter().find(|(v, _)| (*v - s).abs() < 0.5).map(|(_, l)| l.to_string()).unwrap_or_else(|| crate::view::present::clock_label(s)),
             };
             let r = egui::ComboBox::from_id_salt("rate").selected_text(current).width(104.0).show_ui(ui, |ui| {
                 ui.label(egui::RichText::new("By rows: so many rows of the view a second, whatever their times").small().color(theme::DIM));
@@ -818,17 +818,38 @@ impl Viewer {
                         }
                     }
                 }
+                ui.horizontal(|ui| {
+                    let mut v = self.rate;
+                    if ui.add(egui::DragValue::new(&mut v).range(0.1..=100_000.0).speed(0.5).max_decimals(1).suffix(" rows/s")).on_hover_text("Your own: type a number or drag").changed() {
+                        self.rate = v;
+                        if self.rate_secs.take().is_some() && self.playing {
+                            self.acc = 0.0;
+                        }
+                    }
+                    ui.label(egui::RichText::new("your own").small().color(theme::DIM));
+                });
                 ui.separator();
                 ui.label(egui::RichText::new("By the clock: so much of the timeline a second; a quiet hour takes as long as a busy one").small().color(theme::DIM));
+                let mut pick_clock: Option<f32> = None;
                 for (v, l) in clock {
                     if ui.selectable_label(self.rate_secs.map_or(false, |s| (s - v).abs() < 0.5), l).clicked() {
-                        let was_rows = self.rate_secs.is_none();
-                        self.rate_secs = Some(v);
-                        if self.playing && was_rows {
-                            // the clock picks up where the head is
-                            let k = self.cursor.saturating_sub(1);
-                            self.replay_t = self.graph.events.get(k).map(|&ei| self.store.edges[ei as usize].t as f64).unwrap_or(0.0);
-                        }
+                        pick_clock = Some(v);
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let mut mins = self.rate_secs.unwrap_or(3600.0) / 60.0;
+                    if ui.add(egui::DragValue::new(&mut mins).range(0.01..=10_000_000.0).speed(1.0).max_decimals(1).suffix(" min/s")).on_hover_text("Your own: minutes of the timeline a second; type a number or drag").changed() {
+                        pick_clock = Some(mins * 60.0);
+                    }
+                    ui.label(egui::RichText::new("your own").small().color(theme::DIM));
+                });
+                if let Some(v) = pick_clock {
+                    let was_rows = self.rate_secs.is_none();
+                    self.rate_secs = Some(v);
+                    if self.playing && was_rows {
+                        // the clock picks up where the head is
+                        let k = self.cursor.saturating_sub(1);
+                        self.replay_t = self.graph.events.get(k).map(|&ei| self.store.edges[ei as usize].t as f64).unwrap_or(0.0);
                     }
                 }
             });

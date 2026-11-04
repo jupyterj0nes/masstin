@@ -40,6 +40,50 @@ impl Default for StepOverride {
     }
 }
 
+/// A stretch of the timeline with a speed of its own: steps whose time
+/// falls in `[from, to)` take this timing instead of the story's. Times
+/// are `YYYY-MM-DD HH:MM[:SS]`; empty means open on that side.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stretch {
+    pub from: String,
+    pub to: String,
+    pub timing: Timing,
+    pub step_secs: f32,
+    /// timeline seconds a second when by the clock
+    pub compress: f32,
+}
+
+impl Default for Stretch {
+    fn default() -> Self {
+        Stretch { from: String::new(), to: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0 }
+    }
+}
+
+impl Stretch {
+    pub fn contains(&self, t: i64) -> bool {
+        let from = super::query::parse_time(&self.from);
+        let to = super::query::parse_time(&self.to);
+        from.map_or(true, |f| t >= f) && to.map_or(true, |x| t < x)
+    }
+}
+
+/// A clock speed as people say it: "10 min/s", "1.5 h/s", "2 day/s".
+pub fn clock_label(secs_per_sec: f32) -> String {
+    let tidy = |x: f32| if (x - x.round()).abs() < 0.05 { format!("{:.0}", x) } else { format!("{:.1}", x) };
+    if secs_per_sec < 60.0 {
+        format!("{} s/s", tidy(secs_per_sec))
+    } else if secs_per_sec < 3600.0 {
+        format!("{} min/s", tidy(secs_per_sec / 60.0))
+    } else if secs_per_sec < 86_400.0 {
+        format!("{} h/s", tidy(secs_per_sec / 3600.0))
+    } else if secs_per_sec < 7.0 * 86_400.0 {
+        format!("{} day/s", tidy(secs_per_sec / 86_400.0))
+    } else {
+        format!("{} week/s", tidy(secs_per_sec / (7.0 * 86_400.0)))
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Story {
@@ -60,11 +104,14 @@ pub struct Story {
     pub hold_end: f32,
     /// per step, keyed by `file:line` of its first row
     pub steps: HashMap<String, StepOverride>,
+    /// stretches of the timeline with a speed of their own; the first that
+    /// contains a step wins
+    pub stretches: Vec<Stretch>,
 }
 
 impl Default for Story {
     fn default() -> Self {
-        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new() }
+        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new() }
     }
 }
 
@@ -118,11 +165,16 @@ pub fn build_steps(events: &[(i64, String, bool)], story: &Story) -> Vec<Step> {
             continue;
         }
         let prev_t = steps.last().map(|s| s.t);
-        let base = match story.timing {
-            Timing::Fixed => story.step_secs,
+        // the stretch this step falls in sets its timing; else the story's
+        let (timing, step_secs, compress) = match story.stretches.iter().find(|s| s.contains(t0)) {
+            Some(s) => (s.timing, s.step_secs, s.compress),
+            None => (story.timing, story.step_secs, story.compress),
+        };
+        let base = match timing {
+            Timing::Fixed => step_secs,
             Timing::Compressed => match prev_t {
-                Some(p) => (((t0 - p) as f32) / story.compress.max(1.0)).clamp(story.min_gap, story.max_gap),
-                None => story.step_secs,
+                Some(p) => (((t0 - p) as f32) / compress.max(1.0)).clamp(story.min_gap, story.max_gap),
+                None => step_secs,
             },
         };
         let dur = ov.and_then(|o| o.secs).unwrap_or(base).max(0.05);
@@ -320,6 +372,27 @@ mod tests {
         story.compress = 10.0;
         let s2 = build_steps(&ev, &story);
         assert!((s2[1].dur - 1.0).abs() < 1e-6, "{:?}", s2[1]);
+    }
+
+    #[test]
+    fn a_stretch_sets_its_own_speed() {
+        let mut story = Story::default();
+        story.group_secs = 0.0;
+        story.step_secs = 1.0;
+        story.stretches.push(Stretch { from: "2024-01-01 10:00".into(), to: "2024-01-01 11:00".into(), timing: Timing::Fixed, step_secs: 0.25, compress: 600.0 });
+        let t = |s: &str| super::super::query::parse_time(s).unwrap();
+        let events = vec![
+            (t("2024-01-01 09:30"), "a:1".to_string(), false),
+            (t("2024-01-01 10:15"), "a:2".to_string(), false),
+            (t("2024-01-01 10:45"), "a:3".to_string(), false),
+            (t("2024-01-01 11:30"), "a:4".to_string(), false),
+        ];
+        let steps = build_steps(&events, &story);
+        let durs: Vec<f32> = steps.iter().map(|s| s.dur).collect();
+        assert_eq!(durs, vec![1.0, 0.25, 0.25, 1.0]);
+        assert_eq!(clock_label(600.0), "10 min/s");
+        assert_eq!(clock_label(5400.0), "1.5 h/s");
+        assert_eq!(clock_label(2.0 * 86_400.0), "2 day/s");
     }
 
     #[test]

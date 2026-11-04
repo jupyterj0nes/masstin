@@ -2807,6 +2807,65 @@ impl Viewer {
                 });
                 ui.end_row();
             });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("STRETCHES   (a part of the timeline at a speed of its own: the first stretch a step falls in sets its timing; the rest take the global one)").small().color(MUTED));
+            let mut remove_stretch: Option<usize> = None;
+            egui::Grid::new("stretches").num_columns(7).spacing([8.0, 4.0]).show(ui, |ui| {
+                for h in ["from", "to", "timing", "speed", "", "", ""] {
+                    ui.label(egui::RichText::new(h).small().color(MUTED));
+                }
+                ui.end_row();
+                let n_str = self.story.stretches.len();
+                for i in 0..n_str {
+                    let s = &mut self.story.stretches[i];
+                    let ok_from = s.from.trim().is_empty() || parse_time(&s.from).is_some();
+                    let ok_to = s.to.trim().is_empty() || parse_time(&s.to).is_some();
+                    changed |= ui.add_sized([150.0, 20.0], egui::TextEdit::singleline(&mut s.from).hint_text("start").text_color(if ok_from { TEXT } else { SIGNIFICANT })).on_hover_text("YYYY-MM-DD HH:MM; empty: from the start").changed();
+                    changed |= ui.add_sized([150.0, 20.0], egui::TextEdit::singleline(&mut s.to).hint_text("end").text_color(if ok_to { TEXT } else { SIGNIFICANT })).on_hover_text("YYYY-MM-DD HH:MM; empty: to the end").changed();
+                    egui::ComboBox::from_id_salt(("stretch-timing", i)).selected_text(match s.timing { Timing::Fixed => "same time per step", Timing::Compressed => "by the clock" }).width(150.0).show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut s.timing, Timing::Fixed, "same time per step").changed();
+                        changed |= ui.selectable_value(&mut s.timing, Timing::Compressed, "by the clock").changed();
+                    });
+                    match s.timing {
+                        Timing::Fixed => {
+                            changed |= ui.add(egui::DragValue::new(&mut s.step_secs).range(0.05..=60.0).speed(0.05).fixed_decimals(2).suffix(" s/step")).changed();
+                            ui.label(egui::RichText::new("every step this long").small().color(MUTED));
+                        }
+                        Timing::Compressed => {
+                            let mut mins = s.compress / 60.0;
+                            if ui.add(egui::DragValue::new(&mut mins).range(0.01..=1_000_000.0).speed(1.0).fixed_decimals(1).suffix(" min/s")).on_hover_text("minutes of the timeline a second; the gap min / max above still clamp each step").changed() {
+                                s.compress = mins * 60.0;
+                                changed = true;
+                            }
+                            ui.label(egui::RichText::new(present::clock_label(s.compress)).small().color(MUTED));
+                        }
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new(super::icons::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Remove this stretch").clicked() {
+                        remove_stretch = Some(i);
+                    }
+                    ui.label("");
+                    ui.end_row();
+                }
+            });
+            if let Some(i) = remove_stretch {
+                self.story.stretches.remove(i);
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                if ui.button("+  Add a stretch").on_hover_text("A new stretch over the window the filter selects (From / To), at the story's speed; edit it").clicked() {
+                    let mut s = present::Stretch::default();
+                    s.from = self.filter.from.trim().to_string();
+                    s.to = self.filter.to.trim().to_string();
+                    s.timing = self.story.timing;
+                    s.step_secs = self.story.step_secs;
+                    s.compress = self.story.compress;
+                    self.story.stretches.push(s);
+                    changed = true;
+                }
+                if !self.story.stretches.is_empty() {
+                    ui.label(egui::RichText::new(format!("{} stretch(es); steps outside them take the global timing", self.story.stretches.len())).small().color(MUTED));
+                }
+            });
             if changed {
                 self.rebuild_steps();
             }
