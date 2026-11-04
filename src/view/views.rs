@@ -109,6 +109,29 @@ impl Shape {
     }
 }
 
+/// How a host is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum NodeStyle {
+    /// a piece of glass: gradient, shadow, highlight, thin rim
+    #[default]
+    Glass,
+    /// the same, with an icon for what the host is in the middle, the name under it
+    Icon,
+    /// a small dot inside a thin ring
+    Minimal,
+}
+
+impl NodeStyle {
+    pub const ALL: [NodeStyle; 3] = [NodeStyle::Glass, NodeStyle::Icon, NodeStyle::Minimal];
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeStyle::Glass => "glass",
+            NodeStyle::Icon => "icons",
+            NodeStyle::Minimal => "minimal",
+        }
+    }
+}
+
 /// Where a host's name is drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum LabelPos {
@@ -167,11 +190,14 @@ pub struct Rule {
     pub label_size: Option<f32>,
     #[serde(default)]
     pub label_bg: Option<[u8; 3]>,
+    /// a host's own icon (a key of the catalogue), shown whatever the node style
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 impl Default for Rule {
     fn default() -> Self {
-        Rule { enabled: true, field: Field::User, pattern: String::new(), color: Some([255, 196, 84]), width: 1.0, size: 1.0, dashed: false, hide: false, shape: None, glow: false, label_pos: None, label_size: None, label_bg: None }
+        Rule { enabled: true, field: Field::User, pattern: String::new(), color: Some([255, 196, 84]), width: 1.0, size: 1.0, dashed: false, hide: false, shape: None, glow: false, label_pos: None, label_size: None, label_bg: None, icon: None }
     }
 }
 
@@ -198,6 +224,8 @@ pub struct Style {
     pub label_bg: bool,
     #[serde(default = "label_box")]
     pub label_bg_color: [u8; 3],
+    #[serde(default)]
+    pub node_style: NodeStyle,
 }
 
 fn label_box() -> [u8; 3] {
@@ -210,7 +238,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box() }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Glass }
     }
 }
 

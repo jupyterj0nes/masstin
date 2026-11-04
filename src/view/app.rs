@@ -28,7 +28,7 @@ use chrome::{Brush, ColorPick, Tab};
 use edge_style::EdgeEdit;
 use labels::HostEdit;
 use merge_hosts::MergeHostsEdit;
-use super::views::LabelPos;
+use super::views::{LabelPos, NodeStyle};
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
@@ -45,14 +45,17 @@ const BORDER: Color32 = Color32::from_rgb(40, 46, 60);
 const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 const MUTED: Color32 = Color32::from_rgb(132, 142, 160);
 const ACCENT: Color32 = Color32::from_rgb(255, 198, 88);
-const HOST_FILL: Color32 = Color32::from_rgb(70, 198, 236);
-const HOST_RING: Color32 = Color32::from_rgb(120, 222, 250);
-const IP_FILL: Color32 = Color32::from_rgb(255, 188, 74);
-const IP_RING: Color32 = Color32::from_rgb(255, 214, 140);
-const DC_FILL: Color32 = Color32::from_rgb(196, 140, 222);
-const DC_RING: Color32 = Color32::from_rgb(224, 180, 240);
-const SERVER_FILL: Color32 = Color32::from_rgb(86, 150, 232);
-const SERVER_RING: Color32 = Color32::from_rgb(140, 186, 246);
+// hosts: quiet, by what they are; the hunt's red and orange stay the loud ones
+const HOST_FILL: Color32 = Color32::from_rgb(86, 122, 176);
+const HOST_RING: Color32 = Color32::from_rgb(158, 188, 228);
+const IP_FILL: Color32 = Color32::from_rgb(150, 134, 108);
+const IP_RING: Color32 = Color32::from_rgb(206, 190, 160);
+const DC_FILL: Color32 = Color32::from_rgb(126, 100, 180);
+const DC_RING: Color32 = Color32::from_rgb(186, 164, 226);
+const SERVER_FILL: Color32 = Color32::from_rgb(50, 140, 148);
+const SERVER_RING: Color32 = Color32::from_rgb(124, 200, 204);
+const EXTERNAL_FILL: Color32 = Color32::from_rgb(178, 124, 62);
+const EXTERNAL_RING: Color32 = Color32::from_rgb(226, 182, 118);
 const SIGNIFICANT: Color32 = Color32::from_rgb(255, 92, 108);
 const CANDIDATE: Color32 = Color32::from_rgb(255, 152, 86);
 const SUSPICIOUS: Color32 = Color32::from_rgb(255, 99, 132);
@@ -142,6 +145,8 @@ struct NodeLook {
     /// text size multiplier of its own
     label_size: f32,
     label_bg: Option<Color32>,
+    /// the glyph in the middle, when the style or the host asks for one
+    icon: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -934,7 +939,10 @@ impl Viewer {
                 ui.label(text);
             });
         };
-        chip(ui, HOST_FILL, HOST_RING, "host (name)");
+        chip(ui, HOST_FILL, HOST_RING, "workstation (mostly an origin)");
+        chip(ui, SERVER_FILL, SERVER_RING, "server (mostly a destination)");
+        chip(ui, DC_FILL, DC_RING, "domain controller (Kerberos ticket traffic)");
+        chip(ui, EXTERNAL_FILL, EXTERNAL_RING, "address outside the private ranges");
         chip(ui, IP_FILL, IP_RING, "address the hunt could not tie to a name");
         chip(ui, HOST_FILL, SIGNIFICANT, "touched by a significant connection");
         chip(ui, HOST_FILL, CANDIDATE, "touched by a candidate");
@@ -1478,18 +1486,16 @@ impl Viewer {
         for (i, n) in g.nodes.iter().enumerate() {
             let name = self.store.hosts.name(n.host).to_string();
             let is_ip = crate::load_neo4j::looks_like_ip(&name);
-            let (mut fill, mut ring) = if self.style.shapes_by_role {
-                match n.role {
-                    Role::DomainController => (DC_FILL, DC_RING),
-                    Role::External => (IP_FILL, IP_RING),
-                    Role::Server => (SERVER_FILL, SERVER_RING),
-                    _ => if is_ip { (IP_FILL, IP_RING) } else { (HOST_FILL, HOST_RING) },
-                }
-            } else if is_ip {
-                (IP_FILL, IP_RING)
-            } else {
-                (HOST_FILL, HOST_RING)
+            // the colour says what the host is; an address the hunt could not
+            // name stays sand-coloured whatever it does
+            let (mut fill, mut ring) = match n.role {
+                Role::External => (EXTERNAL_FILL, EXTERNAL_RING),
+                _ if is_ip => (IP_FILL, IP_RING),
+                Role::DomainController => (DC_FILL, DC_RING),
+                Role::Server => (SERVER_FILL, SERVER_RING),
+                _ => (HOST_FILL, HOST_RING),
             };
+            let mut icon: Option<&'static str> = if self.style.node_style == NodeStyle::Icon { Some(labels::role_icon(n.role, is_ip)) } else { None };
             let mut shape = if self.style.shapes_by_role {
                 match n.role {
                     Role::DomainController => Shape::Hexagon,
@@ -1518,6 +1524,9 @@ impl Viewer {
                 if let Some(c) = rule.label_bg {
                     label_bg = Some(Color32::from_rgb(c[0], c[1], c[2]));
                 }
+                if let Some(key) = rule.icon.as_deref() {
+                    icon = labels::icon_glyph(key).or(icon);
+                }
                 if let Some(c) = rule.color {
                     fill = Color32::from_rgb(c[0], c[1], c[2]);
                     ring = Color32::from_rgb((c[0] as f32 * 0.75) as u8, (c[1] as f32 * 0.75) as u8, (c[2] as f32 * 0.75) as u8);
@@ -1528,7 +1537,7 @@ impl Viewer {
                 size = rule.size;
                 glow = rule.glow;
             }
-            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]), label_pos, label_size, label_bg });
+            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]), label_pos, label_size, label_bg, icon });
         }
         let n_ip = nodes.iter().filter(|n| n.is_ip).count();
         self.scene = Scene { fingerprint, graph_id: self.graph_id, edges, nodes, chips: self.legend_chips(), n_ip };
@@ -2025,7 +2034,14 @@ impl Viewer {
                     draw::ring(&mut node_mesh, p, r, ring_w.min(1.5) * if significant { 1.6 } else { 1.0 }, draw::fade(draw::lighten(ring, 0.25), alpha * 0.95));
                 }
             } else {
-                draw::orb(&painter, look.shape, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 });
+                if matches!(look.shape, Shape::Circle) {
+                    draw::glass(&painter, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 }, look.icon, self.style.node_style == NodeStyle::Minimal);
+                } else {
+                    draw::orb(&painter, look.shape, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 });
+                    if let Some(g) = look.icon {
+                        painter.text(p, Align2::CENTER_CENTER, g, FontId::proportional((r * 1.0).max(8.0)), draw::fade(Color32::WHITE, 0.94 * alpha));
+                    }
+                }
             }
             nodes_drawn += 1;
             let anonym = self.presenting && self.story.anonymise;
@@ -2033,7 +2049,8 @@ impl Viewer {
             let shown_name: &str = &shown;
             if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
                 let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
-                labels::paint_host_label(&painter, shown_name, p, r, look.label_pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod);
+                let pos = if (look.icon.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) { LabelPos::Below } else { look.label_pos };
+                labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod);
             }
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
                 let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * fs).clamp(8.0, 14.0)), ACCENT);

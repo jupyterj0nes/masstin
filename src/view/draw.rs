@@ -169,6 +169,53 @@ pub fn orb(painter: &egui::Painter, shape: NodeShape, c: Pos2, r: f32, fill: Col
     }
 }
 
+/// A host as a piece of glass: a soft shadow, a radial gradient from a
+/// lit centre to a darker rim, a highlight towards the top left, a thin
+/// bright rim and a faint outer ring; an icon in the middle when asked.
+#[allow(clippy::too_many_arguments)]
+pub fn glass(painter: &egui::Painter, c: Pos2, r: f32, base: Color32, ring: Color32, alpha: f32, ring_width: f32, icon: Option<&str>, minimal: bool) {
+    if minimal {
+        painter.circle_filled(c, r * 0.5, fade(lighten(base, 0.15), alpha));
+        painter.circle_stroke(c, r, Stroke::new(ring_width.min(1.5), fade(ring, 0.7 * alpha)));
+        if let Some(g) = icon {
+            painter.text(c, egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(r * 0.75), fade(Color32::WHITE, 0.9 * alpha));
+        }
+        return;
+    }
+    painter.circle_filled(Pos2::new(c.x, c.y + r * 0.14), r * 1.02, fade(Color32::BLACK, 0.38 * alpha));
+    let n = ((r * 1.2) as usize).clamp(12, 56);
+    let mut mesh = Mesh::default();
+    let centre = fade(lighten(base, 0.32), alpha);
+    let rim = fade(darken(base, 0.32), alpha);
+    let clear = fade(rim, 0.0);
+    mesh.vertices.push(Vertex { pos: Pos2::new(c.x - r * 0.12, c.y - r * 0.16), uv: WHITE_UV, color: centre });
+    for k in 0..n {
+        let a = k as f32 / n as f32 * std::f32::consts::TAU;
+        let (sn, cs) = a.sin_cos();
+        mesh.vertices.push(Vertex { pos: Pos2::new(c.x + cs * r, c.y + sn * r), uv: WHITE_UV, color: rim });
+        mesh.vertices.push(Vertex { pos: Pos2::new(c.x + cs * (r + 1.0), c.y + sn * (r + 1.0)), uv: WHITE_UV, color: clear });
+    }
+    for k in 0..n as u32 {
+        let a = 1 + k * 2;
+        let b = 1 + ((k + 1) % n as u32) * 2;
+        mesh.add_triangle(0, a, b);
+        mesh.add_triangle(a, a + 1, b + 1);
+        mesh.add_triangle(a, b + 1, b);
+    }
+    painter.add(Shape::mesh(mesh));
+    if r > 6.0 {
+        painter.circle_filled(Pos2::new(c.x - r * 0.28, c.y - r * 0.36), r * 0.40, fade(Color32::WHITE, 0.10 * alpha));
+        painter.circle_filled(Pos2::new(c.x - r * 0.30, c.y - r * 0.40), r * 0.22, fade(Color32::WHITE, 0.10 * alpha));
+    }
+    painter.circle_stroke(c, r, Stroke::new(ring_width, fade(lighten(ring, 0.12), 0.85 * alpha)));
+    painter.circle_stroke(c, r + 2.5, Stroke::new(1.0, fade(ring, 0.16 * alpha)));
+    if let Some(g) = icon {
+        let size = (r * 1.05).max(8.0);
+        painter.text(Pos2::new(c.x, c.y + r * 0.02), egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::from_rgb(10, 14, 22), 0.35 * alpha));
+        painter.text(Pos2::new(c.x, c.y - r * 0.02), egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::WHITE, 0.94 * alpha));
+    }
+}
+
 pub fn bez(a: Pos2, c: Pos2, b: Pos2, t: f32) -> Pos2 {
     let u = 1.0 - t;
     Pos2::new(u * u * a.x + 2.0 * u * t * c.x + t * t * b.x, u * u * a.y + 2.0 * u * t * c.y + t * t * b.y)
