@@ -126,7 +126,7 @@ impl Viewer {
                 ui.checkbox(&mut self.hud, format!("{}  Frame budget (F1)", ic::PULSE));
                 ui.separator();
                 let mut changed = false;
-                changed |= ui.checkbox(&mut self.style.motion, format!("{}  Motion", ic::SPARKLE)).changed();
+                changed |= ui.checkbox(&mut self.style.motion, format!("{}  Motion", ic::WAVEFORM)).changed();
                 changed |= ui.checkbox(&mut self.style.shapes_by_role, format!("{}  Shapes by role", ic::HEXAGON)).changed();
                 if ui.checkbox(&mut self.style.size_by_traffic, format!("{}  Host size by traffic", ic::CIRCLES_THREE_PLUS)).on_hover_text("On: a host grows with its events in and out of the view (log scale). Off: every host the same size").changed() {
                     changed = true;
@@ -270,7 +270,7 @@ impl Viewer {
                 self.draft = f;
                 self.requery(true);
             }
-            if tool(ui, ic::SPARKLE, "Motion: dots along the connections that matter, pulses, glides", self.style.motion).clicked() {
+            if tool(ui, ic::WAVEFORM, "Motion: dots along the connections that matter, the sheen on the hosts, pulses, glides", self.style.motion).clicked() {
                 self.style.motion = !self.style.motion;
                 self.persist();
             }

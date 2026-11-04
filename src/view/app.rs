@@ -2035,7 +2035,12 @@ impl Viewer {
                 }
             } else {
                 if matches!(look.shape, Shape::Circle) {
-                    draw::glass(&painter, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 }, look.icon, self.style.node_style == NodeStyle::Minimal);
+                    // the sheen runs on the hosts that matter, and on all of them when few
+                    let sheen = if motion && (lit || significant || n.hunt_rank == 1 || self.graph.nodes.len() <= 120) { Some(now * 0.9 + i as f32 * 0.7) } else { None };
+                    if sheen.is_some() {
+                        keep_moving = true;
+                    }
+                    draw::glass(&painter, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 }, look.icon, self.style.node_style == NodeStyle::Minimal, sheen);
                 } else {
                     draw::orb(&painter, look.shape, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 });
                     if let Some(g) = look.icon {

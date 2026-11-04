@@ -167,7 +167,12 @@ impl Viewer {
                     }
                 }
             });
-            ui.label(egui::RichText::new("Icons follow what the graph makes of each host (workstation, server, domain controller, address, external); a host's own icon is set from its right-click menu.").color(theme::DIM).small());
+            ui.horizontal_wrapped(|ui| {
+                for (g, l) in [(ic::DESKTOP, "workstation"), (ic::HARD_DRIVES, "server"), (ic::CASTLE_TURRET, "domain controller"), (ic::BROADCAST, "address"), (ic::GLOBE, "external")] {
+                    ui.label(egui::RichText::new(format!("{}  {}", g, l)).color(theme::MUTED).size(12.0));
+                }
+            });
+            ui.label(egui::RichText::new("That is what each host gets in the icon style, from what the graph makes of it; a host's own icon comes from its right-click menu, Style of this host, with the whole catalogue.").color(theme::DIM).small());
             theme::section(ui, "Where the name goes");
             ui.horizontal_wrapped(|ui| {
                 for pos in LabelPos::ALL {
@@ -233,7 +238,7 @@ impl Viewer {
         let mut bg = current.as_ref().and_then(|r| r.label_bg);
         let mut color = current.as_ref().and_then(|r| r.color);
         let mut icon_key: Option<String> = current.as_ref().and_then(|r| r.icon.clone());
-        egui::Window::new(format!("{}  {}", ic::DESKTOP, name)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
+        egui::Window::new(format!("{}  {}", ic::DESKTOP, name)).open(&mut open).collapsible(false).resizable(false).default_width(470.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
             theme::section(ui, "Name");
             ui.horizontal_wrapped(|ui| {
                 if theme::pill(ui, pos.is_none(), "as the global setting", theme::MUTED).clicked() {
@@ -269,22 +274,29 @@ impl Viewer {
                 }
             });
             theme::section(ui, "Host");
-            ui.horizontal(|ui| {
-                ui.label("icon");
-                let shown = icon_key.as_deref().and_then(|k| ICONS.iter().find(|(key, _, _)| key.eq_ignore_ascii_case(k))).map(|(_, g, l)| format!("{}  {}", g, l)).unwrap_or_else(|| "none (by role in icon style)".to_string());
-                egui::ComboBox::from_id_salt("host-icon").selected_text(shown).width(240.0).show_ui(ui, |ui| {
-                    if ui.selectable_label(icon_key.is_none(), "none (by role in icon style)").clicked() {
-                        icon_key = None;
+            ui.label(egui::RichText::new("icon").color(theme::MUTED));
+            // the catalogue as a grid of glyphs: the first cell is "by role"
+            let cell = Vec2::new(40.0, 40.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
+                let on = icon_key.is_none();
+                let b = egui::Button::new(egui::RichText::new(ic::DOT_OUTLINE).size(18.0).color(if on { theme::ACCENT } else { theme::MUTED })).min_size(cell).fill(if on { draw::fade(theme::ACCENT, 0.18) } else { theme::FIELD }).stroke(if on { Stroke::new(1.0, theme::ACCENT) } else { Stroke::new(1.0, theme::BORDER) }).corner_radius(CornerRadius::same(9));
+                if ui.add(b).on_hover_text("by role (workstation, server, domain controller, address, external), in the icon style").clicked() {
+                    icon_key = None;
+                    changed = true;
+                }
+                for (key, glyph, label) in ICONS {
+                    let on = icon_key.as_deref().map_or(false, |k| k.eq_ignore_ascii_case(key));
+                    let b = egui::Button::new(egui::RichText::new(*glyph).size(19.0).color(if on { theme::ACCENT_INK } else { TEXT })).min_size(cell).fill(if on { theme::ACCENT } else { theme::FIELD }).stroke(if on { Stroke::NONE } else { Stroke::new(1.0, theme::BORDER) }).corner_radius(CornerRadius::same(9));
+                    if ui.add(b).on_hover_text(*label).clicked() {
+                        icon_key = Some(key.to_string());
                         changed = true;
                     }
-                    for (key, glyph, label) in ICONS {
-                        if ui.selectable_label(icon_key.as_deref().map_or(false, |k| k.eq_ignore_ascii_case(key)), format!("{}  {}", glyph, label)).clicked() {
-                            icon_key = Some(key.to_string());
-                            changed = true;
-                        }
-                    }
-                });
+                }
             });
+            if let Some((_, g, l)) = icon_key.as_deref().and_then(|k| ICONS.iter().find(|(key, _, _)| key.eq_ignore_ascii_case(k))) {
+                ui.label(egui::RichText::new(format!("{}  {}", g, l)).color(theme::DIM).small());
+            }
             ui.horizontal(|ui| {
                 ui.label("size ×");
                 changed |= ui.add(egui::Slider::new(&mut size_mul, 0.4..=3.0).fixed_decimals(1)).changed();
