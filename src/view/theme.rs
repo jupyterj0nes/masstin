@@ -15,8 +15,12 @@ pub const BORDER_2: Color32 = Color32::from_rgb(56, 65, 84);
 pub const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 pub const MUTED: Color32 = Color32::from_rgb(132, 142, 160);
 pub const DIM: Color32 = Color32::from_rgb(88, 97, 114);
-pub const ACCENT: Color32 = Color32::from_rgb(255, 198, 88);
-pub const ACCENT_INK: Color32 = Color32::from_rgb(34, 26, 8);
+/// The logo's neon: cyan to violet to magenta on black.
+pub const CYAN: Color32 = Color32::from_rgb(38, 228, 226);
+pub const VIOLET: Color32 = Color32::from_rgb(138, 96, 240);
+pub const MAGENTA: Color32 = Color32::from_rgb(242, 84, 182);
+pub const ACCENT: Color32 = CYAN;
+pub const ACCENT_INK: Color32 = Color32::from_rgb(6, 22, 24);
 
 /// The named families the chrome uses besides the default proportional one.
 pub const SEMIBOLD: &str = "semibold";
@@ -60,7 +64,7 @@ pub fn install(ctx: &egui::Context) {
     visuals.hyperlink_color = ACCENT;
     visuals.override_text_color = Some(TEXT);
     visuals.weak_text_color = Some(MUTED);
-    visuals.selection.bg_fill = Color32::from_rgb(74, 58, 22);
+    visuals.selection.bg_fill = Color32::from_rgb(18, 66, 70);
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
     let r = CornerRadius::same(7);
     visuals.widgets.noninteractive.bg_fill = PANEL;
@@ -111,6 +115,19 @@ pub fn install(ctx: &egui::Context) {
         style.interaction.tooltip_delay = 0.35;
         style.interaction.show_tooltips_only_when_still = true;
     });
+}
+
+/// The wordmark: "masstin" with the logo's gradient, letter by letter.
+pub fn wordmark(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let text = "masstin";
+    let n = text.chars().count().max(1) as f32;
+    let mut job = egui::text::LayoutJob::default();
+    for (i, ch) in text.chars().enumerate() {
+        let t = i as f32 / (n - 1.0);
+        let c = if t < 0.5 { super::draw::mix(CYAN, VIOLET, t * 2.0) } else { super::draw::mix(VIOLET, MAGENTA, (t - 0.5) * 2.0) };
+        job.append(&ch.to_string(), 0.0, egui::text::TextFormat { font_id: FontId::new(size, FontFamily::Name(SEMIBOLD.into())), color: c, ..Default::default() });
+    }
+    ui.add(egui::Label::new(job).selectable(false))
 }
 
 pub fn semibold(text: impl Into<String>, size: f32) -> RichText {

@@ -119,15 +119,18 @@ pub enum NodeStyle {
     Icon,
     /// a small dot inside a thin ring
     Minimal,
+    /// the machine itself: a monitor, a rack, a laptop, an antenna…
+    Device,
 }
 
 impl NodeStyle {
-    pub const ALL: [NodeStyle; 3] = [NodeStyle::Glass, NodeStyle::Icon, NodeStyle::Minimal];
+    pub const ALL: [NodeStyle; 4] = [NodeStyle::Device, NodeStyle::Glass, NodeStyle::Icon, NodeStyle::Minimal];
     pub fn label(self) -> &'static str {
         match self {
             NodeStyle::Glass => "glass",
             NodeStyle::Icon => "icons",
             NodeStyle::Minimal => "minimal",
+            NodeStyle::Device => "machines",
         }
     }
 }
@@ -238,7 +241,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Glass }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Device }
     }
 }
 

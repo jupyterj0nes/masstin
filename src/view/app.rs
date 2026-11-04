@@ -147,6 +147,8 @@ struct NodeLook {
     label_bg: Option<Color32>,
     /// the glyph in the middle, when the style or the host asks for one
     icon: Option<&'static str>,
+    /// the machine to draw, in the machines style or when the host's icon names one
+    device: Option<super::devices::Device>,
 }
 
 #[derive(Default)]
@@ -300,6 +302,10 @@ pub struct Viewer {
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
     show_labels: bool,
+    /// the dog, for the menu bar, and the whole logo for About
+    logo_small: Option<egui::TextureHandle>,
+    logo_full: Option<egui::TextureHandle>,
+    show_about: bool,
     host_edit: Option<HostEdit>,
     edge_edit: Option<EdgeEdit>,
     /// the analyst's merges, `(from, into)`, kept in the views file
@@ -343,9 +349,44 @@ struct ExportJob {
     rec: present::Recorder,
 }
 
+/// The logo (`resources/masstin_logo.png`, embedded): the dog's head cut
+/// out for the menu bar, and the whole picture for About.
+fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui::TextureHandle>) {
+    let bytes = include_bytes!("../../resources/masstin_logo.png");
+    let Ok(img) = image::load_from_memory(bytes) else { return (None, None) };
+    let rgba = img.to_rgba8();
+    let to_tex = |name: &str, im: image::RgbaImage| {
+        let (w, h) = (im.width() as usize, im.height() as usize);
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], im.as_raw());
+        ctx.load_texture(name, ci, egui::TextureOptions::LINEAR)
+    };
+    let head = image::imageops::crop_imm(&rgba, 290, 380, 560, 350).to_image();
+    let head = image::imageops::resize(&head, 93, 58, image::imageops::FilterType::Lanczos3);
+    let full = image::imageops::resize(&rgba, 420, 357, image::imageops::FilterType::Lanczos3);
+    (Some(to_tex("masstin-logo-head", head)), Some(to_tex("masstin-logo", full)))
+}
+
 impl Viewer {
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("About masstin").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).frame(egui::Frame::window(&ctx.global_style()).fill(Color32::from_rgb(4, 4, 8))).show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                if let Some(t) = &self.logo_full {
+                    ui.image((t.id(), Vec2::new(420.0, 357.0)));
+                }
+                ui.label(egui::RichText::new(format!("masstin {}  ·  lateral movement tracker for anything", env!("CARGO_PKG_VERSION"))).color(theme::MUTED));
+                ui.label(egui::RichText::new("The graph viewer: the timeline CSV is the truth, no database. Fonts: Inter (OFL) and Phosphor icons (MIT).").color(theme::DIM).small());
+            });
+        });
+        self.show_about = open;
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, opts: Options) -> Viewer {
         theme::install(&cc.egui_ctx);
+        let logos = load_logos(&cc.egui_ctx);
 
         let mut filter = Filter::default();
         if let Some(f) = &opts.focus {
@@ -487,6 +528,9 @@ impl Viewer {
             reveal_rank: Vec::new(),
             hunt_autorun: false,
             show_labels: false,
+            logo_small: logos.0,
+            logo_full: logos.1,
+            show_about: false,
             host_edit: None,
             edge_edit: None,
             merges: vf.merges.clone(),
@@ -1496,6 +1540,7 @@ impl Viewer {
                 _ => (HOST_FILL, HOST_RING),
             };
             let mut icon: Option<&'static str> = if self.style.node_style == NodeStyle::Icon { Some(labels::role_icon(n.role, is_ip)) } else { None };
+            let mut device: Option<super::devices::Device> = if self.style.node_style == NodeStyle::Device { Some(labels::role_device(n.role, is_ip)) } else { None };
             let mut shape = if self.style.shapes_by_role {
                 match n.role {
                     Role::DomainController => Shape::Hexagon,
@@ -1525,7 +1570,15 @@ impl Viewer {
                     label_bg = Some(Color32::from_rgb(c[0], c[1], c[2]));
                 }
                 if let Some(key) = rule.icon.as_deref() {
-                    icon = labels::icon_glyph(key).or(icon);
+                    match super::devices::Device::from_key(key) {
+                        Some(d) if self.style.node_style == NodeStyle::Device => {
+                            device = Some(d);
+                        }
+                        _ => {
+                            device = None;
+                            icon = labels::icon_glyph(key).or(icon);
+                        }
+                    }
                 }
                 if let Some(c) = rule.color {
                     fill = Color32::from_rgb(c[0], c[1], c[2]);
@@ -1537,7 +1590,7 @@ impl Viewer {
                 size = rule.size;
                 glow = rule.glow;
             }
-            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]), label_pos, label_size, label_bg, icon });
+            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]), label_pos, label_size, label_bg, icon, device });
         }
         let n_ip = nodes.iter().filter(|n| n.is_ip).count();
         self.scene = Scene { fingerprint, graph_id: self.graph_id, edges, nodes, chips: self.legend_chips(), n_ip };
@@ -2034,7 +2087,15 @@ impl Viewer {
                     draw::ring(&mut node_mesh, p, r, ring_w.min(1.5) * if significant { 1.6 } else { 1.0 }, draw::fade(draw::lighten(ring, 0.25), alpha * 0.95));
                 }
             } else {
-                if matches!(look.shape, Shape::Circle) {
+                if let Some(dev) = look.device {
+                    if motion {
+                        keep_moving = true;
+                    }
+                    if significant {
+                        painter.circle_filled(p, r * 1.3, draw::fade(SIGNIFICANT, 0.12 * alpha));
+                    }
+                    super::devices::draw(&painter, dev, p, r, fill, ring, alpha, now + i as f32 * 0.37, motion);
+                } else if matches!(look.shape, Shape::Circle) {
                     // the sheen runs on the hosts that matter, and on all of them when few
                     let sheen = if motion && (lit || significant || n.hunt_rank == 1 || self.graph.nodes.len() <= 120) { Some(now * 0.9 + i as f32 * 0.7) } else { None };
                     if sheen.is_some() {
@@ -2054,7 +2115,7 @@ impl Viewer {
             let shown_name: &str = &shown;
             if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
                 let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
-                let pos = if (look.icon.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) { LabelPos::Below } else { look.label_pos };
+                let pos = if (look.icon.is_some() || look.device.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) { LabelPos::Below } else { look.label_pos };
                 labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod);
             }
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
@@ -2982,6 +3043,7 @@ impl eframe::App for Viewer {
         self.job_window(&ctx);
         self.last_log_window(&ctx);
         self.labels_window(&ctx);
+        self.about_window(&ctx);
         self.host_window(&ctx);
         self.edge_window(&ctx);
         self.merge_host_window(&ctx);

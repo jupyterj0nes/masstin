@@ -37,8 +37,14 @@ impl Viewer {
     pub(super) fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(4.0);
-            ui.label(theme::semibold("masstin", 15.0).color(theme::ACCENT));
+            ui.add_space(2.0);
+            if let Some(t) = &self.logo_small {
+                let r = ui.add(egui::Image::new((t.id(), Vec2::new(40.0, 25.0))).sense(Sense::click())).on_hover_text("About masstin");
+                if r.clicked() {
+                    self.show_about = true;
+                }
+            }
+            theme::wordmark(ui, 16.0);
             ui.add_space(10.0);
             ui.menu_button("Evidence", |ui| {
                 ui.set_min_width(260.0);
@@ -216,7 +222,10 @@ impl Viewer {
                     ui.ctx().open_url(egui::OpenUrl::new_tab("https://github.com/c00pr/masstin/blob/main/docs/viewer.md"));
                 }
                 ui.separator();
-                ui.label(egui::RichText::new(format!("masstin {}", env!("CARGO_PKG_VERSION"))).color(theme::MUTED));
+                if icon_button(ui, ic::INFO, &format!("About masstin {}", env!("CARGO_PKG_VERSION"))).clicked() {
+                    ui.close();
+                    self.show_about = true;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(6.0);
