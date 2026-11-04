@@ -979,14 +979,14 @@ impl Viewer {
                     _ => None,
                 };
                 if let Some(sel) = other {
-                    if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merge {} into this host", sel)).on_hover_text("The selected host becomes part of this one").clicked() {
+                    if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merge with {}…", sel)).on_hover_text("This host and the selected one are the same machine; you choose the name that stays").clicked() {
                         ui.close();
-                        self.merge_hosts(&sel, &name);
+                        self.merge_edit = Some(MergeHostsEdit { a: name.clone(), b: sel, keep_a: true, filter: String::new() });
                     }
                 }
-                if icon_button(ui, ic::ARROWS_CLOCKWISE, "Merge into another host…").on_hover_text("This host is the same machine as another one (an address and its name): make them one").clicked() {
+                if icon_button(ui, ic::ARROWS_CLOCKWISE, "Merge with another host…").on_hover_text("This host is the same machine as another one (an address and its name): make them one, and choose the name that stays").clicked() {
                     ui.close();
-                    self.merge_edit = Some(MergeHostsEdit { from: name.clone(), into: String::new(), filter: String::new() });
+                    self.merge_edit = Some(MergeHostsEdit { a: name.clone(), b: String::new(), keep_a: true, filter: String::new() });
                 }
                 ui.separator();
                 let pinned = self.layout.fixed.get(i).copied().unwrap_or(false);
