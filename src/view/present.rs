@@ -207,7 +207,7 @@ pub struct Recorder {
     pub sent: usize,
 }
 
-fn to_rgba(img: &egui::ColorImage) -> image::RgbaImage {
+pub(super) fn to_rgba(img: &egui::ColorImage) -> image::RgbaImage {
     let (w, h) = (img.width() as u32, img.height() as u32);
     let mut buf = Vec::with_capacity((w * h * 4) as usize);
     for px in img.pixels.iter() {

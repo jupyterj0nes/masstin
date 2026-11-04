@@ -142,11 +142,19 @@ pub struct Style {
     pub edge_scale: f32,
     pub font_scale: f32,
     pub rules: Vec<Rule>,
+    /// the dots travelling along the edges that matter, the pulse of a
+    /// significant host, the hover ring
+    #[serde(default = "yes")]
+    pub motion: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new() }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true }
     }
 }
 

@@ -8,6 +8,7 @@
 //! go straight into the CSV. No server, no browser.
 
 mod app;
+mod draw;
 mod layout;
 mod paths;
 mod present;
