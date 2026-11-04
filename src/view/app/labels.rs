@@ -82,7 +82,8 @@ pub(super) fn ink_for(bg: Color32) -> Color32 {
 /// Paint a host's name. `r` is the drawn radius, `base_px` the font size
 /// the zoom and the scales ask for; returns whether something was drawn.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: f32, pos: LabelPos, base_px: f32, bg: Option<Color32>, ring: Color32, alpha: f32, lit: bool, crowd: bool) -> bool {
+pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: f32, pos: LabelPos, base_px: f32, bg: Option<Color32>, ring: Color32, alpha: f32, lit: bool, crowd: bool, mono: bool) -> bool {
+    let font_of = |px: f32| if mono { FontId::monospace(px) } else { FontId::proportional(px) };
     let chars = name.chars().count().max(1) as f32;
     let fits = (r * 1.8) / (chars * 0.56);
     let inside_ok = r > 9.0 && fits >= (base_px * 0.75).max(8.5);
@@ -108,12 +109,12 @@ pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: 
             let font = base_px.min(fits).max(6.5);
             let max_chars = ((r * 1.8) / (font * 0.56)).floor().max(3.0) as usize;
             let text: String = if name.chars().count() > max_chars { format!("{}…", name.chars().take(max_chars.saturating_sub(1)).collect::<String>()) } else { name.to_string() };
-            painter.text(p, Align2::CENTER_CENTER, text, FontId::proportional(font), draw::fade(Color32::from_rgb(14, 18, 26), alpha));
+            painter.text(p, Align2::CENTER_CENTER, text, font_of(font), draw::fade(Color32::from_rgb(14, 18, 26), alpha));
             true
         }
         LabelPos::Band => {
             let font = base_px.clamp(7.0, 22.0);
-            let galley = painter.layout_no_wrap(name.to_string(), FontId::proportional(font), TEXT);
+            let galley = painter.layout_no_wrap(name.to_string(), font_of(font), TEXT);
             let w = (galley.size().x + 18.0).max(r * 2.4);
             let h = galley.size().y + 6.0;
             let rect = Rect::from_center_size(p, Vec2::new(w, h));
@@ -126,7 +127,7 @@ pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: 
         }
         LabelPos::Below | LabelPos::Above => {
             let font = base_px.clamp(7.0, 22.0);
-            let galley = painter.layout_no_wrap(name.to_string(), FontId::proportional(font), TEXT);
+            let galley = painter.layout_no_wrap(name.to_string(), font_of(font), TEXT);
             let h = galley.size().y;
             let y = if pos == LabelPos::Below { p.y + r + 8.0 + h / 2.0 } else { p.y - r - 8.0 - h / 2.0 };
             match bg {
@@ -169,61 +170,89 @@ impl Viewer {
         let mut open = true;
         let mut changed = false;
         let mut resize = false;
-        egui::Window::new(format!("{}  Labels and sizes", ic::TAG)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
-            theme::section(ui, "How a host is drawn");
-            ui.horizontal_wrapped(|ui| {
-                for st in NodeStyle::ALL {
-                    if theme::pill(ui, self.style.node_style == st, st.label(), theme::ACCENT).clicked() {
-                        self.style.node_style = st;
-                        changed = true;
+        egui::Window::new(format!("{}  Style", ic::TAG)).open(&mut open).collapsible(false).resizable(false).default_width(440.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(620.0).show(ui, |ui| {
+                theme::section(ui, "Mode");
+                ui.horizontal_wrapped(|ui| {
+                    for st in NodeStyle::ALL {
+                        if theme::pill(ui, self.style.node_style == st, st.label(), theme::ACCENT).on_hover_text(st.help()).clicked() {
+                            self.style.node_style = st;
+                            changed = true;
+                        }
                     }
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                for (g, l) in [(ic::DESKTOP, "workstation"), (ic::HARD_DRIVES, "server"), (ic::CASTLE_TURRET, "domain controller"), (ic::BROADCAST, "address"), (ic::GLOBE, "external")] {
-                    ui.label(egui::RichText::new(format!("{}  {}", g, l)).color(theme::MUTED).size(12.0));
-                }
-            });
-            ui.label(egui::RichText::new("That is what each host gets from what the graph makes of it: drawn as the machine in the machines style, as a glyph in the icon style. A host's own choice comes from its right-click menu, Style of this host, with the whole catalogue; the machines (workstation, laptop, server, tower, domain controller, address, globe, database, cloud, router, phone) are drawn, the rest are glyphs.").color(theme::DIM).small());
-            theme::section(ui, "Where the name goes");
-            ui.horizontal_wrapped(|ui| {
-                for pos in LabelPos::ALL {
-                    if theme::pill(ui, self.style.label_pos == pos, pos.label(), theme::ACCENT).on_hover_text(pos.help()).clicked() {
-                        self.style.label_pos = pos;
-                        changed = true;
+                });
+                ui.label(egui::RichText::new(self.style.node_style.help()).color(theme::DIM).small());
+                ui.horizontal_wrapped(|ui| {
+                    for (g, l) in [(ic::DESKTOP, "workstation"), (ic::HARD_DRIVES, "server"), (ic::CASTLE_TURRET, "domain controller"), (ic::BROADCAST, "address"), (ic::GLOBE, "external")] {
+                        ui.label(egui::RichText::new(format!("{}  {}", g, l)).color(theme::MUTED).size(12.0));
                     }
-                }
-            });
-            theme::section(ui, "Text");
-            ui.horizontal(|ui| {
-                ui.label("size");
-                changed |= ui.add(egui::Slider::new(&mut self.style.font_scale, 0.6..=2.4).fixed_decimals(1)).changed();
-            });
-            ui.horizontal(|ui| {
-                changed |= ui.checkbox(&mut self.style.label_bg, "a box behind the name").changed();
-                let mut c = Color32::from_rgb(self.style.label_bg_color[0], self.style.label_bg_color[1], self.style.label_bg_color[2]);
-                if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
-                    self.style.label_bg_color = [c.r(), c.g(), c.b()];
-                    self.style.label_bg = true;
+                });
+                ui.label(egui::RichText::new("What each host is comes from the graph: a domain controller, a server, a workstation, an address, the outside. A host's own machine or glyph is chosen in its right-click menu, Style of this host.").color(theme::DIM).small());
+
+                theme::section(ui, "Hosts");
+                ui.horizontal(|ui| {
+                    ui.label("size");
+                    changed |= ui.add(egui::Slider::new(&mut self.style.node_scale, 0.4..=2.5).fixed_decimals(1)).changed();
+                });
+                if ui.checkbox(&mut self.style.auto_size, "bigger when there are few of them").on_hover_text("Fifteen hosts get a bigger drawing than three hundred; off: the same size whatever the count").changed() {
                     changed = true;
+                    resize = true;
                 }
-                ui.label(egui::RichText::new("its colour").color(theme::MUTED));
+                if ui.checkbox(&mut self.style.size_by_traffic, "size by traffic (events in and out of the view, log scale)").changed() {
+                    changed = true;
+                    resize = true;
+                }
+
+                theme::section(ui, "Names");
+                ui.horizontal_wrapped(|ui| {
+                    for pos in LabelPos::ALL {
+                        if theme::pill(ui, self.style.label_pos == pos, pos.label(), theme::ACCENT).on_hover_text(pos.help()).clicked() {
+                            self.style.label_pos = pos;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("text size");
+                    changed |= ui.add(egui::Slider::new(&mut self.style.font_scale, 0.6..=2.4).fixed_decimals(1)).changed();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut self.style.label_bg, "a box behind the name").changed();
+                    let mut c = Color32::from_rgb(self.style.label_bg_color[0], self.style.label_bg_color[1], self.style.label_bg_color[2]);
+                    if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                        self.style.label_bg_color = [c.r(), c.g(), c.b()];
+                        self.style.label_bg = true;
+                        changed = true;
+                    }
+                    ui.label(egui::RichText::new("its colour").color(theme::MUTED));
+                });
+
+                theme::section(ui, "Connections");
+                ui.horizontal(|ui| {
+                    ui.label("width");
+                    changed |= ui.add(egui::Slider::new(&mut self.style.edge_scale, 0.3..=3.0).fixed_decimals(1)).on_hover_text("Thinner lines read better when there are many; a busy connection is still wider than a rare one").changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("opacity");
+                    changed |= ui.add(egui::Slider::new(&mut self.style.edge_opacity, 0.2..=1.0).fixed_decimals(2)).on_hover_text("How much of a line's colour shows; lower lets the hosts stand out").changed();
+                });
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut self.style.curves, "curved").on_hover_text("Off: straight lines, except the fan of a pair with several connections").changed();
+                    changed |= ui.checkbox(&mut self.style.arrows, "arrowheads").changed();
+                    changed |= ui.checkbox(&mut self.style.edge_glow, "glow on findings").on_hover_text("A soft glow under the significant and candidate connections and the ones you light").changed();
+                    changed |= ui.checkbox(&mut self.style.caption_hover, "captions only on hover").on_hover_text("The account (or whatever the caption shows) only on the connection under the pointer or selected; the rest stay bare").changed();
+                });
+                ui.label(egui::RichText::new("What the caption says and what colours the lines are in the View menu.").color(theme::DIM).small());
+
+                theme::section(ui, "Canvas");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut self.style.grid, "grid").changed();
+                    changed |= ui.checkbox(&mut self.style.vignette, "spotlight").on_hover_text("The lighter middle of the canvas").changed();
+                    changed |= ui.checkbox(&mut self.style.motion, "motion").on_hover_text("Lights, dots along the connections, the sheen; off for a still picture").changed();
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Right-click a host or a connection for its own style; those are kept as rules and win over these. All of this is saved with the view.").color(theme::DIM).small());
             });
-            theme::section(ui, "Hosts");
-            if ui.checkbox(&mut self.style.size_by_traffic, "size by traffic (events in and out of the view, log scale)").changed() {
-                changed = true;
-                resize = true;
-            }
-            ui.horizontal(|ui| {
-                ui.label("size");
-                changed |= ui.add(egui::Slider::new(&mut self.style.node_scale, 0.4..=2.5).fixed_decimals(1)).changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label("edges");
-                changed |= ui.add(egui::Slider::new(&mut self.style.edge_scale, 0.3..=3.0).fixed_decimals(1)).changed();
-            });
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Right-click a host for its own name position, text size, box and size; those are kept as style rules on its name and win over these.").color(theme::DIM).small());
         });
         if changed {
             self.persist();

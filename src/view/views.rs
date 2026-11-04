@@ -112,26 +112,43 @@ impl Shape {
 /// How a host is drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum NodeStyle {
-    /// a piece of glass: gradient, shadow, highlight, thin rim
+    /// the machine itself, shaded: a monitor, a rack, a laptop, an antenna…
     #[default]
-    Glass,
-    /// the same, with an icon for what the host is in the middle, the name under it
+    #[serde(alias = "Device")]
+    Realistic,
+    /// a clean tile with a glyph for what the host is, like a network diagram
     Icon,
+    /// neon outlines, scanlines, a line grid: the cabinet of the eighties
+    Arcade,
+    /// a piece of glass: gradient, shadow, highlight, thin rim
+    Glass,
     /// a small dot inside a thin ring
     Minimal,
-    /// the machine itself: a monitor, a rack, a laptop, an antenna…
-    Device,
 }
 
 impl NodeStyle {
-    pub const ALL: [NodeStyle; 4] = [NodeStyle::Device, NodeStyle::Glass, NodeStyle::Icon, NodeStyle::Minimal];
+    pub const ALL: [NodeStyle; 5] = [NodeStyle::Realistic, NodeStyle::Icon, NodeStyle::Arcade, NodeStyle::Glass, NodeStyle::Minimal];
     pub fn label(self) -> &'static str {
         match self {
-            NodeStyle::Glass => "glass",
+            NodeStyle::Realistic => "realistic",
             NodeStyle::Icon => "icons",
+            NodeStyle::Arcade => "arcade",
+            NodeStyle::Glass => "glass",
             NodeStyle::Minimal => "minimal",
-            NodeStyle::Device => "machines",
         }
+    }
+    pub fn help(self) -> &'static str {
+        match self {
+            NodeStyle::Realistic => "The machines drawn as they are, with shading, a shadow and their lights: a monitor, a laptop, a rack, a domain controller with its badge, an antenna for an address, a globe for the outside.",
+            NodeStyle::Icon => "Clean tiles with a glyph for what each host is, the name under it: the look of a network diagram.",
+            NodeStyle::Arcade => "Neon outlines on black, scanlines, a line grid behind, the connections as beams: the cabinet of the eighties.",
+            NodeStyle::Glass => "Glossy orbs with a highlight and a bright rim.",
+            NodeStyle::Minimal => "A dot in a thin ring; the quietest.",
+        }
+    }
+    /// The modes that draw the machines.
+    pub fn draws_devices(self) -> bool {
+        matches!(self, NodeStyle::Realistic | NodeStyle::Arcade)
     }
 }
 
@@ -235,6 +252,34 @@ pub struct Style {
     /// a group per /24 besides the named CIDRs
     #[serde(default = "yes")]
     pub subnets_auto: bool,
+    /// how much of a connection's colour shows, 0.2 to 1
+    #[serde(default = "edge_opacity")]
+    pub edge_opacity: f32,
+    /// the account on an edge only when the edge is hovered or selected
+    #[serde(default)]
+    pub caption_hover: bool,
+    /// curved connections; off: straight, except the fan of a busy pair
+    #[serde(default = "yes")]
+    pub curves: bool,
+    /// an arrowhead at the destination
+    #[serde(default = "yes")]
+    pub arrows: bool,
+    /// a soft glow under the findings and the lit connections
+    #[serde(default = "yes")]
+    pub edge_glow: bool,
+    /// the dot grid behind the canvas
+    #[serde(default = "yes")]
+    pub grid: bool,
+    /// the spotlight in the middle of the canvas
+    #[serde(default = "yes")]
+    pub vignette: bool,
+    /// hosts drawn bigger when there are few of them
+    #[serde(default = "yes")]
+    pub auto_size: bool,
+}
+
+fn edge_opacity() -> f32 {
+    0.8
 }
 
 fn label_box() -> [u8; 3] {
@@ -247,7 +292,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Device, show_subnets: false, subnets_auto: true }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 0.8, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Realistic, show_subnets: false, subnets_auto: true, edge_opacity: edge_opacity(), caption_hover: false, curves: true, arrows: true, edge_glow: true, grid: true, vignette: true, auto_size: true }
     }
 }
 

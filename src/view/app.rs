@@ -334,6 +334,8 @@ pub struct Viewer {
     brand: Option<(String, egui::TextureHandle, [usize; 2])>,
     /// the path that could not be read, and why
     brand_err: Option<(String, String)>,
+    /// the height of the legend chips over the canvas, kept clear by Fit
+    legend_h: f32,
     show_about: bool,
     /// the summary shown once the findings have lit up
     hunt_report: Option<HuntReport>,
@@ -583,6 +585,7 @@ impl Viewer {
             logo_dog: logos.2,
             brand: None,
             brand_err: None,
+            legend_h: 0.0,
             show_about: false,
             hunt_report: None,
             hunt_report_at: None,
@@ -634,7 +637,11 @@ impl Viewer {
         };
         let max_traffic = g.nodes.iter().map(|n| n.inn + n.out).max().unwrap_or(1).max(1) as f32;
         let by_traffic = self.style.size_by_traffic;
-        let radii: Vec<f32> = g.nodes.iter().map(|n| if by_traffic { 20.0 + 10.0 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln() } else { 24.0 }).collect();
+        // the base size: bigger when there are few hosts, so fifteen of them
+        // fill a window the way three hundred do
+        let n_hosts = g.nodes.len().max(1) as f32;
+        let base_r = if self.style.auto_size { 20.0 + 14.0 * ((300.0 / n_hosts).ln() / (300.0f32 / 8.0).ln()).clamp(0.0, 1.0) } else { 24.0 };
+        let radii: Vec<f32> = g.nodes.iter().map(|n| if by_traffic { base_r * (0.82 + 0.42 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln()) } else { base_r }).collect();
         let mut links: Vec<(usize, usize)> = g.edges.iter().map(|e| (g.node_of_host[&e.src], g.node_of_host[&e.dst])).filter(|(a, b)| a != b).collect();
         links.sort_unstable();
         links.dedup();
@@ -711,8 +718,9 @@ impl Viewer {
         let gw = (hi.x - lo.x).max(1.0);
         let gh = (hi.y - lo.y).max(1.0);
         let margin = 90.0;
+        let inset = if self.presenting { 0.0 } else { self.legend_h + 12.0 };
         let cw = (canvas.width() - margin * 2.0).max(100.0);
-        let ch = (canvas.height() - margin * 2.0).max(100.0);
+        let ch = (canvas.height() - inset - margin * 2.0).max(100.0);
         // the zoom the graph would get as it is, and the stretch that makes it
         // fill both axes at that zoom (never shrinking an axis)
         let z = (cw / gw).min(ch / gh).min(2.2);
@@ -733,8 +741,10 @@ impl Viewer {
             let w = (hi.x - lo.x).max(50.0) + 80.0;
             let h = (hi.y - lo.y).max(50.0) + 80.0;
             let max_zoom = if self.presenting { 1.8 } else { 2.2 };
-            self.zoom_t = (canvas.width() / w).min(canvas.height() / h).clamp(0.05, max_zoom);
-            self.cam_t = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+            // the legend chips sit over the top of the canvas: keep it clear
+            let inset = if self.presenting { 0.0 } else { self.legend_h + 12.0 };
+            self.zoom_t = (canvas.width() / w).min((canvas.height() - inset).max(50.0) / h).clamp(0.05, max_zoom);
+            self.cam_t = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0 - (inset / 2.0) / self.zoom_t);
             if snap {
                 self.zoom = self.zoom_t;
                 self.cam = self.cam_t;
@@ -1709,9 +1719,9 @@ impl Viewer {
             if a != b {
                 node_edges[b].push(k as u32);
             }
-            let base = 1.2 + 3.0 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln();
+            let base = 1.0 + 2.2 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln();
             let mut color = self.edge_base_color(e);
-            let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.8 } else { base };
+            let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.5 } else { base };
             let mut dashed = e.result == R_LOGOFF || e.result == R_CONNECT;
             let mut glow = false;
             let mut hide = false;
@@ -1742,7 +1752,7 @@ impl Viewer {
                 _ => (HOST_FILL, HOST_RING),
             };
             let mut icon: Option<&'static str> = if self.style.node_style == NodeStyle::Icon { Some(labels::role_icon(n.role, is_ip)) } else { None };
-            let mut device: Option<super::devices::Device> = if self.style.node_style == NodeStyle::Device { Some(labels::role_device(n.role, is_ip)) } else { None };
+            let mut device: Option<super::devices::Device> = if self.style.node_style.draws_devices() { Some(labels::role_device(n.role, is_ip)) } else { None };
             let mut shape = if self.style.shapes_by_role {
                 match n.role {
                     Role::DomainController => Shape::Hexagon,
@@ -1773,7 +1783,7 @@ impl Viewer {
                 }
                 if let Some(key) = rule.icon.as_deref() {
                     match super::devices::Device::from_key(key) {
-                        Some(d) if self.style.node_style == NodeStyle::Device => {
+                        Some(d) if self.style.node_style.draws_devices() => {
                             device = Some(d);
                         }
                         _ => {
@@ -1823,7 +1833,7 @@ impl Viewer {
                 let normal = V2::new(-u.y, u.x);
                 let side = if a < b { 1.0 } else { -1.0 };
                 let (idx, cnt) = look.fan;
-                let offset = (idx as f32 - (cnt as f32 - 1.0) / 2.0) * 34.0 * side;
+                let offset = if self.style.curves || cnt > 1 { (idx as f32 - (cnt as f32 - 1.0) / 2.0) * 34.0 * side } else { 0.0 };
                 let mid = pa + d * 0.5 + normal * offset;
                 let da = mid - pa;
                 let start = pa + da * ((ra + 1.0) / da.len().max(1.0));
@@ -1905,7 +1915,7 @@ impl Viewer {
             self.fit_pending = false;
         }
         let t_bg = std::time::Instant::now();
-        draw::background(&painter, canvas, BG, BG_CENTRE, (self.cam.x, self.cam.y), self.zoom);
+        draw::background(&painter, canvas, BG, BG_CENTRE, (self.cam.x, self.cam.y), self.zoom, draw::BgStyle { grid: self.style.grid, vignette: self.style.vignette, arcade: self.style.node_style == NodeStyle::Arcade });
         self.bg_ms = t_bg.elapsed().as_secs_f32() * 1000.0;
         if self.layout.len() == 0 {
             painter.text(canvas.center(), Align2::CENTER_CENTER, "nothing to draw with these filters", FontId::proportional(16.0), MUTED);
@@ -2166,8 +2176,10 @@ impl Viewer {
                 continue;
             }
             let emphasised = self.presenting && self.step_of_event.get(e.first_event).and_then(|&st| self.steps.get(st)).map_or(false, |st| st.emphasis || (st.significant && progress < 1.0));
+            let alpha = alpha * self.style.edge_opacity;
+            let arcade = self.style.node_style == NodeStyle::Arcade;
             let mut width = look.width * z.sqrt() * self.style.edge_scale;
-            let mut color = look.color;
+            let mut color = if arcade { draw::lighten(look.color, 0.15) } else { look.color };
             let mut flash = 0.0f32;
             if let Some((shown, f)) = self.reveal_state(k, frame_now) {
                 if !shown {
@@ -2181,7 +2193,7 @@ impl Viewer {
             let stroke_color = if selected { ACCENT } else { color };
             let short = (pa - pb).length() < 14.0;
             let plain = lod && !lit && !selected;
-            let glow = !plain && (look.glow || emphasised || progress < 1.0 || (lit && focus.is_some()) || (look.finding && dimmed < 0.5));
+            let glow = !plain && (arcade || ((self.style.edge_glow || look.glow) && (look.glow || emphasised || progress < 1.0 || (lit && focus.is_some()) || (look.finding && dimmed < 0.5))));
             if glow {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 9.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else { 0.2 } * alpha)) });
             }
@@ -2210,7 +2222,7 @@ impl Viewer {
                 continue;
             }
             // arrowhead at the destination's rim
-            if !short && (!plain || lit) {
+            if self.style.arrows && !short && (!plain || lit) {
                 let dir = (pb - draw::bez(pa, pc, pb, 0.9)).normalized();
                 let size = (6.0 + width * 1.4).min(15.0) * z.sqrt().max(0.5);
                 draw::arrow(&painter, pb, dir, size, draw::fade(stroke_color, alpha));
@@ -2219,7 +2231,7 @@ impl Viewer {
                 animated.push(k);
             }
             // the account on the edge, like Neo4j's relationship caption
-            if !plain && self.style.caption != Caption::None && (z > 0.6 || lit) && (pa - pb).length() > 90.0 {
+            if !plain && self.style.caption != Caption::None && (z > 0.6 || lit) && (pa - pb).length() > 90.0 && (!(self.style.caption_hover || self.edges_on_screen > 80) || lit || selected) {
                 let caption = self.edge_caption(e);
                 if !caption.is_empty() {
                     let mid = draw::bez(pa, pc, pb, 0.5);
@@ -2349,7 +2361,13 @@ impl Viewer {
                     if significant {
                         painter.circle_filled(p, r * 1.3, draw::fade(SIGNIFICANT, 0.12 * alpha));
                     }
-                    super::devices::draw(&painter, dev, p, r, fill, ring, alpha, now + i as f32 * 0.37, motion);
+                    if self.style.node_style == NodeStyle::Arcade {
+                        super::devices::draw_arcade(&painter, dev, p, r, fill, ring, alpha, now + i as f32 * 0.37, motion);
+                    } else {
+                        super::devices::draw(&painter, dev, p, r, fill, ring, alpha, now + i as f32 * 0.37, motion);
+                    }
+                } else if let (Some(g), NodeStyle::Icon) = (look.icon, self.style.node_style) {
+                    draw::tile(&painter, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 }, g);
                 } else if matches!(look.shape, Shape::Circle) {
                     // the sheen runs on the hosts that matter, and on all of them when few
                     let sheen = if motion && (lit || significant || n.hunt_rank == 1 || self.graph.nodes.len() <= 120) { Some(now * 0.9 + i as f32 * 0.7) } else { None };
@@ -2371,7 +2389,7 @@ impl Viewer {
             if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
                 let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
                 let pos = if (look.icon.is_some() || look.device.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) { LabelPos::Below } else { look.label_pos };
-                labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod);
+                labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod, self.style.node_style == NodeStyle::Arcade);
             }
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
                 let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * fs).clamp(8.0, 14.0)), ACCENT);

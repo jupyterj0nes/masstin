@@ -178,7 +178,7 @@ impl Viewer {
                     self.persist();
                 }
                 ui.separator();
-                if icon_button(ui, ic::TAG, "Labels and sizes…").clicked() {
+                if icon_button(ui, ic::TAG, "Style: mode, sizes, names, connections, canvas…").clicked() {
                     ui.close();
                     self.show_labels = true;
                 }
@@ -303,7 +303,7 @@ impl Viewer {
                 self.style.shapes_by_role = !self.style.shapes_by_role;
                 self.persist();
             }
-            if tool(ui, ic::TAG, "Labels and sizes", self.show_labels).clicked() {
+            if tool(ui, ic::TAG, "Style: mode, sizes, names, connections, canvas", self.show_labels).clicked() {
                 self.show_labels = !self.show_labels;
             }
             if tool(ui, ic::WIFI_HIGH, "Subnet regions: hosts grouped by where they sit on the network", self.style.show_subnets).clicked() {
@@ -1255,7 +1255,7 @@ impl Viewer {
         let n_host = self.graph.nodes.len() - n_ip;
         let chips: Vec<(String, Color32, usize)> = self.scene.chips.clone();
         let by_user = self.style.color_by == ColorBy::User;
-        egui::Area::new(egui::Id::unique("legend-overlay")).fixed_pos(canvas.min + Vec2::new(10.0, 10.0)).order(egui::Order::Middle).show(ctx, |ui| {
+        let area = egui::Area::new(egui::Id::unique("legend-overlay")).fixed_pos(canvas.min + Vec2::new(10.0, 10.0)).order(egui::Order::Middle).show(ctx, |ui| {
             ui.set_max_width(canvas.width() - 20.0);
             ui.spacing_mut().item_spacing = Vec2::new(5.0, 5.0);
             ui.horizontal_wrapped(|ui| {
@@ -1277,6 +1277,7 @@ impl Viewer {
                 }
             });
         });
+        self.legend_h = area.response.rect.height() + 10.0;
     }
 
     /// The colour picker window for a host or an account; OK writes a
