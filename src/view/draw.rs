@@ -47,25 +47,41 @@ pub fn darken(c: Color32, k: f32) -> Color32 {
 /// The canvas background: a flat fill, a soft spotlight in the middle
 /// that darkens towards the corners, and a grid of faint dots that pans
 /// and zooms with the camera so the picture has a floor.
-pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Color32, cam: (f32, f32), zoom: f32) {
+/// What the canvas behind the graph shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BgStyle {
+    pub grid: bool,
+    pub vignette: bool,
+    /// the arcade: a line grid in neon instead of dots, a violet spotlight
+    pub arcade: bool,
+}
+
+pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Color32, cam: (f32, f32), zoom: f32, style: BgStyle) {
+    let base = if style.arcade { Color32::from_rgb(6, 5, 14) } else { base };
     painter.rect_filled(rect, 0.0, base);
     // the vignette: a fan of triangles from a lighter centre to the dark rim
-    let mut mesh = Mesh::default();
-    let c = rect.center();
-    let rim = fade(base, 1.0);
-    let n = 40;
-    mesh.vertices.push(Vertex { pos: c, uv: WHITE_UV, color: centre });
-    let rx = rect.width() * 0.75;
-    let ry = rect.height() * 0.85;
-    for k in 0..=n {
-        let a = k as f32 / n as f32 * std::f32::consts::TAU;
-        mesh.vertices.push(Vertex { pos: Pos2::new(c.x + rx * a.cos(), c.y + ry * a.sin()), uv: WHITE_UV, color: rim });
+    if style.vignette {
+        let mut mesh = Mesh::default();
+        let c = rect.center();
+        let rim = fade(base, 1.0);
+        let n = 40;
+        let centre = if style.arcade { mix(base, super::theme::VIOLET, 0.16) } else { centre };
+        mesh.vertices.push(Vertex { pos: c, uv: WHITE_UV, color: centre });
+        let rx = rect.width() * 0.75;
+        let ry = rect.height() * 0.85;
+        for k in 0..=n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            mesh.vertices.push(Vertex { pos: Pos2::new(c.x + rx * a.cos(), c.y + ry * a.sin()), uv: WHITE_UV, color: rim });
+        }
+        for k in 0..n {
+            mesh.add_triangle(0, 1 + k as u32, 2 + k as u32);
+        }
+        painter.add(Shape::mesh(mesh));
     }
-    for k in 0..n {
-        mesh.add_triangle(0, 1 + k as u32, 2 + k as u32);
+    if !style.grid {
+        return;
     }
-    painter.add(Shape::mesh(mesh));
-    // the dot grid: world spacing 60, doubled until at least 18 px apart
+    // the grid: world spacing 60, doubled until at least 18 px apart
     let mut spacing = 60.0 * zoom;
     while spacing < 18.0 {
         spacing *= 2.0;
@@ -75,10 +91,37 @@ pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Co
     let world_spacing = spacing / zoom;
     let x0 = ((cam.0 - rect.width() * 0.5 / zoom) / world_spacing).floor() * world_spacing;
     let y0 = ((cam.1 - rect.height() * 0.5 / zoom) / world_spacing).floor() * world_spacing;
-    let mut mesh = Mesh::default();
-    let s = 1.2;
+    let c = rect.center();
     let cols = (rect.width() / spacing) as i32 + 2;
     let rows = (rect.height() / spacing) as i32 + 2;
+    if style.arcade {
+        // neon lines, every fourth one brighter, in the brand's violet and cyan
+        let mut mesh = Mesh::default();
+        for i in 0..cols {
+            let wx = x0 + i as f32 * world_spacing;
+            let x = c.x + (wx - cam.0) * zoom;
+            if x < rect.left() || x > rect.right() {
+                continue;
+            }
+            let major = ((wx / world_spacing).round() as i64).rem_euclid(4) == 0;
+            let col = if major { fade(super::theme::CYAN, 0.10 * alpha) } else { fade(super::theme::VIOLET, 0.09 * alpha) };
+            line_quad(&mut mesh, Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom()), if major { 1.2 } else { 1.0 }, col);
+        }
+        for j in 0..rows {
+            let wy = y0 + j as f32 * world_spacing;
+            let y = c.y + (wy - cam.1) * zoom;
+            if y < rect.top() || y > rect.bottom() {
+                continue;
+            }
+            let major = ((wy / world_spacing).round() as i64).rem_euclid(4) == 0;
+            let col = if major { fade(super::theme::CYAN, 0.10 * alpha) } else { fade(super::theme::VIOLET, 0.09 * alpha) };
+            line_quad(&mut mesh, Pos2::new(rect.left(), y), Pos2::new(rect.right(), y), if major { 1.2 } else { 1.0 }, col);
+        }
+        painter.add(Shape::mesh(mesh));
+        return;
+    }
+    let mut mesh = Mesh::default();
+    let s = 1.2;
     if cols * rows < 20_000 {
         for i in 0..cols {
             for j in 0..rows {
@@ -99,6 +142,36 @@ pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Co
         }
         painter.add(Shape::mesh(mesh));
     }
+}
+
+/// The icon mode's host: a rounded tile with a soft gradient in the host's
+/// colour, a thin rim, a shadow under it and the glyph in the middle.
+#[allow(clippy::too_many_arguments)]
+pub fn tile(painter: &egui::Painter, c: Pos2, r: f32, fill: Color32, ring: Color32, alpha: f32, ring_width: f32, icon: &str) {
+    let half = r * 0.86;
+    let rect = Rect::from_center_size(c, Vec2::splat(half * 2.0));
+    let corner = egui::CornerRadius::same((half * 0.42).clamp(2.0, 60.0) as u8);
+    // the shadow
+    painter.rect_filled(rect.translate(Vec2::new(0.0, half * 0.12)).expand(half * 0.06), corner, fade(Color32::BLACK, 0.28 * alpha));
+    // the body: a vertical gradient, lighter at the top
+    let mut m = Mesh::default();
+    let top = fade(lighten(fill, 0.12), alpha);
+    let bottom = fade(darken(fill, 0.38), alpha);
+    let inner = rect.shrink(half * 0.04);
+    m.vertices.push(Vertex { pos: inner.left_top(), uv: WHITE_UV, color: top });
+    m.vertices.push(Vertex { pos: inner.right_top(), uv: WHITE_UV, color: top });
+    m.vertices.push(Vertex { pos: inner.right_bottom(), uv: WHITE_UV, color: bottom });
+    m.vertices.push(Vertex { pos: inner.left_bottom(), uv: WHITE_UV, color: bottom });
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    painter.rect_filled(rect, corner, fade(darken(fill, 0.3), alpha));
+    painter.add(Shape::mesh(m));
+    // the corners back, over the square gradient
+    painter.rect_stroke(rect, corner, Stroke::new(half * 0.08, fade(darken(fill, 0.3), alpha)), egui::StrokeKind::Inside);
+    // a highlight along the top
+    painter.line_segment([Pos2::new(rect.left() + half * 0.35, rect.top() + 1.0), Pos2::new(rect.right() - half * 0.35, rect.top() + 1.0)], Stroke::new(1.0, fade(Color32::WHITE, 0.22 * alpha)));
+    painter.rect_stroke(rect, corner, Stroke::new(ring_width.max(1.0), fade(lighten(ring, 0.1), 0.9 * alpha)), egui::StrokeKind::Inside);
+    painter.text(c, egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional((r * 1.05).max(8.0)), fade(Color32::WHITE, 0.96 * alpha));
 }
 
 /// A soft halo: three concentric discs of falling alpha.
