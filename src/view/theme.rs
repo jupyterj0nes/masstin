@@ -138,12 +138,54 @@ pub fn medium(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text).font(FontId::new(size, FontFamily::Name(MEDIUM.into())))
 }
 
-/// A small upper-case section title, the way a settings pane labels its groups.
+/// A small upper-case section title, the way a settings pane labels its
+/// groups, with a short cyan tick before it.
 pub fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
-    ui.label(medium(title.to_ascii_uppercase(), 10.5).color(DIM));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (r, p) = ui.allocate_painter(Vec2::new(10.0, 10.0), egui::Sense::hover());
+        let y = r.rect.center().y;
+        p.line_segment([Pos2::new(r.rect.left(), y), Pos2::new(r.rect.right(), y)], Stroke::new(2.0, super::draw::fade(CYAN, 0.8)));
+        ui.label(medium(title.to_ascii_uppercase(), 10.5).color(MUTED));
+    });
     ui.add_space(1.0);
 }
+
+/// A one-pixel line in the logo's gradient, cyan to magenta, across the width.
+pub fn brand_line(ui: &mut egui::Ui) {
+    let r = ui.available_rect_before_wrap();
+    let y = ui.cursor().top();
+    let mut mesh = egui::epaint::Mesh::default();
+    let v = |x: f32, yy: f32, c: Color32| egui::epaint::Vertex { pos: Pos2::new(x, yy), uv: egui::epaint::WHITE_UV, color: c };
+    let (a, m, b) = (super::draw::fade(CYAN, 0.9), super::draw::fade(VIOLET, 0.9), super::draw::fade(MAGENTA, 0.9));
+    let mid = (r.left() + r.right()) / 2.0;
+    mesh.vertices.extend([v(r.left(), y, a), v(mid, y, m), v(mid, y + 1.5, m), v(r.left(), y + 1.5, a), v(r.right(), y, b), v(r.right(), y + 1.5, b)]);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    mesh.add_triangle(1, 4, 5);
+    mesh.add_triangle(1, 5, 2);
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.add_space(2.0);
+}
+
+/// A card: a rounded box that lights up under the pointer; the closure
+/// draws its contents. Returns the card's response (click to pick).
+pub fn card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let fill = if selected { Color32::from_rgb(16, 48, 52) } else { PANEL_2 };
+    let stroke = if selected { Stroke::new(1.0, super::draw::fade(CYAN, 0.8)) } else { Stroke::new(1.0, BORDER) };
+    let inner = egui::Frame::new().fill(fill).stroke(stroke).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add(ui);
+    });
+    let resp = ui.interact(inner.response.rect, inner.response.id.with("card"), egui::Sense::click());
+    if resp.hovered() && !selected {
+        ui.painter().rect_stroke(inner.response.rect, CornerRadius::same(9), Stroke::new(1.0, super::draw::fade(CYAN, 0.45)), egui::StrokeKind::Inside);
+    }
+    resp
+}
+
+use egui::Pos2;
 
 /// An on/off pill with the category's colour when on.
 pub fn pill(ui: &mut egui::Ui, on: bool, text: &str, color: Color32) -> egui::Response {
