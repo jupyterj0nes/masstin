@@ -49,7 +49,7 @@ The pane on the left (the funnel on the toolbar hides it). **Apply filters** at 
 | Section | Meaning |
 |---|---|
 | View | **Findings**: the connections the hunt marked `significant` or `candidate`. **Neighbourhood**: the hosts within *hops* of the host(s) named. **Everything**: the other filters alone decide |
-| Search | hosts, accounts, logon type: `contains` by default; `*` wildcards (`adm*`, `*$`); `!` negates; several separated by commas (`ws*,!ws09`) |
+| Search | hosts, accounts, logon type: `contains` by default; `*` wildcards (`adm*`, `*$`); `=name` exactly that name; `!` negates; several separated by commas (`ws*,!ws09`) |
 | Hunt | **score ≥**: `hunt_score` at least this (13 is one in twenty, 30 one in a thousand, 60 one in a million); the state pills (fixed to significant + candidate in Findings) |
 | Result, Verdict | pills |
 | Grouping | **Group accounts** (one edge per origin, destination, account and result; a pair with more than six accounts becomes one edge that says how many), **One edge per account** (never folded), **One edge per event** (every row its own curve, for a tight window) |
@@ -67,6 +67,7 @@ In the View menu and on the toolbar:
 - **Shapes by role**: hexagon for a domain controller (it receives Kerberos ticket traffic, 4768 / 4769 / 4770 / 4771), rounded square for a server (mostly a destination), circle for a workstation, diamond for an address outside the private ranges; colours follow.
 - **Hosts / Edges / Text**: scales.
 - **Account and host colours**: coloured by account, the legend chips over the canvas are buttons: click one to pick that account's colour (a palette, or any colour); right-click a host or a connection for *Colour this host…* / *Colour <account>…*. These are style rules, saved with the style.
+- **Labels and sizes** (View menu, or the tag on the toolbar): where every host's name goes (**auto**: inside when it fits readably, under it otherwise; **inside**; **band**: a band across the host, wider than it, like a road sign; **below**; **above**), the text size, a box behind the names and its colour, host size by traffic or not, the host and edge scales. Right-click a host › *Name, size and colour of this host…* sets the same for that host alone (its own name position, text size, box, size and colour), kept as a style rule on its exact name (`=NAME`) that wins over the global setting; *Back to the global settings* removes it.
 - **Rules**: the style rules window. A rule is a field (host, account, logon type, event id, result, hunt, verdict) and a pattern (same syntax as the filters; empty matches everything), then the look it gives: colour, edge width, host size, shape, dashed, glow, hide. The first rule that matches wins; rules on host and hunt also apply to hosts. Buttons add the usual ones: one account in colour, hide machine accounts, fade what was marked benign, domain controllers as hexagons. Rules are saved with the style.
 
 ## Paths, cones and questions

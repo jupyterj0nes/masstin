@@ -491,6 +491,10 @@ impl Pattern {
             Some(r) => (true, r),
             None => (false, s),
         };
+        // `=name` is the name exactly (what a host's own rule uses)
+        if let Some(exact) = s.strip_prefix('=') {
+            return Pattern { negate, anchored_start: true, anchored_end: true, parts: vec![exact.to_uppercase()] };
+        }
         // a bare word means "contains"
         let glob = if s.contains('*') { s.to_string() } else { format!("*{}*", s) };
         Pattern {
@@ -545,6 +549,17 @@ impl Pattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_equals_pattern_is_exact() {
+        let p = Pattern::parse_list("=PTR-DC01");
+        assert!(Pattern::any(&p, "ptr-dc01"));
+        assert!(!Pattern::any(&p, "PTR-DC01$"));
+        assert!(!Pattern::any(&p, "RF-PTR-DC01"));
+        let n = Pattern::parse_list("!=PTR-DC01");
+        assert!(!Pattern::any(&n, "PTR-DC01"));
+        assert!(Pattern::any(&n, "PTR-DC01$"));
+    }
 
     #[test]
     fn patterns_are_globs_or_contains() {

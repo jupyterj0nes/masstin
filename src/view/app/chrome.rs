@@ -128,6 +128,12 @@ impl Viewer {
                 let mut changed = false;
                 changed |= ui.checkbox(&mut self.style.motion, format!("{}  Motion", ic::SPARKLE)).changed();
                 changed |= ui.checkbox(&mut self.style.shapes_by_role, format!("{}  Shapes by role", ic::HEXAGON)).changed();
+                if ui.checkbox(&mut self.style.size_by_traffic, format!("{}  Host size by traffic", ic::CIRCLES_THREE_PLUS)).on_hover_text("On: a host grows with its events in and out of the view (log scale). Off: every host the same size").changed() {
+                    changed = true;
+                    let f = self.draft.clone();
+                    self.draft = f;
+                    self.requery(false);
+                }
                 ui.horizontal(|ui| {
                     ui.label("Hosts");
                     changed |= ui.add(egui::DragValue::new(&mut self.style.node_scale).range(0.4..=2.5).speed(0.02).fixed_decimals(1)).changed();
@@ -156,6 +162,10 @@ impl Viewer {
                     self.persist();
                 }
                 ui.separator();
+                if icon_button(ui, ic::TAG, "Labels and sizes…").clicked() {
+                    ui.close();
+                    self.show_labels = true;
+                }
                 if icon_button(ui, ic::PALETTE, &format!("Style rules ({})", self.style.rules.iter().filter(|r| r.enabled).count())).clicked() {
                     ui.close();
                     self.show_rules = true;
@@ -263,6 +273,9 @@ impl Viewer {
             if tool(ui, ic::HEXAGON, "Shapes by role: hexagon domain controller, square server, circle workstation, diamond external", self.style.shapes_by_role).clicked() {
                 self.style.shapes_by_role = !self.style.shapes_by_role;
                 self.persist();
+            }
+            if tool(ui, ic::TAG, "Labels and sizes", self.show_labels).clicked() {
+                self.show_labels = !self.show_labels;
             }
             if tool(ui, ic::PALETTE, "Style rules", self.show_rules).clicked() {
                 self.show_rules = !self.show_rules;
@@ -588,6 +601,12 @@ impl Viewer {
             }
         });
         theme::hairline(ui);
+        // a selection the last query no longer has
+        match self.selected {
+            Some(Sel::Node(i)) if i >= self.graph.nodes.len() => self.selected = None,
+            Some(Sel::Edge(k)) if k >= self.graph.edges.len() => self.selected = None,
+            _ => {}
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
             Tab::Selection => match self.selected {
                 None => {
@@ -733,6 +752,8 @@ impl Viewer {
             });
             let w = (ui.available_width() - 470.0).max(160.0);
             self.histogram_brush(ui, w);
+            // the brush may have applied a new window: the view can be another one now
+            let n_view = self.graph.events.len();
             let at = if n_view == 0 {
                 String::new()
             } else {
@@ -914,7 +935,13 @@ impl Viewer {
     /// The right-click menu of what was under the pointer.
     pub(super) fn context_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(240.0);
-        match self.ctx_target {
+        // the target may be gone if the view changed while the menu was open
+        let target = match self.ctx_target {
+            Some(Sel::Node(i)) if i >= self.graph.nodes.len() => None,
+            Some(Sel::Edge(k)) if k >= self.graph.edges.len() => None,
+            t => t,
+        };
+        match target {
             Some(Sel::Node(i)) => {
                 let host = self.graph.nodes[i].host;
                 let name = self.store.hosts.name(host).to_string();
@@ -951,13 +978,17 @@ impl Viewer {
                     }
                     self.layout.reheat(0.1);
                 }
+                if icon_button(ui, ic::TAG, "Name, size and colour of this host…").clicked() {
+                    ui.close();
+                    self.host_edit = Some(HostEdit { name: name.clone() });
+                }
                 if icon_button(ui, ic::PALETTE, "Colour this host…").clicked() {
                     ui.close();
                     self.color_pick = Some(ColorPick { field: Field::Host, pattern: name.clone(), color: self.scene.nodes.get(i).map(|n| n.fill).unwrap_or(HOST_FILL), title: format!("Colour of {}", name) });
                 }
                 if icon_button(ui, ic::EYE_SLASH, "Hide this host").clicked() {
                     ui.close();
-                    self.style.rules.push(Rule { enabled: true, field: Field::Host, pattern: name.clone(), color: None, hide: true, ..Rule::default() });
+                    self.style.rules.push(Rule { enabled: true, field: Field::Host, pattern: format!("={}", name), color: None, hide: true, ..Rule::default() });
                     self.persist();
                 }
                 ui.separator();
@@ -1005,11 +1036,11 @@ impl Viewer {
                     let uname = self.store.users.name(users[0]).to_string();
                     if icon_button(ui, ic::PALETTE, &format!("Colour {}…", uname)).clicked() {
                         ui.close();
-                        self.color_pick = Some(ColorPick { field: Field::User, pattern: uname.clone(), color: Color32::from_rgb(palette_color(users[0])[0], palette_color(users[0])[1], palette_color(users[0])[2]), title: format!("Colour of {}", uname) });
+                        self.color_pick = Some(ColorPick { field: Field::User, pattern: format!("={}", uname), color: Color32::from_rgb(palette_color(users[0])[0], palette_color(users[0])[1], palette_color(users[0])[2]), title: format!("Colour of {}", uname) });
                     }
                     if icon_button(ui, ic::EYE_SLASH, &format!("Hide {}", uname)).clicked() {
                         ui.close();
-                        self.style.rules.push(Rule { enabled: true, field: Field::User, pattern: uname.clone(), color: None, hide: true, ..Rule::default() });
+                        self.style.rules.push(Rule { enabled: true, field: Field::User, pattern: format!("={}", uname), color: None, hide: true, ..Rule::default() });
                         self.persist();
                     }
                     if icon_button(ui, ic::USER, &format!("Only {}", uname)).clicked() {
@@ -1082,7 +1113,7 @@ impl Viewer {
                     if by_user {
                         let r = r.on_hover_text("Click to pick this account's colour");
                         if r.clicked() {
-                            self.color_pick = Some(ColorPick { field: Field::User, pattern: text.clone(), color: c, title: format!("Colour of {}", text) });
+                            self.color_pick = Some(ColorPick { field: Field::User, pattern: format!("={}", text), color: c, title: format!("Colour of {}", text) });
                         }
                     }
                 }
@@ -1127,9 +1158,15 @@ impl Viewer {
         });
         if done || clear {
             let pick = self.color_pick.take().unwrap();
-            self.style.rules.retain(|r| !(r.field == pick.field && r.pattern.eq_ignore_ascii_case(&pick.pattern) && r.color.is_some() && !r.hide));
-            if done {
-                self.style.rules.insert(0, Rule { enabled: true, field: pick.field, pattern: pick.pattern, color: Some([pick.color.r(), pick.color.g(), pick.color.b()]), ..Rule::default() });
+            if pick.field == Field::Host {
+                // a host keeps one rule with everything of its own
+                let rule = self.host_rule_mut(&pick.pattern);
+                rule.color = if done { Some([pick.color.r(), pick.color.g(), pick.color.b()]) } else { None };
+            } else {
+                self.style.rules.retain(|r| !(r.field == pick.field && r.pattern.eq_ignore_ascii_case(&pick.pattern) && r.color.is_some() && !r.hide));
+                if done {
+                    self.style.rules.insert(0, Rule { enabled: true, field: pick.field, pattern: pick.pattern, color: Some([pick.color.r(), pick.color.g(), pick.color.b()]), ..Rule::default() });
+                }
             }
             self.persist();
         } else if !open {
