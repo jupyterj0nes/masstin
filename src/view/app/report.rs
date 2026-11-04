@@ -116,11 +116,12 @@ impl Viewer {
                 });
             });
             ui.horizontal_wrapped(|ui| {
-                let _ = theme::pill(ui, sig > 0, &format!("{} significant", sig), SIGNIFICANT);
-                let _ = theme::pill(ui, cand > 0, &format!("{} candidate", cand), CANDIDATE);
-                let _ = theme::pill(ui, false, &format!("{} habitual", hab), theme::MUTED);
-                let _ = theme::pill(ui, false, &format!("{} not evaluated", ne), theme::MUTED);
-                let _ = theme::pill(ui, false, &format!("{} baseline", base), theme::MUTED);
+                theme::pill(ui, sig > 0, &format!("{} significant", sig), SIGNIFICANT).on_hover_text(HELP_SIGNIFICANT);
+                theme::pill(ui, cand > 0, &format!("{} candidate", cand), CANDIDATE).on_hover_text(HELP_CANDIDATE);
+                theme::pill(ui, false, &format!("{} habitual", hab), theme::MUTED).on_hover_text(HELP_HABITUAL);
+                theme::pill(ui, false, &format!("{} not evaluated", ne), theme::MUTED).on_hover_text(HELP_NOT_EVALUATED);
+                theme::pill(ui, false, &format!("{} baseline", base), theme::MUTED).on_hover_text(HELP_BASELINE);
+                ui.label(egui::RichText::new("rows of the timeline, by state").color(theme::DIM).size(11.0)).on_hover_text("Every row of the CSV got one of these in its hunt column. Hover a pill for what it means.");
             });
 
             // ── the findings ──
@@ -152,9 +153,17 @@ impl Viewer {
             };
             let list_h = (ui.available_height() - 250.0).max(160.0);
             egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
-                egui::Grid::new("report-findings").num_columns(6).spacing([12.0, 3.0]).striped(true).min_col_width(40.0).show(ui, |ui| {
-                    for h in ["first seen", "origin  →  destination", "account", "state", "score", "why"] {
-                        ui.label(egui::RichText::new(h).small().color(theme::DIM));
+                egui::Grid::new("report-findings").num_columns(7).spacing([12.0, 3.0]).striped(true).min_col_width(40.0).show(ui, |ui| {
+                    for (h, help) in [
+                        ("first seen", "The time of the first event of this connection (UTC). The connection may repeat after it."),
+                        ("origin  →  destination", "The host the logon came from and the host it went to: one connection is one origin, one destination and one account."),
+                        ("account", "The account the logon used. A machine account ends in $."),
+                        ("events", "How many rows of the timeline this connection has: the same origin, destination and account, over and over. One event is one logon."),
+                        ("state", HELP_STATE),
+                        ("score", HELP_SCORE),
+                        ("why", "The hunt's explanation: what it compared and what it found. Hover a cell to read it whole; the inspector shows it too."),
+                    ] {
+                        ui.label(egui::RichText::new(h).small().color(theme::DIM)).on_hover_text(help);
                     }
                     ui.end_row();
                     for (src, dst, user, t, sname, dname, uname, count, hunt, score, why) in &rows {
@@ -162,19 +171,20 @@ impl Viewer {
                         let c = hunt_color(*hunt).unwrap_or(theme::MUTED);
                         let link = |ui: &mut egui::Ui, text: egui::RichText| -> bool { ui.add(egui::Button::new(text).frame(false).fill(if selected { draw::fade(theme::CYAN, 0.18) } else { Color32::TRANSPARENT })).clicked() };
                         let mut clicked = false;
-                        clicked |= link(ui, egui::RichText::new(&t[..16]).monospace().size(11.5).color(theme::MUTED));
-                        clicked |= link(ui, egui::RichText::new(format!("{}  {}  {}", sname, ic::ARROW_RIGHT, dname)).size(12.5).color(TEXT));
-                        clicked |= link(ui, egui::RichText::new(if uname.is_empty() { "(no account)".to_string() } else { uname.clone() }).size(12.5).color(theme::MUTED));
-                        clicked |= link(ui, egui::RichText::new(format!("{}{}", HUNT_NAMES[*hunt as usize], if *count > 1 { format!(" ×{}", count) } else { String::new() })).size(12.0).color(c));
-                        clicked |= link(ui, theme::medium(format!("{}", score), 12.5).color(TEXT));
+                        let cell = |ui: &mut egui::Ui, text: egui::RichText, help: String| -> bool {
+                            ui.add(egui::Button::new(text).frame(false).fill(if selected { draw::fade(theme::CYAN, 0.18) } else { Color32::TRANSPARENT })).on_hover_text(help).clicked()
+                        };
+                        let _ = link;
+                        clicked |= cell(ui, egui::RichText::new(&t[..16]).monospace().size(11.5).color(theme::MUTED), format!("First event of this connection: {} UTC. Click to see it in the graph.", t));
+                        clicked |= cell(ui, egui::RichText::new(format!("{}  {}  {}", sname, ic::ARROW_RIGHT, dname)).size(12.5).color(TEXT), format!("From {} to {}. Click to select the connection in the graph and open it in the inspector.", sname, dname));
+                        clicked |= cell(ui, egui::RichText::new(if uname.is_empty() { "(no account)".to_string() } else { uname.clone() }).size(12.5).color(theme::MUTED), if uname.is_empty() { "The logon carried no account (a connection without authentication).".to_string() } else if uname.ends_with('$') { format!("{}: a machine account (the computer itself), not a person.", uname) } else { format!("The account {} used for the logon.", uname) });
+                        clicked |= cell(ui, egui::RichText::new(format!("{}", count)).size(12.5).color(TEXT), format!("{} event(s): the same origin, destination and account repeated {} time(s) in the timeline. The hunt judged the connection, not each repeat.", count, count));
+                        clicked |= cell(ui, egui::RichText::new(HUNT_NAMES[*hunt as usize]).size(12.0).color(c), match *hunt { super::super::store::H_SIGNIFICANT => HELP_SIGNIFICANT.to_string(), _ => HELP_CANDIDATE.to_string() });
+                        clicked |= cell(ui, theme::medium(format!("{}", score), 12.5).color(TEXT), format!("Score {}: {}. {}", score, crate::csv_out::score_words(*score), HELP_SCORE));
                         let short: String = if why.chars().count() > 70 { format!("{}…", why.chars().take(69).collect::<String>()) } else { why.clone() };
                         let r = ui.add(egui::Button::new(egui::RichText::new(short).size(11.5).color(theme::MUTED)).frame(false).fill(if selected { draw::fade(theme::CYAN, 0.18) } else { Color32::TRANSPARENT }));
-                        if !why.is_empty() {
-                            let r = r.on_hover_text(why);
-                            clicked |= r.clicked();
-                        } else {
-                            clicked |= r.clicked();
-                        }
+                        let r = r.on_hover_text(if why.is_empty() { "The hunt left no explanation on this row.".to_string() } else { format!("The hunt's explanation:\n{}", why) });
+                        clicked |= r.clicked();
                         if clicked {
                             go = Some((*src, *dst, *user));
                         }
@@ -190,6 +200,7 @@ impl Viewer {
             theme::section(ui, "Scores, and where to set the bar");
             ui.horizontal(|ui| {
                 let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width() - 8.0, 44.0), Sense::hover());
+                let r = r.on_hover_text("Rows of the timeline by score, ten points a bar (log scale). Grey below 10: no rarer than chance. Orange from 10: one in ten and rarer. Red from 30: one in a thousand and rarer. Bars below the threshold you set fade.");
                 let max = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
                 let w = r.rect.width() / 11.0;
                 for (i, n) in hist.iter().enumerate() {
@@ -238,3 +249,11 @@ impl Viewer {
         }
     }
 }
+
+const HELP_SIGNIFICANT: &str = "significant: a connection new after the start of the investigation, rarer than chance at the alpha you asked (0.05: one in twenty) once every test of the run is taken together (Benjamini-Hochberg). The strongest state.";
+const HELP_CANDIDATE: &str = "candidate: a connection new after the start, tested, but not rare enough to be significant at the alpha. Worth a look, not an alarm.";
+const HELP_HABITUAL: &str = "habitual: a connection the network already made before the start of the investigation. Not tested (p = 1).";
+const HELP_NOT_EVALUATED: &str = "not evaluated: a row the hunt could not test, for instance a destination with no comparable coverage in the baseline.";
+const HELP_BASELINE: &str = "baseline: a row before the start of the investigation. It is what the new connections are compared against.";
+const HELP_STATE: &str = "What the hunt made of the connection: significant (rarer than chance at the alpha), candidate (new and tested, not rare enough), habitual (seen before the start), not evaluated, baseline (before the start). Hover a value for more.";
+const HELP_SCORE: &str = "hunt_score: how rare the connection is, 0 to 100, from its q-value (-10 log10 q). 0: no rarer than chance. 13: one in twenty (alpha 0.05). 20: one in a hundred. 30: one in a thousand. 60: one in a million. The slider below keeps only the rows at or above a score.";
