@@ -256,6 +256,10 @@ pub struct SavedView {
     pub name: String,
     pub filter: Filter,
     pub style: Style,
+    /// where the hosts were on the canvas when the view was saved:
+    /// `(host, x, y)`; empty when the analyst did not keep the arrangement
+    #[serde(default)]
+    pub places: Vec<(String, f32, f32)>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -295,7 +299,7 @@ impl ViewsFile {
 pub fn builtin_views(t_max: i64) -> Vec<SavedView> {
     let base = Filter::default();
     let mut v = Vec::new();
-    let mut push = |name: &str, f: Filter| v.push(SavedView { name: name.to_string(), filter: f, style: Style::default() });
+    let mut push = |name: &str, f: Filter| v.push(SavedView { name: name.to_string(), filter: f, style: Style::default(), places: Vec::new() });
     push("Findings", base.clone());
     let mut all = base.clone();
     all.view = View::All;

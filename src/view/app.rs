@@ -213,6 +213,12 @@ pub struct Viewer {
     show_rules: bool,
     show_save: bool,
     save_name: String,
+    /// Save the current filter… keeps the hosts' places too
+    save_places: bool,
+    /// a saved filter asked for: delete it once the analyst confirms
+    confirm_delete: Option<String>,
+    /// places to give the hosts on the next query (a saved view picked)
+    restore_places: Option<Vec<(String, f32, f32)>>,
     // presentation and recording
     story: Story,
     story_path: std::path::PathBuf,
@@ -467,6 +473,9 @@ impl Viewer {
             show_rules: false,
             show_save: false,
             save_name: String::new(),
+            save_places: true,
+            confirm_delete: None,
+            restore_places: None,
             story,
             story_path,
             steps: Vec::new(),
@@ -593,15 +602,45 @@ impl Viewer {
             Some(o) => GraphView::from_edges(&self.store, &self.filter, o.edges.clone()),
             None => GraphView::build(&self.store, &self.filter),
         };
+        let restore = self.restore_places.take();
         let g = &self.graph;
+        // the places a saved view brings, by host name
+        let placed: Vec<Option<V2>> = match &restore {
+            Some(places) => {
+                let by_name: HashMap<&str, V2> = places.iter().map(|(n, x, y)| (n.as_str(), V2::new(*x, *y))).collect();
+                g.nodes.iter().map(|n| by_name.get(self.store.hosts.name(n.host)).copied()).collect()
+            }
+            None => Vec::new(),
+        };
         let max_traffic = g.nodes.iter().map(|n| n.inn + n.out).max().unwrap_or(1).max(1) as f32;
         let by_traffic = self.style.size_by_traffic;
         let radii: Vec<f32> = g.nodes.iter().map(|n| if by_traffic { 20.0 + 10.0 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln() } else { 24.0 }).collect();
         let mut links: Vec<(usize, usize)> = g.edges.iter().map(|e| (g.node_of_host[&e.src], g.node_of_host[&e.dst])).filter(|(a, b)| a != b).collect();
         links.sort_unstable();
         links.dedup();
-        let known: Vec<Option<V2>> = g.nodes.iter().map(|n| if fresh_layout { None } else { self.remembered.get(&n.host).copied() }).collect();
+        let known: Vec<Option<V2>> = g.nodes.iter().enumerate().map(|(i, n)| {
+            if let Some(p) = placed.get(i).copied().flatten() {
+                Some(p)
+            } else if fresh_layout {
+                None
+            } else {
+                self.remembered.get(&n.host).copied()
+            }
+        }).collect();
         self.layout = Layout::new(radii, links, &known);
+        let restored = restore.is_some();
+        if restored {
+            // the placed hosts stay where the analyst left them; hosts the
+            // saved view did not know settle around them
+            for (i, p) in placed.iter().enumerate() {
+                if p.is_some() {
+                    self.layout.fixed[i] = true;
+                }
+            }
+            if placed.iter().all(|p| p.is_some()) {
+                self.layout.stop();
+            }
+        }
         // the room each host gets: the canvas at 100 % shared out, so a small
         // graph spreads over the window instead of huddling in the middle
         let canvas = if self.canvas_rect.width() > 100.0 { self.canvas_rect } else { Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0)) };
@@ -610,10 +649,11 @@ impl Viewer {
         self.layout.aspect = (canvas.width() / canvas.height().max(1.0)).clamp(0.5, 2.5);
         self.compute_subnets();
         let now = self.t0.elapsed().as_secs_f32();
-        self.born = self.graph.nodes.iter().map(|n| if fresh_layout || !self.remembered.contains_key(&n.host) { now } else { now - 10.0 }).collect();
+        self.born = self.graph.nodes.iter().enumerate().map(|(i, n)| if placed.get(i).copied().flatten().is_some() || !(fresh_layout || !self.remembered.contains_key(&n.host)) { now - 10.0 } else { now }).collect();
         self.graph_id += 1;
         self.focus_t = 0.0;
-        self.fill_pending = true;
+        // a saved arrangement is framed as it is, not stretched to the window
+        self.fill_pending = !restored;
         self.fill_anim = None;
         self.selected = None;
         self.hovered = None;
@@ -1368,13 +1408,22 @@ impl Viewer {
             };
             ui.label(egui::RichText::new(summary).color(TEXT).size(12.5));
             ui.label(egui::RichText::new(format!("and the style: colour by {}, {} hosts, {}", self.style.color_by.label(), self.style.node_style.label(), if self.style.motion { "motion on" } else { "still" })).color(theme::DIM).size(11.5));
+            ui.add_space(6.0);
+            let n_hosts = self.graph.nodes.len();
+            ui.checkbox(&mut self.save_places, format!("Keep the arrangement: the {} hosts where they are now", n_hosts))
+                .on_hover_text("Picking the filter later puts these hosts back in these places, pinned; hosts the filter did not have then settle around them. Lay out again frees them.");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let name = self.save_name.trim().to_string();
                 let exists = self.saved.iter().any(|v| v.name == name);
                 if ui.add_enabled(!name.is_empty(), egui::Button::new(theme::semibold(if exists { "Replace" } else { "Save" }, 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(90.0, 30.0))).clicked() {
                     self.saved.retain(|v| v.name != name);
-                    self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style.clone() });
+                    let places: Vec<(String, f32, f32)> = if self.save_places {
+                        self.graph.nodes.iter().enumerate().filter_map(|(i, n)| self.layout.pos.get(i).map(|p| (self.store.hosts.name(n.host).to_string(), p.x, p.y))).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style.clone(), places });
                     self.saved.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                     self.preset = name;
                     self.persist();
@@ -3198,6 +3247,7 @@ impl eframe::App for Viewer {
         self.subnets_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
+        self.confirm_delete_window(&ctx);
         self.story_window(&ctx);
         self.export_window(&ctx);
         self.paths_window(&ctx);

@@ -172,17 +172,25 @@ pub fn brand_line(ui: &mut egui::Ui) {
 /// A card: a rounded box that lights up under the pointer; the closure
 /// draws its contents. Returns the card's response (click to pick).
 pub fn card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
-    let fill = if selected { Color32::from_rgb(16, 48, 52) } else { PANEL_2 };
-    let stroke = if selected { Stroke::new(1.0, super::draw::fade(CYAN, 0.8)) } else { Stroke::new(1.0, BORDER) };
-    let inner = egui::Frame::new().fill(fill).stroke(stroke).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        add(ui);
-    });
-    let resp = ui.interact(inner.response.rect, inner.response.id.with("card"), egui::Sense::click());
-    if resp.hovered() && !selected {
-        ui.painter().rect_stroke(inner.response.rect, CornerRadius::same(9), Stroke::new(1.0, super::draw::fade(CYAN, 0.45)), egui::StrokeKind::Inside);
-    }
-    resp
+    // the card senses the click as a Ui of its own: egui registers that
+    // before the contents, so a button inside the card gets its own clicks
+    // (an interact over the frame afterwards would sit on top of them)
+    ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        let hovered = ui.response().hovered();
+        let fill = if selected { Color32::from_rgb(16, 48, 52) } else { PANEL_2 };
+        let stroke = if selected {
+            Stroke::new(1.0, super::draw::fade(CYAN, 0.8))
+        } else if hovered {
+            Stroke::new(1.0, super::draw::fade(CYAN, 0.45))
+        } else {
+            Stroke::new(1.0, BORDER)
+        };
+        egui::Frame::new().fill(fill).stroke(stroke).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui);
+        });
+    })
+    .response
 }
 
 use egui::Pos2;
