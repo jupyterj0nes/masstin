@@ -12,6 +12,7 @@ mod chrome;
 mod edge_style;
 mod labels;
 mod merge_hosts;
+mod subnets;
 mod tasks;
 
 use std::borrow::Cow;
@@ -28,6 +29,7 @@ use chrome::{Brush, ColorPick, Tab};
 use edge_style::EdgeEdit;
 use labels::HostEdit;
 use merge_hosts::MergeHostsEdit;
+use subnets::SubnetGroup;
 use super::views::{LabelPos, NodeStyle};
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
@@ -310,6 +312,10 @@ pub struct Viewer {
     edge_edit: Option<EdgeEdit>,
     /// the analyst's merges, `(from, into)`, kept in the views file
     merges: Vec<(String, String)>,
+    subnet_defs: Vec<(String, String)>,
+    subnets: Vec<SubnetGroup>,
+    subnet_of: Vec<Option<u16>>,
+    show_subnets_window: bool,
     merge_edit: Option<MergeHostsEdit>,
     show_merges: bool,
     merge_add: (String, String),
@@ -534,6 +540,10 @@ impl Viewer {
             host_edit: None,
             edge_edit: None,
             merges: vf.merges.clone(),
+            subnet_defs: vf.subnets.clone(),
+            subnets: Vec::new(),
+            subnet_of: Vec::new(),
+            show_subnets_window: false,
             merge_edit: None,
             show_merges: false,
             merge_add: (String::new(), String::new()),
@@ -570,7 +580,13 @@ impl Viewer {
         links.dedup();
         let known: Vec<Option<V2>> = g.nodes.iter().map(|n| if fresh_layout { None } else { self.remembered.get(&n.host).copied() }).collect();
         self.layout = Layout::new(radii, links, &known);
-        self.layout.link_distance = if g.nodes.len() > 300 { 120.0 } else { 170.0 };
+        // the room each host gets: the canvas at 100 % shared out, so a small
+        // graph spreads over the window instead of huddling in the middle
+        let canvas = if self.canvas_rect.width() > 100.0 { self.canvas_rect } else { Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0)) };
+        let per_host = (canvas.width() * canvas.height() / g.nodes.len().max(1) as f32).sqrt();
+        self.layout.link_distance = (per_host * 0.95).clamp(120.0, 330.0);
+        self.layout.aspect = (canvas.width() / canvas.height().max(1.0)).clamp(0.5, 2.5);
+        self.compute_subnets();
         let now = self.t0.elapsed().as_secs_f32();
         self.born = self.graph.nodes.iter().map(|n| if fresh_layout || !self.remembered.contains_key(&n.host) { now } else { now - 10.0 }).collect();
         self.graph_id += 1;
@@ -583,14 +599,14 @@ impl Viewer {
         self.cursor = self.graph.events.len();
         self.playing = false;
         let mut parts = vec![
-            format!("{} hosts", g.nodes.len()),
-            format!("{} connections drawn of {}", g.edges.len(), g.connections),
-            format!("{} rows", g.events.len()),
+            format!("{} hosts", self.graph.nodes.len()),
+            format!("{} connections drawn of {}", self.graph.edges.len(), self.graph.connections),
+            format!("{} rows", self.graph.events.len()),
         ];
         if let Some(o) = &self.overlay {
             parts.insert(0, o.title.clone());
         }
-        if g.truncated {
+        if self.graph.truncated {
             parts.push("limit reached: narrow the filters or raise the limit".into());
         }
         self.rebuild_steps();
@@ -1259,7 +1275,7 @@ impl Viewer {
     // ───────────────────────── style ─────────────────────────
 
     fn persist(&self) {
-        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone() };
+        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone(), subnets: self.subnet_defs.clone() };
         if let Err(e) = vf.save(&self.views_path) {
             eprintln!("masstin: cannot save {}: {}", self.views_path.display(), e);
         }
@@ -1890,6 +1906,10 @@ impl Viewer {
         }
         let t_edges = std::time::Instant::now();
 
+        // ── the subnet regions, behind everything ──
+        self.layout.aspect = (canvas.width() / canvas.height().max(1.0)).clamp(0.5, 2.5);
+        self.draw_subnets(&painter, canvas, false);
+
         // ── edges ──
         let mut animated: Vec<usize> = Vec::new();
         let mut edges_drawn = 0usize;
@@ -2150,6 +2170,7 @@ impl Viewer {
         if !node_mesh.is_empty() {
             painter.set(node_slot, egui::Shape::mesh(node_mesh));
         }
+        self.draw_subnets(&painter, canvas, true);
         self.nodes_ms = t_nodes.elapsed().as_secs_f32() * 1000.0;
         if keep_moving {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
@@ -3071,6 +3092,7 @@ impl eframe::App for Viewer {
         self.edge_window(&ctx);
         self.merge_host_window(&ctx);
         self.merges_window(&ctx);
+        self.subnets_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.story_window(&ctx);

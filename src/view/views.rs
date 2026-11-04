@@ -229,6 +229,12 @@ pub struct Style {
     pub label_bg_color: [u8; 3],
     #[serde(default)]
     pub node_style: NodeStyle,
+    /// subnet regions behind the hosts
+    #[serde(default)]
+    pub show_subnets: bool,
+    /// a group per /24 besides the named CIDRs
+    #[serde(default = "yes")]
+    pub subnets_auto: bool,
 }
 
 fn label_box() -> [u8; 3] {
@@ -241,7 +247,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Device }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Device, show_subnets: false, subnets_auto: true }
     }
 }
 
@@ -262,6 +268,9 @@ pub struct ViewsFile {
     /// hosts the analyst merged: `(from, into)`
     #[serde(default)]
     pub merges: Vec<(String, String)>,
+    /// named subnets: `(cidr, name)`
+    #[serde(default)]
+    pub subnets: Vec<(String, String)>,
 }
 
 impl ViewsFile {
