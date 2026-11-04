@@ -108,7 +108,7 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 ## The hunt, from the window
 
-**Hunt** on the toolbar (or the Hunt menu) runs `graph-hunt-csv` on the timeline(s) open: the start of the investigation (prefilled with the window's From, or the last third of the timeline), an optional end, alpha. It runs as a child masstin with the same command line you would type, its output in a log window, and while it runs a sweep crosses the canvas. When it ends the timeline is read again, the view switches to Findings and **the findings appear one after another in time order, each with a flash**; then the score slider is where you raise the bar. The verdicts and notes already written are kept. *Tools › Log of the last run…* brings the log back.
+**Hunt** on the toolbar (or the Hunt menu) runs `graph-hunt-csv` on the timeline(s) open: the start of the investigation (prefilled with the window's From, or the last third of the timeline), an optional end, alpha. It runs as a child masstin with the same command line you would type, its output in a log window, and while it runs the mastiff of the logo is on the scent in the middle of the canvas and a sweep crosses it. When it ends the timeline is read again, the view switches to Findings and **the findings appear one after another in time order, each with a flash**; then **the summary** opens: rows by state, the rarest connections with their scores, the spread of scores, and the score threshold with one-click bars (one in twenty, one in a hundred, one in a thousand) that apply at once. The slider in the filter pane does the same at any time. The verdicts and notes already written are kept. *Tools › Log of the last run…* brings the log back.
 
 ## Presentation and recording
 
