@@ -163,9 +163,8 @@ impl Viewer {
         if let Some(Ok(())) = finished {
             match kind {
                 JobKind::Hunt => {
-                    match Store::load(&self.files, self.alpha) {
-                        Ok(s) => {
-                            self.store = s;
+                    match self.reload_store() {
+                        Ok(()) => {
                             self.remembered.clear();
                             self.draft.view = View::Findings;
                             self.requery(false);
@@ -183,10 +182,12 @@ impl Viewer {
                                 files.push(f);
                             }
                         }
-                        match Store::load(&files, self.alpha) {
+                        let merges = ViewsFile::load(&ViewsFile::path_for(&files[0])).merges;
+                        match Store::load_with(&files, self.alpha, &merges) {
                             Ok(s) => {
                                 self.store = s;
                                 self.files = files;
+                                self.merges = merges;
                                 self.views_path = ViewsFile::path_for(&self.files[0]);
                                 self.story_path = Story::path_for(&self.files[0]);
                                 self.remembered.clear();

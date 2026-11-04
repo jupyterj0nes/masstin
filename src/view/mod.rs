@@ -35,7 +35,8 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     for f in &opts.files {
         crate::banner::print_phase_detail("File:", f);
     }
-    let store = store::Store::load(&opts.files, opts.alpha)?;
+    let merges = views::ViewsFile::load(&views::ViewsFile::path_for(&opts.files[0])).merges;
+    let store = store::Store::load_with(&opts.files, opts.alpha, &merges)?;
     crate::banner::print_phase_result(&format!(
         "{} rows: {} edges between {} hosts, {} accounts; {} row(s) without an origin, {} with an unreadable time ({:.1}s)",
         store.rows_total,

@@ -169,12 +169,37 @@ impl Store {
     /// Read the timelines. `alpha` is the false discovery rate of the
     /// IP -> name test (the one graph-hunt and the loaders use).
     pub fn load(paths: &[String], alpha: f64) -> std::io::Result<Store> {
+        Self::load_with(paths, alpha, &[])
+    }
+
+    /// The same, with the analyst's merges: each `(from, into)` makes
+    /// `from` part of `into` (after the hunt's own address folding), chains
+    /// followed to their end.
+    pub fn load_with(paths: &[String], alpha: f64, merges: &[(String, String)]) -> std::io::Result<Store> {
         let ambiguous = ambiguous_short_names(paths)?;
         let resolved: HashMap<String, (String, u32, f64)> = ip_names_for_csv(paths, alpha).unwrap_or_default();
+        let mut manual: HashMap<String, String> = merges.iter().map(|(f, i)| (f.trim().to_uppercase(), i.trim().to_uppercase())).filter(|(f, i)| !f.is_empty() && !i.is_empty() && f != i).collect();
+        // follow chains: A -> B, B -> C gives A -> C
+        for _ in 0..16 {
+            let mut changed = false;
+            let snapshot = manual.clone();
+            for (_, into) in manual.iter_mut() {
+                if let Some(next) = snapshot.get(into) {
+                    if next != into {
+                        *into = next.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         let mut hosts = Interner::default();
         let mut aliases: Vec<Vec<String>> = Vec::new();
         let mut host_of = |raw: &str, hosts: &mut Interner| -> u32 {
             let label = resolved.get(raw).map(|r| r.0.as_str()).unwrap_or(raw);
+            let label = manual.get(&label.to_uppercase()).map(String::as_str).unwrap_or(label);
             let id = hosts.id(label);
             if aliases.len() <= id as usize {
                 aliases.push(vec![label.to_string()]);
@@ -549,6 +574,30 @@ impl Pattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_fold_hosts_and_follow_chains() {
+        let dir = std::env::temp_dir().join(format!("masstin-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.csv");
+        let mut s = csv_out::HEADER.to_string();
+        s.push('\n');
+        s.push_str(&row(1, 10, "WS01", "SRV01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
+        s.push_str(&row(1, 11, "10.0.0.5", "SRV01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
+        s.push_str(&row(1, 12, "WS01", "DC01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
+        std::fs::write(&p, s).unwrap();
+        let path = p.to_string_lossy().to_string();
+        let plain = Store::load(&[path.clone()], 0.05).unwrap();
+        assert_eq!(plain.hosts.len(), 4);
+        let merged = Store::load_with(&[path.clone()], 0.05, &[("10.0.0.5".into(), "ws01".into())]).unwrap();
+        assert_eq!(merged.hosts.len(), 3, "the address is part of WS01");
+        let ws = merged.hosts.get("WS01").unwrap();
+        assert!(merged.aliases[ws as usize].iter().any(|a| a == "10.0.0.5"));
+        assert_eq!(merged.out_adj.of(ws).len(), 3);
+        let chained = Store::load_with(&[path], 0.05, &[("10.0.0.5".into(), "WS01".into()), ("WS01".into(), "DC01".into())]).unwrap();
+        assert_eq!(chained.hosts.len(), 2, "WS01 and the address both end in DC01");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_equals_pattern_is_exact() {
