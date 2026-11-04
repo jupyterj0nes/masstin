@@ -30,28 +30,44 @@ Drag a host to move it, drag the background to pan, scroll to zoom, double-click
 
 The layout is d3's: repulsion through a Barnes-Hut quadtree (a far cell counts as its centre of mass), springs on the links weaker on a busy host (1 / the smaller degree, so a hub's five hundred leaves do not crush it), a weak gravity, the picture recentred every tick, overlaps pushed apart on a hash grid. A tick over 3,000 hosts and 47,000 links costs about 8 ms. Drawing adapts to the crowd: beyond 2,500 edges on screen the unlit edges become straight segments in one mesh (findings keep their colour), small hosts become discs in one mesh, captions and halos go, and the detail comes back as you zoom in. Measured on a laptop: the 15 hosts of a lab at the display's rate; 600 hosts with 12,700 edges drawn at 48 frames a second settled and 40 while the layout runs; 3,000 hosts with 47,000 edges at 29 settled and 20 while the layout runs. **F1** shows the frame budget (hosts and edges drawn, layout, geometry, edges, hosts, frame, fps) at the bottom left.
 
+## The window
+
+A menu bar (**Evidence**, **Hunt**, **View**, **Tools**, **Help**), a toolbar, the row of applied filters, the filter pane on the left, the canvas, the inspector on the right, the time strip and a status line.
+
+- **Evidence**: open or add timeline CSVs, reload, **Ingest evidence…** (masstin's own parsers run from here: pick what it is, where it is and the CSV to write; the command line is shown and the result opens in the window), **Merge timelines…**.
+- **Hunt**: **Run the hunt on this timeline…** (below) and the score threshold.
+- **View**: the three views, fit, lay out again, the panes, motion, shapes by role, sizes, colour by, captions, the style rules.
+- **Tools**: paths and reach, questions, the story and its recording, **Open the case in agentc00pr**, the log of the last run.
+- **Toolbar**: the filter pane toggle, the three views as one control, a quick search (a host name, Enter opens its neighbourhood), fit, lay out again, motion, shapes by role, rules; on the right questions, paths, **Hunt**, agentc00pr, the frame budget, the inspector toggle.
+- **Applied filters**: every filter that narrows the view is a chip under the toolbar (`host: SRV*`, `score ≥ 13`, `2026-11-03 20:00 → 2026-11-04 00:19`, `findings only`, `one edge per event`…); the × on a chip removes that filter at once, *clear all* removes them all. No chips, no filters.
+- **Right-click** a host: expand around, only this host, paths from or to here, pin, colour, hide, a note, copy the name. A connection: open in the inspector, mark suspicious / confirmed / benign, a note, and for one account its colour, hide it, only it. The background: fit, lay out again, Findings, Everything, back to the view, clear the selection, a note on the case.
+
 ## Filters
 
-| Control | Meaning |
+The pane on the left (the funnel on the toolbar hides it). **Apply filters** at the bottom applies the pane; *apply as I change them* applies pills at once and text fields when you pause; Enter in a field applies too.
+
+| Section | Meaning |
 |---|---|
-| View | **Findings**: the connections the hunt marked `significant` or `candidate`. **Neighbourhood**: the hosts within *hops* of the host(s) named in *around*. **Everything**: the other filters alone decide |
-| Host / User / Logon type | `contains` by default; `*` wildcards (`adm*`, `*$`); `!` negates; several separated by commas (`ws*,!ws09`) |
-| Result, Hunt, Verdict | toggles; in Findings the hunt toggles are fixed to significant + candidate |
-| From / To | `YYYY-MM-DD HH:MM:SS` (UTC); a date alone is midnight |
-| Limit | connections drawn, the most pressing first (significant, then candidate, then by number of events). The status line says when it was reached |
+| View | **Findings**: the connections the hunt marked `significant` or `candidate`. **Neighbourhood**: the hosts within *hops* of the host(s) named. **Everything**: the other filters alone decide |
+| Search | hosts, accounts, logon type: `contains` by default; `*` wildcards (`adm*`, `*$`); `!` negates; several separated by commas (`ws*,!ws09`) |
+| Hunt | **score ≥**: `hunt_score` at least this (13 is one in twenty, 30 one in a thousand, 60 one in a million); the state pills (fixed to significant + candidate in Findings) |
+| Result, Verdict | pills |
+| Grouping | **Group accounts** (one edge per origin, destination, account and result; a pair with more than six accounts becomes one edge that says how many), **One edge per account** (never folded), **One edge per event** (every row its own curve, for a tight window) |
+| Limit | connections drawn, the most pressing first (significant, then candidate, then by number of events); the status line and the inspector say when it was reached |
+| Saved filters | yours, by name, and the built-in ones (RDP only, network logons, SSH, admin accounts, service accounts, without machine accounts, failures and touches, marked by the analyst, last 24 hours); **Save the current filter…** keeps the filter *and* the style under a name in `<timeline>.views.json`, next to the timeline |
 
-`--focus HOST` opens in Neighbourhood on that host; `--start-time` / `--end-time` fill From / To.
+The time window is the **time strip** at the bottom (below), and the same From / To the chips show.
 
-## Presets, saved views and style
+## Style
 
-The third row of the bar:
+In the View menu and on the toolbar:
 
-- **View presets**: Findings, Everything, RDP only (type 10), Network logons (type 3), SSH, Admin accounts, Service accounts, Without machine accounts, Failures and touches, Marked by the analyst, Last 24 hours of the timeline. Picking one fills the filters and applies them. **Save view…** keeps the current filter *and* style under a name; a saved view brings its style back when picked; **Delete view** removes it. Saved views and the last style used live in `<timeline>.views.json`, next to the timeline, so they survive sessions and travel with the case.
 - **Colour by**: result (the default: logon OK grey, FAILED red, connect purple, logoff grey, with the hunt's red and orange on top), account (one colour per account, Neo4j's palette), logon type, hunt state, verdict. The chips at the top left list the categories in the view with their counts.
 - **On edges**: what is written on an edge: the account, the first time, the logon type, account + time, the number of events, or nothing.
 - **Shapes by role**: hexagon for a domain controller (it receives Kerberos ticket traffic, 4768 / 4769 / 4770 / 4771), rounded square for a server (mostly a destination), circle for a workstation, diamond for an address outside the private ranges; colours follow.
 - **Hosts / Edges / Text**: scales.
-- **Rules (n)**: the style rules window. A rule is a field (host, account, logon type, event id, result, hunt, verdict) and a pattern (same syntax as the filters; empty matches everything), then the look it gives: colour, edge width, host size, shape, dashed, glow, hide. The first rule that matches wins; rules on host and hunt also apply to hosts. Buttons add the usual ones: one account in colour, hide machine accounts, fade what was marked benign, domain controllers as hexagons. Rules are saved with the style.
+- **Account and host colours**: coloured by account, the legend chips over the canvas are buttons: click one to pick that account's colour (a palette, or any colour); right-click a host or a connection for *Colour this host…* / *Colour <account>…*. These are style rules, saved with the style.
+- **Rules**: the style rules window. A rule is a field (host, account, logon type, event id, result, hunt, verdict) and a pattern (same syntax as the filters; empty matches everything), then the look it gives: colour, edge width, host size, shape, dashed, glow, hide. The first rule that matches wins; rules on host and hunt also apply to hosts. Buttons add the usual ones: one account in colour, hide machine accounts, fade what was marked benign, domain controllers as hexagons. Rules are saved with the style.
 
 ## Paths, cones and questions
 
@@ -61,18 +77,27 @@ The third row of the bar:
 
 These are the questions the Cypher catalogue of the Neo4j export used to answer (`neo4j-resources/cypher_queries.md`), without a database.
 
-## The pane
+## The inspector
 
-- A **host**: its names, events in and out, every connection it has in the view (click one to open it), *Expand around* and *Only this host*.
-- A **connection**: the account(s), result, number of events, first and last time, logon types and event IDs, the hunt's state with its score (0 to 100, how rare: 30 is one in a thousand) and explanation, and the rows behind it (first 300) with their event columns.
+Three tabs on the right.
 
-## Marks
+- **Selection**. A **host**: its names, events in and out, its notes, every connection it has in the view (click one to open it), *Expand around*, *Only this host*, *Paths from here*, *Paths to here*. A **connection**: the account(s), result, number of events, first and last time, logon types and event IDs, the hunt's state with its score (0 to 100, how rare: 30 is one in a thousand) and explanation, the mark, and the rows behind it (first 300) with their event columns. Nothing selected: what is in the view, by state and verdict.
+- **Notes**: the notes of the case (on a host, on a connection, or free), with the time they were written and a way to delete them, then every row of the timeline that carries a verdict or a note, click to open its connection.
+- **Legend**: what the colours, rings, halos and widths mean.
 
-On a connection: **suspicious**, **confirmed**, **benign** or **clear**, plus notes, then *Save*. The verdict and the notes are written into the `verdict` and `notes` columns of every row of that connection in the timeline CSV (the file is rewritten through a temporary copy and renamed over the original). A case tool reading the same CSV sees them; the viewer reloads a file another program changed (**Reload** forces it).
+## Marks and notes
 
-## Replay
+A **verdict** (suspicious, confirmed, benign, or clear) with notes goes on the rows of a connection, into the `verdict` and `notes` columns of the timeline CSV (the file is rewritten through a temporary copy and renamed over the original). When a drawn edge stands for several rows, **the viewer asks**: the whole block (every row, every account folded into it) or only the rows you tick in the list. A case tool reading the same CSV sees the marks; the viewer reloads a file another program changed (**Reload** forces it).
 
-The bar at the bottom runs the rows of the view in time order: hosts and connections appear when their first event happens. **Play** / **Pause**, the speed in rows per second, **All** to show everything again. The strip in the middle is the view's events over time, a bar every three pixels on a log scale, red where a significant connection falls, bright up to the cursor and dim beyond it; click or drag on it to scrub, hover for the time.
+A **note** on a host, on a connection or on the case itself has no row to live in: it goes to `<timeline>.notes.json` next to the timeline, with its time, where agentc00pr can read it too. Right-click, or the Notes tab.
+
+## The time strip
+
+The strip at the bottom is the whole timeline's events over time (a bar every three pixels, log scale, red where a significant connection falls), with the **window the filter selects as a bright band between two handles**. Drag a handle to narrow the window: that *is* the From / To filter, and the chips and the fields follow. Double-click frees the whole timeline. The white line is the **replay head**: drag anywhere else to scrub, **Play** runs the rows of the view in time order at the chosen speed (hosts and connections appear when their first event happens), **All** shows everything again. Hover for the time under the pointer.
+
+## The hunt, from the window
+
+**Hunt** on the toolbar (or the Hunt menu) runs `graph-hunt-csv` on the timeline(s) open: the start of the investigation (prefilled with the window's From, or the last third of the timeline), an optional end, alpha. It runs as a child masstin with the same command line you would type, its output in a log window, and while it runs a sweep crosses the canvas. When it ends the timeline is read again, the view switches to Findings and **the findings appear one after another in time order, each with a flash**; then the score slider is where you raise the bar. The verdicts and notes already written are kept. *Tools › Log of the last run…* brings the log back.
 
 ## Presentation and recording
 
@@ -90,7 +115,7 @@ The bar at the bottom runs the rows of the view in time order: hosts and connect
 
 ## Driving it from outside
 
-`MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `questions`, `paths=A:B[:gap_h]`, `cone=A`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p), `shot=file.png` (a screenshot of the window), `all=LIMIT` (the Everything view with that limit), `select=HOST`, `zoom=F`, `hud`, `motion`, `bench=N` (times the next N frames with the layout heated and prints the figures on stderr; `bench=N:cold` as it is), `wait=SECONDS` and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes; `MASSTIN_VIEW_AUTO="all=5000,wait=5,shot=big.png,bench=120,wait=10,quit"` is how the figures above were taken. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr; `MASSTIN_VIEW_HUD=1` opens with the frame budget shown.
+`MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `questions`, `paths=A:B[:gap_h]`, `cone=A`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p), `shot=file.png` (a screenshot of the window), `hunt=YYYY-MM-DD HH:MM:SS` (run the hunt from that start), `all=LIMIT` (the Everything view with that limit), `select=HOST`, `zoom=F`, `hud`, `motion`, `bench=N` (times the next N frames with the layout heated and prints the figures on stderr; `bench=N:cold` as it is), `wait=SECONDS` and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes; `MASSTIN_VIEW_AUTO="all=5000,wait=5,shot=big.png,bench=120,wait=10,quit"` is how the figures above were taken. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr; `MASSTIN_VIEW_HUD=1` opens with the frame budget shown.
 
 ## Building without it
 
