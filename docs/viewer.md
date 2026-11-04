@@ -18,11 +18,17 @@ masstin -a view -f dc01.csv -f srv02.csv
 The picture follows Neo4j Browser: a **host** is a circle with its name inside (cyan when it is a name, amber when it is an address the hunt could not tie to a name), a **connection** is a line from origin to destination with an arrowhead and the account written on it. Hosts are the machines graph-hunt sees: upper-case short names, an IP folded into the host name the same-login test gives it (the host lists its addresses in the pane and in the tooltip).
 
 - **Width** of an edge grows with its number of events; **size** of a host with its traffic in the view.
-- **Colour** of an edge is its result (logon OK grey, logon FAILED red, connect purple and dotted, logoff grey and dotted), unless the hunt has a word on it: `significant` red and thick, `candidate` orange. A host touched by a significant connection gets a red ring.
+- **Colour** of an edge is its result (logon OK grey, logon FAILED red, connect purple and dotted, logoff grey and dotted), unless the hunt has a word on it: `significant` red and thick, `candidate` orange. An edge fades in from its origin and is brightest at its destination, so the direction reads even before the arrowhead. A host touched by a significant connection gets a red ring and a slow red pulse; a candidate a faint orange one.
 - **Halo**: a connection the analyst marked carries a halo (pink for suspicious and confirmed, green for benign).
 - Two hosts with more than six accounts between them are drawn as **one edge** that says how many (a spray or a Kerberoast would otherwise be a fan of parallel curves).
+- **Motion** (a checkbox in the bar, saved with the style): bright dots travel along the connections that matter, origin to destination (the findings, the glowing rules, whatever is hovered or selected), the significant hosts breathe, a hovered host gets a pulsing ring. Off, the picture is still; it costs nothing when nothing moves.
+- Hovering or selecting something fades everything else out over a fraction of a second; a host that enters the view pops in; the camera glides to where it goes (Fit, zoom, a neighbourhood).
 
-Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood. The force layout runs while warm and settles; **Shake** lays it out again, **Fit** frames it.
+Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood. The force layout runs while warm and settles; **Shake** lays it out again, **Fit** frames it. Captions that would sit on one another are left out until the view is zoomed in or the edge is lit.
+
+### Many hosts
+
+The layout is d3's: repulsion through a Barnes-Hut quadtree (a far cell counts as its centre of mass), springs on the links weaker on a busy host (1 / the smaller degree, so a hub's five hundred leaves do not crush it), a weak gravity, the picture recentred every tick, overlaps pushed apart on a hash grid. A tick over 3,000 hosts and 47,000 links costs about 8 ms. Drawing adapts to the crowd: beyond 2,500 edges on screen the unlit edges become straight segments in one mesh (findings keep their colour), small hosts become discs in one mesh, captions and halos go, and the detail comes back as you zoom in. Measured on a laptop: the 15 hosts of a lab at the display's rate; 600 hosts with 12,700 edges drawn at 48 frames a second settled and 40 while the layout runs; 3,000 hosts with 47,000 edges at 29 settled and 20 while the layout runs. **F1** shows the frame budget (hosts and edges drawn, layout, geometry, edges, hosts, frame, fps) at the bottom left.
 
 ## Filters
 
@@ -66,7 +72,7 @@ On a connection: **suspicious**, **confirmed**, **benign** or **clear**, plus no
 
 ## Replay
 
-The bar at the bottom runs the rows of the view in time order: hosts and connections appear when their first event happens. **Play** / **Pause**, the speed in rows per second, the slider to scrub, **All** to show everything again.
+The bar at the bottom runs the rows of the view in time order: hosts and connections appear when their first event happens. **Play** / **Pause**, the speed in rows per second, **All** to show everything again. The strip in the middle is the view's events over time, a bar every three pixels on a log scale, red where a significant connection falls, bright up to the cursor and dim beyond it; click or drag on it to scrub, hover for the time.
 
 ## Presentation and recording
 
@@ -84,7 +90,7 @@ The bar at the bottom runs the rows of the view in time order: hosts and connect
 
 ## Driving it from outside
 
-`MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p) and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr.
+`MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `questions`, `paths=A:B[:gap_h]`, `cone=A`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p), `shot=file.png` (a screenshot of the window), `all=LIMIT` (the Everything view with that limit), `select=HOST`, `zoom=F`, `hud`, `motion`, `bench=N` (times the next N frames with the layout heated and prints the figures on stderr; `bench=N:cold` as it is), `wait=SECONDS` and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes; `MASSTIN_VIEW_AUTO="all=5000,wait=5,shot=big.png,bench=120,wait=10,quit"` is how the figures above were taken. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr; `MASSTIN_VIEW_HUD=1` opens with the frame budget shown.
 
 ## Building without it
 

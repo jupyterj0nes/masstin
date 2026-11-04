@@ -3,8 +3,12 @@
 //! an ideal distance, a weak gravity keeps the whole thing centred, and
 //! circles never overlap. The simulation has a temperature (`alpha`) that
 //! decays; it stops when cold and is reheated when the graph changes or a
-//! node is dragged. Repulsion is exact between neighbours and approximated
-//! by cell centroids farther away, so a few thousand nodes still animate.
+//! node is dragged.
+//!
+//! Repulsion goes through a Barnes-Hut quadtree (a far cell counts as its
+//! centre of mass), so a tick is `n log n` and a few thousand hosts still
+//! animate; the tree's storage is kept between ticks. Collisions use a
+//! hash grid rebuilt per tick.
 
 use std::collections::HashMap;
 
@@ -20,6 +24,9 @@ impl V2 {
     }
     pub fn len(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
+    }
+    pub fn len2(self) -> f32 {
+        self.x * self.x + self.y * self.y
     }
 }
 
@@ -54,6 +61,165 @@ impl std::ops::SubAssign for V2 {
     }
 }
 
+/// Barnes-Hut opening angle: a cell whose width over its distance is
+/// below this is one body at its centre of mass.
+const THETA: f32 = 0.85;
+const THETA2: f32 = THETA * THETA;
+
+/// One cell of the quadtree. A leaf holds one body (or several that sit
+/// on the same point, past the depth limit, counted in `mass`).
+#[derive(Clone, Copy)]
+struct Cell {
+    /// centre of the square and half its side
+    cx: f32,
+    cy: f32,
+    half: f32,
+    /// mass and centre of mass of everything inside
+    mass: f32,
+    mx: f32,
+    my: f32,
+    /// index of the first child; the four are consecutive (u32::MAX = leaf)
+    child: u32,
+    /// the body of a leaf (u32::MAX = empty)
+    body: u32,
+}
+
+const NONE: u32 = u32::MAX;
+
+struct Tree {
+    cells: Vec<Cell>,
+}
+
+impl Tree {
+    fn new() -> Tree {
+        Tree { cells: Vec::new() }
+    }
+
+    fn build(&mut self, pos: &[V2]) {
+        self.cells.clear();
+        if pos.is_empty() {
+            return;
+        }
+        let mut lo = V2::new(f32::MAX, f32::MAX);
+        let mut hi = V2::new(f32::MIN, f32::MIN);
+        for p in pos {
+            lo.x = lo.x.min(p.x);
+            lo.y = lo.y.min(p.y);
+            hi.x = hi.x.max(p.x);
+            hi.y = hi.y.max(p.y);
+        }
+        let half = ((hi.x - lo.x).max(hi.y - lo.y) * 0.5 + 1.0).max(1.0);
+        self.cells.push(Cell { cx: (lo.x + hi.x) * 0.5, cy: (lo.y + hi.y) * 0.5, half, mass: 0.0, mx: 0.0, my: 0.0, child: NONE, body: NONE });
+        for (i, p) in pos.iter().enumerate() {
+            self.insert(i as u32, *p, pos);
+        }
+        // centres of mass
+        for c in &mut self.cells {
+            if c.mass > 0.0 {
+                c.mx /= c.mass;
+                c.my /= c.mass;
+            }
+        }
+    }
+
+    fn quadrant(c: &Cell, p: V2) -> usize {
+        (if p.x >= c.cx { 1 } else { 0 }) | (if p.y >= c.cy { 2 } else { 0 })
+    }
+
+    fn split(&mut self, k: usize) {
+        let c = self.cells[k];
+        let first = self.cells.len() as u32;
+        let h = c.half * 0.5;
+        for q in 0..4 {
+            let dx = if q & 1 == 1 { h } else { -h };
+            let dy = if q & 2 == 2 { h } else { -h };
+            self.cells.push(Cell { cx: c.cx + dx, cy: c.cy + dy, half: h, mass: 0.0, mx: 0.0, my: 0.0, child: NONE, body: NONE });
+        }
+        self.cells[k].child = first;
+    }
+
+    fn insert(&mut self, body: u32, p: V2, pos: &[V2]) {
+        let mut k = 0usize;
+        let mut depth = 0;
+        loop {
+            let c = &mut self.cells[k];
+            c.mass += 1.0;
+            c.mx += p.x;
+            c.my += p.y;
+            if c.child != NONE {
+                let q = Self::quadrant(c, p);
+                k = c.child as usize + q;
+                depth += 1;
+                continue;
+            }
+            if c.body == NONE {
+                c.body = body;
+                return;
+            }
+            if depth > 24 {
+                // two bodies on one point: the leaf keeps the first and the mass of both
+                return;
+            }
+            // a leaf with a body: split, move that body down, go on with ours
+            let other = c.body;
+            c.body = NONE;
+            self.split(k);
+            let op = pos[other as usize];
+            let c = self.cells[k];
+            let ok = c.child as usize + Self::quadrant(&c, op);
+            let oc = &mut self.cells[ok];
+            oc.mass += 1.0;
+            oc.mx += op.x;
+            oc.my += op.y;
+            oc.body = other;
+            k = c.child as usize + Self::quadrant(&c, p);
+            depth += 1;
+        }
+    }
+
+    /// Repulsion on body `i` at `p`: sum of `strength / d²` away from every
+    /// other body, far cells as one. `near` is the distance under which a
+    /// pair counts triple (they are about to overlap).
+    fn force(&self, i: u32, p: V2, strength: f32, near: f32, stack: &mut Vec<u32>) -> V2 {
+        let mut f = V2::default();
+        if self.cells.is_empty() {
+            return f;
+        }
+        stack.clear();
+        stack.push(0);
+        let near2 = near * near;
+        while let Some(k) = stack.pop() {
+            let c = &self.cells[k as usize];
+            if c.mass == 0.0 {
+                continue;
+            }
+            let d = V2::new(p.x - c.mx, p.y - c.my);
+            let dist2 = d.len2();
+            let width = c.half * 2.0;
+            if c.child == NONE {
+                if c.body == i {
+                    // our own leaf: bodies on the very same point, if any, are
+                    // left to the collision pass
+                    continue;
+                }
+                let dist2 = dist2.max(16.0);
+                let k = strength * c.mass / dist2 * if dist2 < near2 { 3.0 } else { 1.0 };
+                f += d * (k / dist2.sqrt());
+            } else if width * width < THETA2 * dist2 && ((p.x - c.cx).abs() > c.half || (p.y - c.cy).abs() > c.half) {
+                // far enough, and we are not inside it (a cell holding this body
+                // would make it repel itself, and every body the same way)
+                let dist2 = dist2.max(16.0);
+                f += d * (strength * c.mass / dist2 / dist2.sqrt());
+            } else {
+                for q in 0..4 {
+                    stack.push(c.child + q);
+                }
+            }
+        }
+        f
+    }
+}
+
 pub struct Layout {
     pub pos: Vec<V2>,
     vel: Vec<V2>,
@@ -64,6 +230,15 @@ pub struct Layout {
     degree: Vec<u32>,
     alpha: f32,
     pub link_distance: f32,
+    max_radius: f32,
+    /// the last tick still pushed overlapping hosts apart
+    unsettled: bool,
+    /// when the forces went cold (overlaps alone are resolved from then on)
+    cold_since: Option<std::time::Instant>,
+    tree: Tree,
+    force: Vec<V2>,
+    stack: Vec<u32>,
+    grid: HashMap<(i32, i32), Vec<u32>>,
 }
 
 impl Layout {
@@ -73,12 +248,13 @@ impl Layout {
         let n = radius.len();
         let mut pos = Vec::with_capacity(n);
         let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
-        let spread = 14.0 * (n as f32).sqrt().max(4.0);
+        // d3's initial radius is 10·√i for links of 30: ours are five times longer
+        let spread = 50.0;
         for i in 0..n {
             match known.get(i).copied().flatten() {
                 Some(p) => pos.push(p),
                 None => {
-                    let r = spread * ((i + 1) as f32).sqrt() * 1.6;
+                    let r = spread * ((i + 1) as f32).sqrt();
                     let a = i as f32 * golden;
                     pos.push(V2::new(r * a.cos(), r * a.sin()));
                 }
@@ -89,7 +265,8 @@ impl Layout {
             degree[a] += 1;
             degree[b] += 1;
         }
-        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0 }
+        let max_radius = radius.iter().copied().fold(1.0f32, f32::max);
+        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, max_radius, unsettled: true, cold_since: None, tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -98,14 +275,30 @@ impl Layout {
 
     pub fn reheat(&mut self, alpha: f32) {
         self.alpha = self.alpha.max(alpha);
+        self.cold_since = None;
     }
 
     pub fn is_running(&self) -> bool {
-        self.alpha > 0.003
+        self.alpha > 0.003 || self.unsettled
     }
 
     pub fn stop(&mut self) {
         self.alpha = 0.0;
+        self.unsettled = false;
+    }
+
+    /// Ticks until the layout is cold or the time is spent, at most
+    /// `max_ticks`. Returns whether anything still moves.
+    pub fn tick_for(&mut self, budget: std::time::Duration, max_ticks: usize) -> bool {
+        let start = std::time::Instant::now();
+        let mut moving = false;
+        for k in 0..max_ticks.max(1) {
+            moving = self.tick();
+            if !moving || (k + 1 < max_ticks && start.elapsed() >= budget) {
+                break;
+            }
+        }
+        moving
     }
 
     /// One step. Returns whether anything still moves.
@@ -114,68 +307,40 @@ impl Layout {
         if n == 0 || !self.is_running() {
             return false;
         }
-        let alpha = self.alpha;
+        let alpha = if self.alpha > 0.003 { self.alpha } else { 0.0 };
+        if alpha == 0.0 && self.cold_since.is_none() {
+            self.cold_since = Some(std::time::Instant::now());
+        }
         self.alpha += (0.0 - self.alpha) * 0.028;
-        let mut force = vec![V2::default(); n];
+        self.force.clear();
+        self.force.resize(n, V2::default());
 
-        // repulsion: exact within the cell neighbourhood, centroids beyond
-        let cell = (self.link_distance * 2.0).max(1.0);
-        let key = |p: V2| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32);
-        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-        for (i, p) in self.pos.iter().enumerate() {
-            cells.entry(key(*p)).or_default().push(i);
-        }
-        let centroids: Vec<((i32, i32), V2, f32)> = cells
-            .iter()
-            .map(|(k, v)| {
-                let mut c = V2::default();
-                for &i in v {
-                    c += self.pos[i];
-                }
-                (*k, c * (1.0 / v.len() as f32), v.len() as f32)
-            })
-            .collect();
+        // repulsion through the quadtree
+        self.tree.build(&self.pos);
         let strength = -2600.0 * alpha;
+        let mut stack = std::mem::take(&mut self.stack);
         for i in 0..n {
-            let p = self.pos[i];
-            let (kx, ky) = key(p);
-            let mut f = V2::default();
-            for (ck, c, mass) in &centroids {
-                let near = (ck.0 - kx).abs() <= 1 && (ck.1 - ky).abs() <= 1;
-                if near {
-                    for &j in &cells[ck] {
-                        if j == i {
-                            continue;
-                        }
-                        let d = p - self.pos[j];
-                        let dist2 = (d.x * d.x + d.y * d.y).max(16.0);
-                        let dist = dist2.sqrt();
-                        let min = self.radius[i] + self.radius[j];
-                        let k = strength / dist2 * if dist < min * 1.5 { 3.0 } else { 1.0 };
-                        f += d * (k / dist);
-                    }
-                } else {
-                    let d = p - *c;
-                    let dist2 = (d.x * d.x + d.y * d.y).max(16.0);
-                    let dist = dist2.sqrt();
-                    f += d * (strength * mass / dist2 / dist);
-                }
-            }
-            force[i] -= f;
+            let near = (self.radius[i] * 2.0) * 1.5;
+            let f = self.tree.force(i as u32, self.pos[i], strength, near, &mut stack);
+            self.force[i] -= f;
         }
-        // links: a spring towards the ideal distance, the lighter end moves more
+        self.stack = stack;
+        // links: a spring towards the ideal distance, weaker on a busy node
+        // (d3: strength 1 / the smaller degree, so a hub's forty links do not
+        // crush it), the lighter end moving more
         for &(a, b) in &self.links {
             let d = self.pos[b] - self.pos[a];
             let dist = d.len().max(1.0);
             let target = self.link_distance + self.radius[a] + self.radius[b] - 30.0;
-            let k = (dist - target) / dist * 0.25 * alpha;
+            let strength = (0.5 / self.degree[a].min(self.degree[b]).max(1) as f32).clamp(0.02, 0.5);
+            let k = (dist - target) / dist * strength * alpha;
             let bias = self.degree[a] as f32 / (self.degree[a] + self.degree[b]).max(1) as f32;
-            force[a] += d * (k * (1.0 - bias));
-            force[b] -= d * (k * bias);
+            self.force[a] += d * (k * (1.0 - bias));
+            self.force[b] -= d * (k * bias);
         }
         // gravity towards the origin
         for i in 0..n {
-            force[i] -= self.pos[i] * (0.006 * alpha);
+            self.force[i] -= self.pos[i] * (0.006 * alpha);
         }
         // integrate
         let mut moving = false;
@@ -184,7 +349,7 @@ impl Layout {
                 self.vel[i] = V2::default();
                 continue;
             }
-            self.vel[i] = (self.vel[i] + force[i]) * 0.55;
+            self.vel[i] = (self.vel[i] + self.force[i]) * 0.55;
             let v = self.vel[i].len();
             if v > 60.0 {
                 self.vel[i] = self.vel[i] * (60.0 / v);
@@ -194,22 +359,54 @@ impl Layout {
                 moving = true;
             }
         }
-        // collisions: push overlapping circles apart
+        // centring, as d3's forceCenter: the springs do not conserve momentum
+        // (a hub's leaves take the whole pull), so without it a graph with hubs
+        // sails off; skipped while the analyst holds a host
+        if !self.fixed.iter().any(|&f| f) {
+            let mut c = V2::default();
+            for p in &self.pos {
+                c += *p;
+            }
+            let c = c * (1.0 / n as f32);
+            for p in &mut self.pos {
+                *p -= c;
+            }
+        }
+        // collisions: push overlapping circles apart (hash grid with cells the
+        // size of the largest pair, two passes)
+        let cell = (self.max_radius * 2.0 + 16.0).max(1.0);
+        let key = |p: V2| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32);
+        for v in self.grid.values_mut() {
+            v.clear();
+        }
+        for (i, p) in self.pos.iter().enumerate() {
+            self.grid.entry(key(*p)).or_default().push(i as u32);
+        }
+        self.grid.retain(|_, v| !v.is_empty());
+        let mut grid = std::mem::take(&mut self.grid);
+        let mut max_push = 0.0f32;
         for _ in 0..2 {
-            for (k, v) in &cells {
+            for (k, v) in &grid {
                 for &i in v {
+                    let i = i as usize;
                     for dx in -1..=1 {
                         for dy in -1..=1 {
-                            if let Some(w) = cells.get(&(k.0 + dx, k.1 + dy)) {
+                            if let Some(w) = grid.get(&(k.0 + dx, k.1 + dy)) {
                                 for &j in w {
+                                    let j = j as usize;
                                     if j <= i {
                                         continue;
                                     }
-                                    let d = self.pos[j] - self.pos[i];
+                                    let mut d = self.pos[j] - self.pos[i];
+                                    if d.len2() < 1e-6 {
+                                        let a = (i * 7 + j * 13) as f32 * 0.7;
+                                        d = V2::new(a.cos(), a.sin());
+                                    }
                                     let dist = d.len().max(0.1);
                                     let min = self.radius[i] + self.radius[j] + 14.0;
                                     if dist < min {
                                         let push = d * ((min - dist) / dist * 0.5);
+                                        max_push = max_push.max(min - dist);
                                         if !self.fixed[i] {
                                             self.pos[i] -= push;
                                         }
@@ -224,6 +421,10 @@ impl Layout {
                 }
             }
         }
+        self.grid = std::mem::take(&mut grid);
+        // a packed ball never settles to the last pixel: three seconds of cold
+        // ticks are enough
+        self.unsettled = max_push > 0.6 && self.cold_since.map_or(true, |t| t.elapsed().as_secs_f32() < 3.0);
         moving || self.is_running()
     }
 
@@ -270,5 +471,96 @@ mod tests {
             l.tick();
         }
         assert_eq!(l.pos[0], V2::new(5.0, 5.0));
+    }
+
+    #[test]
+    fn the_tree_repels_like_the_exact_sum_from_afar() {
+        // 200 bodies in a blob and one probe far away: the tree's force on the
+        // probe is within a few percent of the exact pairwise sum
+        let mut pos: Vec<V2> = (0..200).map(|i| V2::new((i % 20) as f32 * 7.0, (i / 20) as f32 * 7.0)).collect();
+        let probe = V2::new(2000.0, 300.0);
+        pos.push(probe);
+        let mut tree = Tree::new();
+        tree.build(&pos);
+        let mut stack = Vec::new();
+        let f = tree.force(200, probe, -1000.0, 0.0, &mut stack);
+        let mut exact = V2::default();
+        for p in &pos[..200] {
+            let d = probe - *p;
+            let d2 = d.len2();
+            exact += d * (-1000.0 / d2 / d2.sqrt());
+        }
+        assert!((f.x - exact.x).abs() < exact.x.abs() * 0.03 + 1e-3, "{f:?} {exact:?}");
+        assert!((f.y - exact.y).abs() < exact.x.abs() * 0.03 + 1e-3, "{f:?} {exact:?}");
+    }
+
+    #[test]
+    fn two_thousand_nodes_tick_fast() {
+        let n = 2000;
+        let links: Vec<(usize, usize)> = (1..n).map(|i| (i, i / 3)).collect();
+        let mut l = Layout::new(vec![22.0; n], links, &vec![None; n]);
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            l.tick();
+        }
+        // debug builds are slow; the point is that it is not quadratic
+        assert!(t.elapsed().as_millis() < 20 * 150, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_tick_budget_is_honoured() {
+        let n = 500;
+        let mut l = Layout::new(vec![22.0; n], (1..n).map(|i| (i, i / 2)).collect(), &vec![None; n]);
+        let moving = l.tick_for(std::time::Duration::from_millis(1), 50);
+        assert!(moving);
+        assert!(l.is_running());
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn a_dense_ball_stays_centred() {
+        let n = 3000;
+        let mut seed = 12345u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // hubs like a real network: half the links go to twelve servers
+        let mut links: Vec<(usize, usize)> = (0..47_000).map(|k| ((rnd() % n as u64) as usize, if k % 2 == 0 { (rnd() % 12) as usize } else { (rnd() % n as u64) as usize })).filter(|(a, b)| a != b).collect();
+        links.sort_unstable();
+        links.dedup();
+        let radius: Vec<f32> = (0..n).map(|i| if i < 12 { 30.0 } else { 20.0 + (i % 7) as f32 }).collect();
+        let mut l = Layout::new(radius, links, &vec![None; n]);
+        l.link_distance = 120.0;
+        let centroid = |l: &Layout| {
+            let mut c = V2::default();
+            for p in &l.pos {
+                c += *p;
+            }
+            c * (1.0 / l.pos.len() as f32)
+        };
+        let c0 = centroid(&l);
+        let (lo0, hi0) = l.bounds().unwrap();
+        let t = std::time::Instant::now();
+        for k in 0..300 {
+            l.tick();
+            if k % 50 == 0 {
+                let c = centroid(&l);
+                let (lo, hi) = l.bounds().unwrap();
+                eprintln!("tick {k}: centroid ({:.0}, {:.0}) bounds ({:.0},{:.0})-({:.0},{:.0}) alpha {:.3}", c.x, c.y, lo.x, lo.y, hi.x, hi.y, l.alpha);
+            }
+        }
+        eprintln!("300 ticks in {:?}", t.elapsed());
+        let c = centroid(&l);
+        let (lo, hi) = l.bounds().unwrap();
+        eprintln!("start centroid ({:.0}, {:.0}) bounds ({:.0},{:.0})-({:.0},{:.0})", c0.x, c0.y, lo0.x, lo0.y, hi0.x, hi0.y);
+        eprintln!("end   centroid ({:.0}, {:.0}) bounds ({:.0},{:.0})-({:.0},{:.0})", c.x, c.y, lo.x, lo.y, hi.x, hi.y);
+        assert!(c.len() < 300.0, "the ball drifted to {:?}", c);
     }
 }

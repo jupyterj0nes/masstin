@@ -30,9 +30,9 @@ An incident leaves logins in a dozen places: Security.evtx on fifty Windows host
 - **See it as a graph, in masstin's own window.** `masstin -a view` draws the timeline the way Neo4j Browser would (hosts as circles, accounts on the edges, IP ↔ hostname unification), with the hunt's states on it, neighbourhoods, time-respecting paths and reach cones between hosts, the questions an analyst asks of a login graph, a replay that can be presented and recorded as a video, and the analyst's marks written back into the CSV. No database to install. [The viewer →](docs/viewer.md) · Neo4j / Memgraph remain an optional export. [Graph databases →](docs/graph-databases.md)
 
 <div align="center">
-  <img src="resources/viewer-findings.png" alt="masstin -a view on the public EVTX-to-MITRE-Attack set: the hunt's candidate connections, hosts shaped by role, a domain controller as a hexagon, the accounts on the edges"/>
+  <img src="resources/viewer-findings.png" alt="masstin -a view on the public EVTX-to-MITRE-Attack set: the hunt's candidate connections glowing, hosts shaped by role, the domain controller as a hexagon, servers as squares, the accounts on the edges"/>
   <br>
-  <em>`masstin -a view` on the public EVTX-to-MITRE-Attack set: the connections the hunt flagged, the domain controller as a hexagon, the account on every edge, a brute force folded into one edge that says 84 accounts. No database.</em>
+  <em>`masstin -a view` on the public EVTX-to-MITRE-Attack set: the connections the hunt flagged, glowing, with dots travelling from origin to destination; the domain controller as a hexagon, the servers as squares, the account on every edge. No database, and still fluid with thousands of hosts.</em>
 </div>
 
 <div align="center">
