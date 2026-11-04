@@ -34,13 +34,23 @@ The layout is d3's: repulsion through a Barnes-Hut quadtree (a far cell counts a
 
 The logo's dog and the wordmark in its cyan-to-magenta gradient at the top left (click the dog for About); the accent of the window is the logo's cyan. A menu bar (**Evidence**, **Hunt**, **View**, **Tools**, **Help**), a toolbar, the row of applied filters, the filter pane on the left, the canvas, the inspector on the right, the time strip and a status line.
 
-- **Evidence**: open or add timeline CSVs, reload, **Ingest evidence…** (masstin's own parsers run from here: pick what it is, where it is and the CSV to write; the command line is shown and the result opens in the window), **Merge timelines…**.
+- **Evidence**: open or add timeline CSVs, reload, **Ingest evidence…** (below), **Rows as a table…**, **Merge timelines…**, the timelines open now and the recent ones.
 - **Hunt**: **Run the hunt on this timeline…** (below) and the score threshold.
 - **View**: the three views, fit, lay out again, the panes, motion, shapes by role, sizes, colour by, captions, the style rules.
 - **Tools**: paths and reach, questions, the story and its recording, **Open the case in agentc00pr**, the log of the last run.
 - **Toolbar**: the filter pane toggle, the three views as one control, a quick search (a host name, Enter opens its neighbourhood), fit, lay out again, motion, shapes by role, rules; on the right questions, paths, **Hunt**, agentc00pr, the frame budget, the inspector toggle.
 - **Applied filters**: every filter that narrows the view is a chip under the toolbar (`host: SRV*`, `score ≥ 13`, `2026-11-03 20:00 → 2026-11-04 00:19`, `findings only`, `one edge per event`…); the × on a chip removes that filter at once, *clear all* removes them all. No chips, no filters.
 - **Right-click** a host: expand around, only this host, paths from or to here, pin, **style of this host** (name position, text size, box, size, colour), hide, a note, copy the name. A connection: open in the inspector, mark suspicious / confirmed / benign, a note, **style of this connection** (colour, width, dashes, glow, hidden, for every connection of that account; a folded edge lets you pick the account), hide the account, only it. The background: fit, lay out again, Findings, Everything, back to the view, clear the selection, a note on the case.
+
+## Evidence in
+
+`masstin -a view` with no `-f` opens on a **welcome**: the dog, a drop zone, *Open a timeline*, *Ingest a folder*, *Ingest files*, and the recent timelines. Evidence goes into the window three ways: **drop it** anywhere (a timeline CSV opens, Ctrl adds it to the view; anything else goes to the wizard), the **Ingest** button on the toolbar, or Evidence › Ingest evidence….
+
+The **wizard** has four steps. *Evidence*: a drop zone and Folder… / Files… pickers; as soon as something is given masstin looks at it (bounded: twelve levels, sixty thousand entries, eight seconds) and says what it found as chips (EVTX, UAL databases, triage packages by kind: KAPE, Velociraptor, Cortex XDR, UAC; disk images; Linux logs by family; logarchives and `log show` exports; Winlogbeat JSON; timelines; other archives) and what it concludes: *Windows evidence → parse-windows*, *A disk image → parse-image*, *An evidence folder → parse-massive*, *Linux logs*, *macOS logs*, *Winlogbeat JSON*; timelines alone open as they are. When it cannot tell (Windows and Linux side by side, archives of no known layout, nothing it recognises) it says so and the next step asks. *Parser*: the six parsers as cards, the recommended one marked; you can always pick another. *Timeline*: the CSV to write (next to the evidence by default), whether it opens here (instead of or added to what is open), as a table, and / or with the system's CSV application; the command line, the same one for a terminal or a script. *Run*: masstin runs as a child process and the console's own progress is drawn here: the phases (`[1/3] Searching…`, `[2/3] Processing…`, `[3/3] Writing…`) with a tick as each ends, the bar with its count and the file under way, the spinners, the `=>` results, and the closing summary (artifacts parsed, events collected, time). *Stop* kills the child. When it is done: Open here, As a table, System's CSV app, Show in folder, Parse more.
+
+**Rows as a table** (Evidence menu, or the wizard) shows every row of the open timelines in time order with a find box over hosts and accounts, drawn on demand, and buttons to open each file with the system's application or show it in its folder.
+
+For scripts, `MASSTIN_VIEW_AUTO` takes `ingest=<path>` (the wizard on that evidence), `ingest` (the wizard) and `table`.
 
 ## Filters
 

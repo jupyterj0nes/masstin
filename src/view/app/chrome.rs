@@ -61,18 +61,42 @@ impl Viewer {
                     self.reload();
                 }
                 ui.separator();
-                if icon_button(ui, ic::DOWNLOAD_SIMPLE, "Ingest evidence…").on_hover_text("Parse EVTX, triage folders, images or Linux / macOS logs into a timeline with masstin's parsers").clicked() {
+                if icon_button(ui, ic::DOWNLOAD_SIMPLE, "Ingest evidence…").on_hover_text("Evidence into a timeline with masstin's parsers: a folder, images, EVTX, Linux or macOS logs, a triage package. Or drop it on the window.").clicked() {
                     ui.close();
-                    self.show_ingest = true;
+                    self.ingest.open = true;
+                }
+                if icon_button(ui, ic::TABLE, "Rows as a table…").on_hover_text("The timeline's rows in time order, with a find box; open it with the system's CSV application from there").clicked() {
+                    ui.close();
+                    self.show_table = true;
                 }
                 if icon_button(ui, ic::STACK, "Merge timelines…").clicked() {
                     ui.close();
                     self.show_merge = true;
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("Open now").small().color(theme::DIM));
-                for f in self.files.clone() {
-                    ui.label(egui::RichText::new(std::path::Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone())).color(theme::MUTED)).on_hover_text(&f);
+                if !self.files.is_empty() {
+                    ui.label(egui::RichText::new("Open now").small().color(theme::DIM));
+                    for f in self.files.clone() {
+                        ui.label(egui::RichText::new(std::path::Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone())).color(theme::MUTED)).on_hover_text(&f);
+                    }
+                }
+                let recent: Vec<String> = self.recent.iter().filter(|f| !self.files.contains(f) && std::path::Path::new(f).is_file()).take(8).cloned().collect();
+                if !recent.is_empty() {
+                    ui.label(egui::RichText::new("Recent").small().color(theme::DIM));
+                    let mut pick: Option<String> = None;
+                    for f in &recent {
+                        let name = std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
+                        if ui.add(egui::Button::new(format!("{}  {}", ic::CLOCK, name)).frame(false)).on_hover_text(format!("{}\n(Ctrl adds it to the view)", f)).clicked() {
+                            pick = Some(f.clone());
+                        }
+                    }
+                    if let Some(f) = pick {
+                        ui.close();
+                        let add = ui.input(|i| i.modifiers.ctrl);
+                        let mut files: Vec<String> = if add { self.files.clone() } else { Vec::new() };
+                        files.push(f);
+                        self.open_files(files);
+                    }
                 }
                 ui.separator();
                 if icon_button(ui, ic::X, "Quit").clicked() {
@@ -330,6 +354,10 @@ impl Viewer {
                 let hunt = egui::Button::new(theme::semibold(format!("{}  Hunt", ic::DETECTIVE), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 28.0)).corner_radius(CornerRadius::same(7));
                 if ui.add(hunt).on_hover_text("Run the statistical hunt on this timeline and watch the findings light up").clicked() {
                     self.show_hunt = true;
+                }
+                let ingest = egui::Button::new(egui::RichText::new(format!("{}  Ingest", ic::DOWNLOAD_SIMPLE))).min_size(Vec2::new(0.0, 28.0)).corner_radius(CornerRadius::same(7));
+                if ui.add(ingest).on_hover_text("Evidence into a timeline: a folder, images, EVTX, logs, a triage package. Or drop it anywhere on the window.").clicked() {
+                    self.ingest.open = true;
                 }
                 if tool(ui, ic::PATH, "Paths and reach", self.show_paths).clicked() {
                     self.show_paths = !self.show_paths;
@@ -1348,20 +1376,7 @@ impl Viewer {
         if files.is_empty() {
             return;
         }
-        let merges = ViewsFile::load(&ViewsFile::path_for(&files[0])).merges;
-        match Store::load_with(&files, self.alpha, &merges) {
-            Ok(s) => {
-                self.store = s;
-                self.files = files;
-                self.merges = merges;
-                self.views_path = ViewsFile::path_for(&self.files[0]);
-                self.story_path = Story::path_for(&self.files[0]);
-                self.remembered.clear();
-                self.requery(true);
-                self.status = format!("Opened: {}", self.status);
-            }
-            Err(e) => self.status = format!("Cannot read: {}", e),
-        }
+        self.open_files(files);
     }
 
     pub(super) fn open_agentc00pr(&mut self) {

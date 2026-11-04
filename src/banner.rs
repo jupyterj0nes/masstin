@@ -3,6 +3,55 @@ use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// `MASSTIN_PROGRESS_PIPE=1`: the bars and the spinners are written as
+/// plain lines on stderr, one per redraw, each prefixed `@@pb ` (an empty
+/// `@@pb` clears), for a program that runs masstin as a child and draws
+/// the progress itself, such as the viewer. No terminal is needed.
+#[derive(Debug)]
+struct PipeTerm;
+
+impl indicatif::TermLike for PipeTerm {
+    fn width(&self) -> u16 {
+        110
+    }
+    fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        eprintln!("@@pb {}", s);
+        Ok(())
+    }
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        eprintln!("@@pb {}", s);
+        Ok(())
+    }
+    fn clear_line(&self) -> std::io::Result<()> {
+        eprintln!("@@pb");
+        Ok(())
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stderr().flush()
+    }
+}
+
+fn draw_target() -> ProgressDrawTarget {
+    if std::env::var_os("MASSTIN_PROGRESS_PIPE").is_some() {
+        ProgressDrawTarget::term_like_with_hz(Box::new(PipeTerm), 6)
+    } else {
+        ProgressDrawTarget::stderr()
+    }
+}
+
 static SILENT_MODE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_silent_mode(silent: bool) {
@@ -267,7 +316,7 @@ pub fn create_progress_bar(total: u64) -> ProgressBar {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
-    pb.set_draw_target(ProgressDrawTarget::stderr());
+    pb.set_draw_target(draw_target());
     pb.set_style(
         ProgressStyle::default_bar()
             .template("        [{bar:25.cyan/dim}] {pos}/{len} {spinner} {msg}")
@@ -564,7 +613,7 @@ pub fn create_spinner(message: &str) -> ProgressBar {
         return ProgressBar::hidden();
     }
     let sp = ProgressBar::new_spinner();
-    sp.set_draw_target(ProgressDrawTarget::stderr());
+    sp.set_draw_target(draw_target());
     sp.set_style(
         ProgressStyle::default_spinner()
             .template("        {spinner} {msg}")
