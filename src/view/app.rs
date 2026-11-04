@@ -12,6 +12,7 @@ mod chrome;
 mod edge_style;
 mod labels;
 mod merge_hosts;
+mod report;
 mod subnets;
 mod tasks;
 
@@ -29,6 +30,7 @@ use chrome::{Brush, ColorPick, Tab};
 use edge_style::EdgeEdit;
 use labels::HostEdit;
 use merge_hosts::MergeHostsEdit;
+use report::HuntReport;
 use subnets::SubnetGroup;
 use super::views::{LabelPos, NodeStyle};
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
@@ -311,7 +313,11 @@ pub struct Viewer {
     /// the dog, for the menu bar, and the whole logo for About
     logo_small: Option<egui::TextureHandle>,
     logo_full: Option<egui::TextureHandle>,
+    logo_dog: Option<egui::TextureHandle>,
     show_about: bool,
+    /// the summary shown once the findings have lit up
+    hunt_report: Option<HuntReport>,
+    hunt_report_at: Option<std::time::Instant>,
     host_edit: Option<HostEdit>,
     edge_edit: Option<EdgeEdit>,
     /// the analyst's merges, `(from, into)`, kept in the views file
@@ -361,9 +367,9 @@ struct ExportJob {
 
 /// The logo (`resources/masstin_logo.png`, embedded): the dog's head cut
 /// out for the menu bar, and the whole picture for About.
-fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui::TextureHandle>) {
+fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui::TextureHandle>, Option<egui::TextureHandle>) {
     let bytes = include_bytes!("../../resources/masstin_logo.png");
-    let Ok(img) = image::load_from_memory(bytes) else { return (None, None) };
+    let Ok(img) = image::load_from_memory(bytes) else { return (None, None, None) };
     let rgba = img.to_rgba8();
     let to_tex = |name: &str, im: image::RgbaImage| {
         let (w, h) = (im.width() as usize, im.height() as usize);
@@ -373,7 +379,9 @@ fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui:
     let head = image::imageops::crop_imm(&rgba, 290, 380, 560, 350).to_image();
     let head = image::imageops::resize(&head, 93, 58, image::imageops::FilterType::Lanczos3);
     let full = image::imageops::resize(&rgba, 420, 357, image::imageops::FilterType::Lanczos3);
-    (Some(to_tex("masstin-logo-head", head)), Some(to_tex("masstin-logo", full)))
+    let big = image::imageops::crop_imm(&rgba, 290, 380, 560, 350).to_image();
+    let big = image::imageops::resize(&big, 448, 280, image::imageops::FilterType::Lanczos3);
+    (Some(to_tex("masstin-logo-head", head)), Some(to_tex("masstin-logo", full)), Some(to_tex("masstin-logo-dog", big)))
 }
 
 impl Viewer {
@@ -542,7 +550,10 @@ impl Viewer {
             show_labels: false,
             logo_small: logos.0,
             logo_full: logos.1,
+            logo_dog: logos.2,
             show_about: false,
+            hunt_report: None,
+            hunt_report_at: None,
             host_edit: None,
             edge_edit: None,
             merges: vf.merges.clone(),
@@ -1941,6 +1952,26 @@ impl Viewer {
         } else if self.hunt_reveal.is_some() {
             self.hunt_reveal = None;
         }
+        // the mastiff on the scent while the hunt runs, fading out as the findings light up
+        let dog_alpha = if let Some(started) = self.hunt_sweep {
+            let t = started.elapsed().as_secs_f32();
+            (t * 1.5).min(1.0) * (0.22 + 0.06 * (t * 2.2).sin())
+        } else if let Some(started) = self.hunt_reveal {
+            (1.0 - started.elapsed().as_secs_f32() / 1.2).clamp(0.0, 1.0) * 0.22
+        } else {
+            0.0
+        };
+        if dog_alpha > 0.005 {
+            if let Some(t) = &self.logo_dog {
+                let w = (canvas.width().min(canvas.height()) * 0.62).clamp(160.0, 520.0);
+                let h = w * 280.0 / 448.0;
+                let pulse = if motion { 1.0 + 0.02 * (now * 2.2).sin() } else { 1.0 };
+                let r = Rect::from_center_size(canvas.center(), Vec2::new(w * pulse, h * pulse));
+                painter.circle_filled(canvas.center(), w * 0.55, draw::fade(theme::VIOLET, 0.06 * dog_alpha / 0.22));
+                painter.image(t.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), draw::fade(Color32::WHITE, dog_alpha));
+                keep_moving = true;
+            }
+        }
         // while a hunt runs, a sweep crosses the canvas
         if let Some(started) = self.hunt_sweep {
             let t = started.elapsed().as_secs_f32();
@@ -3139,6 +3170,15 @@ impl eframe::App for Viewer {
         self.note_window(&ctx);
         self.help_window(&ctx);
         self.hunt_window(&ctx);
+        if let Some(at) = self.hunt_report_at {
+            if std::time::Instant::now() >= at {
+                self.hunt_report_at = None;
+                self.hunt_report = Some(self.build_report());
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+        self.report_window(&ctx);
         self.ingest_window(&ctx);
         self.merge_window(&ctx);
         self.poll_job(&ctx);

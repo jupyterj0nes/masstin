@@ -283,6 +283,8 @@ impl Viewer {
         }
         self.hunt_reveal = Some(std::time::Instant::now());
         self.hunt_sweep = None;
+        self.hunt_report = None;
+        self.hunt_report_at = Some(std::time::Instant::now() + std::time::Duration::from_secs_f32(REVEAL_SECS + 0.8));
     }
 
     /// Where an edge is in the reveal: None when no reveal runs or it is not
