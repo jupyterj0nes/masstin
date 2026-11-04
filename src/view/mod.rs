@@ -9,7 +9,10 @@
 
 mod app;
 mod draw;
+pub(crate) mod icons;
 mod layout;
+mod notes;
+pub(crate) mod theme;
 mod paths;
 mod present;
 mod query;

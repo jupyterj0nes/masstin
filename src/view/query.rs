@@ -19,6 +19,19 @@ pub enum View {
     All,
 }
 
+/// How the rows of a view become drawn edges.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Grouping {
+    /// one edge per origin, destination, account and result; a pair with
+    /// more than `FOLD_ABOVE` accounts between them becomes one edge
+    #[default]
+    Fold,
+    /// one edge per origin, destination, account and result, never folded
+    PerAccount,
+    /// one edge per row
+    PerEvent,
+}
+
 /// The analyst's filter. Text fields hold what was typed; `compile`
 /// turns them into patterns and times once per query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -39,6 +52,9 @@ pub struct Filter {
     pub from: String,
     pub to: String,
     pub limit: usize,
+    /// `hunt_score` at least this (0: any)
+    pub min_score: u8,
+    pub grouping: Grouping,
 }
 
 impl Default for Filter {
@@ -56,6 +72,8 @@ impl Default for Filter {
             from: String::new(),
             to: String::new(),
             limit: 600,
+            min_score: 0,
+            grouping: Grouping::Fold,
         }
     }
 }
@@ -112,6 +130,9 @@ impl Filter {
             return false;
         }
         if !self.verdict[e.verdict as usize] {
+            return false;
+        }
+        if self.min_score > 0 && !(e.score >= self.min_score as f32) {
             return false;
         }
         if !c.users.is_empty() && !Pattern::any(&c.users, s.users.name(e.user)) {
@@ -278,10 +299,12 @@ impl GraphView {
             src_is_ip: bool,
             rows: Vec<u32>,
         }
-        let mut agg: HashMap<(u32, u32, u32, u8), Agg> = HashMap::new();
+        let mut agg: HashMap<(u32, u32, u32, u8, u32), Agg> = HashMap::new();
         for &ei in &selected {
             let e = &s.edges[ei as usize];
-            let a = agg.entry((e.src, e.dst, e.user, e.result)).or_insert(Agg { count: 0, first: e.t, last: e.t, hunt: e.hunt, q: e.score, why: e.why, verdicts: [0; 4], lts: HashSet::new(), eids: HashSet::new(), src_is_ip: e.src_is_ip, rows: Vec::new() });
+            // one edge per event: the row itself is the key
+            let own = if f.grouping == Grouping::PerEvent { ei + 1 } else { 0 };
+            let a = agg.entry((e.src, e.dst, e.user, e.result, own)).or_insert(Agg { count: 0, first: e.t, last: e.t, hunt: e.hunt, q: e.score, why: e.why, verdicts: [0; 4], lts: HashSet::new(), eids: HashSet::new(), src_is_ip: e.src_is_ip, rows: Vec::new() });
             a.count += 1;
             a.first = a.first.min(e.t);
             a.last = a.last.max(e.t);
@@ -296,7 +319,7 @@ impl GraphView {
             a.rows.push(ei);
         }
         let connections = agg.len();
-        let mut list: Vec<((u32, u32, u32, u8), Agg)> = agg.into_iter().collect();
+        let mut list: Vec<((u32, u32, u32, u8), Agg)> = agg.into_iter().map(|((a, b, c, d, _), v)| ((a, b, c, d), v)).collect();
         list.sort_by(|a, b| hunt_rank(a.1.hunt).cmp(&hunt_rank(b.1.hunt)).then_with(|| b.1.count.cmp(&a.1.count)).then_with(|| a.1.first.cmp(&b.1.first)).then_with(|| a.0.cmp(&b.0)));
         let truncated = list.len() > f.limit;
         list.truncate(f.limit);
@@ -310,7 +333,7 @@ impl GraphView {
         let mut pairs: Vec<((u32, u32, u8), Vec<usize>)> = by_pair.into_iter().collect();
         pairs.sort_by_key(|(k, _)| *k);
         for ((src, dst, result), idx) in pairs {
-            if idx.len() <= Self::FOLD_ABOVE {
+            if idx.len() <= Self::FOLD_ABOVE || f.grouping != Grouping::Fold {
                 continue;
             }
             let mut g = GEdge { src, dst, user: None, users: Vec::new(), result, count: 0, first: i64::MAX, last: i64::MIN, hunt: 0, score: f32::NAN, why: 0, verdicts: [0; 4], logon_types: Vec::new(), event_ids: Vec::new(), src_is_ip: false, rows: Vec::new(), first_event: usize::MAX };

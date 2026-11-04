@@ -8,6 +8,9 @@
 //! touches it, selecting opens it in the pane. The force layout runs while
 //! warm and the analyst can drag any host.
 
+mod chrome;
+mod tasks;
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +18,11 @@ use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec
 
 use super::draw;
 use super::layout::{Layout, V2};
-use super::query::{fmt_time, hunt_rank, Filter, GEdge, GraphView, Role, View};
+use super::notes::{NoteTarget, Notes};
+use super::query::{fmt_time, hunt_rank, parse_time, Filter, GEdge, GraphView, Role, View};
+use super::theme;
+use chrome::{Brush, ColorPick, Tab};
+use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
 use super::present::{self, Anonymiser, Format, Step, StepOverride, Story, Timing};
@@ -27,7 +34,6 @@ use super::Options;
 
 const BG: Color32 = Color32::from_rgb(9, 12, 19);
 const BG_CENTRE: Color32 = Color32::from_rgb(19, 24, 35);
-const PANEL: Color32 = Color32::from_rgb(16, 20, 29);
 const BORDER: Color32 = Color32::from_rgb(40, 46, 60);
 const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
 const MUTED: Color32 = Color32::from_rgb(132, 142, 160);
@@ -77,10 +83,6 @@ fn verdict_color(v: u8) -> Option<Color32> {
         3 => Some(BENIGN),
         _ => None,
     }
-}
-
-fn dim(c: Color32, k: f32) -> Color32 {
-    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (c.a() as f32 * k) as u8)
 }
 
 // ───────────────────────────── state ────────────────────────────────────────
@@ -247,6 +249,49 @@ pub struct Viewer {
     /// 0 nothing focused, 1 the rest dimmed; glides between
     focus_t: f32,
     hist: Option<(usize, usize, i64, Vec<(u32, u32)>)>,
+    hist_all: Option<(usize, usize, Vec<(u32, u32)>)>,
+    // the chrome
+    show_filters: bool,
+    show_inspector: bool,
+    show_hunt: bool,
+    show_ingest: bool,
+    show_merge: bool,
+    show_help: bool,
+    quick: String,
+    focus_around: bool,
+    auto_apply: bool,
+    auto_apply_at: Option<std::time::Instant>,
+    tab: Tab,
+    brush: Option<Brush>,
+    canvas_rect: Rect,
+    ctx_target: Option<Sel>,
+    color_pick: Option<ColorPick>,
+    notes: Notes,
+    note_draft: Option<(NoteTarget, String)>,
+    mark_dialog: Option<MarkDialog>,
+    // work in progress: a child masstin, the hunt's reveal
+    job: Option<Job>,
+    hunt_form: HuntForm,
+    ingest_form: IngestForm,
+    merge_form: MergeForm,
+    /// a hunt is running: a sweep crosses the canvas
+    hunt_sweep: Option<std::time::Instant>,
+    /// a hunt just ended: the findings appear one by one
+    hunt_reveal: Option<std::time::Instant>,
+    reveal_rank: Vec<f32>,
+    /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
+    hunt_autorun: bool,
+    last_log: Option<(String, Vec<String>)>,
+    show_last_log: bool,
+}
+
+/// A verdict about to be written: on every row of the connection, or on
+/// the rows the analyst ticks.
+struct MarkDialog {
+    edge: usize,
+    verdict: u8,
+    whole: bool,
+    picked: Vec<bool>,
 }
 
 /// What the canvas shows instead of the filter's selection: the edges of
@@ -274,24 +319,7 @@ struct ExportJob {
 
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, opts: Options) -> Viewer {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = PANEL;
-        visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = BG;
-        visuals.faint_bg_color = Color32::from_rgb(38, 41, 49);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(42, 46, 55);
-        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(42, 46, 55);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(56, 61, 72);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(70, 76, 90);
-        visuals.selection.bg_fill = Color32::from_rgb(70, 60, 30);
-        visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        visuals.override_text_color = Some(TEXT);
-        cc.egui_ctx.set_visuals(visuals);
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-            style.spacing.button_padding = Vec2::new(8.0, 4.0);
-        });
+        theme::install(&cc.egui_ctx);
 
         let mut filter = Filter::default();
         if let Some(f) = &opts.focus {
@@ -317,6 +345,7 @@ impl Viewer {
         let builtin = builtin_views(store.t_max);
         let story_path = Story::path_for(&opts.files[0]);
         let story = Story::load(&story_path);
+        let notes_path = opts.files[0].clone();
         let mut v = Viewer {
             store,
             files: opts.files,
@@ -403,6 +432,35 @@ impl Viewer {
             zoom_t: 1.0,
             focus_t: 0.0,
             hist: None,
+            hist_all: None,
+            show_filters: true,
+            show_inspector: true,
+            show_hunt: false,
+            show_ingest: false,
+            show_merge: false,
+            show_help: false,
+            quick: String::new(),
+            focus_around: false,
+            auto_apply: false,
+            auto_apply_at: None,
+            tab: Tab::Selection,
+            brush: None,
+            canvas_rect: Rect::NOTHING,
+            ctx_target: None,
+            color_pick: None,
+            notes: Notes::load(&Notes::path_for(&notes_path)),
+            note_draft: None,
+            mark_dialog: None,
+            job: None,
+            hunt_form: HuntForm { from: String::new(), end: String::new(), alpha: String::new() },
+            ingest_form: IngestForm { action: 0, source: String::new(), output: String::new(), add: true },
+            merge_form: MergeForm { inputs: Vec::new(), output: String::new() },
+            hunt_sweep: None,
+            hunt_reveal: None,
+            reveal_rank: Vec::new(),
+            hunt_autorun: false,
+            last_log: None,
+            show_last_log: false,
         };
         v.requery(true);
         v
@@ -629,6 +687,193 @@ impl Viewer {
         }
     }
 
+    /// Whether anything narrows the view beyond "everything".
+    fn filters_active(&self) -> bool {
+        let f = &self.filter;
+        f.view != View::All || !f.host.trim().is_empty() || !f.user.trim().is_empty() || !f.logon_type.trim().is_empty() || !f.from.trim().is_empty() || !f.to.trim().is_empty() || f.min_score > 0 || f.hunt.iter().any(|h| !h) || f.results.iter().any(|r| !r) || f.verdict.iter().any(|v| !v) || f.grouping != super::query::Grouping::Fold
+    }
+
+    /// A verdict on a connection: written at once when it is one row,
+    /// otherwise the analyst says whether it goes on the whole block or on
+    /// the rows they tick.
+    fn begin_mark(&mut self, edge: usize, verdict: u8) {
+        self.load_rows(edge);
+        let n = self.graph.edges[edge].rows.len();
+        if n <= 1 {
+            self.pending_verdict = Some(verdict);
+            self.save_mark(edge);
+            return;
+        }
+        let shown = self.rows.as_ref().map(|(_, r, _)| r.len()).unwrap_or(0);
+        self.mark_dialog = Some(MarkDialog { edge, verdict, whole: true, picked: vec![false; shown] });
+    }
+
+    fn mark_window(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.mark_dialog.take() else { return };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        let g = &self.graph.edges[d.edge];
+        let total = g.rows.len();
+        let accounts = g.users.len();
+        let title = format!("Mark {} -> {} as {}", self.store.hosts.name(g.src), self.store.hosts.name(g.dst), VERDICT_NAMES[d.verdict as usize]);
+        let c = verdict_color(d.verdict).unwrap_or(MUTED);
+        egui::Window::new(title).open(&mut open).collapsible(false).resizable(true).default_width(560.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(egui::RichText::new(format!("This connection is drawn as one edge but it is {} row(s){}.", total, if accounts > 1 { format!(" of {} accounts", accounts) } else { String::new() })).color(theme::MUTED));
+            ui.add_space(4.0);
+            if ui.add(egui::RadioButton::new(d.whole, format!("The whole block: every one of the {} rows", total))).clicked() {
+                d.whole = true;
+            }
+            if ui.add(egui::RadioButton::new(!d.whole, "Only the rows I tick")).clicked() {
+                d.whole = false;
+            }
+            if !d.whole {
+                if let Some((_, rows, _)) = &self.rows {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("all").clicked() {
+                            d.picked.iter_mut().for_each(|p| *p = true);
+                        }
+                        if ui.small_button("none").clicked() {
+                            d.picked.iter_mut().for_each(|p| *p = false);
+                        }
+                        ui.label(egui::RichText::new(format!("{} ticked{}", d.picked.iter().filter(|p| **p).count(), if total > rows.len() { format!(" · first {} of {} shown", rows.len(), total) } else { String::new() })).color(theme::MUTED).small());
+                    });
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        egui::Grid::new("mark-rows").striped(true).show(ui, |ui| {
+                            for (k, r) in rows.iter().enumerate() {
+                                if k >= d.picked.len() {
+                                    break;
+                                }
+                                ui.checkbox(&mut d.picked[k], "");
+                                ui.label(egui::RichText::new(&r.t).monospace().small());
+                                ui.label(egui::RichText::new(r.fields.get(5).cloned().unwrap_or_default()).small());
+                                ui.label(egui::RichText::new(r.fields.get(2).cloned().unwrap_or_default()).small().color(theme::MUTED));
+                                ui.label(egui::RichText::new(r.fields.get(4).cloned().unwrap_or_default()).small().color(theme::MUTED));
+                                ui.label(egui::RichText::new(VERDICT_NAMES[r.verdict as usize]).small().color(verdict_color(r.verdict).unwrap_or(theme::DIM)));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+            }
+            ui.add_space(6.0);
+            ui.add(egui::TextEdit::multiline(&mut self.notes_draft).desired_rows(2).desired_width(f32::INFINITY).hint_text("notes, written on the same rows"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let n = if d.whole { total } else { d.picked.iter().filter(|p| **p).count() };
+                if ui.add_enabled(n > 0, egui::Button::new(theme::semibold(format!("Write {} on {} row(s)", VERDICT_NAMES[d.verdict as usize], n), 13.0).color(theme::ACCENT_INK)).fill(c).stroke(Stroke::NONE)).clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            let rows: Vec<(u16, u32)> = if d.whole {
+                self.graph.edges[d.edge].rows.iter().map(|&ei| (self.store.edges[ei as usize].file, self.store.edges[ei as usize].line)).collect()
+            } else {
+                self.rows.as_ref().map(|(_, r, _)| r.iter().enumerate().filter(|(k, _)| d.picked.get(*k).copied().unwrap_or(false)).map(|(_, r)| (r.file, r.line)).collect()).unwrap_or_default()
+            };
+            self.mark_rows(d.edge, &rows, d.verdict);
+        } else if open && !cancel {
+            self.mark_dialog = Some(d);
+        }
+    }
+
+    /// Write a verdict and the notes draft on these rows of a connection.
+    fn mark_rows(&mut self, edge: usize, rows: &[(u16, u32)], verdict: u8) {
+        match self.store.mark(rows, verdict, self.notes_draft.trim()) {
+            Ok(n) => {
+                self.mark_msg = format!("{} row(s) written to the timeline", n);
+                self.status = self.mark_msg.clone();
+                let g = &mut self.graph.edges[edge];
+                let total = g.rows.len() as u32;
+                let written = rows.len() as u32;
+                if written >= total {
+                    g.verdicts = [0; 4];
+                    g.verdicts[verdict as usize] = total;
+                } else {
+                    // the rest keep what they had: recount from the store
+                    g.verdicts = [0; 4];
+                    for &ei in &g.rows {
+                        let e = &self.store.edges[ei as usize];
+                        let v = if rows.contains(&(e.file, e.line)) { verdict } else { e.verdict };
+                        g.verdicts[v as usize] += 1;
+                    }
+                }
+                self.rows = None;
+                self.load_rows(edge);
+                self.pending_verdict = None;
+            }
+            Err(e) => {
+                self.mark_msg = format!("cannot write the timeline: {}", e);
+                self.status = self.mark_msg.clone();
+            }
+        }
+    }
+
+    fn note_window(&mut self, ctx: &egui::Context) {
+        let Some((target, mut text)) = self.note_draft.take() else { return };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(format!("Note on {}", target.label())).open(&mut open).collapsible(false).resizable(true).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            let r = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(4).desired_width(f32::INFINITY).hint_text("what you saw, what to check next…"));
+            r.request_focus();
+            ui.label(egui::RichText::new(format!("Saved in {}", self.notes.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())).color(theme::DIM).small());
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!text.trim().is_empty(), egui::Button::new(theme::semibold("Save note", 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if save {
+            self.notes.add(target, &text);
+            if let Err(e) = self.notes.save() {
+                self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
+            } else {
+                self.status = "Note saved".into();
+                self.tab = Tab::Notes;
+            }
+        } else if open && !cancel {
+            self.note_draft = Some((target, text));
+        }
+    }
+
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Mouse and keys").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            egui::Grid::new("help").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("drag a host", "move it (it is held while you drag)"),
+                    ("drag the background", "pan"),
+                    ("scroll / pinch", "zoom at the pointer"),
+                    ("click", "inspect a host or a connection"),
+                    ("double-click a host", "open its neighbourhood"),
+                    ("right-click", "what you can do with it"),
+                    ("Enter in a filter field", "apply"),
+                    ("time strip: drag a handle", "narrow the window"),
+                    ("time strip: drag elsewhere", "scrub the replay"),
+                    ("time strip: double-click", "the whole timeline again"),
+                    ("F1", "frame budget"),
+                    ("Present: Space / ← → / Home / Esc", "pause, step, restart, leave"),
+                ] {
+                    ui.label(theme::medium(k, 13.0));
+                    ui.label(egui::RichText::new(v).color(theme::MUTED));
+                    ui.end_row();
+                }
+            });
+        });
+        self.show_help = open;
+    }
+
     fn reload(&mut self) {
         match Store::load(&self.files, self.alpha) {
             Ok(s) => {
@@ -640,333 +885,7 @@ impl Viewer {
         }
     }
 
-    // ───────────────────────── UI: bars ─────────────────────────
-
-    fn filter_bar(&mut self, ui: &mut egui::Ui) {
-        let mut apply = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("masstin").strong().color(ACCENT).size(16.0));
-            ui.label(egui::RichText::new(self.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect::<Vec<_>>().join(", ")).color(MUTED));
-            ui.separator();
-            ui.label(egui::RichText::new(format!("{} rows · {} edges · {} hosts · {} accounts · {} -> {}", self.store.rows_total, self.store.edges.len(), self.store.hosts.len(), self.store.users.len(), &fmt_time(self.store.t_min)[..10], &fmt_time(self.store.t_max)[..10])).color(MUTED).small());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Reload").on_hover_text("Read the timeline again from disk").clicked() {
-                    self.reload();
-                }
-            });
-        });
-        ui.horizontal_wrapped(|ui| {
-            let d = &mut self.draft;
-            ui.label("View");
-            egui::ComboBox::from_id_salt("view")
-                .selected_text(match d.view {
-                    View::Findings => "Findings",
-                    View::Around => "Neighbourhood",
-                    View::All => "Everything",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.view, View::Findings, "Findings");
-                    ui.selectable_value(&mut d.view, View::Around, "Neighbourhood");
-                    ui.selectable_value(&mut d.view, View::All, "Everything");
-                });
-            if d.view == View::Around {
-                ui.label("around");
-                let r = ui.add(egui::TextEdit::singleline(&mut d.around).hint_text("SRV01, 10.0.0.*").desired_width(140.0));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.label("hops");
-                ui.add(egui::DragValue::new(&mut d.hops).range(1..=4));
-            }
-            ui.label("Host");
-            let r = ui.add(egui::TextEdit::singleline(&mut d.host).hint_text("contains, * wildcards, !not").desired_width(150.0));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                apply = true;
-            }
-            ui.label("User");
-            let r = ui.add(egui::TextEdit::singleline(&mut d.user).hint_text("adm*, !*$").desired_width(120.0));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                apply = true;
-            }
-            ui.label("Logon type");
-            let r = ui.add(egui::TextEdit::singleline(&mut d.logon_type).hint_text("10, 3, SSH").desired_width(80.0));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                apply = true;
-            }
-            ui.label("From");
-            let r = ui.add(egui::TextEdit::singleline(&mut d.from).hint_text("YYYY-MM-DD HH:MM:SS").desired_width(140.0));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                apply = true;
-            }
-            ui.label("To");
-            let r = ui.add(egui::TextEdit::singleline(&mut d.to).hint_text("YYYY-MM-DD HH:MM:SS").desired_width(140.0));
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                apply = true;
-            }
-            ui.label("Limit");
-            ui.add(egui::DragValue::new(&mut d.limit).range(10..=50_000).speed(10));
-            if ui.add(egui::Button::new(egui::RichText::new("Apply").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
-                apply = true;
-            }
-            if ui.button("Fit").on_hover_text("Fit the graph to the window").clicked() {
-                self.fit_pending = true;
-            }
-            if ui.button("Shake").on_hover_text("Lay the graph out again").clicked() {
-                let f = self.draft.clone();
-                self.draft = f;
-                self.requery(true);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let d = &mut self.draft;
-            ui.label(egui::RichText::new("Result").color(MUTED));
-            for (i, name) in RESULT_NAMES.iter().enumerate() {
-                let c = result_color(i as u8);
-                if ui.add(egui::Button::selectable(d.results[i], egui::RichText::new(*name).color(if d.results[i] { c } else { MUTED }))).clicked() {
-                    d.results[i] = !d.results[i];
-                }
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("Hunt").color(MUTED));
-            let enabled = d.view != View::Findings;
-            for (i, name) in HUNT_NAMES.iter().enumerate() {
-                let label = if name.is_empty() { "not hunted" } else { name };
-                let on = if enabled { d.hunt[i] } else { i == 1 || i == 2 };
-                let c = hunt_color(i as u8).unwrap_or(TEXT);
-                if ui.add_enabled(enabled, egui::Button::selectable(on, egui::RichText::new(label).color(if on { c } else { MUTED }))).clicked() {
-                    d.hunt[i] = !d.hunt[i];
-                }
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("Verdict").color(MUTED));
-            for (i, name) in VERDICT_NAMES.iter().enumerate() {
-                let label = if name.is_empty() { "unmarked" } else { name };
-                let c = verdict_color(i as u8).unwrap_or(TEXT);
-                if ui.add(egui::Button::selectable(d.verdict[i], egui::RichText::new(label).color(if d.verdict[i] { c } else { MUTED }))).clicked() {
-                    d.verdict[i] = !d.verdict[i];
-                }
-            }
-        });
-        let mut style_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Preset").color(MUTED));
-            let mut pick: Option<SavedView> = None;
-            egui::ComboBox::from_id_salt("preset").selected_text(if self.preset.is_empty() { "presets…" } else { self.preset.as_str() }).width(220.0).show_ui(ui, |ui| {
-                ui.label(egui::RichText::new("BUILT IN").small().color(MUTED));
-                for v in &self.builtin {
-                    if ui.selectable_label(self.preset == v.name, &v.name).clicked() {
-                        pick = Some(v.clone());
-                    }
-                }
-                if !self.saved.is_empty() {
-                    ui.separator();
-                    ui.label(egui::RichText::new("SAVED").small().color(MUTED));
-                    for v in &self.saved {
-                        if ui.selectable_label(self.preset == v.name, &v.name).clicked() {
-                            pick = Some(v.clone());
-                        }
-                    }
-                }
-            });
-            if let Some(v) = pick {
-                self.preset = v.name.clone();
-                self.draft = v.filter.clone();
-                if self.saved.iter().any(|x| x.name == v.name) {
-                    self.style = v.style.clone();
-                    style_changed = true;
-                }
-                self.requery(false);
-            }
-            if ui.button("Save view…").on_hover_text("Keep the current filter and style under a name, next to the timeline").clicked() {
-                self.show_save = true;
-                if self.save_name.is_empty() {
-                    self.save_name = self.preset.clone();
-                }
-            }
-            if self.saved.iter().any(|x| x.name == self.preset) && ui.button("Delete view").clicked() {
-                let name = self.preset.clone();
-                self.saved.retain(|x| x.name != name);
-                self.preset.clear();
-                style_changed = true;
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("Colour by").color(MUTED));
-            egui::ComboBox::from_id_salt("colorby").selected_text(self.style.color_by.label()).show_ui(ui, |ui| {
-                for c in ColorBy::ALL {
-                    if ui.selectable_value(&mut self.style.color_by, c, c.label()).changed() {
-                        style_changed = true;
-                    }
-                }
-            });
-            ui.label(egui::RichText::new("On edges").color(MUTED));
-            egui::ComboBox::from_id_salt("caption").selected_text(self.style.caption.label()).show_ui(ui, |ui| {
-                for c in Caption::ALL {
-                    if ui.selectable_value(&mut self.style.caption, c, c.label()).changed() {
-                        style_changed = true;
-                    }
-                }
-            });
-            if ui.checkbox(&mut self.style.shapes_by_role, "shapes by role").on_hover_text("hexagon: domain controller · square: server · circle: workstation · diamond: external address").changed() {
-                style_changed = true;
-            }
-            if ui.checkbox(&mut self.style.motion, "motion").on_hover_text("dots travelling along the connections that matter, the pulse of a significant host; off for a still picture or a slow machine").changed() {
-                style_changed = true;
-            }
-            ui.label(egui::RichText::new("Hosts").color(MUTED));
-            if ui.add(egui::DragValue::new(&mut self.style.node_scale).range(0.4..=2.5).speed(0.02).fixed_decimals(1)).changed() {
-                style_changed = true;
-            }
-            ui.label(egui::RichText::new("Edges").color(MUTED));
-            if ui.add(egui::DragValue::new(&mut self.style.edge_scale).range(0.3..=3.0).speed(0.02).fixed_decimals(1)).changed() {
-                style_changed = true;
-            }
-            ui.label(egui::RichText::new("Text").color(MUTED));
-            if ui.add(egui::DragValue::new(&mut self.style.font_scale).range(0.6..=2.0).speed(0.02).fixed_decimals(1)).changed() {
-                style_changed = true;
-            }
-            let n_rules = self.style.rules.iter().filter(|r| r.enabled).count();
-            if ui.selectable_label(self.show_rules, format!("Rules ({})", n_rules)).on_hover_text("condition -> colour, width, size, shape, dashes, glow, hide; first match wins").clicked() {
-                self.show_rules = !self.show_rules;
-            }
-            ui.separator();
-            if ui.selectable_label(self.show_paths, "Paths…").on_hover_text("Time-respecting paths between two hosts, and what a host could reach (or be reached from)").clicked() {
-                self.show_paths = !self.show_paths;
-            }
-            if ui.selectable_label(self.show_questions, "Questions…").on_hover_text("Fan-out, fan-in, shared accounts, failures then success, first appearances, PageRank and betweenness of the view").clicked() {
-                self.show_questions = !self.show_questions;
-            }
-            if self.overlay.is_some() && ui.button("Back to the view").clicked() {
-                self.overlay = None;
-                self.requery(false);
-            }
-        });
-        if style_changed {
-            self.persist();
-        }
-        if apply {
-            self.requery(false);
-        }
-        ui.label(egui::RichText::new(&self.status).color(if self.graph.truncated { CANDIDATE } else { MUTED }).small());
-    }
-
-    /// The events of the view over time, a bar per few pixels (log scale,
-    /// red when a significant connection is in the bin), the replay cursor
-    /// on it; click or drag to scrub.
-    fn histogram(&mut self, ui: &mut egui::Ui) {
-        let n = self.graph.events.len();
-        let w = (ui.available_width() - 430.0).max(160.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(6), BG);
-        painter.rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-        if n == 0 {
-            return;
-        }
-        let bins = (rect.width() / 3.0).max(1.0) as usize;
-        let t0 = self.store.edges[self.graph.events[0] as usize].t;
-        let t1 = self.store.edges[self.graph.events[n - 1] as usize].t;
-        let span = (t1 - t0).max(1) as f64;
-        if self.hist.as_ref().map_or(true, |h| h.0 != n || h.1 != bins || h.2 != t0) {
-            let mut h = vec![(0u32, 0u32); bins];
-            for &ei in &self.graph.events {
-                let e = &self.store.edges[ei as usize];
-                let b = (((e.t - t0) as f64 / span) * bins as f64) as usize;
-                let b = b.min(bins - 1);
-                h[b].0 += 1;
-                if e.hunt == super::store::H_SIGNIFICANT {
-                    h[b].1 += 1;
-                }
-            }
-            self.hist = Some((n, bins, t0, h));
-        }
-        let h = &self.hist.as_ref().unwrap().3;
-        let max = h.iter().map(|b| b.0).max().unwrap_or(1).max(1) as f32;
-        let cursor_t = if self.cursor == 0 { t0 - 1 } else { self.store.edges[self.graph.events[self.cursor.min(n) - 1] as usize].t };
-        let inner_h = rect.height() - 8.0;
-        for (i, (c, sig)) in h.iter().enumerate() {
-            if *c == 0 {
-                continue;
-            }
-            let x = rect.left() + 3.0 + i as f32 * 3.0;
-            let hh = ((*c as f32).ln_1p() / max.ln_1p()) * inner_h;
-            let bin_t = t0 + (i as f64 / bins as f64 * span) as i64;
-            let past = bin_t <= cursor_t;
-            let col = draw::fade(if *sig > 0 { SIGNIFICANT } else { HOST_FILL }, if past { 0.9 } else { 0.28 });
-            painter.rect_filled(Rect::from_min_max(Pos2::new(x, rect.bottom() - 4.0 - hh.max(1.5)), Pos2::new(x + 2.0, rect.bottom() - 4.0)), CornerRadius::same(1), col);
-        }
-        let cx = rect.left() + 3.0 + (((cursor_t - t0) as f64 / span).clamp(0.0, 1.0) as f32) * (rect.width() - 6.0);
-        painter.line_segment([Pos2::new(cx, rect.top() + 3.0), Pos2::new(cx, rect.bottom() - 3.0)], Stroke::new(1.5, ACCENT));
-        if resp.clicked() || resp.dragged() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let t = t0 + ((((p.x - rect.left() - 3.0) / (rect.width() - 6.0)).clamp(0.0, 1.0) as f64) * span) as i64;
-                let edges = &self.store.edges;
-                self.cursor = self.graph.events.partition_point(|&ei| edges[ei as usize].t <= t);
-                self.playing = false;
-            }
-        }
-        if let Some(p) = resp.hover_pos() {
-            let t = t0 + ((((p.x - rect.left() - 3.0) / (rect.width() - 6.0)).clamp(0.0, 1.0) as f64) * span) as i64;
-            let galley = painter.layout_no_wrap(fmt_time(t), FontId::monospace(10.5), TEXT);
-            let at = Pos2::new(p.x.clamp(rect.left() + galley.size().x / 2.0 + 8.0, rect.right() - galley.size().x / 2.0 - 8.0), rect.top() + 9.0);
-            draw::pill(&painter, at, galley, CAPTION_BG, None, TEXT);
-        }
-    }
-
-    fn time_bar(&mut self, ui: &mut egui::Ui) {
-        let n = self.graph.events.len();
-        ui.horizontal(|ui| {
-            let label = if self.playing { "Pause" } else { "Play" };
-            if ui.button(label).on_hover_text("Replay the connections in time order").clicked() {
-                if self.playing {
-                    self.playing = false;
-                } else {
-                    if self.cursor >= n {
-                        self.cursor = 0;
-                    }
-                    self.playing = true;
-                    self.acc = 0.0;
-                }
-            }
-            egui::ComboBox::from_id_salt("rate").selected_text(format!("{} rows/s", self.rate as u32)).width(90.0).show_ui(ui, |ui| {
-                for r in [1.0, 4.0, 15.0, 60.0, 250.0] {
-                    ui.selectable_value(&mut self.rate, r, format!("{} rows/s", r as u32));
-                }
-            });
-            self.histogram(ui);
-            let at = if n == 0 {
-                String::new()
-            } else {
-                let k = self.cursor.min(n).saturating_sub(1);
-                fmt_time(self.store.edges[self.graph.events[k] as usize].t)
-            };
-            ui.label(egui::RichText::new(at).monospace());
-            ui.label(egui::RichText::new(format!("{} / {}", self.cursor.min(n), n)).color(MUTED));
-            if ui.button("All").clicked() {
-                self.cursor = n;
-                self.playing = false;
-            }
-            ui.separator();
-            if ui.add(egui::Button::new(egui::RichText::new("Present").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).on_hover_text("Play the story full screen (Esc leaves)").clicked() {
-                self.start_presentation();
-            }
-            if ui.selectable_label(self.show_story, "Story…").on_hover_text("Timing, captions, per-step settings, recording").clicked() {
-                self.show_story = !self.show_story;
-                if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
-                    eprintln!("[view] story window: {}", self.show_story);
-                }
-            }
-        });
-    }
-
     // ───────────────────────── UI: details pane ─────────────────────────
-
-    fn details(&mut self, ui: &mut egui::Ui) {
-        match self.selected {
-            None => self.legend(ui),
-            Some(Sel::Node(i)) => self.node_details(ui, i),
-            Some(Sel::Edge(i)) => self.edge_details(ui, i),
-        }
-    }
 
     fn legend(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Click a host or a connection. Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood.").color(MUTED));
@@ -1036,6 +955,13 @@ impl Viewer {
         }
         let n = &self.graph.nodes[i];
         ui.label(format!("{} events in · {} events out (in this view)", n.inn, n.out));
+        let host_notes: Vec<(String, String)> = self.notes.on_host(&name).map(|n| (n.when.clone(), n.text.clone())).collect();
+        if !host_notes.is_empty() {
+            theme::section(ui, "Notes");
+            for (when, text) in host_notes {
+                ui.label(egui::RichText::new(format!("{}  {}", &when[..16], text)).color(theme::MUTED).size(12.5));
+            }
+        }
         ui.horizontal(|ui| {
             if ui.button("Expand around").clicked() {
                 self.draft.view = View::Around;
@@ -1155,8 +1081,9 @@ impl Viewer {
         ui.add(egui::TextEdit::multiline(&mut self.notes_draft).desired_rows(3).desired_width(f32::INFINITY).hint_text("notes (written into the timeline)"));
         ui.horizontal(|ui| {
             let label = if users_n > 1 { format!("Save on every row of these {} accounts", users_n) } else { "Save on every row of this connection".to_string() };
-            if ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
-                self.save_mark(i);
+            if ui.add(egui::Button::new(theme::semibold(label, 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).clicked() {
+                let v = self.pending_verdict.unwrap_or(verdict);
+                self.begin_mark(i, v);
             }
             ui.label(egui::RichText::new(&self.mark_msg).color(MUTED).small());
         });
@@ -1662,6 +1589,13 @@ impl Viewer {
         let hit = pointer.and_then(|p| self.hit_test(canvas, p));
         self.hit_ms = t_hit.elapsed().as_secs_f32() * 1000.0;
         self.hovered = hit;
+        self.canvas_rect = canvas;
+        if resp.secondary_clicked() {
+            self.ctx_target = hit;
+        }
+        if !self.presenting {
+            resp.context_menu(|ui| self.context_menu(ui));
+        }
         if resp.drag_started() {
             if let Some(Sel::Node(i)) = hit {
                 self.dragging = Some(i);
@@ -1742,6 +1676,30 @@ impl Viewer {
         let (reveal_done, reveal_now) = self.reveal();
         let cur_step = self.current_step();
         let mut keep_moving = false;
+        let frame_now = std::time::Instant::now();
+        if self.reveal_running(frame_now) {
+            keep_moving = true;
+        } else if self.hunt_reveal.is_some() {
+            self.hunt_reveal = None;
+        }
+        // while a hunt runs, a sweep crosses the canvas
+        if let Some(started) = self.hunt_sweep {
+            let t = started.elapsed().as_secs_f32();
+            let x = canvas.left() + ((t * 0.35).fract()) * canvas.width();
+            let mut mesh = egui::epaint::Mesh::default();
+            let w = 140.0;
+            let c = draw::fade(ACCENT, 0.0);
+            let m = draw::fade(ACCENT, 0.09);
+            let v = |p: Pos2, col: Color32| egui::epaint::Vertex { pos: p, uv: egui::epaint::WHITE_UV, color: col };
+            mesh.vertices.extend([v(Pos2::new(x - w, canvas.top()), c), v(Pos2::new(x, canvas.top()), m), v(Pos2::new(x, canvas.bottom()), m), v(Pos2::new(x - w, canvas.bottom()), c), v(Pos2::new(x + 8.0, canvas.top()), c), v(Pos2::new(x + 8.0, canvas.bottom()), c)]);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            mesh.add_triangle(1, 4, 5);
+            mesh.add_triangle(1, 5, 2);
+            painter.add(egui::Shape::mesh(mesh));
+            painter.line_segment([Pos2::new(x, canvas.top()), Pos2::new(x, canvas.bottom())], Stroke::new(1.5, draw::fade(ACCENT, 0.6)));
+            keep_moving = true;
+        }
         let t_edges = std::time::Instant::now();
 
         // ── edges ──
@@ -1787,8 +1745,17 @@ impl Viewer {
                 continue;
             }
             let emphasised = self.presenting && self.step_of_event.get(e.first_event).and_then(|&st| self.steps.get(st)).map_or(false, |st| st.emphasis || (st.significant && progress < 1.0));
-            let width = look.width * z.sqrt() * self.style.edge_scale;
-            let color = look.color;
+            let mut width = look.width * z.sqrt() * self.style.edge_scale;
+            let mut color = look.color;
+            let mut flash = 0.0f32;
+            if let Some((shown, f)) = self.reveal_state(k, frame_now) {
+                if !shown {
+                    color = EDGE_LOGOFF;
+                    width = (width * 0.7).max(1.0);
+                } else {
+                    flash = f;
+                }
+            }
             let selected = self.selected == Some(Sel::Edge(k));
             let stroke_color = if selected { ACCENT } else { color };
             let short = (pa - pb).length() < 14.0;
@@ -1796,6 +1763,9 @@ impl Viewer {
             let glow = !plain && (look.glow || emphasised || progress < 1.0 || (lit && focus.is_some()) || (look.finding && dimmed < 0.5));
             if glow {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 9.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else { 0.2 } * alpha)) });
+            }
+            if flash > 0.0 {
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + (6.0 + 26.0 * flash) * z.sqrt(), draw::fade(draw::lighten(color, 0.4), 0.55 * flash * alpha)) });
             }
             if let Some(vc) = look.verdict {
                 if !plain {
@@ -1907,6 +1877,10 @@ impl Viewer {
             let hovered = self.hovered == Some(Sel::Node(i));
             let significant = n.hunt_rank == 0;
             let (fill, ring) = (look.fill, if significant { SIGNIFICANT } else { look.ring });
+            let node_flash = if self.hunt_reveal.is_some() { look.edges.iter().filter_map(|&k| self.reveal_state(k as usize, frame_now)).filter(|(shown, _)| *shown).map(|(_, f)| f).fold(0.0f32, f32::max) } else { 0.0 };
+            if node_flash > 0.0 && r > 2.0 {
+                painter.circle_filled(p, r + 4.0 + 22.0 * node_flash, draw::fade(if significant { SIGNIFICANT } else { CANDIDATE }, 0.35 * node_flash));
+            }
             let glow_strength = if look.glow {
                 1.0
             } else if significant {
@@ -1999,29 +1973,7 @@ impl Viewer {
             painter.galley(r.min + Vec2::new(6.0, 4.0), galley, TEXT);
         }
 
-        // ── overlay: legend chips at the top left, like Neo4j's ──
-        let mut x = canvas.left() + 12.0;
-        let y = canvas.top() + 12.0;
-        let n_ip = self.scene.n_ip;
-        let chips: Vec<(String, Color32)> = vec![(format!("Host ({})", self.graph.nodes.len() - n_ip), HOST_FILL), (format!("IP ({})", n_ip), IP_FILL)];
-        for (text, c) in chips {
-            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), c);
-            let w = galley.size().x + 12.0;
-            draw::pill(&painter, Pos2::new(x + w / 2.0, y + 10.0), galley, CHIP_BG, Some(draw::fade(c, 0.55)), c);
-            x += w + 6.0;
-        }
-        let mut x = canvas.left() + 12.0;
-        let y = y + 30.0;
-        for (text, c, n) in &self.scene.chips {
-            let galley = painter.layout_no_wrap(format!("{} ({})", text, n), FontId::proportional(11.0), TEXT);
-            let w = galley.size().x + 12.0;
-            draw::pill(&painter, Pos2::new(x + w / 2.0, y + 9.0), galley, CHIP_BG, Some(draw::fade(*c, 0.8)), TEXT);
-            x += w + 6.0;
-        }
-        // zoom hint, bottom right
-        if !self.presenting {
-            painter.text(Pos2::new(canvas.right() - 10.0, canvas.bottom() - 8.0), Align2::RIGHT_BOTTOM, format!("{:.0} %", self.zoom * 100.0), FontId::proportional(11.0), MUTED);
-        } else {
+        if self.presenting {
             self.presentation_overlays(&painter, canvas);
         }
         self.nodes_drawn = nodes_drawn;
@@ -2644,6 +2596,13 @@ impl Viewer {
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "hud" => self.hud = !self.hud,
             "motion" => self.style.motion = !self.style.motion,
+            other if other.starts_with("hunt=") => {
+                self.hunt_form.from = other["hunt=".len()..].to_string();
+                self.hunt_form.alpha = format!("{}", self.alpha);
+                self.hunt_form.end.clear();
+                self.show_hunt = true;
+                self.hunt_autorun = true;
+            }
             other if other.starts_with("bench=") => {
                 // bench=N heats the layout first; bench=N:cold measures it as it is
                 let spec = &other["bench=".len()..];
@@ -2876,12 +2835,37 @@ impl eframe::App for Viewer {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
             return;
         }
-        egui::Panel::top("filters").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.filter_bar(ui));
-        egui::Panel::bottom("time").frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| self.time_bar(ui));
-        egui::Panel::right("details").default_size(400.0).resizable(true).frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(12))).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.details(ui));
-        });
+        let bar = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).inner_margin(m);
+        egui::Panel::top("menu").frame(bar(theme::PANEL, egui::Margin::symmetric(6, 3))).show_separator_line(false).show(ui, |ui| self.menu_bar(ui));
+        egui::Panel::top("toolbar").frame(bar(theme::PANEL, egui::Margin::symmetric(10, 6))).show_separator_line(false).show(ui, |ui| self.toolbar(ui));
+        if self.filters_active() {
+            egui::Panel::top("chips").frame(bar(theme::PANEL_2, egui::Margin::symmetric(12, 6))).show_separator_line(false).show(ui, |ui| {
+                self.filter_chips(ui);
+            });
+        }
+        egui::Panel::bottom("status").frame(bar(theme::PANEL, egui::Margin::symmetric(12, 4))).show_separator_line(false).show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("time").frame(bar(theme::PANEL, egui::Margin::symmetric(10, 8))).show(ui, |ui| self.time_strip(ui));
+        if self.show_filters {
+            egui::Panel::left("filters").default_size(292.0).resizable(true).frame(bar(theme::PANEL, egui::Margin::symmetric(14, 10))).show(ui, |ui| self.left_panel(ui));
+        }
+        if self.show_inspector {
+            egui::Panel::right("inspector").default_size(400.0).resizable(true).frame(bar(theme::PANEL, egui::Margin::same(14))).show(ui, |ui| self.inspector(ui));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
+        if self.layout.len() > 0 {
+            let r = self.canvas_rect;
+            self.legend_overlay(&ctx, r);
+        }
+        self.color_window(&ctx);
+        self.mark_window(&ctx);
+        self.note_window(&ctx);
+        self.help_window(&ctx);
+        self.hunt_window(&ctx);
+        self.ingest_window(&ctx);
+        self.merge_window(&ctx);
+        self.poll_job(&ctx);
+        self.job_window(&ctx);
+        self.last_log_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.story_window(&ctx);
