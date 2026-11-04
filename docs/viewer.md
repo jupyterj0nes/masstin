@@ -24,7 +24,7 @@ A **host** is a piece of glass: a soft shadow, a gradient from a lit centre to a
 - **Motion** (a checkbox in the bar, saved with the style): bright dots travel along the connections that matter, origin to destination (the findings, the glowing rules, whatever is hovered or selected), the significant hosts breathe, a hovered host gets a pulsing ring. Off, the picture is still; it costs nothing when nothing moves.
 - Hovering or selecting something fades everything else out over a fraction of a second; a host that enters the view pops in; the camera glides to where it goes (Fit, zoom, a neighbourhood).
 
-Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood. The force layout runs while warm and settles; **Shake** lays it out again, **Fit** frames it. Captions that would sit on one another are left out until the view is zoomed in or the edge is lit.
+Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood. The force layout runs while warm and settles; when it does, the picture is **stretched to the window's shape** and framed, so a tall graph uses the sides and a flat one the height. **Fill the window** (the corners on the toolbar) does it again at any time; **Lay out again** starts the layout over. Captions that would sit on one another are left out until the view is zoomed in or the edge is lit.
 
 ### Many hosts
 
