@@ -318,6 +318,9 @@ pub struct Viewer {
     /// the summary shown once the findings have lit up
     hunt_report: Option<HuntReport>,
     hunt_report_at: Option<std::time::Instant>,
+    /// how many findings the summary lists, and what it is filtered by
+    report_top: usize,
+    report_find: String,
     host_edit: Option<HostEdit>,
     edge_edit: Option<EdgeEdit>,
     /// the analyst's merges, `(from, into)`, kept in the views file
@@ -554,6 +557,8 @@ impl Viewer {
             show_about: false,
             hunt_report: None,
             hunt_report_at: None,
+            report_top: 10,
+            report_find: String::new(),
             host_edit: None,
             edge_edit: None,
             merges: vf.merges.clone(),
