@@ -25,6 +25,12 @@ pub const ACCENT_INK: Color32 = Color32::from_rgb(6, 22, 24);
 /// The named families the chrome uses besides the default proportional one.
 pub const SEMIBOLD: &str = "semibold";
 pub const MEDIUM: &str = "medium";
+/// the 8-bit face of the arcade (Press Start 2P, OFL)
+pub const PIXEL: &str = "pixel";
+
+pub fn pixel_font(px: f32) -> FontId {
+    FontId::new(px, FontFamily::Name(PIXEL.into()))
+}
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -35,6 +41,9 @@ pub fn install(ctx: &egui::Context) {
     phosphor.tweak.y_offset_factor = 0.0;
     phosphor.tweak.scale = 1.08;
     fonts.font_data.insert("phosphor".into(), Arc::new(phosphor));
+    let mut pixel = FontData::from_static(include_bytes!("fonts/PressStart2P-Regular.ttf"));
+    pixel.tweak.y_offset_factor = 0.05;
+    fonts.font_data.insert("pixel".into(), Arc::new(pixel));
     // egui's own fallbacks (whatever this build has) stay behind ours
     let base: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     // Inter is subset to the text ranges (its private-use alternates would
@@ -47,6 +56,11 @@ pub fn install(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Proportional, chain("inter"));
     fonts.families.insert(FontFamily::Name(MEDIUM.into()), chain("inter-medium"));
     fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), chain("inter-semibold"));
+    fonts.families.insert(FontFamily::Name(PIXEL.into()), {
+        let mut v = vec!["pixel".to_string()];
+        v.extend(chain("inter"));
+        v
+    });
     fonts.families.entry(FontFamily::Monospace).or_default().push("phosphor".into());
     ctx.set_fonts(fonts);
 

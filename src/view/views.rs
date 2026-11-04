@@ -141,7 +141,7 @@ impl NodeStyle {
         match self {
             NodeStyle::Realistic => "The machines drawn as they are, with shading, a shadow and their lights: a monitor, a laptop, a rack, a domain controller with its badge, an antenna for an address, a globe for the outside.",
             NodeStyle::Icon => "Clean tiles with a glyph for what each host is, the name under it: the look of a network diagram.",
-            NodeStyle::Arcade => "Neon outlines on black, scanlines, a line grid behind, the connections as beams: the cabinet of the eighties.",
+            NodeStyle::Arcade => "A video game: the machines as pixel sprites with blinking lights, names in an 8-bit face, a starfield with depth, scanlines, square bullets along the connections.",
             NodeStyle::Glass => "Glossy orbs with a highlight and a bright rim.",
             NodeStyle::Minimal => "A dot in a thin ring; the quietest.",
         }

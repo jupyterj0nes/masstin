@@ -48,12 +48,29 @@ pub fn darken(c: Color32, k: f32) -> Color32 {
 /// that darkens towards the corners, and a grid of faint dots that pans
 /// and zooms with the camera so the picture has a floor.
 /// What the canvas behind the graph shows.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct BgStyle {
     pub grid: bool,
     pub vignette: bool,
-    /// the arcade: a line grid in neon instead of dots, a violet spotlight
+    /// the arcade: a starfield with parallax instead of a dot grid, a violet spotlight
     pub arcade: bool,
+    /// seconds, for the twinkle
+    pub t: f32,
+    pub motion: bool,
+}
+
+/// A small, fast hash for the things the canvas scatters: stars, dust.
+fn hash(x: i32, y: i32, salt: u32) -> u32 {
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA6B) ^ salt.wrapping_mul(0xC2B2_AE35);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^ (h >> 15)
+}
+
+fn unit(h: u32) -> f32 {
+    (h & 0xFFFF) as f32 / 65_535.0
 }
 
 pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Color32, cam: (f32, f32), zoom: f32, style: BgStyle) {
@@ -95,29 +112,8 @@ pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Co
     let cols = (rect.width() / spacing) as i32 + 2;
     let rows = (rect.height() / spacing) as i32 + 2;
     if style.arcade {
-        // neon lines, every fourth one brighter, in the brand's violet and cyan
-        let mut mesh = Mesh::default();
-        for i in 0..cols {
-            let wx = x0 + i as f32 * world_spacing;
-            let x = c.x + (wx - cam.0) * zoom;
-            if x < rect.left() || x > rect.right() {
-                continue;
-            }
-            let major = ((wx / world_spacing).round() as i64).rem_euclid(4) == 0;
-            let col = if major { fade(super::theme::CYAN, 0.10 * alpha) } else { fade(super::theme::VIOLET, 0.09 * alpha) };
-            line_quad(&mut mesh, Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom()), if major { 1.2 } else { 1.0 }, col);
-        }
-        for j in 0..rows {
-            let wy = y0 + j as f32 * world_spacing;
-            let y = c.y + (wy - cam.1) * zoom;
-            if y < rect.top() || y > rect.bottom() {
-                continue;
-            }
-            let major = ((wy / world_spacing).round() as i64).rem_euclid(4) == 0;
-            let col = if major { fade(super::theme::CYAN, 0.10 * alpha) } else { fade(super::theme::VIOLET, 0.09 * alpha) };
-            line_quad(&mut mesh, Pos2::new(rect.left(), y), Pos2::new(rect.right(), y), if major { 1.2 } else { 1.0 }, col);
-        }
-        painter.add(Shape::mesh(mesh));
+        let _ = (alpha, x0, y0, cols, rows, world_spacing);
+        starfield(painter, rect, cam, zoom, style.t, style.motion);
         return;
     }
     let mut mesh = Mesh::default();
@@ -141,6 +137,110 @@ pub fn background(painter: &egui::Painter, rect: Rect, base: Color32, centre: Co
             }
         }
         painter.add(Shape::mesh(mesh));
+    }
+}
+
+/// The arcade's sky: three layers of stars that drift with the camera at
+/// different speeds, so the picture has depth; a few twinkle.
+fn starfield(painter: &egui::Painter, rect: Rect, cam: (f32, f32), zoom: f32, t: f32, motion: bool) {
+    let c = rect.center();
+    let mut mesh = Mesh::default();
+    let layers: [(f32, f32, f32, u32); 3] = [(0.22, 70.0, 1.0, 11), (0.45, 95.0, 1.5, 23), (0.8, 140.0, 2.0, 37)];
+    for (parallax, cell, size, salt) in layers {
+        // the layer's world: the camera scaled by the parallax
+        let cx = cam.0 * parallax;
+        let cy = cam.1 * parallax;
+        let half_w = rect.width() * 0.5 / zoom + cell;
+        let half_h = rect.height() * 0.5 / zoom + cell;
+        let ix0 = ((cx - half_w) / cell).floor() as i32;
+        let ix1 = ((cx + half_w) / cell).ceil() as i32;
+        let iy0 = ((cy - half_h) / cell).floor() as i32;
+        let iy1 = ((cy + half_h) / cell).ceil() as i32;
+        if (ix1 - ix0) * (iy1 - iy0) > 6000 {
+            continue;
+        }
+        for ix in ix0..ix1 {
+            for iy in iy0..iy1 {
+                let h = hash(ix, iy, salt);
+                if h % 7 < 3 {
+                    continue;
+                }
+                let wx = (ix as f32 + unit(h >> 3)) * cell;
+                let wy = (iy as f32 + unit(h >> 9)) * cell;
+                let p = Pos2::new((c.x + (wx - cx) * zoom).round(), (c.y + (wy - cy) * zoom).round());
+                if !rect.contains(p) {
+                    continue;
+                }
+                let kind = (h >> 20) % 10;
+                let color = match kind {
+                    0 => super::theme::CYAN,
+                    1 => super::theme::MAGENTA,
+                    2 => Color32::from_rgb(255, 220, 150),
+                    _ => Color32::from_rgb(214, 220, 240),
+                };
+                let twinkle = if motion && (h >> 13) % 3 == 0 { 0.55 + 0.45 * (t * (1.5 + unit(h >> 5) * 2.0) + unit(h >> 7) * 6.28).sin() } else { 0.8 };
+                let a = (0.25 + 0.5 * unit(h >> 11)) * twinkle * parallax.max(0.5);
+                let s = size * if (h >> 17) % 5 == 0 { 1.6 } else { 1.0 };
+                let r = Rect::from_min_size(p, Vec2::splat(s));
+                let i0 = mesh.vertices.len() as u32;
+                let col = fade(color, a);
+                mesh.vertices.push(Vertex { pos: r.left_top(), uv: WHITE_UV, color: col });
+                mesh.vertices.push(Vertex { pos: r.right_top(), uv: WHITE_UV, color: col });
+                mesh.vertices.push(Vertex { pos: r.right_bottom(), uv: WHITE_UV, color: col });
+                mesh.vertices.push(Vertex { pos: r.left_bottom(), uv: WHITE_UV, color: col });
+                mesh.add_triangle(i0, i0 + 1, i0 + 2);
+                mesh.add_triangle(i0, i0 + 2, i0 + 3);
+            }
+        }
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// The lines of a tube over the whole picture.
+pub fn scanlines(painter: &egui::Painter, rect: Rect, alpha: f32) {
+    let mut mesh = Mesh::default();
+    let col = fade(Color32::BLACK, alpha);
+    let mut y = rect.top();
+    while y < rect.bottom() {
+        let i0 = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex { pos: Pos2::new(rect.left(), y), uv: WHITE_UV, color: col });
+        mesh.vertices.push(Vertex { pos: Pos2::new(rect.right(), y), uv: WHITE_UV, color: col });
+        mesh.vertices.push(Vertex { pos: Pos2::new(rect.right(), y + 1.0), uv: WHITE_UV, color: col });
+        mesh.vertices.push(Vertex { pos: Pos2::new(rect.left(), y + 1.0), uv: WHITE_UV, color: col });
+        mesh.add_triangle(i0, i0 + 1, i0 + 2);
+        mesh.add_triangle(i0, i0 + 2, i0 + 3);
+        y += 3.0;
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Motes drifting slowly over the canvas, for depth when motion is on.
+pub fn dust(painter: &egui::Painter, rect: Rect, t: f32) {
+    let mut mesh = Mesh::default();
+    let w = rect.width();
+    let h = rect.height();
+    for k in 0..56u32 {
+        let hk = hash(k as i32, 7, 5);
+        let speed = 4.0 + 10.0 * unit(hk);
+        let x = rect.left() + ((unit(hk >> 4) * w + t * speed) % w);
+        let y = rect.top() + ((unit(hk >> 8) * h + (t * (0.2 + 0.3 * unit(hk >> 12)) + unit(hk >> 2) * 6.28).sin() * 18.0 + h) % h);
+        let a = 0.05 + 0.09 * (0.5 + 0.5 * (t * (0.8 + unit(hk >> 6)) + unit(hk >> 10) * 6.28).sin());
+        let s = 1.0 + 1.4 * unit(hk >> 14);
+        let color = fade(if hk % 5 == 0 { super::theme::CYAN } else { Color32::from_rgb(200, 210, 230) }, a);
+        disc(&mut mesh, Pos2::new(x, y), s, color);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// The arcade's bullet along an edge: a square, with its trail.
+#[allow(clippy::too_many_arguments)]
+pub fn particle_square(painter: &egui::Painter, a: Pos2, c: Pos2, b: Pos2, t: f32, r: f32, color: Color32, alpha: f32) {
+    for (k, back) in [0.0f32, 0.04, 0.08].iter().enumerate() {
+        let tt = (t - back).clamp(0.0, 1.0);
+        let p = bez(a, c, b, tt);
+        let s = (r * 2.0 * (1.0 - k as f32 * 0.25)).max(1.5);
+        let rect = Rect::from_center_size(Pos2::new(p.x.round(), p.y.round()), Vec2::splat(s));
+        painter.rect_filled(rect, 0.0, fade(if k == 0 { lighten(color, 0.5) } else { color }, alpha * (1.0 - k as f32 * 0.35)));
     }
 }
 
