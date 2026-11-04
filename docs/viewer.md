@@ -40,7 +40,7 @@ A menu bar (**Evidence**, **Hunt**, **View**, **Tools**, **Help**), a toolbar, t
 - **Tools**: paths and reach, questions, the story and its recording, **Open the case in agentc00pr**, the log of the last run.
 - **Toolbar**: the filter pane toggle, the three views as one control, a quick search (a host name, Enter opens its neighbourhood), fit, lay out again, motion, shapes by role, rules; on the right questions, paths, **Hunt**, agentc00pr, the frame budget, the inspector toggle.
 - **Applied filters**: every filter that narrows the view is a chip under the toolbar (`host: SRV*`, `score ≥ 13`, `2026-11-03 20:00 → 2026-11-04 00:19`, `findings only`, `one edge per event`…); the × on a chip removes that filter at once, *clear all* removes them all. No chips, no filters.
-- **Right-click** a host: expand around, only this host, paths from or to here, pin, colour, hide, a note, copy the name. A connection: open in the inspector, mark suspicious / confirmed / benign, a note, and for one account its colour, hide it, only it. The background: fit, lay out again, Findings, Everything, back to the view, clear the selection, a note on the case.
+- **Right-click** a host: expand around, only this host, paths from or to here, pin, **style of this host** (name position, text size, box, size, colour), hide, a note, copy the name. A connection: open in the inspector, mark suspicious / confirmed / benign, a note, **style of this connection** (colour, width, dashes, glow, hidden, for every connection of that account; a folded edge lets you pick the account), hide the account, only it. The background: fit, lay out again, Findings, Everything, back to the view, clear the selection, a note on the case.
 
 ## Filters
 

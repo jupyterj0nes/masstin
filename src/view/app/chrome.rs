@@ -978,13 +978,9 @@ impl Viewer {
                     }
                     self.layout.reheat(0.1);
                 }
-                if icon_button(ui, ic::TAG, "Name, size and colour of this host…").clicked() {
+                if icon_button(ui, ic::PALETTE, "Style of this host…").on_hover_text("Name position, text size, box, size and colour of this host alone").clicked() {
                     ui.close();
                     self.host_edit = Some(HostEdit { name: name.clone() });
-                }
-                if icon_button(ui, ic::PALETTE, "Colour this host…").clicked() {
-                    ui.close();
-                    self.color_pick = Some(ColorPick { field: Field::Host, pattern: name.clone(), color: self.scene.nodes.get(i).map(|n| n.fill).unwrap_or(HOST_FILL), title: format!("Colour of {}", name) });
                 }
                 if icon_button(ui, ic::EYE_SLASH, "Hide this host").clicked() {
                     ui.close();
@@ -1032,12 +1028,13 @@ impl Viewer {
                     self.note_draft = Some((NoteTarget::Edge { src: self.store.hosts.name(src).to_string(), dst: self.store.hosts.name(dst).to_string(), user: users.first().map(|&u| self.store.users.name(u).to_string()).unwrap_or_default() }, String::new()));
                 }
                 ui.separator();
+                let names: Vec<String> = users.iter().map(|&u| self.store.users.name(u).to_string()).collect();
+                if icon_button(ui, ic::PALETTE, "Style of this connection…").on_hover_text("Colour, width, dashes, glow or hide, for every connection of the account").clicked() {
+                    ui.close();
+                    self.edge_edit = Some(EdgeEdit { user: names.first().cloned().unwrap_or_default(), choices: names.clone() });
+                }
                 if users.len() == 1 {
-                    let uname = self.store.users.name(users[0]).to_string();
-                    if icon_button(ui, ic::PALETTE, &format!("Colour {}…", uname)).clicked() {
-                        ui.close();
-                        self.color_pick = Some(ColorPick { field: Field::User, pattern: format!("={}", uname), color: Color32::from_rgb(palette_color(users[0])[0], palette_color(users[0])[1], palette_color(users[0])[2]), title: format!("Colour of {}", uname) });
-                    }
+                    let uname = names[0].clone();
                     if icon_button(ui, ic::EYE_SLASH, &format!("Hide {}", uname)).clicked() {
                         ui.close();
                         self.style.rules.push(Rule { enabled: true, field: Field::User, pattern: format!("={}", uname), color: None, hide: true, ..Rule::default() });
@@ -1045,7 +1042,7 @@ impl Viewer {
                     }
                     if icon_button(ui, ic::USER, &format!("Only {}", uname)).clicked() {
                         ui.close();
-                        self.draft.user = uname;
+                        self.draft.user = format!("={}", uname);
                         self.requery(false);
                     }
                 }

@@ -9,6 +9,7 @@
 //! warm and the analyst can drag any host.
 
 mod chrome;
+mod edge_style;
 mod labels;
 mod tasks;
 
@@ -23,6 +24,7 @@ use super::notes::{NoteTarget, Notes};
 use super::query::{fmt_time, hunt_rank, parse_time, Filter, GEdge, GraphView, Role, View};
 use super::theme;
 use chrome::{Brush, ColorPick, Tab};
+use edge_style::EdgeEdit;
 use labels::HostEdit;
 use super::views::LabelPos;
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
@@ -292,6 +294,7 @@ pub struct Viewer {
     hunt_autorun: bool,
     show_labels: bool,
     host_edit: Option<HostEdit>,
+    edge_edit: Option<EdgeEdit>,
     last_log: Option<(String, Vec<String>)>,
     show_last_log: bool,
 }
@@ -473,6 +476,7 @@ impl Viewer {
             hunt_autorun: false,
             show_labels: false,
             host_edit: None,
+            edge_edit: None,
             last_log: None,
             show_last_log: false,
         };
@@ -2932,6 +2936,7 @@ impl eframe::App for Viewer {
         self.last_log_window(&ctx);
         self.labels_window(&ctx);
         self.host_window(&ctx);
+        self.edge_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.story_window(&ctx);
