@@ -580,22 +580,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("masstin-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.csv");
-        let mut s = csv_out::HEADER.to_string();
-        s.push('\n');
-        s.push_str(&row(1, 10, "WS01", "SRV01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
-        s.push_str(&row(1, 11, "10.0.0.5", "SRV01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
-        s.push_str(&row(1, 12, "WS01", "DC01", "bob", "SUCCESSFUL_LOGON", ",,,,"));
+        let s = [
+            csv_out::HEADER.to_string(),
+            row(1, 10, "10.0.0.7", "SRV01", "bob", "SUCCESSFUL_LOGON", ",,,,"),
+            row(1, 11, "10.0.0.5", "SRV01", "eve", "SUCCESSFUL_LOGON", ",,,,"),
+            row(1, 12, "10.0.0.7", "DC01", "bob", "SUCCESSFUL_LOGON", ",,,,"),
+        ]
+        .join("\n");
         std::fs::write(&p, s).unwrap();
         let path = p.to_string_lossy().to_string();
         let plain = Store::load(&[path.clone()], 0.05).unwrap();
-        assert_eq!(plain.hosts.len(), 4);
-        let merged = Store::load_with(&[path.clone()], 0.05, &[("10.0.0.5".into(), "ws01".into())]).unwrap();
-        assert_eq!(merged.hosts.len(), 3, "the address is part of WS01");
-        let ws = merged.hosts.get("WS01").unwrap();
+        let names: Vec<&str> = (0..plain.hosts.len() as u32).map(|h| plain.hosts.name(h)).collect();
+        assert_eq!(plain.hosts.len(), 4, "hosts {:?}, {} rows without origin", names, plain.rows_without_origin);
+        let merged = Store::load_with(&[path.clone()], 0.05, &[("10.0.0.5".into(), "10.0.0.7".into())]).unwrap();
+        assert_eq!(merged.hosts.len(), 3, "the two addresses are one host");
+        let ws = merged.hosts.get("10.0.0.7").unwrap();
         assert!(merged.aliases[ws as usize].iter().any(|a| a == "10.0.0.5"));
         assert_eq!(merged.out_adj.of(ws).len(), 3);
-        let chained = Store::load_with(&[path], 0.05, &[("10.0.0.5".into(), "WS01".into()), ("WS01".into(), "DC01".into())]).unwrap();
-        assert_eq!(chained.hosts.len(), 2, "WS01 and the address both end in DC01");
+        let chained = Store::load_with(&[path], 0.05, &[("10.0.0.5".into(), "10.0.0.7".into()), ("10.0.0.7".into(), "DC01".into())]).unwrap();
+        assert_eq!(chained.hosts.len(), 2, "both addresses end in DC01");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -88,7 +88,7 @@ Three tabs on the right.
 
 ## Merging hosts
 
-The same machine often comes as an address in one log and as a name in another. The hunt folds an address into a name by itself when the same-login test allows it; for the rest, **right-click a host › Merge into another host…** (pick the host it belongs to), or select a host and right-click the one it belongs to › **Merge <host> into this host**. The two become one node, every connection follows, the merged name stays among the host's names in the inspector (with an undo next to it). **Tools › Merged hosts…** lists the pairs, undoes any, adds one by name. The timeline is not changed: the pairs live in `<timeline>.views.json` next to it, so they survive sessions and travel with the case.
+The same machine often comes as an address in one log and as a name in another. The hunt folds an address into a name by itself when the same-login test allows it; for the rest, **right-click a host › Merge with another host…** (pick the other from the list), or select a host and right-click the other › **Merge with <host>…**. The window asks **which name stays**; the two become one node, every connection follows, the other name stays among the host's names in the inspector (with an undo next to it), and a note in the case says the host is a merge of the two. **Tools › Merged hosts…** lists the pairs, undoes any, adds one by name. The timeline CSV is not changed and keeps both names: the pairs live in `<timeline>.views.json` next to it, so they survive sessions and travel with the case.
 
 ## Marks and notes
 

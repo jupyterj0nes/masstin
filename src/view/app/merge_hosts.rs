@@ -7,10 +7,12 @@ use super::*;
 use crate::view::icons as ic;
 use crate::view::theme;
 
-/// The merge window's form.
+/// The merge window's form: two hosts and which name stays.
 pub(super) struct MergeHostsEdit {
-    pub from: String,
-    pub into: String,
+    pub a: String,
+    pub b: String,
+    /// true: `a` is the name that stays
+    pub keep_a: bool,
     pub filter: String,
 }
 
@@ -42,6 +44,10 @@ impl Viewer {
         }
         self.merges.push((from.clone(), into.clone()));
         self.persist();
+        self.notes.add(NoteTarget::Host(into.clone()), &format!("Merged host: {} is the same machine as {}; shown as {} (undo in the inspector or Tools › Merged hosts). The timeline CSV keeps both names.", from, into, into));
+        if let Err(e) = self.notes.save() {
+            self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
+        }
         match self.reload_store() {
             Ok(()) => {
                 self.remembered.clear();
@@ -59,6 +65,10 @@ impl Viewer {
             return;
         }
         self.persist();
+        self.notes.add(NoteTarget::Host(from.to_uppercase()), &format!("Unmerged host: {} is its own host again.", from.to_uppercase()));
+        if let Err(e) = self.notes.save() {
+            self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
+        }
         match self.reload_store() {
             Ok(()) => {
                 self.remembered.clear();
@@ -75,33 +85,46 @@ impl Viewer {
         self.merges.iter().filter(|(_, i)| i.eq_ignore_ascii_case(host)).map(|(f, _)| f.clone()).collect()
     }
 
-    /// Right-click › Merge into another host: pick the host it belongs to.
+    /// Right-click › Merge: the two hosts, and which name stays.
     pub(super) fn merge_host_window(&mut self, ctx: &egui::Context) {
         let Some(edit) = self.merge_edit.as_mut() else { return };
         let mut open = true;
         let mut go: Option<(String, String)> = None;
-        let mut names: Vec<String> = (0..self.store.hosts.len() as u32).map(|h| self.store.hosts.name(h).to_string()).filter(|n| !n.eq_ignore_ascii_case(&edit.from)).collect();
+        let mut names: Vec<String> = (0..self.store.hosts.len() as u32).map(|h| self.store.hosts.name(h).to_string()).filter(|n| !n.eq_ignore_ascii_case(&edit.a)).collect();
         names.sort();
-        egui::Window::new(format!("{}  Merge {} into…", ic::ARROWS_CLOCKWISE, edit.from)).open(&mut open).collapsible(false).resizable(false).default_width(460.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(egui::RichText::new("The two become one host in the graph: every connection of the first is drawn on the second, which keeps the first among its names. The timeline is not changed; the pair is kept next to it and can be undone from the host's inspector or Tools › Merged hosts.").color(theme::MUTED));
-            ui.add_space(6.0);
+        let title = if edit.b.trim().is_empty() { format!("{}  Merge {} with…", ic::ARROWS_CLOCKWISE, edit.a) } else { format!("{}  Merge {} and {}", ic::ARROWS_CLOCKWISE, edit.a, edit.b) };
+        egui::Window::new(title).open(&mut open).collapsible(false).resizable(false).default_width(480.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(egui::RichText::new("The two become one host in the graph: every connection of both is drawn on the one that stays, which keeps the other among its names. The timeline CSV is not changed (both names stay in it); the pair is kept next to it, a note says so in the case, and it can be undone from the host's inspector or Tools › Merged hosts.").color(theme::MUTED));
+            theme::section(ui, "The other host");
             ui.horizontal(|ui| {
-                ui.label("into");
-                ui.add(egui::TextEdit::singleline(&mut edit.into).hint_text("host name or address").desired_width(220.0));
+                ui.add(egui::TextEdit::singleline(&mut edit.b).hint_text("host name or address").desired_width(220.0));
             });
             ui.add(egui::TextEdit::singleline(&mut edit.filter).hint_text(format!("{}  find in the list", ic::MAGNIFYING_GLASS)).desired_width(f32::INFINITY));
             let needle = edit.filter.trim().to_uppercase();
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                 for n in names.iter().filter(|n| needle.is_empty() || n.to_uppercase().contains(&needle)).take(300) {
-                    if ui.add(egui::Button::selectable(edit.into.eq_ignore_ascii_case(n), n)).clicked() {
-                        edit.into = n.clone();
+                    if ui.add(egui::Button::selectable(edit.b.eq_ignore_ascii_case(n), n)).clicked() {
+                        edit.b = n.clone();
                     }
                 }
             });
+            let b_ok = !edit.b.trim().is_empty() && !edit.b.trim().eq_ignore_ascii_case(&edit.a);
+            if b_ok {
+                theme::section(ui, "The name that stays");
+                ui.horizontal(|ui| {
+                    if ui.add(egui::RadioButton::new(edit.keep_a, &edit.a)).clicked() {
+                        edit.keep_a = true;
+                    }
+                    if ui.add(egui::RadioButton::new(!edit.keep_a, edit.b.trim())).clicked() {
+                        edit.keep_a = false;
+                    }
+                });
+            }
             ui.add_space(6.0);
-            let ok = !edit.into.trim().is_empty() && !edit.into.trim().eq_ignore_ascii_case(&edit.from);
-            if ui.add_enabled(ok, egui::Button::new(theme::semibold(format!("{}  Merge", ic::ARROWS_CLOCKWISE), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
-                go = Some((edit.from.clone(), edit.into.trim().to_string()));
+            let label = if b_ok { format!("{}  Merge, keep {}", ic::ARROWS_CLOCKWISE, if edit.keep_a { edit.a.clone() } else { edit.b.trim().to_string() }) } else { format!("{}  Merge", ic::ARROWS_CLOCKWISE) };
+            if ui.add_enabled(b_ok, egui::Button::new(theme::semibold(label, 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                let (a, b) = (edit.a.clone(), edit.b.trim().to_string());
+                go = Some(if edit.keep_a { (b, a) } else { (a, b) });
             }
         });
         if let Some((from, into)) = go {
