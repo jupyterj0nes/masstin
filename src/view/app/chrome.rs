@@ -85,6 +85,10 @@ impl Viewer {
                     ui.close();
                     self.show_hunt = true;
                 }
+                if icon_button(ui, ic::LIST_BULLETS, "The findings, as a list…").on_hover_text("The summary of the last hunt: every connection flagged, with its explanation and score").clicked() {
+                    ui.close();
+                    self.hunt_report = Some(self.build_report());
+                }
                 ui.separator();
                 if icon_button(ui, ic::FIRE, "Findings only").clicked() {
                     ui.close();
