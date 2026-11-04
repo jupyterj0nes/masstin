@@ -48,6 +48,9 @@ egui = { version = "0.37", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 rfd = { version = "0.17", optional = true }
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [features]
 # the built-in graph viewer (`-a view`, a native window); off for a parser-only binary
 default = ["ui"]

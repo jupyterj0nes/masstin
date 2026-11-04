@@ -1271,18 +1271,40 @@ impl Viewer {
         }
         let mut open = true;
         let mut done = false;
-        egui::Window::new("Save view").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label("The current filter and style, under a name, in the views file next to the timeline.");
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.save_name).desired_width(260.0));
-                r.request_focus();
-            });
-            ui.label(egui::RichText::new(self.views_path.to_string_lossy()).small().color(MUTED));
+        egui::Window::new(format!("{}  Save this filter", super::icons::BOOKMARK_SIMPLE)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(egui::RichText::new("The filter as it is now, and the style with it, under a name. It goes in the views file next to the timeline and travels with the case.").color(theme::MUTED));
+            theme::section(ui, "Name");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.save_name).desired_width(f32::INFINITY).hint_text("RDP from the jump box, last week…"));
+            r.request_focus();
+            theme::section(ui, "What it keeps");
+            let summary = {
+                let f = &self.draft;
+                let mut parts: Vec<String> = Vec::new();
+                match f.view {
+                    View::Findings => parts.push("findings only".into()),
+                    View::Around => parts.push(format!("around {}", f.around)),
+                    View::All => {}
+                }
+                for (label, v) in [("host", &f.host), ("account", &f.user), ("logon type", &f.logon_type)] {
+                    if !v.trim().is_empty() {
+                        parts.push(format!("{} {}", label, v.trim()));
+                    }
+                }
+                if f.min_score > 0 {
+                    parts.push(format!("score ≥ {}", f.min_score));
+                }
+                if !f.from.trim().is_empty() || !f.to.trim().is_empty() {
+                    parts.push(format!("{} → {}", if f.from.trim().is_empty() { "start" } else { f.from.trim() }, if f.to.trim().is_empty() { "end" } else { f.to.trim() }));
+                }
+                if parts.is_empty() { "everything".to_string() } else { parts.join("  ·  ") }
+            };
+            ui.label(egui::RichText::new(summary).color(TEXT).size(12.5));
+            ui.label(egui::RichText::new(format!("and the style: colour by {}, {} hosts, {}", self.style.color_by.label(), self.style.node_style.label(), if self.style.motion { "motion on" } else { "still" })).color(theme::DIM).size(11.5));
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let name = self.save_name.trim().to_string();
                 let exists = self.saved.iter().any(|v| v.name == name);
-                if ui.add_enabled(!name.is_empty(), egui::Button::new(if exists { "Replace" } else { "Save" })).clicked() {
+                if ui.add_enabled(!name.is_empty(), egui::Button::new(theme::semibold(if exists { "Replace" } else { "Save" }, 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(90.0, 30.0))).clicked() {
                     self.saved.retain(|v| v.name != name);
                     self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style.clone() });
                     self.saved.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -3031,6 +3053,7 @@ impl eframe::App for Viewer {
         if self.layout.len() > 0 {
             let r = self.canvas_rect;
             self.legend_overlay(&ctx, r);
+            self.limit_banner(&ctx, r);
         }
         self.color_window(&ctx);
         self.mark_window(&ctx);

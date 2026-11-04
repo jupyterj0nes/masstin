@@ -238,6 +238,7 @@ impl Viewer {
     // ───────────────────────── toolbar ─────────────────────────
 
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+        theme::brand_line(ui);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             if tool(ui, ic::FUNNEL, "Filter pane", self.show_filters).clicked() {
@@ -540,21 +541,45 @@ impl Viewer {
             section(ui, "Saved filters");
             let mut pick: Option<SavedView> = None;
             let mut delete: Option<String> = None;
+            if self.saved.is_empty() {
+                ui.label(egui::RichText::new("Yours will be here: Save the current filter… below.").color(theme::DIM).small());
+            }
             for v in self.saved.clone() {
-                ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(format!("{}  {}", ic::BOOKMARK_SIMPLE, v.name)).frame(false)).clicked() {
-                        pick = Some(v.clone());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new(egui::RichText::new(ic::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Delete this saved filter").clicked() {
-                            delete = Some(v.name.clone());
-                        }
+                let sel = self.preset == v.name;
+                let summary = describe_filter(&v.filter);
+                let r = theme::card(ui, sel, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(ic::BOOKMARK_SIMPLE).color(theme::CYAN).size(14.0));
+                        ui.vertical(|ui| {
+                            ui.label(theme::medium(&v.name, 13.0));
+                            ui.label(egui::RichText::new(&summary).color(theme::MUTED).size(11.5));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new(egui::RichText::new(ic::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Delete this saved filter").clicked() {
+                                delete = Some(v.name.clone());
+                            }
+                        });
                     });
                 });
+                if r.clicked() {
+                    pick = Some(v.clone());
+                }
             }
-            egui::CollapsingHeader::new(egui::RichText::new("Built in").color(theme::MUTED)).default_open(self.saved.is_empty()).show(ui, |ui| {
+            egui::CollapsingHeader::new(egui::RichText::new(format!("Built in ({})", self.builtin.len())).color(theme::MUTED)).default_open(self.saved.is_empty()).show(ui, |ui| {
                 for v in self.builtin.clone() {
-                    if ui.add(egui::Button::new(format!("{}  {}", ic::DOT_OUTLINE, v.name)).frame(false)).clicked() {
+                    let sel = self.preset == v.name;
+                    let summary = describe_filter(&v.filter);
+                    let icon = builtin_icon(&v.name);
+                    let r = theme::card(ui, sel, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(icon).color(theme::VIOLET).size(14.0));
+                            ui.vertical(|ui| {
+                                ui.label(theme::medium(&v.name, 13.0));
+                                ui.label(egui::RichText::new(&summary).color(theme::MUTED).size(11.5));
+                            });
+                        });
+                    });
+                    if r.clicked() {
                         pick = Some(v);
                     }
                 }
@@ -1115,6 +1140,36 @@ impl Viewer {
         }
     }
 
+    /// The banner over the canvas when the limit cut the picture.
+    pub(super) fn limit_banner(&mut self, ctx: &egui::Context, canvas: Rect) {
+        if !self.graph.truncated {
+            return;
+        }
+        let drawn = self.graph.edges.len();
+        let total = self.graph.connections;
+        egui::Area::new(egui::Id::unique("limit-banner")).fixed_pos(Pos2::new(canvas.center().x - 260.0, canvas.top() + 66.0)).order(egui::Order::Middle).show(ctx, |ui| {
+            egui::Frame::new().fill(draw::fade(Color32::from_rgb(58, 34, 10), 0.96)).stroke(Stroke::new(1.0, draw::fade(CANDIDATE, 0.9))).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+                ui.set_width(520.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(ic::WARNING).color(CANDIDATE).size(18.0));
+                    ui.vertical(|ui| {
+                        ui.label(theme::medium(format!("Only {} of {} connections are drawn", drawn, total), 13.0).color(TEXT));
+                        ui.label(egui::RichText::new(format!("The limit is {}. The most pressing come first: significant, then candidate, then by number of events. Raise it, or narrow the filters.", self.filter.limit)).color(theme::MUTED).size(11.5));
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(egui::RichText::new(format!("Draw all {}", total)).color(theme::ACCENT_INK)).fill(CANDIDATE).stroke(Stroke::NONE)).on_hover_text("Could be slow with tens of thousands").clicked() {
+                                self.draft.limit = total.max(10);
+                                self.requery(false);
+                            }
+                            if ui.button("Filters").clicked() {
+                                self.show_filters = true;
+                            }
+                        });
+                    });
+                });
+            });
+        });
+    }
+
     /// The legend chips over the canvas as real widgets: counts per
     /// category, and when coloured by account a click picks its colour.
     pub(super) fn legend_overlay(&mut self, ctx: &egui::Context, canvas: Rect) {
@@ -1247,5 +1302,72 @@ impl Viewer {
             }
         }
         self.status = "agentc00pr is not next to masstin nor on the PATH".into();
+    }
+}
+
+/// One line that says what a filter keeps, for the cards.
+fn describe_filter(f: &Filter) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    match f.view {
+        View::Findings => parts.push("findings only".into()),
+        View::Around => parts.push(format!("around {}", f.around)),
+        View::All => {}
+    }
+    if !f.host.trim().is_empty() {
+        parts.push(format!("host {}", f.host.trim()));
+    }
+    if !f.user.trim().is_empty() {
+        parts.push(format!("account {}", f.user.trim()));
+    }
+    if !f.logon_type.trim().is_empty() {
+        parts.push(format!("logon type {}", f.logon_type.trim()));
+    }
+    if f.min_score > 0 {
+        parts.push(format!("score ≥ {}", f.min_score));
+    }
+    if f.results != [true, true, true, true] {
+        let on: Vec<&str> = RESULT_NAMES.iter().enumerate().filter(|(i, _)| f.results[*i]).map(|(_, n)| *n).collect();
+        parts.push(on.join(" + "));
+    }
+    if f.verdict.iter().any(|v| !v) {
+        let on: Vec<&str> = VERDICT_NAMES.iter().enumerate().filter(|(i, _)| f.verdict[*i]).map(|(_, n)| if n.is_empty() { "unmarked" } else { *n }).collect();
+        parts.push(format!("verdict {}", on.join(" + ")));
+    }
+    if !f.from.trim().is_empty() || !f.to.trim().is_empty() {
+        parts.push(format!("{} → {}", if f.from.trim().is_empty() { "start" } else { &f.from[..f.from.len().min(16)] }, if f.to.trim().is_empty() { "end" } else { &f.to[..f.to.len().min(16)] }));
+    }
+    if parts.is_empty() {
+        "everything".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn builtin_icon(name: &str) -> &'static str {
+    let n = name.to_ascii_lowercase();
+    if n.starts_with("findings") {
+        ic::FIRE
+    } else if n.starts_with("everything") {
+        ic::GRAPH
+    } else if n.starts_with("rdp") {
+        ic::MONITOR
+    } else if n.starts_with("network") {
+        ic::PLUGS_CONNECTED
+    } else if n.starts_with("ssh") {
+        ic::TERMINAL_WINDOW
+    } else if n.starts_with("admin") {
+        ic::KEY
+    } else if n.starts_with("service") {
+        ic::ROBOT
+    } else if n.starts_with("without") {
+        ic::EYE_SLASH
+    } else if n.starts_with("failures") {
+        ic::SIREN
+    } else if n.starts_with("marked") {
+        ic::FLAG
+    } else if n.starts_with("last") {
+        ic::CLOCK
+    } else {
+        ic::DOT_OUTLINE
     }
 }

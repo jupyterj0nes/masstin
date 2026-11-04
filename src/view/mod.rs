@@ -50,10 +50,16 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
     crate::banner::print_phase("2", "2", "Opening the viewer (close the window to end)");
     let title = format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", "));
-    let native = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title(&title).with_inner_size([1460.0, 900.0]).with_min_inner_size([900.0, 600.0]),
-        ..Default::default()
-    };
+    let icon = image::load_from_memory(include_bytes!("../../resources/masstin_icon.png")).ok().map(|img| {
+        let rgba = img.to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        std::sync::Arc::new(egui::IconData { rgba: rgba.into_raw(), width: w, height: h })
+    });
+    let mut viewport = egui::ViewportBuilder::default().with_title(&title).with_inner_size([1460.0, 900.0]).with_min_inner_size([900.0, 600.0]).with_app_id("masstin");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
+    let native = eframe::NativeOptions { viewport, ..Default::default() };
     let app_opts = opts;
     eframe::run_native("masstin", native, Box::new(move |cc| Ok(Box::new(app::Viewer::new(cc, store, app_opts))))).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
     Ok(())
