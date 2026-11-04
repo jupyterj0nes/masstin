@@ -58,6 +58,18 @@ pub(super) fn role_icon(role: Role, is_ip: bool) -> &'static str {
     }
 }
 
+/// The machine a host is drawn as in the machines style.
+pub(super) fn role_device(role: Role, is_ip: bool) -> crate::view::devices::Device {
+    use crate::view::devices::Device;
+    match role {
+        Role::External => Device::Globe,
+        _ if is_ip => Device::Address,
+        Role::DomainController => Device::DomainController,
+        Role::Server => Device::Server,
+        _ => Device::Workstation,
+    }
+}
+
 /// The default box behind a name when a box is asked for and no colour is.
 pub(super) const LABEL_BOX: [u8; 3] = [20, 25, 36];
 
@@ -172,7 +184,7 @@ impl Viewer {
                     ui.label(egui::RichText::new(format!("{}  {}", g, l)).color(theme::MUTED).size(12.0));
                 }
             });
-            ui.label(egui::RichText::new("That is what each host gets in the icon style, from what the graph makes of it; a host's own icon comes from its right-click menu, Style of this host, with the whole catalogue.").color(theme::DIM).small());
+            ui.label(egui::RichText::new("That is what each host gets from what the graph makes of it: drawn as the machine in the machines style, as a glyph in the icon style. A host's own choice comes from its right-click menu, Style of this host, with the whole catalogue; the machines (workstation, laptop, server, tower, domain controller, address, globe, database, cloud, router, phone) are drawn, the rest are glyphs.").color(theme::DIM).small());
             theme::section(ui, "Where the name goes");
             ui.horizontal_wrapped(|ui| {
                 for pos in LabelPos::ALL {
