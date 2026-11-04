@@ -381,7 +381,7 @@ enum ActionType {
     /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.
     #[value(alias = "graph-hunt-csv")]
     GraphHuntCsv,
-    /// Open the graph viewer (a window) on timeline CSVs (-f): the lateral-movement graph with its hunt states, filters, neighbourhoods, a replay in time order and the analyst's marks, written back into the CSV. --focus HOST opens on a host's neighbourhood; --start-time / --end-time bound the window.
+    /// Open the graph viewer (a window) on timeline CSVs (-f): the lateral-movement graph with its hunt states, filters, neighbourhoods, a replay in time order and the analyst's marks, written back into the CSV. Without -f it opens on a welcome, to open a timeline or ingest evidence (drop it on the window). --focus HOST opens on a host's neighbourhood; --start-time / --end-time bound the window.
     View,
 }
 
@@ -835,9 +835,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             }
         }
         ActionType::View => {
-            if config.file.is_empty() {
-                return Err(String::from("For view you must specify at least one timeline CSV with -f."));
-            }
+            // no -f: the window opens on its welcome, to open or ingest one
         }
         ActionType::GraphHuntCsv => {
             if config.file.is_empty() {

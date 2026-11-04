@@ -15,6 +15,8 @@ mod merge_hosts;
 mod report;
 mod subnets;
 mod tasks;
+mod ingest;
+mod table;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -33,7 +35,8 @@ use merge_hosts::MergeHostsEdit;
 use report::HuntReport;
 use subnets::SubnetGroup;
 use super::views::{LabelPos, NodeStyle};
-use tasks::{HuntForm, IngestForm, Job, MergeForm};
+use ingest::Ingest;
+use tasks::{HuntForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
 use super::present::{self, Anonymiser, Format, LogoPos, Step, StepOverride, Story, Timing};
@@ -296,8 +299,14 @@ pub struct Viewer {
     show_filters: bool,
     show_inspector: bool,
     show_hunt: bool,
-    show_ingest: bool,
     show_merge: bool,
+    /// the timeline as a plain table
+    show_table: bool,
+    table_find: String,
+    table_rows: Vec<u32>,
+    table_key: (String, usize, usize),
+    /// timelines opened lately, for the welcome and the menu
+    recent: Vec<String>,
     show_help: bool,
     quick: String,
     focus_around: bool,
@@ -316,7 +325,8 @@ pub struct Viewer {
     // work in progress: a child masstin, the hunt's reveal
     job: Option<Job>,
     hunt_form: HuntForm,
-    ingest_form: IngestForm,
+    /// the ingest wizard
+    ingest: Ingest,
     merge_form: MergeForm,
     /// a hunt is running: a sweep crosses the canvas
     hunt_sweep: Option<std::time::Instant>,
@@ -449,13 +459,19 @@ impl Viewer {
         if filter.view == View::All && store.edges.len() > 200_000 && filter.from.is_empty() {
             filter.from = fmt_time(store.t_max - 86_400);
         }
-        let views_path = ViewsFile::path_for(&opts.files[0]);
+        // with no timeline the side files go under the temp folder, so the
+        // style chosen on the welcome is kept
+        let first = opts.files.first().cloned().unwrap_or_else(ingest::scratch_csv);
+        if !opts.files.is_empty() {
+            ingest::remember(&opts.files);
+        }
+        let views_path = ViewsFile::path_for(&first);
         let vf = ViewsFile::load(&views_path);
         let style = vf.last_style.clone().unwrap_or_default();
         let builtin = builtin_views(store.t_max);
-        let story_path = Story::path_for(&opts.files[0]);
+        let story_path = Story::path_for(&first);
         let story = Story::load(&story_path);
-        let notes_path = opts.files[0].clone();
+        let notes_path = first.clone();
         let mut v = Viewer {
             store,
             files: opts.files,
@@ -555,8 +571,12 @@ impl Viewer {
             show_filters: true,
             show_inspector: true,
             show_hunt: false,
-            show_ingest: false,
             show_merge: false,
+            show_table: false,
+            table_find: String::new(),
+            table_rows: Vec::new(),
+            table_key: (String::new(), usize::MAX, 0),
+            recent: ingest::load_recent(),
             show_help: false,
             quick: String::new(),
             focus_around: false,
@@ -573,7 +593,7 @@ impl Viewer {
             row_pick: Vec::new(),
             job: None,
             hunt_form: HuntForm { from: String::new(), end: String::new(), alpha: String::new() },
-            ingest_form: IngestForm { action: 0, source: String::new(), output: String::new(), add: true },
+            ingest: Ingest::default(),
             merge_form: MergeForm { inputs: Vec::new(), output: String::new() },
             hunt_sweep: None,
             hunt_reveal: None,
@@ -1897,6 +1917,10 @@ impl Viewer {
     // ───────────────────────── UI: canvas ─────────────────────────
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
+        if self.files.is_empty() {
+            self.welcome(ui);
+            return;
+        }
         let draw_start = std::time::Instant::now();
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let canvas = resp.rect;
@@ -3230,6 +3254,16 @@ impl Viewer {
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "hud" => self.hud = !self.hud,
             "motion" => self.style.motion = !self.style.motion,
+            "table" => self.show_table = true,
+            "ingest" => self.ingest.open = true,
+            "ingest-go" => {
+                if self.ingest.output.trim().is_empty() {
+                    self.ingest.output = self.ingest.default_output();
+                }
+                self.run_ingest();
+            }
+            other if other.starts_with("ingest=") => self.ingest_with(vec![other["ingest=".len()..].to_string()]),
+            other if other.starts_with("out=") => self.ingest.output = other["out=".len()..].to_string(),
             other if other.starts_with("hunt=") => {
                 self.hunt_form.from = other["hunt=".len()..].to_string();
                 self.hunt_form.alpha = format!("{}", self.alpha);
@@ -3491,6 +3525,12 @@ impl eframe::App for Viewer {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
             return;
         }
+        // files dropped on the window: timelines open, evidence goes to the wizard
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if !dropped.is_empty() {
+            let add = ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift);
+            self.drop_files(dropped, add);
+        }
         let bar = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).inner_margin(m);
         egui::Panel::top("menu").frame(bar(theme::PANEL, egui::Margin::symmetric(6, 3))).show_separator_line(false).show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").frame(bar(theme::PANEL, egui::Margin::symmetric(10, 6))).show_separator_line(false).show(ui, |ui| self.toolbar(ui));
@@ -3508,7 +3548,7 @@ impl eframe::App for Viewer {
             egui::Panel::right("inspector").default_size(400.0).resizable(true).frame(bar(theme::PANEL, egui::Margin::same(14))).show(ui, |ui| self.inspector(ui));
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.canvas(ui));
-        if self.layout.len() > 0 {
+        if self.layout.len() > 0 && !self.ingest.open {
             let r = self.canvas_rect;
             self.legend_overlay(&ctx, r);
             self.limit_banner(&ctx, r);
@@ -3532,6 +3572,8 @@ impl eframe::App for Viewer {
         self.poll_job(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);
+        self.table_window(&ctx);
+        self.drop_overlay(&ctx);
         self.labels_window(&ctx);
         self.about_window(&ctx);
         self.host_window(&ctx);

@@ -5,6 +5,7 @@
 //! and, for the hunt, the findings light up one after another.
 
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::view::icons as ic;
@@ -22,15 +23,120 @@ pub(super) enum JobMsg {
     Done(Result<(), String>),
 }
 
+/// The console's phases, bars and summary, read from the child's lines.
+#[derive(Default)]
+pub(super) struct Progress {
+    /// `[1/3]` and what the phase is
+    pub phases: Vec<(String, String)>,
+    /// position, length, what is being done
+    pub bar: Option<(u64, u64, String)>,
+    pub spinner: Option<String>,
+    /// the `=>` lines: what was found or made
+    pub notes: Vec<String>,
+    /// the closing summary: `Events collected`, `Completed in`…
+    pub summary: Vec<(String, String)>,
+}
+
+impl Progress {
+    /// Read one line; true when it was a bar or a spinner (not for the log).
+    pub fn absorb(&mut self, line: &str) -> bool {
+        let line = strip_ansi(line);
+        if let Some(rest) = line.strip_prefix("@@pb") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.spinner = None;
+                return true;
+            }
+            // a bar: `[=====>----] 12/120 | Security.evtx`
+            if let (Some(a), Some(b)) = (rest.find('['), rest.find(']')) {
+                if a < b {
+                    let after = rest[b + 1..].trim();
+                    let mut it = after.splitn(2, char::is_whitespace);
+                    if let Some((pos, len)) = it.next().and_then(|x| x.split_once('/')) {
+                        if let (Ok(pos), Ok(len)) = (pos.parse::<u64>(), len.parse::<u64>()) {
+                            let msg = it.next().unwrap_or("").trim();
+                            let msg = msg.trim_start_matches(['|', '/', '-', '\\']).trim();
+                            self.bar = Some((pos, len, msg.to_string()));
+                            self.spinner = None;
+                            return true;
+                        }
+                    }
+                }
+            }
+            // a spinner: `| Scanning for forensic images...`
+            let msg = rest.trim_start_matches(['|', '/', '-', '\\']).trim();
+            self.spinner = Some(msg.to_string());
+            return true;
+        }
+        let t = line.trim();
+        if t.starts_with('[') {
+            if let Some(end) = t.find(']') {
+                let tag = &t[..=end];
+                let inner = &tag[1..tag.len() - 1];
+                if let Some((a, b)) = inner.split_once('/') {
+                    if a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit()) && !a.is_empty() {
+                        self.phases.push((tag.to_string(), t[end + 1..].trim().to_string()));
+                        self.bar = None;
+                        self.spinner = None;
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(rest) = t.strip_prefix("=>") {
+            self.notes.push(rest.trim().to_string());
+            return false;
+        }
+        for key in ["Artifacts parsed", "Events collected", "Skipped", "Output", "Completed in", "Connections loaded", "Rows written", "Rows"] {
+            if let Some(rest) = t.strip_prefix(key) {
+                if let Some(v) = rest.strip_prefix(':') {
+                    self.summary.push((key.to_string(), v.trim().to_string()));
+                    return false;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Without the terminal's colour codes, should any slip through.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\u{1b}') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A child masstin running, with its log.
 pub(super) struct Job {
     pub kind: JobKind,
     pub title: String,
     pub command: String,
     pub started: std::time::Instant,
+    /// when it ended, so the clock stops
+    pub ended: Option<std::time::Instant>,
     pub log: Vec<String>,
     pub rx: Receiver<JobMsg>,
     pub done: Option<Result<(), String>>,
+    pub progress: Progress,
+    /// the child, to stop it
+    child: Arc<Mutex<Option<std::process::Child>>>,
     /// timelines to open (or add) when it ends well
     pub open: Vec<String>,
     pub add: bool,
@@ -46,25 +152,26 @@ pub(super) struct HuntForm {
     pub alpha: String,
 }
 
-pub(super) struct IngestForm {
-    pub action: usize,
-    pub source: String,
-    pub output: String,
-    pub add: bool,
-}
-
 pub(super) struct MergeForm {
     pub inputs: Vec<String>,
     pub output: String,
 }
 
-const ACTIONS: [(&str, &str, bool); 5] = [
-    ("parse-windows", "Windows: EVTX files, triage folders, UAL (.mdb)", true),
-    ("parse-linux", "Linux: auth.log, secure, journal exports, wtmp / btmp / lastlog, audit.log, a UAC tree", true),
-    ("parse-mac", "macOS: a .logarchive bundle or a `log show` JSON export", true),
-    ("parse-image", "A disk image (E01, dd, VMDK, VHD / VHDX) or a mounted volume", false),
-    ("parse-massive", "Everything under a folder: images, triage packages, loose logs", true),
-];
+impl Job {
+    /// Seconds it has run, or ran.
+    pub fn elapsed(&self) -> f32 {
+        self.ended.unwrap_or_else(std::time::Instant::now).duration_since(self.started).as_secs_f32()
+    }
+
+    /// Stop the child; the job ends as failed ("stopped").
+    pub fn cancel(&mut self) {
+        if let Ok(mut c) = self.child.lock() {
+            if let Some(child) = c.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
 
 impl Viewer {
     fn masstin_exe() -> std::path::PathBuf {
@@ -72,14 +179,16 @@ impl Viewer {
     }
 
     /// Start a child masstin with these arguments; its lines come through the channel.
-    fn start_job(&mut self, kind: JobKind, title: String, args: Vec<String>, open: Vec<String>, add: bool) {
+    pub(super) fn start_job(&mut self, kind: JobKind, title: String, args: Vec<String>, open: Vec<String>, add: bool) {
         let exe = Self::masstin_exe();
         let command = format!("masstin {}", args.iter().map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }).collect::<Vec<_>>().join(" "));
         let (tx, rx) = channel::<JobMsg>();
+        let handle: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+        let handle2 = handle.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
+            cmd.args(&args).env("MASSTIN_PROGRESS_PIPE", "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -94,6 +203,7 @@ impl Viewer {
             };
             let out = child.stdout.take();
             let err = child.stderr.take();
+            *handle2.lock().unwrap() = Some(child);
             let tx2 = tx.clone();
             let t_err = std::thread::spawn(move || {
                 if let Some(err) = err {
@@ -108,14 +218,24 @@ impl Viewer {
                 }
             }
             let _ = t_err.join();
-            let status = child.wait();
+            // the pipes are closed: the child is ending (or was stopped)
+            let status = loop {
+                let waited = handle2.lock().unwrap().as_mut().map(|c| c.try_wait());
+                match waited {
+                    Some(Ok(Some(s))) => break Ok(s),
+                    Some(Ok(None)) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Some(Err(e)) => break Err(e),
+                    None => break Err(std::io::Error::other("the child went missing")),
+                }
+            };
+            *handle2.lock().unwrap() = None;
             let _ = tx.send(JobMsg::Done(match status {
                 Ok(s) if s.success() => Ok(()),
                 Ok(s) => Err(format!("masstin ended with {}", s)),
                 Err(e) => Err(e.to_string()),
             }));
         });
-        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), log: Vec::new(), rx, done: None, open, add, past_banner: false, autoclose_at: None });
+        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), ended: None, log: Vec::new(), rx, done: None, progress: Progress::default(), child: handle, open, add, past_banner: false, autoclose_at: None });
     }
 
     /// Drain the running job's output; on its end, read the timeline again.
@@ -138,6 +258,9 @@ impl Viewer {
                         }
                         continue;
                     }
+                    if job.progress.absorb(&l) {
+                        continue;
+                    }
                     if let Some(last) = job.log.last() {
                         let head: String = l.chars().take(12).collect();
                         if last.starts_with(&head) && l.contains('%') {
@@ -154,6 +277,7 @@ impl Viewer {
                         job.autoclose_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(1800));
                     }
                     job.done = Some(r);
+                    job.ended = Some(std::time::Instant::now());
                 }
             }
         }
@@ -174,7 +298,12 @@ impl Viewer {
                         Err(e) => self.status = format!("Hunt done, but the timeline cannot be read again: {}", e),
                     }
                 }
-                JobKind::Ingest | JobKind::Merge => {
+                JobKind::Ingest => {
+                    if !open.is_empty() {
+                        self.finish_ingest(open, add);
+                    }
+                }
+                JobKind::Merge => {
                     if !open.is_empty() {
                         let mut files: Vec<String> = if add { self.files.clone() } else { Vec::new() };
                         for f in open {
@@ -182,21 +311,8 @@ impl Viewer {
                                 files.push(f);
                             }
                         }
-                        let merges = ViewsFile::load(&ViewsFile::path_for(&files[0])).merges;
-                        match Store::load_with(&files, self.alpha, &merges) {
-                            Ok(s) => {
-                                self.store = s;
-                                self.files = files;
-                                self.merges = merges;
-                                self.views_path = ViewsFile::path_for(&self.files[0]);
-                                self.story_path = Story::path_for(&self.files[0]);
-                                self.remembered.clear();
-                                self.draft.view = View::All;
-                                self.requery(true);
-                                self.status = format!("Opened: {}", self.status);
-                            }
-                            Err(e) => self.status = format!("Cannot read the result: {}", e),
-                        }
+                        self.draft.view = View::All;
+                        self.open_files(files);
                     }
                 }
             }
@@ -310,77 +426,6 @@ impl Viewer {
 
     // ───────────────────────── ingest and merge ─────────────────────────
 
-    pub(super) fn ingest_window(&mut self, ctx: &egui::Context) {
-        if !self.show_ingest {
-            return;
-        }
-        let mut open = true;
-        let mut run = false;
-        egui::Window::new(format!("{}  Ingest evidence", ic::DOWNLOAD_SIMPLE)).open(&mut open).collapsible(false).resizable(false).default_width(600.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(egui::RichText::new("masstin's own parsers, run from here: the evidence becomes a timeline CSV that opens in this window when it is done. The same command line is shown so it can be repeated or scripted.").color(theme::MUTED));
-            ui.add_space(8.0);
-            theme::section(ui, "What");
-            for (i, (name, desc, _)) in ACTIONS.iter().enumerate() {
-                if ui.add(egui::RadioButton::new(self.ingest_form.action == i, format!("{}   {}", name, desc))).clicked() {
-                    self.ingest_form.action = i;
-                }
-            }
-            theme::section(ui, "Where it is");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.ingest_form.source).desired_width(380.0).hint_text("a folder, or an image file"));
-                if ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Evidence folder").pick_folder() {
-                        self.ingest_form.source = p.to_string_lossy().to_string();
-                        if self.ingest_form.output.is_empty() {
-                            self.ingest_form.output = format!("{}.csv", self.ingest_form.source.trim_end_matches(['\\', '/']));
-                        }
-                    }
-                }
-                if ui.button("File…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Evidence file (image, EVTX, log, archive)").pick_file() {
-                        self.ingest_form.source = p.to_string_lossy().to_string();
-                        if self.ingest_form.output.is_empty() {
-                            self.ingest_form.output = format!("{}.csv", p.with_extension("").to_string_lossy());
-                        }
-                    }
-                }
-            });
-            theme::section(ui, "Timeline to write");
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.ingest_form.output).desired_width(380.0).hint_text("…\\host.csv"));
-                if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Timeline CSV to write").add_filter("CSV", &["csv"]).set_file_name("timeline.csv").save_file() {
-                        self.ingest_form.output = p.to_string_lossy().to_string();
-                    }
-                }
-            });
-            ui.checkbox(&mut self.ingest_form.add, "add it to the timelines open here (instead of replacing them)");
-            ui.add_space(6.0);
-            let src = self.ingest_form.source.trim().to_string();
-            let is_dir = std::path::Path::new(&src).is_dir();
-            let flag = if is_dir { "-d" } else { "-f" };
-            let (name, _, _) = ACTIONS[self.ingest_form.action];
-            ui.label(egui::RichText::new(format!("masstin -a {} {} \"{}\" -o \"{}\" --overwrite", name, flag, src, self.ingest_form.output.trim())).monospace().size(11.5).color(theme::DIM));
-            ui.add_space(6.0);
-            let ok = !src.is_empty() && std::path::Path::new(&src).exists() && !self.ingest_form.output.trim().is_empty();
-            if ui.add_enabled(ok && self.job.is_none(), egui::Button::new(theme::semibold(format!("{}  Parse", ic::LIGHTNING), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
-                run = true;
-            }
-        });
-        if run {
-            let src = self.ingest_form.source.trim().to_string();
-            let out = self.ingest_form.output.trim().to_string();
-            let is_dir = std::path::Path::new(&src).is_dir();
-            let (name, _, _) = ACTIONS[self.ingest_form.action];
-            let args = vec!["-a".to_string(), name.to_string(), (if is_dir { "-d" } else { "-f" }).to_string(), src, "-o".to_string(), out.clone(), "--overwrite".to_string()];
-            let add = self.ingest_form.add;
-            self.start_job(JobKind::Ingest, format!("Parsing with {}", name), args, vec![out], add);
-            self.show_ingest = false;
-        } else {
-            self.show_ingest = open;
-        }
-    }
-
     pub(super) fn merge_window(&mut self, ctx: &egui::Context) {
         if !self.show_merge {
             return;
@@ -449,6 +494,10 @@ impl Viewer {
 
     /// The running (or just finished) job: its log, its time, its command.
     pub(super) fn job_window(&mut self, ctx: &egui::Context) {
+        // an ingest shows in its wizard while that is open
+        if self.ingest.open && self.job.as_ref().map_or(false, |j| j.kind == JobKind::Ingest) {
+            return;
+        }
         if let Some(job) = self.job.as_ref() {
             if job.autoclose_at.map_or(false, |t| std::time::Instant::now() >= t) {
                 let j = self.job.take().unwrap();
@@ -464,7 +513,7 @@ impl Viewer {
             Some(Ok(())) => format!("{}  {} — done", ic::CHECK_CIRCLE, job.title),
             Some(Err(_)) => format!("{}  {} — failed", ic::WARNING, job.title),
         };
-        let elapsed = job.started.elapsed().as_secs_f32();
+        let elapsed = job.elapsed();
         // the hunt's log stays folded while it runs (the canvas is the show); a
         // parse or a merge shows its log, there is nothing else to watch
         let folded = job.kind == JobKind::Hunt;
@@ -480,6 +529,10 @@ impl Viewer {
             ui.add(egui::Label::new(egui::RichText::new(&job.command).monospace().size(11.0).color(theme::MUTED)).wrap());
             if let Some(Err(e)) = &job.done {
                 ui.label(egui::RichText::new(e).color(SIGNIFICANT));
+            }
+            if !job.progress.phases.is_empty() {
+                theme::hairline(ui);
+                super::ingest::progress_ui(ui, job);
             }
             theme::hairline(ui);
             egui::ScrollArea::vertical().stick_to_bottom(true).max_height(230.0).auto_shrink([false, true]).show(ui, |ui| {

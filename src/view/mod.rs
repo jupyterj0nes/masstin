@@ -32,12 +32,18 @@ pub struct Options {
 /// Open the window; returns when it is closed.
 pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let clock = std::time::Instant::now();
-    crate::banner::print_phase("1", "2", "Reading the timeline...");
-    for f in &opts.files {
-        crate::banner::print_phase_detail("File:", f);
-    }
-    let merges = views::ViewsFile::load(&views::ViewsFile::path_for(&opts.files[0])).merges;
-    let store = store::Store::load_with(&opts.files, opts.alpha, &merges)?;
+    let store = if opts.files.is_empty() {
+        crate::banner::print_phase("1", "2", "No timeline given: the window opens on its welcome (open one, or drop evidence on it)");
+        store::Store::load_with(&[], opts.alpha, &[])?
+    } else {
+        crate::banner::print_phase("1", "2", "Reading the timeline...");
+        for f in &opts.files {
+            crate::banner::print_phase_detail("File:", f);
+        }
+        let merges = views::ViewsFile::load(&views::ViewsFile::path_for(&opts.files[0])).merges;
+        store::Store::load_with(&opts.files, opts.alpha, &merges)?
+    };
+    if !opts.files.is_empty() {
     crate::banner::print_phase_result(&format!(
         "{} rows: {} edges between {} hosts, {} accounts; {} row(s) without an origin, {} with an unreadable time ({:.1}s)",
         store.rows_total,
@@ -48,8 +54,9 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         store.rows_bad_time,
         clock.elapsed().as_secs_f64()
     ));
+    }
     crate::banner::print_phase("2", "2", "Opening the viewer (close the window to end)");
-    let title = format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", "));
+    let title = if opts.files.is_empty() { "masstin".to_string() } else { format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", ")) };
     let icon = image::load_from_memory(include_bytes!("../../resources/masstin_icon.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());

@@ -659,7 +659,7 @@ fn entry_is_image(name: &str) -> bool {
 /// pipeline)? Mirrors the dedup rules of the filesystem image scan: keep `.E01`
 /// / vmdk descriptor / `.001`, skip secondary EWF segments, vmdk extents and
 /// split-raw continuations.
-fn is_first_image_segment(p: &Path) -> bool {
+pub(crate) fn is_first_image_segment(p: &Path) -> bool {
     let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let lower = fname.to_lowercase();
     if lower.ends_with(".e01") || lower.ends_with(".ex01") { return true; }
