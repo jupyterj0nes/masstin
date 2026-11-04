@@ -6,12 +6,56 @@
 use super::*;
 use crate::view::icons as ic;
 use crate::view::theme;
-use crate::view::views::LabelPos;
+use crate::view::views::{LabelPos, NodeStyle};
 
 /// A host's rule being edited in its window (a working copy; writes go to
 /// the style on every change so the canvas shows them).
 pub(super) struct HostEdit {
     pub name: String,
+}
+
+/// The icons a host can carry: key (kept in the style), glyph, what it says.
+pub(super) const ICONS: &[(&str, &str, &str)] = &[
+    ("workstation", ic::DESKTOP, "workstation"),
+    ("laptop", ic::LAPTOP, "laptop"),
+    ("server", ic::HARD_DRIVES, "server"),
+    ("tower", ic::COMPUTER_TOWER, "tower"),
+    ("dc", ic::CASTLE_TURRET, "domain controller"),
+    ("database", ic::DATABASE, "database"),
+    ("cloud", ic::CLOUD, "cloud"),
+    ("globe", ic::GLOBE, "external / internet"),
+    ("ip", ic::BROADCAST, "address"),
+    ("router", ic::WIFI_HIGH, "router / network"),
+    ("phone", ic::DEVICE_MOBILE, "phone"),
+    ("tablet", ic::DEVICE_TABLET, "tablet"),
+    ("printer", ic::PRINTER, "printer"),
+    ("camera", ic::CAMERA, "camera / IoT"),
+    ("usb", ic::USB, "removable media"),
+    ("plc", ic::FACTORY, "OT / plant"),
+    ("building", ic::BUILDINGS, "site"),
+    ("user", ic::USER, "person"),
+    ("key", ic::KEY, "credential store"),
+    ("lock", ic::LOCK_KEY, "secured"),
+    ("shield", ic::SHIELD_CHECK, "security tool"),
+    ("skull", ic::SKULL, "attacker"),
+    ("bug", ic::BUG, "malware"),
+    ("robot", ic::ROBOT, "bot / service"),
+    ("question", ic::QUESTION, "unknown"),
+];
+
+pub(super) fn icon_glyph(key: &str) -> Option<&'static str> {
+    ICONS.iter().find(|(k, _, _)| k.eq_ignore_ascii_case(key)).map(|(_, g, _)| *g)
+}
+
+/// The icon a host gets from what the graph makes of it.
+pub(super) fn role_icon(role: Role, is_ip: bool) -> &'static str {
+    match role {
+        Role::External => ic::GLOBE,
+        _ if is_ip => ic::BROADCAST,
+        Role::DomainController => ic::CASTLE_TURRET,
+        Role::Server => ic::HARD_DRIVES,
+        _ => ic::DESKTOP,
+    }
 }
 
 /// The default box behind a name when a box is asked for and no colour is.
@@ -114,6 +158,16 @@ impl Viewer {
         let mut changed = false;
         let mut resize = false;
         egui::Window::new(format!("{}  Labels and sizes", ic::TAG)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
+            theme::section(ui, "How a host is drawn");
+            ui.horizontal_wrapped(|ui| {
+                for st in NodeStyle::ALL {
+                    if theme::pill(ui, self.style.node_style == st, st.label(), theme::ACCENT).clicked() {
+                        self.style.node_style = st;
+                        changed = true;
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("Icons follow what the graph makes of each host (workstation, server, domain controller, address, external); a host's own icon is set from its right-click menu.").color(theme::DIM).small());
             theme::section(ui, "Where the name goes");
             ui.horizontal_wrapped(|ui| {
                 for pos in LabelPos::ALL {
@@ -178,6 +232,7 @@ impl Viewer {
         let mut text_mul = current.as_ref().and_then(|r| r.label_size).unwrap_or(1.0);
         let mut bg = current.as_ref().and_then(|r| r.label_bg);
         let mut color = current.as_ref().and_then(|r| r.color);
+        let mut icon_key: Option<String> = current.as_ref().and_then(|r| r.icon.clone());
         egui::Window::new(format!("{}  {}", ic::DESKTOP, name)).open(&mut open).collapsible(false).resizable(false).default_width(420.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
             theme::section(ui, "Name");
             ui.horizontal_wrapped(|ui| {
@@ -215,6 +270,22 @@ impl Viewer {
             });
             theme::section(ui, "Host");
             ui.horizontal(|ui| {
+                ui.label("icon");
+                let shown = icon_key.as_deref().and_then(|k| ICONS.iter().find(|(key, _, _)| key.eq_ignore_ascii_case(k))).map(|(_, g, l)| format!("{}  {}", g, l)).unwrap_or_else(|| "none (by role in icon style)".to_string());
+                egui::ComboBox::from_id_salt("host-icon").selected_text(shown).width(240.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(icon_key.is_none(), "none (by role in icon style)").clicked() {
+                        icon_key = None;
+                        changed = true;
+                    }
+                    for (key, glyph, label) in ICONS {
+                        if ui.selectable_label(icon_key.as_deref().map_or(false, |k| k.eq_ignore_ascii_case(key)), format!("{}  {}", glyph, label)).clicked() {
+                            icon_key = Some(key.to_string());
+                            changed = true;
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
                 ui.label("size ×");
                 changed |= ui.add(egui::Slider::new(&mut size_mul, 0.4..=3.0).fixed_decimals(1)).changed();
             });
@@ -248,6 +319,7 @@ impl Viewer {
             rule.label_size = if (text_mul - 1.0).abs() < 1e-3 { None } else { Some(text_mul) };
             rule.label_bg = bg;
             rule.color = color;
+            rule.icon = icon_key;
             self.persist();
         }
         if !open {
