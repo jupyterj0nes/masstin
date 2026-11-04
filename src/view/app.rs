@@ -421,7 +421,7 @@ impl Viewer {
                     ui.image((t.id(), Vec2::new(420.0, 357.0)));
                 }
                 ui.label(egui::RichText::new(format!("masstin {}  ·  lateral movement tracker for anything", env!("CARGO_PKG_VERSION"))).color(theme::MUTED));
-                ui.label(egui::RichText::new("The graph viewer: the timeline CSV is the truth, no database. Fonts: Inter (OFL) and Phosphor icons (MIT).").color(theme::DIM).small());
+                ui.label(egui::RichText::new("The graph viewer: the timeline CSV is the truth, no database. Fonts: Inter (OFL), Phosphor icons (MIT), Press Start 2P (OFL) for the arcade.").color(theme::DIM).small());
             });
         });
         self.show_about = open;
@@ -1719,9 +1719,9 @@ impl Viewer {
             if a != b {
                 node_edges[b].push(k as u32);
             }
-            let base = 1.0 + 2.2 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln();
+            let base = 0.7 + 1.6 * ((1 + e.count) as f32).ln() / (1.0 + max_count).ln();
             let mut color = self.edge_base_color(e);
-            let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.5 } else { base };
+            let mut width = if e.hunt == super::store::H_SIGNIFICANT { base * 1.4 } else { base };
             let mut dashed = e.result == R_LOGOFF || e.result == R_CONNECT;
             let mut glow = false;
             let mut hide = false;
@@ -1915,7 +1915,11 @@ impl Viewer {
             self.fit_pending = false;
         }
         let t_bg = std::time::Instant::now();
-        draw::background(&painter, canvas, BG, BG_CENTRE, (self.cam.x, self.cam.y), self.zoom, draw::BgStyle { grid: self.style.grid, vignette: self.style.vignette, arcade: self.style.node_style == NodeStyle::Arcade });
+        let arcade_mode = self.style.node_style == NodeStyle::Arcade;
+        draw::background(&painter, canvas, BG, BG_CENTRE, (self.cam.x, self.cam.y), self.zoom, draw::BgStyle { grid: self.style.grid, vignette: self.style.vignette, arcade: arcade_mode, t: now, motion: self.style.motion && !self.presenting });
+        if self.style.motion && !arcade_mode && !self.presenting {
+            draw::dust(&painter, canvas, now);
+        }
         self.bg_ms = t_bg.elapsed().as_secs_f32() * 1000.0;
         if self.layout.len() == 0 {
             painter.text(canvas.center(), Align2::CENTER_CENTER, "nothing to draw with these filters", FontId::proportional(16.0), MUTED);
@@ -2195,7 +2199,7 @@ impl Viewer {
             let plain = lod && !lit && !selected;
             let glow = !plain && (arcade || ((self.style.edge_glow || look.glow) && (look.glow || emphasised || progress < 1.0 || (lit && focus.is_some()) || (look.finding && dimmed < 0.5))));
             if glow {
-                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 9.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else { 0.2 } * alpha)) });
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 6.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else if arcade { 0.22 } else { 0.16 } * alpha)) });
             }
             if flash > 0.0 {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + (6.0 + 26.0 * flash) * z.sqrt(), draw::fade(draw::lighten(color, 0.4), 0.55 * flash * alpha)) });
@@ -2215,6 +2219,10 @@ impl Viewer {
             } else if look.dashed {
                 draw::dashed_curve(&painter, pa, pc, pb, width, draw::fade(stroke_color, alpha), (5.0 * z.sqrt()).clamp(3.0, 9.0));
             } else {
+                // a faint halo under the line gives it body without weight
+                if !lod && !glow {
+                    painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width * 2.4 + 1.5, draw::fade(stroke_color, 0.09 * alpha)) });
+                }
                 draw::gradient_curve(&painter, pa, pc, pb, width, draw::fade(stroke_color, alpha * 0.5), draw::fade(stroke_color, alpha));
             }
             edges_drawn += 1;
@@ -2265,7 +2273,11 @@ impl Viewer {
                 let r = (2.2 * z.sqrt()).clamp(1.2, 3.2);
                 for j in 0..n {
                     let t = (now * speed + phase + j as f32 / n as f32).fract();
-                    draw::particle(&painter, g.a, g.c, g.b, t, r, if lit { draw::lighten(look.color, 0.2) } else { look.color }, alpha);
+                    if arcade_mode {
+                        draw::particle_square(&painter, g.a, g.c, g.b, t, r * 1.1, if lit { draw::lighten(look.color, 0.2) } else { look.color }, alpha);
+                    } else {
+                        draw::particle(&painter, g.a, g.c, g.b, t, r, if lit { draw::lighten(look.color, 0.2) } else { look.color }, alpha);
+                    }
                 }
             }
             keep_moving = true;
@@ -2403,10 +2415,17 @@ impl Viewer {
         }
         self.draw_subnets(&painter, canvas, true);
         self.nodes_ms = t_nodes.elapsed().as_secs_f32() * 1000.0;
+        if self.style.motion && !self.presenting {
+            // the dust and the stars move on their own
+            keep_moving = true;
+        }
         if keep_moving {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
         }
 
+        if arcade_mode {
+            draw::scanlines(&painter, canvas, 0.10);
+        }
         // ── hover tooltip ──
         if let (Some(Sel::Node(i)), Some(p)) = (self.hovered, pointer) {
             let n = &self.graph.nodes[i];

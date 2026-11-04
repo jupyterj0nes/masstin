@@ -83,7 +83,8 @@ pub(super) fn ink_for(bg: Color32) -> Color32 {
 /// the zoom and the scales ask for; returns whether something was drawn.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: f32, pos: LabelPos, base_px: f32, bg: Option<Color32>, ring: Color32, alpha: f32, lit: bool, crowd: bool, mono: bool) -> bool {
-    let font_of = |px: f32| if mono { FontId::monospace(px) } else { FontId::proportional(px) };
+    // the arcade's face is wide: a size down keeps the names the same length
+    let font_of = |px: f32| if mono { theme::pixel_font((px * 0.72).max(6.0)) } else { FontId::proportional(px) };
     let chars = name.chars().count().max(1) as f32;
     let fits = (r * 1.8) / (chars * 0.56);
     let inside_ok = r > 9.0 && fits >= (base_px * 0.75).max(8.5);
