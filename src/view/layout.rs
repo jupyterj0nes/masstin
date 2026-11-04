@@ -230,6 +230,10 @@ pub struct Layout {
     degree: Vec<u32>,
     alpha: f32,
     pub link_distance: f32,
+    /// the group (subnet) of each node, pulled towards its centre
+    pub group: Vec<Option<u16>>,
+    /// the canvas's width over its height: gravity stretches the picture to it
+    pub aspect: f32,
     max_radius: f32,
     /// the last tick still pushed overlapping hosts apart
     unsettled: bool,
@@ -266,7 +270,7 @@ impl Layout {
             degree[b] += 1;
         }
         let max_radius = radius.iter().copied().fold(1.0f32, f32::max);
-        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, max_radius, unsettled: true, cold_since: None, tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
+        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, group: vec![None; n], aspect: 1.0, max_radius, unsettled: true, cold_since: None, tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -338,9 +342,54 @@ impl Layout {
             self.force[a] += d * (k * (1.0 - bias));
             self.force[b] -= d * (k * bias);
         }
-        // gravity towards the origin
+        // gravity towards the origin, weaker along the canvas's long side so
+        // the picture fills it
+        let (gx, gy) = (0.006 / self.aspect.max(0.5).sqrt(), 0.006 * self.aspect.max(0.5).sqrt());
         for i in 0..n {
-            self.force[i] -= self.pos[i] * (0.006 * alpha);
+            self.force[i].x -= self.pos[i].x * (gx * alpha);
+            self.force[i].y -= self.pos[i].y * (gy * alpha);
+        }
+        // groups: every member pulled towards its group's centre, the groups
+        // pushed apart a little
+        if self.group.len() == n && self.group.iter().any(|g| g.is_some()) {
+            let mut sum: Vec<(V2, f32)> = Vec::new();
+            for i in 0..n {
+                if let Some(g) = self.group[i] {
+                    let g = g as usize;
+                    if sum.len() <= g {
+                        sum.resize(g + 1, (V2::default(), 0.0));
+                    }
+                    sum[g].0 += self.pos[i];
+                    sum[g].1 += 1.0;
+                }
+            }
+            let centres: Vec<Option<V2>> = sum.iter().map(|(s, c)| if *c > 0.0 { Some(*s * (1.0 / c)) } else { None }).collect();
+            for i in 0..n {
+                if let Some(g) = self.group[i] {
+                    if let Some(Some(c)) = centres.get(g as usize) {
+                        self.force[i] += (*c - self.pos[i]) * (0.14 * alpha);
+                    }
+                }
+            }
+            for a in 0..centres.len() {
+                for b in (a + 1)..centres.len() {
+                    if let (Some(ca), Some(cb)) = (centres[a], centres[b]) {
+                        let d = cb - ca;
+                        let dist = d.len().max(1.0);
+                        let want = self.link_distance * 4.5;
+                        if dist < want {
+                            let push = d * ((want - dist) / dist * 0.06 * alpha);
+                            for i in 0..n {
+                                match self.group[i] {
+                                    Some(g) if g as usize == a => self.force[i] -= push,
+                                    Some(g) if g as usize == b => self.force[i] += push,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         // integrate
         let mut moving = false;

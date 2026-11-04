@@ -134,6 +134,11 @@ impl Viewer {
                 let mut changed = false;
                 changed |= ui.checkbox(&mut self.style.motion, format!("{}  Motion", ic::WAVEFORM)).changed();
                 changed |= ui.checkbox(&mut self.style.shapes_by_role, format!("{}  Shapes by role", ic::HEXAGON)).changed();
+                if ui.checkbox(&mut self.style.show_subnets, format!("{}  Subnet regions", ic::WIFI_HIGH)).on_hover_text("Hosts grouped by the /24 of their address, or by your named CIDRs (Tools › Subnets…), each group a region behind them").changed() {
+                    changed = true;
+                    self.compute_subnets();
+                    self.layout.reheat(0.5);
+                }
                 if ui.checkbox(&mut self.style.size_by_traffic, format!("{}  Host size by traffic", ic::CIRCLES_THREE_PLUS)).on_hover_text("On: a host grows with its events in and out of the view (log scale). Off: every host the same size").changed() {
                     changed = true;
                     let f = self.draft.clone();
@@ -205,6 +210,10 @@ impl Viewer {
                 if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merged hosts… ({})", self.merges.len())).clicked() {
                     ui.close();
                     self.show_merges = true;
+                }
+                if icon_button(ui, ic::WIFI_HIGH, &format!("Subnets… ({})", self.subnet_defs.len())).clicked() {
+                    ui.close();
+                    self.show_subnets_window = true;
                 }
                 if icon_button(ui, ic::TERMINAL_WINDOW, "Log of the last run…").clicked() {
                     ui.close();
@@ -290,6 +299,12 @@ impl Viewer {
             }
             if tool(ui, ic::TAG, "Labels and sizes", self.show_labels).clicked() {
                 self.show_labels = !self.show_labels;
+            }
+            if tool(ui, ic::WIFI_HIGH, "Subnet regions: hosts grouped by where they sit on the network", self.style.show_subnets).clicked() {
+                self.style.show_subnets = !self.style.show_subnets;
+                self.persist();
+                self.compute_subnets();
+                self.layout.reheat(0.5);
             }
             if tool(ui, ic::PALETTE, "Style rules", self.show_rules).clicked() {
                 self.show_rules = !self.show_rules;

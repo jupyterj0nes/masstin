@@ -86,6 +86,12 @@ Three tabs on the right.
 - **Notes**: the notes of the case (on a host, on a connection, or free), with the time they were written and a way to delete them, then every row of the timeline that carries a verdict or a note, click to open its connection.
 - **Legend**: what the colours, rings, halos and widths mean.
 
+## Subnets
+
+The toolbar's antenna (or View › Subnet regions) groups the hosts of the view by where they sit on the network: **Tools › Subnets…** takes your CIDRs with a name (`10.10.0.0/24  servers VLAN 10`), and, when *auto* is on, every other host with an address gets the group of its /24. A host joins a group through the addresses it is known by (its own names, the address the hunt or you merged into it). Each group pulls its hosts together in the layout and pushes the other groups away, and is drawn as a soft region in its colour behind them with its name on top. The named subnets live in `<timeline>.views.json`.
+
+The layout shares the window out: the distance between hosts comes from the room there is and the number of hosts, and the picture stretches along the window's long side, so a small graph spreads over the canvas instead of huddling in the middle.
+
 ## Merging hosts
 
 The same machine often comes as an address in one log and as a name in another. The hunt folds an address into a name by itself when the same-login test allows it; for the rest, **right-click a host › Merge with another host…** (pick the other from the list), or select a host and right-click the other › **Merge with <host>…**. The window asks **which name stays**; the two become one node, every connection follows, the other name stays among the host's names in the inspector (with an undo next to it), and a note in the case says the host is a merge of the two. **Tools › Merged hosts…** lists the pairs, undoes any, adds one by name. The timeline CSV is not changed and keeps both names: the pairs live in `<timeline>.views.json` next to it, so they survive sessions and travel with the case.
