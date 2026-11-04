@@ -36,7 +36,7 @@ use super::views::{LabelPos, NodeStyle};
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
-use super::present::{self, Anonymiser, Format, Step, StepOverride, Story, Timing};
+use super::present::{self, Anonymiser, Format, LogoPos, Step, StepOverride, Story, Timing};
 use super::views::{builtin_views, palette_color, Caption, ColorBy, Field, Rule, SavedView, Shape, Style, ViewsFile};
 use super::Options;
 
@@ -330,6 +330,10 @@ pub struct Viewer {
     logo_small: Option<egui::TextureHandle>,
     logo_full: Option<egui::TextureHandle>,
     logo_dog: Option<egui::TextureHandle>,
+    /// the story's logo as loaded: path, texture, pixels
+    brand: Option<(String, egui::TextureHandle, [usize; 2])>,
+    /// the path that could not be read, and why
+    brand_err: Option<(String, String)>,
     show_about: bool,
     /// the summary shown once the findings have lit up
     hunt_report: Option<HuntReport>,
@@ -577,6 +581,8 @@ impl Viewer {
             logo_small: logos.0,
             logo_full: logos.1,
             logo_dog: logos.2,
+            brand: None,
+            brand_err: None,
             show_about: false,
             hunt_report: None,
             hunt_report_at: None,
@@ -2405,6 +2411,9 @@ impl Viewer {
         self.nodes_drawn = nodes_drawn;
         self.edges_drawn = edges_drawn;
         self.draw_ms = draw_start.elapsed().as_secs_f32() * 1000.0;
+        if !self.presenting && self.story.logo_always {
+            self.brand_overlay(&painter, canvas, 0.0);
+        }
         if self.hud {
             let fps = if self.frame_ms > 0.0 { 1000.0 / self.frame_ms } else { 0.0 };
             let text = format!("{} / {} hosts · {} / {} edges · layout {:.1} · bg {:.1} · geom {:.1} · hit {:.1} · edges {:.1} · hosts {:.1} · draw {:.1} ms · frame {:.1} ms · {:.0} fps{}", nodes_drawn, self.graph.nodes.len(), edges_drawn, self.graph.edges.len(), self.layout_ms, self.bg_ms, self.geom_ms, self.hit_ms, self.edges_ms, self.nodes_ms, self.draw_ms, self.frame_ms, fps, if lod { " · reduced detail" } else { "" });
@@ -2416,12 +2425,74 @@ impl Viewer {
         }
     }
 
+    /// The story's logo in its corner. `lift` raises a bottom logo above a
+    /// caption. Returns where it went.
+    fn brand_overlay(&mut self, painter: &egui::Painter, canvas: Rect, lift: f32) -> Option<Rect> {
+        let path = self.story.logo.trim().to_string();
+        if path.is_empty() {
+            self.brand = None;
+            return None;
+        }
+        if self.brand.as_ref().map_or(true, |(p, _, _)| *p != path) {
+            if self.brand_err.as_ref().map_or(false, |(p, _)| *p == path) {
+                return None;
+            }
+            self.brand = None;
+            match image::open(&path) {
+                Ok(img) => {
+                    let mut rgba = img.to_rgba8();
+                    if rgba.width() > 1024 {
+                        let h = ((rgba.height() as f32) * 1024.0 / rgba.width() as f32).max(1.0) as u32;
+                        rgba = image::imageops::resize(&rgba, 1024, h, image::imageops::FilterType::Lanczos3);
+                    }
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    let tex = painter.ctx().load_texture("brand-logo", ci, egui::TextureOptions::LINEAR);
+                    self.brand = Some((path.clone(), tex, size));
+                    self.brand_err = None;
+                }
+                Err(e) => {
+                    self.brand_err = Some((path, e.to_string()));
+                    return None;
+                }
+            }
+        }
+        let (_, tex, size) = self.brand.as_ref()?;
+        let mut w = canvas.width() * self.story.logo_width.clamp(0.03, 0.6);
+        let mut h = w * size[1] as f32 / size[0].max(1) as f32;
+        let max_h = canvas.height() * 0.3;
+        if h > max_h {
+            w *= max_h / h;
+            h = max_h;
+        }
+        let m = 14.0;
+        let x = match self.story.logo_pos {
+            LogoPos::TopLeft | LogoPos::BottomLeft => canvas.left() + m,
+            LogoPos::TopCentre | LogoPos::BottomCentre => canvas.center().x - w / 2.0,
+            LogoPos::TopRight | LogoPos::BottomRight => canvas.right() - m - w,
+        };
+        let y = match self.story.logo_pos {
+            LogoPos::TopLeft | LogoPos::TopCentre | LogoPos::TopRight => canvas.top() + m,
+            _ => canvas.bottom() - m - h - lift,
+        };
+        let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
+        painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), draw::fade(Color32::WHITE, self.story.logo_opacity.clamp(0.05, 1.0)));
+        Some(r)
+    }
+
     fn presentation_overlays(&mut self, painter: &egui::Painter, canvas: Rect) {
         let fs = self.style.font_scale;
-        if !self.story.title.is_empty() {
-            painter.text(Pos2::new(canvas.center().x, canvas.top() + 16.0), Align2::CENTER_TOP, &self.story.title, FontId::proportional(22.0 * fs), TEXT);
-        }
         let cur = self.current_step();
+        // a bottom logo stays above the caption; a top-centre one pushes the title down
+        let lift = if self.story.show_caption && cur.is_some() { 64.0 * fs } else { 0.0 };
+        let logo = self.brand_overlay(painter, canvas, lift);
+        if !self.story.title.is_empty() {
+            let top = match logo {
+                Some(r) if self.story.logo_pos == LogoPos::TopCentre => r.bottom() + 8.0,
+                _ => canvas.top() + 16.0,
+            };
+            painter.text(Pos2::new(canvas.center().x, top), Align2::CENTER_TOP, &self.story.title, FontId::proportional(22.0 * fs), TEXT);
+        }
         if let Some(k) = cur {
             let st = self.steps[k].clone();
             if self.story.show_clock {
@@ -2806,6 +2877,44 @@ impl Viewer {
                     changed |= ui.checkbox(&mut self.story.anonymise, "anonymise").on_hover_text("HOST-01, user-02, 10.x.x.3: consistent stand-ins for a talk").changed();
                 });
                 ui.end_row();
+                ui.label("Logo").on_hover_text("Your company's logo on the presentation and the recording: PNG (with transparency), JPEG, WebP, BMP or GIF. The path is saved with the story.");
+                ui.horizontal(|ui| {
+                    changed |= ui.add_sized([188.0, 20.0], egui::TextEdit::singleline(&mut self.story.logo).hint_text("none: pick an image file…")).changed();
+                    if ui.button("Choose…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().set_title("Logo for the recording").add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]).pick_file() {
+                            self.story.logo = p.to_string_lossy().to_string();
+                            changed = true;
+                        }
+                    }
+                    if !self.story.logo.is_empty() && ui.add(egui::Button::new(egui::RichText::new(super::icons::X).color(theme::DIM)).frame(false)).on_hover_text("No logo").clicked() {
+                        self.story.logo.clear();
+                        changed = true;
+                    }
+                });
+                ui.label("Place it");
+                egui::ComboBox::from_id_salt("logo-pos").selected_text(self.story.logo_pos.label()).show_ui(ui, |ui| {
+                    for p in LogoPos::ALL {
+                        changed |= ui.selectable_value(&mut self.story.logo_pos, p, p.label()).changed();
+                    }
+                });
+                ui.label("Width % / opacity");
+                ui.horizontal(|ui| {
+                    let mut pct = self.story.logo_width * 100.0;
+                    if ui.add(egui::DragValue::new(&mut pct).range(3.0..=60.0).speed(0.5).fixed_decimals(0).suffix(" %")).on_hover_text("of the window's width; the height follows the image").changed() {
+                        self.story.logo_width = pct / 100.0;
+                        changed = true;
+                    }
+                    changed |= ui.add(egui::DragValue::new(&mut self.story.logo_opacity).range(0.05..=1.0).speed(0.02).fixed_decimals(2)).on_hover_text("1: as it is; lower for a watermark").changed();
+                    changed |= ui.checkbox(&mut self.story.logo_always, "also on the window").on_hover_text("Show it outside the presentation too").changed();
+                });
+                ui.end_row();
+                if let Some((p, e)) = &self.brand_err {
+                    if *p == self.story.logo.trim() {
+                        ui.label("");
+                        ui.label(egui::RichText::new(format!("cannot read this image: {}", e)).color(SIGNIFICANT).small());
+                        ui.end_row();
+                    }
+                }
             });
             ui.add_space(4.0);
             ui.label(egui::RichText::new("STRETCHES   (a part of the timeline at a speed of its own: the first stretch a step falls in sets its timing; the rest take the global one)").small().color(MUTED));
