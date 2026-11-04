@@ -173,7 +173,7 @@ pub fn orb(painter: &egui::Painter, shape: NodeShape, c: Pos2, r: f32, fill: Col
 /// lit centre to a darker rim, a highlight towards the top left, a thin
 /// bright rim and a faint outer ring; an icon in the middle when asked.
 #[allow(clippy::too_many_arguments)]
-pub fn glass(painter: &egui::Painter, c: Pos2, r: f32, base: Color32, ring: Color32, alpha: f32, ring_width: f32, icon: Option<&str>, minimal: bool) {
+pub fn glass(painter: &egui::Painter, c: Pos2, r: f32, base: Color32, ring: Color32, alpha: f32, ring_width: f32, icon: Option<&str>, minimal: bool, sheen: Option<f32>) {
     if minimal {
         painter.circle_filled(c, r * 0.5, fade(lighten(base, 0.15), alpha));
         painter.circle_stroke(c, r, Stroke::new(ring_width.min(1.5), fade(ring, 0.7 * alpha)));
@@ -209,10 +209,28 @@ pub fn glass(painter: &egui::Painter, c: Pos2, r: f32, base: Color32, ring: Colo
     }
     painter.circle_stroke(c, r, Stroke::new(ring_width, fade(lighten(ring, 0.12), 0.85 * alpha)));
     painter.circle_stroke(c, r + 2.5, Stroke::new(1.0, fade(ring, 0.16 * alpha)));
+    // a bright sheen sliding round the rim, when the picture is alive
+    if let Some(angle) = sheen {
+        if r > 7.0 {
+            let n = 14;
+            let span = 1.3;
+            for k in 0..n {
+                let t0 = k as f32 / n as f32;
+                let t1 = (k + 1) as f32 / n as f32;
+                let a0 = angle + t0 * span;
+                let a1 = angle + t1 * span;
+                let w = (1.0 - (t0 * 2.0 - 1.0).abs()).max(0.0);
+                let col = fade(Color32::WHITE, 0.55 * w * alpha);
+                painter.line_segment([Pos2::new(c.x + a0.cos() * r, c.y + a0.sin() * r), Pos2::new(c.x + a1.cos() * r, c.y + a1.sin() * r)], Stroke::new(ring_width + 1.0, col));
+            }
+        }
+    }
     if let Some(g) = icon {
-        let size = (r * 1.05).max(8.0);
-        painter.text(Pos2::new(c.x, c.y + r * 0.02), egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::from_rgb(10, 14, 22), 0.35 * alpha));
-        painter.text(Pos2::new(c.x, c.y - r * 0.02), egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::WHITE, 0.94 * alpha));
+        let size = (r * 1.0).max(8.0);
+        // a darker disc behind the glyph so it reads on every colour
+        painter.circle_filled(c, r * 0.72, fade(darken(base, 0.45), 0.55 * alpha));
+        painter.text(Pos2::new(c.x, c.y + r * 0.04), egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::from_rgb(8, 12, 20), 0.5 * alpha));
+        painter.text(c, egui::Align2::CENTER_CENTER, g, egui::FontId::proportional(size), fade(Color32::WHITE, 0.96 * alpha));
     }
 }
 
