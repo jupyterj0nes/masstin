@@ -109,6 +109,41 @@ impl Shape {
     }
 }
 
+/// Where a host's name is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum LabelPos {
+    /// inside when it stays readable there, under the host otherwise
+    #[default]
+    Auto,
+    Inside,
+    /// a band across the host, wider than it, like a road sign
+    Band,
+    Below,
+    Above,
+}
+
+impl LabelPos {
+    pub const ALL: [LabelPos; 5] = [LabelPos::Auto, LabelPos::Inside, LabelPos::Band, LabelPos::Below, LabelPos::Above];
+    pub fn label(self) -> &'static str {
+        match self {
+            LabelPos::Auto => "auto",
+            LabelPos::Inside => "inside",
+            LabelPos::Band => "band",
+            LabelPos::Below => "below",
+            LabelPos::Above => "above",
+        }
+    }
+    pub fn help(self) -> &'static str {
+        match self {
+            LabelPos::Auto => "inside the host when the name fits readably, under it otherwise",
+            LabelPos::Inside => "inside the host, shrunk to fit",
+            LabelPos::Band => "a band across the host, wider than it, the name on it",
+            LabelPos::Below => "under the host",
+            LabelPos::Above => "over the host",
+        }
+    }
+}
+
 /// `condition -> look`. Empty `pattern` matches everything.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Rule {
@@ -125,11 +160,18 @@ pub struct Rule {
     pub shape: Option<Shape>,
     /// a glow around the edge / the host
     pub glow: bool,
+    /// a host's own name position, text size multiplier and box colour
+    #[serde(default)]
+    pub label_pos: Option<LabelPos>,
+    #[serde(default)]
+    pub label_size: Option<f32>,
+    #[serde(default)]
+    pub label_bg: Option<[u8; 3]>,
 }
 
 impl Default for Rule {
     fn default() -> Self {
-        Rule { enabled: true, field: Field::User, pattern: String::new(), color: Some([255, 196, 84]), width: 1.0, size: 1.0, dashed: false, hide: false, shape: None, glow: false }
+        Rule { enabled: true, field: Field::User, pattern: String::new(), color: Some([255, 196, 84]), width: 1.0, size: 1.0, dashed: false, hide: false, shape: None, glow: false, label_pos: None, label_size: None, label_bg: None }
     }
 }
 
@@ -146,6 +188,20 @@ pub struct Style {
     /// significant host, the hover ring
     #[serde(default = "yes")]
     pub motion: bool,
+    /// a host's size grows with its traffic in the view; off, every host is the same
+    #[serde(default = "yes")]
+    pub size_by_traffic: bool,
+    #[serde(default)]
+    pub label_pos: LabelPos,
+    /// a box behind every name, in `label_bg_color`
+    #[serde(default)]
+    pub label_bg: bool,
+    #[serde(default = "label_box")]
+    pub label_bg_color: [u8; 3],
+}
+
+fn label_box() -> [u8; 3] {
+    [20, 25, 36]
 }
 
 fn yes() -> bool {
@@ -154,7 +210,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 1.0, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box() }
     }
 }
 

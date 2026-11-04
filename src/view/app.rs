@@ -9,6 +9,7 @@
 //! warm and the analyst can drag any host.
 
 mod chrome;
+mod labels;
 mod tasks;
 
 use std::borrow::Cow;
@@ -22,6 +23,8 @@ use super::notes::{NoteTarget, Notes};
 use super::query::{fmt_time, hunt_rank, parse_time, Filter, GEdge, GraphView, Role, View};
 use super::theme;
 use chrome::{Brush, ColorPick, Tab};
+use labels::HostEdit;
+use super::views::LabelPos;
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
@@ -131,6 +134,10 @@ struct NodeLook {
     hide: bool,
     /// the drawn edges touching it
     edges: Vec<u32>,
+    label_pos: LabelPos,
+    /// text size multiplier of its own
+    label_size: f32,
+    label_bg: Option<Color32>,
 }
 
 #[derive(Default)]
@@ -269,6 +276,8 @@ pub struct Viewer {
     notes: Notes,
     note_draft: Option<(NoteTarget, String)>,
     mark_dialog: Option<MarkDialog>,
+    /// the rows ticked in the inspector, to mark some and not the whole block
+    row_pick: Vec<bool>,
     // work in progress: a child masstin, the hunt's reveal
     job: Option<Job>,
     hunt_form: HuntForm,
@@ -281,6 +290,8 @@ pub struct Viewer {
     reveal_rank: Vec<f32>,
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
+    show_labels: bool,
+    host_edit: Option<HostEdit>,
     last_log: Option<(String, Vec<String>)>,
     show_last_log: bool,
 }
@@ -451,6 +462,7 @@ impl Viewer {
             notes: Notes::load(&Notes::path_for(&notes_path)),
             note_draft: None,
             mark_dialog: None,
+            row_pick: Vec::new(),
             job: None,
             hunt_form: HuntForm { from: String::new(), end: String::new(), alpha: String::new() },
             ingest_form: IngestForm { action: 0, source: String::new(), output: String::new(), add: true },
@@ -459,6 +471,8 @@ impl Viewer {
             hunt_reveal: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
+            show_labels: false,
+            host_edit: None,
             last_log: None,
             show_last_log: false,
         };
@@ -485,7 +499,8 @@ impl Viewer {
         };
         let g = &self.graph;
         let max_traffic = g.nodes.iter().map(|n| n.inn + n.out).max().unwrap_or(1).max(1) as f32;
-        let radii: Vec<f32> = g.nodes.iter().map(|n| 20.0 + 10.0 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln()).collect();
+        let by_traffic = self.style.size_by_traffic;
+        let radii: Vec<f32> = g.nodes.iter().map(|n| if by_traffic { 20.0 + 10.0 * ((1 + n.inn + n.out) as f32).ln() / (1.0 + max_traffic).ln() } else { 24.0 }).collect();
         let mut links: Vec<(usize, usize)> = g.edges.iter().map(|e| (g.node_of_host[&e.src], g.node_of_host[&e.dst])).filter(|(a, b)| a != b).collect();
         links.sort_unstable();
         links.dedup();
@@ -498,6 +513,8 @@ impl Viewer {
         self.focus_t = 0.0;
         self.selected = None;
         self.hovered = None;
+        self.ctx_target = None;
+        self.mark_dialog = None;
         self.rows = None;
         self.cursor = self.graph.events.len();
         self.playing = false;
@@ -668,6 +685,7 @@ impl Viewer {
         self.notes_draft = out.iter().find(|r| !r.notes.is_empty()).map(|r| r.notes.clone()).unwrap_or_default();
         self.pending_verdict = None;
         self.mark_msg.clear();
+        self.row_pick = vec![false; out.len()];
         self.rows = Some((edge, out, total));
     }
 
@@ -710,6 +728,9 @@ impl Viewer {
 
     fn mark_window(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.mark_dialog.take() else { return };
+        if d.edge >= self.graph.edges.len() {
+            return;
+        }
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
@@ -1079,25 +1100,59 @@ impl Viewer {
             }
         });
         ui.add(egui::TextEdit::multiline(&mut self.notes_draft).desired_rows(3).desired_width(f32::INFINITY).hint_text("notes (written into the timeline)"));
-        ui.horizontal(|ui| {
-            let label = if users_n > 1 { format!("Save on every row of these {} accounts", users_n) } else { "Save on every row of this connection".to_string() };
-            if ui.add(egui::Button::new(theme::semibold(label, 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).clicked() {
-                let v = self.pending_verdict.unwrap_or(verdict);
-                self.begin_mark(i, v);
+        let picked: Vec<(u16, u32)> = self.rows.as_ref().map(|(_, r, _)| r.iter().enumerate().filter(|(k, _)| self.row_pick.get(*k).copied().unwrap_or(false)).map(|(_, r)| (r.file, r.line)).collect()).unwrap_or_default();
+        let total_rows = self.graph.edges[i].rows.len();
+        ui.horizontal_wrapped(|ui| {
+            let v = self.pending_verdict.unwrap_or(verdict);
+            if !picked.is_empty() {
+                let label = format!("Save on the {} ticked row{}", picked.len(), if picked.len() == 1 { "" } else { "s" });
+                if ui.add(egui::Button::new(theme::semibold(label, 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).on_hover_text("Only the rows ticked below get this verdict and these notes").clicked() {
+                    self.mark_rows(i, &picked, v);
+                }
             }
-            ui.label(egui::RichText::new(&self.mark_msg).color(MUTED).small());
+            let label = if total_rows == 1 {
+                "Save on this row".to_string()
+            } else if users_n > 1 {
+                format!("Save on all {} rows of these {} accounts", total_rows, users_n)
+            } else {
+                format!("Save on all {} rows", total_rows)
+            };
+            let whole = egui::Button::new(theme::semibold(label, 13.0).color(if picked.is_empty() { theme::ACCENT_INK } else { TEXT })).fill(if picked.is_empty() { ACCENT } else { theme::FIELD }).stroke(Stroke::NONE);
+            if ui.add(whole).on_hover_text("Every row this edge stands for").clicked() {
+                let all: Vec<(u16, u32)> = self.graph.edges[i].rows.iter().map(|&ei| (self.store.edges[ei as usize].file, self.store.edges[ei as usize].line)).collect();
+                self.mark_rows(i, &all, v);
+            }
         });
+        if !self.mark_msg.is_empty() {
+            ui.label(egui::RichText::new(&self.mark_msg).color(MUTED).small());
+        }
         ui.add_space(10.0);
         if let Some((_, rows, total)) = &self.rows {
-            ui.label(egui::RichText::new(format!("ROWS {}", if *total > rows.len() { format!("(first {} of {})", rows.len(), total) } else { total.to_string() })).small().color(MUTED));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("ROWS {}", if *total > rows.len() { format!("(first {} of {})", rows.len(), total) } else { total.to_string() })).small().color(MUTED));
+                if rows.len() > 1 {
+                    ui.label(egui::RichText::new("· tick the ones to mark:").small().color(theme::DIM));
+                    if ui.small_button("all").clicked() {
+                        self.row_pick.iter_mut().for_each(|p| *p = true);
+                    }
+                    if ui.small_button("none").clicked() {
+                        self.row_pick.iter_mut().for_each(|p| *p = false);
+                    }
+                }
+            });
             egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("rows").striped(true).min_col_width(40.0).show(ui, |ui| {
-                    for h in ["time", "event", "type", "account", "source", "subject", "logon id", "detail", "hunt", "verdict"] {
+                    for h in ["", "time", "event", "type", "account", "source", "subject", "logon id", "detail", "hunt", "verdict", "notes"] {
                         ui.label(egui::RichText::new(h).small().color(MUTED));
                     }
                     ui.end_row();
-                    for r in rows {
+                    for (k, r) in rows.iter().enumerate() {
                         let f = |k: usize| r.fields.get(k).cloned().unwrap_or_default();
+                        if let Some(p) = self.row_pick.get_mut(k) {
+                            ui.checkbox(p, "");
+                        } else {
+                            ui.label("");
+                        }
                         ui.label(egui::RichText::new(&r.t).monospace().small());
                         ui.label(egui::RichText::new(f(3)).small());
                         ui.label(egui::RichText::new(f(4)).small());
@@ -1109,7 +1164,9 @@ impl Viewer {
                         let d = f(12);
                         ui.label(egui::RichText::new(if d.chars().count() > 60 { format!("{}…", d.chars().take(60).collect::<String>()) } else { d.clone() }).small()).on_hover_text(d);
                         ui.label(egui::RichText::new(HUNT_NAMES[r.hunt as usize]).small().color(hunt_color(r.hunt).unwrap_or(MUTED)));
-                        ui.label(egui::RichText::new(VERDICT_NAMES[r.verdict as usize]).small().color(verdict_color(r.verdict).unwrap_or(MUTED))).on_hover_text(&r.notes);
+                        ui.label(egui::RichText::new(VERDICT_NAMES[r.verdict as usize]).small().color(verdict_color(r.verdict).unwrap_or(MUTED)));
+                        let n = &r.notes;
+                        ui.label(egui::RichText::new(if n.chars().count() > 40 { format!("{}…", n.chars().take(40).collect::<String>()) } else { n.clone() }).small().color(MUTED)).on_hover_text(n);
                         ui.end_row();
                         let _ = (r.file, r.line);
                     }
@@ -1417,9 +1474,21 @@ impl Viewer {
             let mut size = 1.0;
             let mut glow = false;
             let mut hide = false;
+            let mut label_pos = self.style.label_pos;
+            let mut label_size = 1.0;
+            let mut label_bg = if self.style.label_bg { Some(Color32::from_rgb(self.style.label_bg_color[0], self.style.label_bg_color[1], self.style.label_bg_color[2])) } else { None };
             if let Some((ri, _)) = rules.iter().filter(|(ri, _)| self.style.rules[*ri].field.on_nodes()).find(|(ri, pats)| self.rule_hits_node(&self.style.rules[*ri], pats, i)) {
                 let rule = &self.style.rules[*ri];
                 hide = rule.hide;
+                if let Some(p) = rule.label_pos {
+                    label_pos = p;
+                }
+                if let Some(s) = rule.label_size {
+                    label_size = s;
+                }
+                if let Some(c) = rule.label_bg {
+                    label_bg = Some(Color32::from_rgb(c[0], c[1], c[2]));
+                }
                 if let Some(c) = rule.color {
                     fill = Color32::from_rgb(c[0], c[1], c[2]);
                     ring = Color32::from_rgb((c[0] as f32 * 0.75) as u8, (c[1] as f32 * 0.75) as u8, (c[2] as f32 * 0.75) as u8);
@@ -1430,7 +1499,7 @@ impl Viewer {
                 size = rule.size;
                 glow = rule.glow;
             }
-            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]) });
+            nodes.push(NodeLook { name, is_ip, fill, ring, shape, size, glow, hide, edges: std::mem::take(&mut node_edges[i]), label_pos, label_size, label_bg });
         }
         let n_ip = nodes.iter().filter(|n| n.is_ip).count();
         self.scene = Scene { fingerprint, graph_id: self.graph_id, edges, nodes, chips: self.legend_chips(), n_ip };
@@ -1595,6 +1664,12 @@ impl Viewer {
         }
         if !self.presenting {
             resp.context_menu(|ui| self.context_menu(ui));
+        }
+        if self.scene.graph_id != self.graph_id {
+            // the menu changed the view under us: the looks and the geometry of
+            // this frame belong to the old graph, so draw it on the next one
+            ui.ctx().request_repaint();
+            return;
         }
         if resp.drag_started() {
             if let Some(Sel::Node(i)) = hit {
@@ -1927,20 +2002,9 @@ impl Viewer {
             let anonym = self.presenting && self.story.anonymise;
             let shown: Cow<str> = if anonym { Cow::Owned(self.anon.host(n.host, look.is_ip)) } else { Cow::Borrowed(look.name.as_str()) };
             let shown_name: &str = &shown;
-            if r > 9.0 && (!crowd_nodes || r > 14.0 || lit) {
-                let chars = shown_name.chars().count().max(1) as f32;
-                let wanted = (11.0 * z.sqrt() * fs).clamp(7.0, 18.0);
-                let fits = (r * 1.8) / (chars * 0.56);
-                let font_size = wanted.min(fits).max(6.5);
-                let max_chars = ((r * 1.8) / (font_size * 0.56)).floor().max(3.0) as usize;
-                let caption: String = if shown_name.chars().count() > max_chars { format!("{}…", shown_name.chars().take(max_chars.saturating_sub(1)).collect::<String>()) } else { shown_name.to_string() };
-                if font_size >= 6.5 {
-                    painter.text(p, Align2::CENTER_CENTER, caption, FontId::proportional(font_size), draw::fade(Color32::from_rgb(14, 18, 26), alpha));
-                }
-            } else if (z > 0.5 && self.graph.nodes.len() < 600 && !lod) || lit {
-                let galley = painter.layout_no_wrap(shown_name.to_string(), FontId::proportional((10.0 * z.sqrt() * fs).clamp(8.0, 13.0)), draw::fade(TEXT, alpha));
-                let h = galley.size().y;
-                draw::pill(&painter, Pos2::new(p.x, p.y + r + 8.0 + h / 2.0), galley, draw::fade(CAPTION_BG, alpha), None, TEXT);
+            if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
+                let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
+                labels::paint_host_label(&painter, shown_name, p, r, look.label_pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod);
             }
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
                 let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * fs).clamp(8.0, 14.0)), ACCENT);
@@ -2866,6 +2930,8 @@ impl eframe::App for Viewer {
         self.poll_job(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);
+        self.labels_window(&ctx);
+        self.host_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.story_window(&ctx);
