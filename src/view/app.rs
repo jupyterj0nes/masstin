@@ -3436,11 +3436,17 @@ impl eframe::App for Viewer {
                 self.present_t = 0.0;
             }
             if right || left {
-                let cur = present::at(&self.steps, self.present_t).map(|(k, _)| k).unwrap_or(0);
-                let k = if right { (cur + 1).min(self.steps.len().saturating_sub(1)) } else { cur.saturating_sub(1) };
-                if let Some(st) = self.steps.get(k) {
-                    self.present_t = st.start + st.dur;
-                }
+                // steps wholly drawn at this moment; Right shows one more,
+                // Left one fewer (the time a step ends is the next one's
+                // start when there is no pause, so counting "the current
+                // step" would stick on the same one and never go back)
+                let t = self.present_t;
+                let done = self.steps.iter().take_while(|s| s.start + s.dur <= t + 1e-4).count();
+                let want = if right { (done + 1).min(self.steps.len()) } else { done.saturating_sub(1) };
+                self.present_t = match want {
+                    0 => 0.0,
+                    n => self.steps[n - 1].start + self.steps[n - 1].dur,
+                };
                 ctx.request_repaint();
             }
         }
