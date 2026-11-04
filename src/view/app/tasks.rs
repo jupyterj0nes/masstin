@@ -465,7 +465,11 @@ impl Viewer {
             Some(Err(_)) => format!("{}  {} — failed", ic::WARNING, job.title),
         };
         let elapsed = job.started.elapsed().as_secs_f32();
-        egui::Window::new(title).open(&mut open).collapsible(true).resizable(true).default_width(720.0).max_width(900.0).max_height(400.0).anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-14.0, -104.0)).show(ctx, |ui| {
+        // the hunt's log stays folded while it runs (the canvas is the show); a
+        // parse or a merge shows its log, there is nothing else to watch
+        let folded = job.kind == JobKind::Hunt;
+        let title = if folded && job.done.is_none() { format!("{}  Hunting…  {:.0} s", ic::ARROWS_CLOCKWISE, elapsed) } else { title };
+        egui::Window::new(title).id(egui::Id::unique("job-window")).open(&mut open).collapsible(true).default_open(!folded).resizable(true).default_width(if folded { 420.0 } else { 720.0 }).max_width(900.0).max_height(400.0).anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-14.0, -104.0)).show(ctx, |ui| {
             ui.set_max_width(880.0);
             ui.horizontal(|ui| {
                 if job.done.is_none() {
