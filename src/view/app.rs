@@ -270,6 +270,10 @@ pub struct Viewer {
     focus_t: f32,
     hist: Option<(usize, usize, i64, Vec<(u32, u32)>)>,
     hist_all: Option<(usize, usize, Vec<(u32, u32)>)>,
+    /// the picture is stretched to the window's shape when the layout settles
+    fill_pending: bool,
+    /// the stretch in progress: from, to, when it started
+    fill_anim: Option<(Vec<V2>, Vec<V2>, f32)>,
     // the chrome
     show_filters: bool,
     show_inspector: bool,
@@ -506,6 +510,8 @@ impl Viewer {
             focus_t: 0.0,
             hist: None,
             hist_all: None,
+            fill_pending: true,
+            fill_anim: None,
             show_filters: true,
             show_inspector: true,
             show_hunt: false,
@@ -591,6 +597,8 @@ impl Viewer {
         self.born = self.graph.nodes.iter().map(|n| if fresh_layout || !self.remembered.contains_key(&n.host) { now } else { now - 10.0 }).collect();
         self.graph_id += 1;
         self.focus_t = 0.0;
+        self.fill_pending = true;
+        self.fill_anim = None;
         self.selected = None;
         self.hovered = None;
         self.ctx_target = None;
@@ -615,11 +623,39 @@ impl Viewer {
     }
 
     /// Frame the graph: the camera glides there, or jumps when `snap`.
+    /// Stretch the settled picture to the window's shape, so a tall graph
+    /// uses the sides and a flat one the height; animated, then framed.
+    fn fill_window(&mut self, canvas: Rect) {
+        let n = self.layout.len();
+        let Some((lo, hi)) = self.layout.bounds() else { return };
+        if n < 2 {
+            return;
+        }
+        let gw = (hi.x - lo.x).max(1.0);
+        let gh = (hi.y - lo.y).max(1.0);
+        let margin = 90.0;
+        let cw = (canvas.width() - margin * 2.0).max(100.0);
+        let ch = (canvas.height() - margin * 2.0).max(100.0);
+        // the zoom the graph would get as it is, and the stretch that makes it
+        // fill both axes at that zoom (never shrinking an axis)
+        let z = (cw / gw).min(ch / gh).min(2.2);
+        let sx = ((cw / z) / gw).clamp(1.0, 2.6);
+        let sy = ((ch / z) / gh).clamp(1.0, 2.6);
+        if (sx - 1.0).abs() < 0.03 && (sy - 1.0).abs() < 0.03 {
+            return;
+        }
+        let c = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+        let from: Vec<V2> = self.layout.pos.clone();
+        let to: Vec<V2> = from.iter().map(|p| V2::new(c.x + (p.x - c.x) * sx, c.y + (p.y - c.y) * sy)).collect();
+        self.layout.stop();
+        self.fill_anim = Some((from, to, self.t0.elapsed().as_secs_f32()));
+    }
+
     fn fit(&mut self, canvas: Rect, snap: bool) {
         if let Some((lo, hi)) = self.layout.bounds() {
             let w = (hi.x - lo.x).max(50.0) + 80.0;
             let h = (hi.y - lo.y).max(50.0) + 80.0;
-            let max_zoom = if self.presenting { 1.8 } else { 1.4 };
+            let max_zoom = if self.presenting { 1.8 } else { 2.2 };
             self.zoom_t = (canvas.width() / w).min(canvas.height() / h).clamp(0.05, max_zoom);
             self.cam_t = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
             if snap {
@@ -1752,6 +1788,25 @@ impl Viewer {
         let big = self.layout.len() > 1500;
         if self.layout.tick_for(std::time::Duration::from_millis(if big { 8 } else { 4 }), if big { 1 } else { 2 }) {
             ui.ctx().request_repaint();
+        } else if self.fill_pending && !self.presenting && self.dragging.is_none() {
+            // the layout settled: stretch it to the window, once per query
+            self.fill_pending = false;
+            self.fill_window(canvas);
+            if self.fill_anim.is_none() {
+                self.fit(canvas, false);
+            }
+        }
+        if let Some((from, to, started)) = &self.fill_anim {
+            let k = draw::ease_out_cubic((now - started) / 0.55);
+            for i in 0..self.layout.pos.len().min(from.len()) {
+                self.layout.pos[i] = from[i] + (to[i] - from[i]) * k;
+            }
+            if k >= 1.0 {
+                self.fill_anim = None;
+                self.fit(canvas, false);
+            } else {
+                ui.ctx().request_repaint();
+            }
         }
         self.layout_ms = t.elapsed().as_secs_f32() * 1000.0;
 
@@ -2810,7 +2865,10 @@ impl Viewer {
             "present" => self.start_presentation(),
             "story" => self.show_story = true,
             "rules" => self.show_rules = true,
-            "fit" => self.fit_pending = true,
+            "fit" => {
+                self.fill_pending = true;
+                self.layout.stop();
+            }
             "questions" => self.show_questions = true,
             "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "hud" => self.hud = !self.hud,

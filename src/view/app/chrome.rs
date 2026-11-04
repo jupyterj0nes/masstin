@@ -116,9 +116,10 @@ impl Viewer {
                     }
                 }
                 ui.separator();
-                if icon_button(ui, ic::CORNERS_OUT, "Fit to window").clicked() {
+                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").clicked() {
                     ui.close();
-                    self.fit_pending = true;
+                    self.layout.stop();
+                    self.fill_pending = true;
                 }
                 if icon_button(ui, ic::SHUFFLE, "Lay out again").clicked() {
                     ui.close();
@@ -281,8 +282,9 @@ impl Viewer {
                 self.requery(false);
             }
             ui.add_space(6.0);
-            if tool(ui, ic::CORNERS_OUT, "Fit to window", false).clicked() {
-                self.fit_pending = true;
+            if tool(ui, ic::CORNERS_OUT, "Fill the window: stretch the picture to its shape and frame it", false).clicked() {
+                self.layout.stop();
+                self.fill_pending = true;
             }
             if tool(ui, ic::SHUFFLE, "Lay out again", false).clicked() {
                 let f = self.draft.clone();
@@ -1116,9 +1118,10 @@ impl Viewer {
                 }
             }
             None => {
-                if icon_button(ui, ic::CORNERS_OUT, "Fit to window").clicked() {
+                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").clicked() {
                     ui.close();
-                    self.fit_pending = true;
+                    self.layout.stop();
+                    self.fill_pending = true;
                 }
                 if icon_button(ui, ic::SHUFFLE, "Lay out again").clicked() {
                     ui.close();
