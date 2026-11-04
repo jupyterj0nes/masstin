@@ -11,6 +11,7 @@
 mod chrome;
 mod edge_style;
 mod labels;
+mod merge_hosts;
 mod tasks;
 
 use std::borrow::Cow;
@@ -26,6 +27,7 @@ use super::theme;
 use chrome::{Brush, ColorPick, Tab};
 use edge_style::EdgeEdit;
 use labels::HostEdit;
+use merge_hosts::MergeHostsEdit;
 use super::views::LabelPos;
 use tasks::{HuntForm, IngestForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
@@ -295,6 +297,11 @@ pub struct Viewer {
     show_labels: bool,
     host_edit: Option<HostEdit>,
     edge_edit: Option<EdgeEdit>,
+    /// the analyst's merges, `(from, into)`, kept in the views file
+    merges: Vec<(String, String)>,
+    merge_edit: Option<MergeHostsEdit>,
+    show_merges: bool,
+    merge_add: (String, String),
     last_log: Option<(String, Vec<String>)>,
     show_last_log: bool,
 }
@@ -477,6 +484,10 @@ impl Viewer {
             show_labels: false,
             host_edit: None,
             edge_edit: None,
+            merges: vf.merges.clone(),
+            merge_edit: None,
+            show_merges: false,
+            merge_add: (String::new(), String::new()),
             last_log: None,
             show_last_log: false,
         };
@@ -900,9 +911,8 @@ impl Viewer {
     }
 
     fn reload(&mut self) {
-        match Store::load(&self.files, self.alpha) {
-            Ok(s) => {
-                self.store = s;
+        match self.reload_store() {
+            Ok(()) => {
                 self.requery(false);
                 self.status = format!("Timeline read again: {}", self.status);
             }
@@ -975,6 +985,21 @@ impl Viewer {
         ui.heading(&name);
         if !aliases.is_empty() {
             ui.label(egui::RichText::new(format!("also seen as {}", aliases.join(", "))).color(MUTED));
+            let mine = self.merged_into(&name);
+            if !mine.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("merged by you:").color(theme::DIM).small());
+                    let mut undo: Option<String> = None;
+                    for m in &mine {
+                        if ui.add(egui::Button::new(egui::RichText::new(format!("{}  {}", m, super::icons::X)).small()).frame(true)).on_hover_text("Undo this merge").clicked() {
+                            undo = Some(m.clone());
+                        }
+                    }
+                    if let Some(m) = undo {
+                        self.unmerge_host(&m);
+                    }
+                });
+            }
         } else if crate::load_neo4j::looks_like_ip(&name) {
             ui.label(egui::RichText::new("an address the hunt could not tie to a host name").color(MUTED));
         }
@@ -1182,7 +1207,7 @@ impl Viewer {
     // ───────────────────────── style ─────────────────────────
 
     fn persist(&self) {
-        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()) };
+        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone() };
         if let Err(e) = vf.save(&self.views_path) {
             eprintln!("masstin: cannot save {}: {}", self.views_path.display(), e);
         }
@@ -2937,6 +2962,8 @@ impl eframe::App for Viewer {
         self.labels_window(&ctx);
         self.host_window(&ctx);
         self.edge_window(&ctx);
+        self.merge_host_window(&ctx);
+        self.merges_window(&ctx);
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.story_window(&ctx);

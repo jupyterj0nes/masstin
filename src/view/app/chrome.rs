@@ -196,6 +196,10 @@ impl Viewer {
                     self.open_agentc00pr();
                 }
                 ui.separator();
+                if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merged hosts… ({})", self.merges.len())).clicked() {
+                    ui.close();
+                    self.show_merges = true;
+                }
                 if icon_button(ui, ic::TERMINAL_WINDOW, "Log of the last run…").clicked() {
                     ui.close();
                     self.show_last_log = true;
@@ -970,6 +974,21 @@ impl Viewer {
                     self.show_paths = true;
                 }
                 ui.separator();
+                let other = match self.selected {
+                    Some(Sel::Node(j)) if j != i => self.graph.nodes.get(j).map(|n| self.store.hosts.name(n.host).to_string()),
+                    _ => None,
+                };
+                if let Some(sel) = other {
+                    if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merge {} into this host", sel)).on_hover_text("The selected host becomes part of this one").clicked() {
+                        ui.close();
+                        self.merge_hosts(&sel, &name);
+                    }
+                }
+                if icon_button(ui, ic::ARROWS_CLOCKWISE, "Merge into another host…").on_hover_text("This host is the same machine as another one (an address and its name): make them one").clicked() {
+                    ui.close();
+                    self.merge_edit = Some(MergeHostsEdit { from: name.clone(), into: String::new(), filter: String::new() });
+                }
+                ui.separator();
                 let pinned = self.layout.fixed.get(i).copied().unwrap_or(false);
                 if icon_button(ui, ic::PUSH_PIN, if pinned { "Unpin" } else { "Pin where it is" }).clicked() {
                     ui.close();
@@ -1186,10 +1205,12 @@ impl Viewer {
         if files.is_empty() {
             return;
         }
-        match Store::load(&files, self.alpha) {
+        let merges = ViewsFile::load(&ViewsFile::path_for(&files[0])).merges;
+        match Store::load_with(&files, self.alpha, &merges) {
             Ok(s) => {
                 self.store = s;
                 self.files = files;
+                self.merges = merges;
                 self.views_path = ViewsFile::path_for(&self.files[0]);
                 self.story_path = Story::path_for(&self.files[0]);
                 self.remembered.clear();

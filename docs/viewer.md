@@ -86,6 +86,10 @@ Three tabs on the right.
 - **Notes**: the notes of the case (on a host, on a connection, or free), with the time they were written and a way to delete them, then every row of the timeline that carries a verdict or a note, click to open its connection.
 - **Legend**: what the colours, rings, halos and widths mean.
 
+## Merging hosts
+
+The same machine often comes as an address in one log and as a name in another. The hunt folds an address into a name by itself when the same-login test allows it; for the rest, **right-click a host › Merge into another host…** (pick the host it belongs to), or select a host and right-click the one it belongs to › **Merge <host> into this host**. The two become one node, every connection follows, the merged name stays among the host's names in the inspector (with an undo next to it). **Tools › Merged hosts…** lists the pairs, undoes any, adds one by name. The timeline is not changed: the pairs live in `<timeline>.views.json` next to it, so they survive sessions and travel with the case.
+
 ## Marks and notes
 
 A **verdict** (suspicious, confirmed, benign, or clear) with notes goes on the rows of a connection, into the `verdict` and `notes` columns of the timeline CSV (the file is rewritten through a temporary copy and renamed over the original). When a drawn edge stands for several rows, **the viewer asks**: the whole block (every row, every account folded into it) or only the rows you tick in the list. A case tool reading the same CSV sees the marks; the viewer reloads a file another program changed (**Reload** forces it).

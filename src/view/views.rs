@@ -228,6 +228,9 @@ pub struct ViewsFile {
     /// the style in use when the window was last closed or a view saved
     #[serde(default)]
     pub last_style: Option<Style>,
+    /// hosts the analyst merged: `(from, into)`
+    #[serde(default)]
+    pub merges: Vec<(String, String)>,
 }
 
 impl ViewsFile {
