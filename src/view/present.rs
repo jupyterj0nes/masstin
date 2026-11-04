@@ -68,6 +68,31 @@ impl Stretch {
     }
 }
 
+/// Where a logo goes on the recording.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum LogoPos {
+    TopLeft,
+    TopCentre,
+    TopRight,
+    BottomLeft,
+    BottomCentre,
+    BottomRight,
+}
+
+impl LogoPos {
+    pub const ALL: [LogoPos; 6] = [LogoPos::TopLeft, LogoPos::TopCentre, LogoPos::TopRight, LogoPos::BottomLeft, LogoPos::BottomCentre, LogoPos::BottomRight];
+    pub fn label(self) -> &'static str {
+        match self {
+            LogoPos::TopLeft => "top left",
+            LogoPos::TopCentre => "top centre",
+            LogoPos::TopRight => "top right",
+            LogoPos::BottomLeft => "bottom left",
+            LogoPos::BottomCentre => "bottom centre",
+            LogoPos::BottomRight => "bottom right",
+        }
+    }
+}
+
 /// A clock speed as people say it: "10 min/s", "1.5 h/s", "2 day/s".
 pub fn clock_label(secs_per_sec: f32) -> String {
     let tidy = |x: f32| if (x - x.round()).abs() < 0.05 { format!("{:.0}", x) } else { format!("{:.1}", x) };
@@ -107,11 +132,19 @@ pub struct Story {
     /// stretches of the timeline with a speed of their own; the first that
     /// contains a step wins
     pub stretches: Vec<Stretch>,
+    /// a logo (PNG, JPEG, WebP, BMP, GIF: the path) on the presentation and
+    /// the recording, where, how wide (a fraction of the width), how opaque,
+    /// and whether it also stays on the window outside the presentation
+    pub logo: String,
+    pub logo_pos: LogoPos,
+    pub logo_width: f32,
+    pub logo_opacity: f32,
+    pub logo_always: bool,
 }
 
 impl Default for Story {
     fn default() -> Self {
-        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new() }
+        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new(), logo: String::new(), logo_pos: LogoPos::BottomRight, logo_width: 0.12, logo_opacity: 0.9, logo_always: false }
     }
 }
 
