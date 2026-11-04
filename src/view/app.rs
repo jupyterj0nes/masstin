@@ -201,8 +201,18 @@ pub struct Viewer {
     // replay
     cursor: usize,
     playing: bool,
+    /// replay speed in rows a second
     rate: f32,
     acc: f32,
+    /// replay by the clock instead of by rows: timeline seconds a second
+    rate_secs: Option<f32>,
+    /// the replay head's place in timeline seconds when playing by the clock
+    replay_t: f64,
+    /// seconds a connection takes to draw itself from origin to destination
+    /// in the replay (0: it just appears)
+    replay_anim: f32,
+    /// when each edge was revealed by the replay, for the drawing animation
+    edge_born: Vec<f32>,
     last_frame: std::time::Instant,
     // style and saved views
     style: Style,
@@ -464,6 +474,10 @@ impl Viewer {
             playing: false,
             rate: 4.0,
             acc: 0.0,
+            rate_secs: None,
+            replay_t: 0.0,
+            replay_anim: 0.6,
+            edge_born: Vec::new(),
             last_frame: std::time::Instant::now(),
             style,
             views_path,
@@ -662,6 +676,7 @@ impl Viewer {
         self.rows = None;
         self.cursor = self.graph.events.len();
         self.playing = false;
+        self.edge_born = vec![f32::NEG_INFINITY; self.graph.edges.len()];
         let mut parts = vec![
             format!("{} hosts", self.graph.nodes.len()),
             format!("{} connections drawn of {}", self.graph.edges.len(), self.graph.connections),
@@ -773,6 +788,48 @@ impl Viewer {
     }
 
     /// The step a presentation is in, if any.
+    /// The replay head moved from `from` to `to`: the connections whose first
+    /// event is in that range start drawing themselves now, and a host they
+    /// reach for the first time pops in when the line gets there.
+    fn replay_crossed(&mut self, from: usize, to: usize) {
+        if self.replay_anim <= 0.0 {
+            return;
+        }
+        let now = self.t0.elapsed().as_secs_f32();
+        let n_in_range = to.saturating_sub(from);
+        for (k, e) in self.graph.edges.iter().enumerate() {
+            if e.first_event >= from && e.first_event < to {
+                // several in one step: each a little after the one before
+                let stagger = if n_in_range > 1 { 0.35 * self.replay_anim * (e.first_event - from) as f32 / n_in_range as f32 } else { 0.0 };
+                if let Some(b) = self.edge_born.get_mut(k) {
+                    *b = now + stagger;
+                }
+                let dst = self.graph.node_of_host[&e.dst];
+                if let Some(n) = self.graph.nodes.get(dst) {
+                    if n.first_event >= from && n.first_event < to {
+                        if let Some(b) = self.born.get_mut(dst) {
+                            *b = now + stagger + self.replay_anim * 0.55;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start the replay from the head's place, by rows or by the clock.
+    pub(super) fn start_replay(&mut self) {
+        let n = self.graph.events.len();
+        if self.cursor >= n {
+            self.cursor = 0;
+        }
+        self.playing = true;
+        self.acc = 0.0;
+        if self.rate_secs.is_some() {
+            let k = if self.cursor == 0 { 0 } else { self.cursor - 1 };
+            self.replay_t = self.graph.events.get(k).map(|&ei| self.store.edges[ei as usize].t as f64).unwrap_or(0.0);
+        }
+    }
+
     fn current_step(&self) -> Option<usize> {
         if !self.presenting {
             return None;
@@ -2065,7 +2122,17 @@ impl Viewer {
             }
             let g = self.geom[k];
             let (pa, pb_full, pc_full) = (g.a, g.b, g.c);
-            let progress = if self.presenting { self.edge_progress(k) } else { 1.0 };
+            let progress = if self.presenting {
+                self.edge_progress(k)
+            } else if self.replay_anim > 0.0 {
+                let b = self.edge_born.get(k).copied().unwrap_or(f32::NEG_INFINITY);
+                if b.is_finite() { draw::ease_out_cubic(((now - b) / self.replay_anim).clamp(0.0, 1.0)) } else { 1.0 }
+            } else {
+                1.0
+            };
+            if progress < 1.0 {
+                keep_moving = true;
+            }
             // while a presentation draws the edge, the curve grows from the origin
             let (pb, pc) = if progress < 1.0 {
                 let pm = draw::bez(pa, pc_full, pb_full, progress);
@@ -3150,14 +3217,30 @@ impl eframe::App for Viewer {
             self.hud = !self.hud;
         }
         if self.playing {
-            self.acc += dt * self.rate;
-            let step = self.acc.floor() as usize;
-            if step > 0 {
-                self.acc -= step as f32;
-                self.cursor = (self.cursor + step).min(self.graph.events.len());
-                if self.cursor >= self.graph.events.len() {
-                    self.playing = false;
+            let before = self.cursor;
+            let n_ev = self.graph.events.len();
+            match self.rate_secs {
+                None => {
+                    self.acc += dt * self.rate;
+                    let step = self.acc.floor() as usize;
+                    if step > 0 {
+                        self.acc -= step as f32;
+                        self.cursor = (self.cursor + step).min(n_ev);
+                    }
                 }
+                Some(per_sec) => {
+                    // the clock advances; the head takes every row up to it
+                    self.replay_t += (dt * per_sec) as f64;
+                    let t = self.replay_t.floor() as i64;
+                    let k = self.graph.events[self.cursor.min(n_ev)..].partition_point(|&ei| self.store.edges[ei as usize].t <= t);
+                    self.cursor = (self.cursor + k).min(n_ev);
+                }
+            }
+            if self.cursor >= n_ev {
+                self.playing = false;
+            }
+            if self.cursor > before {
+                self.replay_crossed(before, self.cursor);
             }
             ctx.request_repaint();
         }

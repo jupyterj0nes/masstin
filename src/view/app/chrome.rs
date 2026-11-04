@@ -800,19 +800,51 @@ impl Viewer {
                 if self.playing {
                     self.playing = false;
                 } else {
-                    if self.cursor >= n_view {
-                        self.cursor = 0;
-                    }
-                    self.playing = true;
-                    self.acc = 0.0;
+                    self.start_replay();
                 }
             }
-            egui::ComboBox::from_id_salt("rate").selected_text(format!("{} rows/s", self.rate as u32)).width(96.0).show_ui(ui, |ui| {
+            let clock = [(60.0, "1 min/s"), (600.0, "10 min/s"), (3600.0, "1 h/s"), (6.0 * 3600.0, "6 h/s"), (24.0 * 3600.0, "1 day/s"), (7.0 * 24.0 * 3600.0, "1 week/s")];
+            let current = match self.rate_secs {
+                None => format!("{} rows/s", self.rate as u32),
+                Some(s) => clock.iter().find(|(v, _)| (*v - s).abs() < 0.5).map(|(_, l)| l.to_string()).unwrap_or_else(|| format!("{:.0} s/s", s)),
+            };
+            let r = egui::ComboBox::from_id_salt("rate").selected_text(current).width(104.0).show_ui(ui, |ui| {
+                ui.label(egui::RichText::new("By rows: so many rows of the view a second, whatever their times").small().color(theme::DIM));
                 for r in [1.0, 4.0, 15.0, 60.0, 250.0] {
-                    ui.selectable_value(&mut self.rate, r, format!("{} rows/s", r as u32));
+                    if ui.selectable_label(self.rate_secs.is_none() && self.rate == r, format!("{} rows/s", r as u32)).clicked() {
+                        self.rate = r;
+                        if self.rate_secs.take().is_some() && self.playing {
+                            self.acc = 0.0;
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("By the clock: so much of the timeline a second; a quiet hour takes as long as a busy one").small().color(theme::DIM));
+                for (v, l) in clock {
+                    if ui.selectable_label(self.rate_secs.map_or(false, |s| (s - v).abs() < 0.5), l).clicked() {
+                        let was_rows = self.rate_secs.is_none();
+                        self.rate_secs = Some(v);
+                        if self.playing && was_rows {
+                            // the clock picks up where the head is
+                            let k = self.cursor.saturating_sub(1);
+                            self.replay_t = self.graph.events.get(k).map(|&ei| self.store.edges[ei as usize].t as f64).unwrap_or(0.0);
+                        }
+                    }
                 }
             });
-            let w = (ui.available_width() - 470.0).max(160.0);
+            r.response.on_hover_text("How fast the replay advances: by rows of the view, or by the timeline's clock.");
+            let anim = [(0.0, "instant"), (0.3, "0.3 s"), (0.6, "0.6 s"), (1.0, "1 s"), (1.5, "1.5 s"), (2.5, "2.5 s"), (4.0, "4 s")];
+            let cur_anim = anim.iter().find(|(v, _)| (*v - self.replay_anim).abs() < 0.01).map(|(_, l)| l.to_string()).unwrap_or_else(|| format!("{:.1} s", self.replay_anim));
+            let r = egui::ComboBox::from_id_salt("replay-anim").selected_text(format!("draw {}", cur_anim)).width(92.0).show_ui(ui, |ui| {
+                ui.label(egui::RichText::new("How long a connection takes to draw itself from origin to destination when the replay reaches it").small().color(theme::DIM));
+                for (v, l) in anim {
+                    if ui.selectable_label((self.replay_anim - v).abs() < 0.01, l).clicked() {
+                        self.replay_anim = v;
+                    }
+                }
+            });
+            r.response.on_hover_text("The drawing of each connection in the replay: instant, or a line that grows from the origin to the destination over so many seconds, the host popping in when it arrives.");
+            let w = (ui.available_width() - 570.0).max(160.0);
             self.histogram_brush(ui, w);
             // the brush may have applied a new window: the view can be another one now
             let n_view = self.graph.events.len();
