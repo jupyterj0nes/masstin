@@ -54,7 +54,7 @@ The pane on the left (the funnel on the toolbar hides it). **Apply filters** at 
 | Result, Verdict | pills |
 | Grouping | **Group accounts** (one edge per origin, destination, account and result; a pair with more than six accounts becomes one edge that says how many), **One edge per account** (never folded), **One edge per event** (every row its own curve, for a tight window) |
 | Limit | connections drawn, the most pressing first (significant, then candidate, then by number of events); the status line and the inspector say when it was reached |
-| Saved filters | yours, by name, and the built-in ones (RDP only, network logons, SSH, admin accounts, service accounts, without machine accounts, failures and touches, marked by the analyst, last 24 hours); **Save the current filter…** keeps the filter *and* the style under a name in `<timeline>.views.json`, next to the timeline |
+| Saved filters | yours, by name, and the built-in ones (RDP only, network logons, SSH, admin accounts, service accounts, without machine accounts, failures and touches, marked by the analyst, last 24 hours); **Save the current filter…** keeps the filter, the style *and*, when the box is ticked, **the arrangement** (where every host is on the canvas) under a name in `<timeline>.views.json`, next to the timeline; picking the filter puts the hosts back in their places, pinned, and hosts it did not know settle around them (*Lay out again* frees them); the trash on a saved filter asks before deleting |
 
 The time window is the **time strip** at the bottom (below), and the same From / To the chips show.
 

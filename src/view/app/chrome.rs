@@ -574,9 +574,13 @@ impl Viewer {
                         ui.vertical(|ui| {
                             ui.label(theme::medium(&v.name, 13.0));
                             ui.label(egui::RichText::new(&summary).color(theme::MUTED).size(11.5));
+                            if !v.places.is_empty() {
+                                ui.label(egui::RichText::new(format!("{}  {} hosts in their places", ic::PUSH_PIN, v.places.len())).color(theme::DIM).size(11.0))
+                                    .on_hover_text("This filter keeps where the hosts were on the canvas; picking it puts them back there.");
+                            }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new(egui::RichText::new(ic::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Delete this saved filter").clicked() {
+                            if ui.add(egui::Button::new(egui::RichText::new(ic::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Delete this saved filter…").clicked() {
                                 delete = Some(v.name.clone());
                             }
                         });
@@ -610,16 +614,15 @@ impl Viewer {
                 self.draft = v.filter.clone();
                 if self.saved.iter().any(|x| x.name == v.name) {
                     self.style = v.style.clone();
+                    if !v.places.is_empty() {
+                        self.restore_places = Some(v.places.clone());
+                    }
                     self.persist();
                 }
                 apply = true;
             }
             if let Some(name) = delete {
-                self.saved.retain(|x| x.name != name);
-                if self.preset == name {
-                    self.preset.clear();
-                }
-                self.persist();
+                self.confirm_delete = Some(name);
             }
             if ui.add(egui::Button::new(format!("{}  Save the current filter…", ic::FLOPPY_DISK)).frame(false)).clicked() {
                 self.show_save = true;
@@ -1391,5 +1394,52 @@ fn builtin_icon(name: &str) -> &'static str {
         ic::CLOCK
     } else {
         ic::DOT_OUTLINE
+    }
+}
+
+impl Viewer {
+    /// The trash on a saved filter asks before anything goes.
+    pub(super) fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.confirm_delete.clone() else { return };
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new(format!("{}  Delete this saved filter?", ic::TRASH))
+            .id(egui::Id::new("confirm-delete-view"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                let (summary, places) = self.saved.iter().find(|v| v.name == name).map(|v| (describe_filter(&v.filter), v.places.len())).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(ic::BOOKMARK_SIMPLE).color(theme::CYAN).size(15.0));
+                    ui.label(theme::medium(&name, 14.0));
+                });
+                ui.label(egui::RichText::new(summary).color(theme::MUTED).size(12.0));
+                if places > 0 {
+                    ui.label(egui::RichText::new(format!("{}  and the arrangement of {} hosts", ic::PUSH_PIN, places)).color(theme::MUTED).size(12.0));
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("It is removed from the views file next to the timeline. The filter in use stays as it is, and the built-in filters are not touched.").color(theme::DIM).size(11.5));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(theme::semibold("Delete", 13.0).color(TEXT)).fill(Color32::from_rgb(140, 40, 56)).stroke(Stroke::NONE).min_size(Vec2::new(90.0, 30.0))).clicked() {
+                        self.saved.retain(|x| x.name != name);
+                        if self.preset == name {
+                            self.preset.clear();
+                        }
+                        self.persist();
+                        self.status = format!("Saved filter \"{}\" deleted.", name);
+                        done = true;
+                    }
+                    if ui.add(egui::Button::new("Keep it").min_size(Vec2::new(90.0, 30.0))).clicked() {
+                        done = true;
+                    }
+                });
+            });
+        if done || !open {
+            self.confirm_delete = None;
+        }
     }
 }
