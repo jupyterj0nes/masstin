@@ -1,7 +1,7 @@
 # Masstin
 
 <div align="center">
-  <img src="resources/masstin_logo.png" alt="Masstin logo" width="420"/>
+  <img src="resources/masstin_logo.png" alt="Masstin logo" width="560"/>
   <br><br>
   <strong>Lateral movement tracker for anything.</strong>
   <br>
