@@ -27,15 +27,11 @@
 2. **Hunt.** `graph-hunt` tests every connection after the start of the investigation against what the network did before it, and keeps what survives a false-discovery-rate test. The only number you choose is the FDR; every finding comes with its reason in words. [graph-hunt →](docs/graph-hunt.md)
 3. **Look.** Hosts drawn as the machines they are, the accounts on the lines, the findings glowing. Neighbourhoods, time-respecting paths and reach cones between hosts, the questions an analyst asks of a login graph, marks and notes written back into the CSV, a replay you can present and record. [The viewer →](docs/viewer.md)
 
-<div align="center">
-  <a href="resources/masstin-viewer-demo.mp4"><img src="resources/viewer-window.png" alt="masstin -a view after the hunt: the candidate connections of a five-host lab glowing, the domain controller with its key badge, the servers as racks, the jump box as a workstation, the accounts on every edge, the filter pane on the left and the inspector on the right"/></a>
-  <br>
-  <em>▶ <a href="resources/masstin-viewer-demo.mp4">Watch the 97-second demo</a>: a case folder dropped on the window, the wizard saying what it holds, the parser's bars, the graph, the hunt and its report, the paths and the reach from the jump box, the replay. Filmed by masstin itself (Tools › Film the window), no hand on the mouse.</em>
-</div>
-
-
 https://github.com/user-attachments/assets/1f28b074-1fe7-43c8-868a-64053b33c00b
 
+<div align="center">
+  <em>The demo, 97 seconds: a case folder dropped on the window, the wizard saying what it holds, the parser's bars, the graph, the hunt and its report, the paths and the reach from the jump box, the replay. Filmed by masstin itself (Tools › Film the window), no hand on the mouse. <a href="resources/masstin-viewer-demo.mp4">MP4 to download</a>.</em>
+</div>
 
 ## Quick start
 

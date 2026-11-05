@@ -13,6 +13,12 @@ masstin -a view -f timeline.csv --focus SRV01 --start-time "2026-03-15 00:00:00"
 masstin -a view -f dc01.csv -f srv02.csv
 ```
 
+<div align="center">
+  <img src="../resources/viewer-window.png" alt="masstin -a view after the hunt: the candidate connections of a five-host lab glowing, the domain controller with its key badge, the servers as racks, the jump box as a workstation, the accounts on every edge, the filter pane on the left and the inspector on the right"/>
+  <br>
+  <em>After the hunt: the Findings view of a five-host lab, the filter pane on the left, the inspector on the right, the time strip below.</em>
+</div>
+
 ## What is drawn
 
 A **host** is a piece of glass: a soft shadow, a gradient from a lit centre to a darker rim, a highlight, a thin bright rim, coloured by what the graph makes of it (slate blue for a workstation, teal for a server, violet for a domain controller, muted amber for an address outside the private ranges, sand for an address the hunt could not tie to a name). Four **node styles** (View > Labels and sizes): **machines** (the default: the host drawn as what it is, a monitor with its screen lit, a laptop, a rack server with its lights, a domain controller with its key badge, an antenna for an address, a globe for an external one, and database, cloud, router and phone from the catalogue; the lights breathe with motion on), **glass**, **icons** (the glass with a glyph in the middle) and **minimal** (a dot in a ring). A host can carry its own icon from a catalogue of twenty-five (right-click > Style of this host), whatever the style. A **connection** is a line from origin to destination with an arrowhead and the account written on it. Hosts are the machines graph-hunt sees: upper-case short names, an IP folded into the host name the same-login test gives it (the host lists its addresses in the pane and in the tooltip).
