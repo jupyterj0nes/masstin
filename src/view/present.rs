@@ -354,6 +354,59 @@ impl Recorder {
         Recorder { tx: Some(tx), done: drx, sent: 0 }
     }
 
+    /// An MP4 written as the frames come, through ffmpeg's standard input
+    /// (raw RGBA, no frame files): what a film of the window needs, since
+    /// it has no end known beforehand. ffmpeg starts with the first frame,
+    /// which sets the size; a frame of another size is left out.
+    pub fn start_stream(fps: u32, out: std::path::PathBuf) -> Recorder {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<egui::ColorImage>>(8);
+        let (dtx, drx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                use std::io::Write;
+                let mut child: Option<std::process::Child> = None;
+                let mut size = (0usize, 0usize);
+                let mut n = 0usize;
+                while let Ok(f) = rx.recv() {
+                    if child.is_none() {
+                        size = (f.width() & !1, f.height() & !1);
+                        let mut cmd = std::process::Command::new("ffmpeg");
+                        cmd.args(["-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s"])
+                            .arg(format!("{}x{}", f.width(), f.height()))
+                            .args(["-r", &fps.to_string(), "-i", "-", "-vf"])
+                            .arg(format!("crop={}:{}:0:0", size.0, size.1))
+                            .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"])
+                            .arg(&out)
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::process::CommandExt;
+                            cmd.creation_flags(0x0800_0000);
+                        }
+                        child = Some(cmd.spawn().map_err(|e| format!("ffmpeg: {}", e))?);
+                    }
+                    if (f.width() & !1, f.height() & !1) != size {
+                        continue;
+                    }
+                    let stdin = child.as_mut().and_then(|c| c.stdin.as_mut()).ok_or("ffmpeg closed its input")?;
+                    stdin.write_all(to_rgba(&f).as_raw()).map_err(|e| format!("ffmpeg: {}", e))?;
+                    n += 1;
+                }
+                let Some(mut c) = child else { return Err("no frame was filmed".into()) };
+                drop(c.stdin.take());
+                let status = c.wait().map_err(|e| format!("ffmpeg: {}", e))?;
+                if !status.success() {
+                    return Err("ffmpeg failed".into());
+                }
+                Ok(format!("{} ({} frames at {} fps, {:.0} s)", out.display(), n, fps, n as f32 / fps.max(1) as f32))
+            })();
+            let _ = dtx.send(result);
+        });
+        Recorder { tx: Some(tx), done: drx, sent: 0 }
+    }
+
     pub fn push(&mut self, img: std::sync::Arc<egui::ColorImage>) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(img);

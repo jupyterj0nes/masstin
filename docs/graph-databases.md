@@ -4,6 +4,12 @@
 
 Loading a timeline, grouped vs ungrouped, IP ↔ hostname unification, loader internals, visualisation and the query catalogue. Back to the [README](../README.md).
 
+<div align="center">
+  <img src="../resources/demo-graph.gif" alt="Memgraph Lab on a masstin timeline: the hour of the intrusion, then the temporal path query between the attacker's IP and the workstation"/>
+  <br>
+  <em>A masstin timeline in Memgraph Lab: every login of the hour the attacker came in, then one Cypher query from the catalogue returns the chronologically valid path from the attacker's IP to the workstation it reached. DFIR Madness "Szechuan sauce" case.</em>
+</div>
+
 ## Load into graph database
 
 ```bash

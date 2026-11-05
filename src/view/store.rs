@@ -199,6 +199,8 @@ impl Store {
         let mut aliases: Vec<Vec<String>> = Vec::new();
         let mut host_of = |raw: &str, hosts: &mut Interner| -> u32 {
             let label = resolved.get(raw).map(|r| r.0.as_str()).unwrap_or(raw);
+            // a machine account named as a computer (`PTR-SRV01$`) is that computer
+            let label = label.strip_suffix('$').filter(|l| !l.is_empty()).unwrap_or(label);
             let label = manual.get(&label.to_uppercase()).map(String::as_str).unwrap_or(label);
             let id = hosts.id(label);
             if aliases.len() <= id as usize {

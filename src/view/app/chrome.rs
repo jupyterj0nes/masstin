@@ -230,6 +230,16 @@ impl Viewer {
                     ui.close();
                     self.show_story = true;
                 }
+                if self.film.is_none() {
+                    if icon_button(ui, ic::VIDEO_CAMERA, "Film the window").on_hover_text("Records the window as you use it, in real time, until you stop it: an MP4 next to the timeline (ffmpeg on the PATH), or a GIF without it").clicked() {
+                        ui.close();
+                        let ctx = ui.ctx().clone();
+                        self.start_film(&ctx, Format::Mp4, 20, 0, None, false);
+                    }
+                } else if icon_button(ui, ic::VIDEO_CAMERA, "Stop filming").clicked() {
+                    ui.close();
+                    self.stop_film(false);
+                }
                 ui.separator();
                 if icon_button(ui, ic::APP_WINDOW, "Open the case in agentc00pr").on_hover_text("Launches agentc00pr, the case tool that reads this timeline and the CSVs of caarea, faramir and allymacb").clicked() {
                     ui.close();
