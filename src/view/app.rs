@@ -209,6 +209,15 @@ pub struct Viewer {
     /// seconds and frames sampled while motion was on, to tell a slow renderer
     light_dt: (f32, u32),
     frames_seen: u64,
+    /// the real time between the last two frames, not clamped (the HUD)
+    frame_gap_ms: f32,
+    /// when the last `ui` call ended: the time from there to the next one is eframe's (tessellate, render, present)
+    ui_end: Option<std::time::Instant>,
+    outside_ms: f32,
+    inside_ms: f32,
+    /// frames drawn since `fps_since`, for the debug log
+    fps_count: u32,
+    fps_since: std::time::Instant,
     // replay
     cursor: usize,
     playing: bool,
@@ -601,6 +610,12 @@ impl Viewer {
             light_mode: false,
             light_checked: false,
             light_dt: (0.0, 0),
+            frame_gap_ms: 0.0,
+            ui_end: None,
+            outside_ms: 0.0,
+            inside_ms: 0.0,
+            fps_count: 0,
+            fps_since: std::time::Instant::now(),
             frames_seen: 0,
             cursor: 0,
             playing: false,
@@ -2066,7 +2081,10 @@ impl Viewer {
         }
         let t = std::time::Instant::now();
         let big = self.layout.len() > 1500;
-        if self.layout.tick_for(std::time::Duration::from_millis(if big { 8 } else { 4 }), if big { 1 } else { 2 }) {
+        // light mode: a frame drawn by the CPU costs a quarter of a second or more, so the
+        // layout does all its ticks now (microseconds each for a lab) rather than two a frame
+        let (budget, max_ticks) = if self.light_mode { (60, 2000) } else if big { (8, 1) } else { (4, 2) };
+        if self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks) {
             ui.ctx().request_repaint();
         } else if self.fill_pending && !self.presenting && self.dragging.is_none() {
             // the layout settled: stretch it to the window, once per query
@@ -2077,7 +2095,7 @@ impl Viewer {
             }
         }
         if let Some((from, to, started)) = &self.fill_anim {
-            let k = draw::ease_out_cubic((now - started) / 0.55);
+            let k = if self.light_mode { 1.0 } else { draw::ease_out_cubic((now - started) / 0.55) };
             for i in 0..self.layout.pos.len().min(from.len()) {
                 self.layout.pos[i] = from[i] + (to[i] - from[i]) * k;
             }
@@ -2091,7 +2109,7 @@ impl Viewer {
         self.layout_ms = t.elapsed().as_secs_f32() * 1000.0;
 
         // ── the camera glides to where it is going ──
-        let k = 1.0 - (-dt * 14.0).exp();
+        let k = if self.light_mode { 1.0 } else { 1.0 - (-dt * 14.0).exp() };
         if (self.zoom_t - self.zoom).abs() > 1e-4 || (self.cam_t - self.cam).len() > 0.05 {
             self.zoom += (self.zoom_t - self.zoom) * k;
             self.cam += (self.cam_t - self.cam) * k;
@@ -2184,7 +2202,7 @@ impl Viewer {
         let focus = self.selected.or(self.hovered);
         let target = if focus.is_some() { 1.0 } else { 0.0 };
         if (self.focus_t - target).abs() > 0.001 {
-            let step = dt / 0.16;
+            let step = if self.light_mode { 1.0 } else { dt / 0.16 };
             self.focus_t = (self.focus_t + (target - self.focus_t).clamp(-step, step)).clamp(0.0, 1.0);
             ui.ctx().request_repaint();
         }
@@ -2437,7 +2455,7 @@ impl Viewer {
             let n = &self.graph.nodes[i];
             let p = self.to_screen(canvas, self.layout.pos[i]);
             let mut r = self.layout.radius[i] * z * self.style.node_scale * look.size;
-            let age = (now - self.born[i]) / 0.45;
+            let age = if self.light_mode { 1.0 } else { (now - self.born[i]) / 0.45 };
             if age < 1.0 {
                 r *= draw::ease_out_back(age).max(0.05);
                 keep_moving = true;
@@ -2591,7 +2609,7 @@ impl Viewer {
         }
         if self.hud {
             let fps = if self.frame_ms > 0.0 { 1000.0 / self.frame_ms } else { 0.0 };
-            let text = format!("{} / {} hosts · {} / {} edges · layout {:.1} · bg {:.1} · geom {:.1} · hit {:.1} · edges {:.1} · hosts {:.1} · draw {:.1} ms · frame {:.1} ms · {:.0} fps{}", nodes_drawn, self.graph.nodes.len(), edges_drawn, self.graph.edges.len(), self.layout_ms, self.bg_ms, self.geom_ms, self.hit_ms, self.edges_ms, self.nodes_ms, self.draw_ms, self.frame_ms, fps, if lod { " · reduced detail" } else { "" });
+            let text = format!("{} / {} hosts · {} / {} edges · layout {:.1} · bg {:.1} · geom {:.1} · hit {:.1} · edges {:.1} · hosts {:.1} · draw {:.1} ms · frame {:.0} ms (masstin {:.0}, rendering {:.0}) · {:.1} fps{}{} · F1 keeps drawing", nodes_drawn, self.graph.nodes.len(), edges_drawn, self.graph.edges.len(), self.layout_ms, self.bg_ms, self.geom_ms, self.hit_ms, self.edges_ms, self.nodes_ms, self.draw_ms, self.frame_ms, self.inside_ms, self.outside_ms, fps, if lod { " · reduced detail" } else { "" }, if self.light_mode { " · light mode" } else { "" });
             let galley = painter.layout_no_wrap(text, FontId::monospace(11.0), TEXT);
             let r = Rect::from_min_size(Pos2::new(canvas.left() + 10.0, canvas.bottom() - galley.size().y - 16.0), galley.size() + Vec2::new(12.0, 8.0));
             painter.rect_filled(r, CornerRadius::same(6), Color32::from_rgba_premultiplied(22, 26, 36, 225));
@@ -3525,6 +3543,14 @@ impl Viewer {
                 self.ingest.open = true;
                 self.ingest.step = other["ingest-step=".len()..].parse::<usize>().unwrap_or(0).min(3);
             }
+            other if other.starts_with("size=") => {
+                // size=WxH: the window's inner size in points
+                if let Some((w, h)) = other["size=".len()..].split_once('x') {
+                    if let (Ok(w), Ok(h)) = (w.parse::<f32>(), h.parse::<f32>()) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h)));
+                    }
+                }
+            }
             other if other.starts_with("results=") => {
                 // results=ok+fail+connect+logoff: the result pills of the filter pane
                 let toks: Vec<&str> = other["results=".len()..].split('+').map(|t| t.trim()).collect();
@@ -3765,12 +3791,41 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let __ui_start = std::time::Instant::now();
+        self.ui_inner(ui);
+        self.inside_ms = self.inside_ms * 0.8 + __ui_start.elapsed().as_secs_f32() * 1000.0 * 0.2;
+        self.ui_end = Some(std::time::Instant::now());
+    }
+}
+
+impl Viewer {
+    fn ui_inner(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let now = std::time::Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.25);
+        let gap = (now - self.last_frame).as_secs_f32();
+        if let Some(end) = self.ui_end.take() {
+            let o = (now - end).as_secs_f32() * 1000.0;
+            if o < 2000.0 {
+                self.outside_ms = self.outside_ms * 0.8 + o * 0.2;
+            }
+        }
+        let dt = gap.min(0.25);
         self.last_frame = now;
         self.frame_dt = dt;
-        self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
+        self.frame_gap_ms = gap * 1000.0;
+        // the HUD's average: only frames that follow one another (a frame after a pause is not a cost)
+        if gap < 2.0 {
+            self.frame_ms = self.frame_ms * 0.8 + gap * 1000.0 * 0.2;
+        }
+        self.fps_count += 1;
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            let since = (now - self.fps_since).as_secs_f32();
+            if since >= 2.0 {
+                eprintln!("[view] {} frame(s) in {:.1} s ({:.1} a second) · in masstin {:.1} ms · in eframe (tessellate, render, present) {:.1} ms{}", self.fps_count, since, self.fps_count as f32 / since, self.inside_ms, self.outside_ms, if self.light_mode { " · light mode" } else { "" });
+                self.fps_count = 0;
+                self.fps_since = now;
+            }
+        }
         self.watch_frame_cost(dt);
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.hud = !self.hud;
