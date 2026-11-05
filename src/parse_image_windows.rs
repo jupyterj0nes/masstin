@@ -31,7 +31,7 @@ struct ExtractedArtifacts {
 }
 
 /// Main entry point: parse forensic disk images (Windows + Linux).
-/// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4→Linux logs.
+/// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4 / XFS→Linux logs.
 /// All sources are extracted to temp directories first, then parsed together into a single CSV.
 pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>, include_loose_artifacts: bool) {
     let start_time = std::time::Instant::now();
@@ -304,7 +304,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     "BitLocker encrypted"
                 } else if msg.contains("No partitions found") {
                     "no MBR/GPT partitions"
-                } else if msg.contains("No NTFS or ext4") {
+                } else if msg.contains("No NTFS or Linux") {
                     "unsupported filesystem"
                 } else if msg.contains("but no forensic artifacts") {
                     "no forensic artifacts inside"
@@ -324,7 +324,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file{}", detail));
                 } else if msg.contains("Empty image (0 bytes)") {
                     crate::banner::print_info(&format!("  Skipped: empty image (0 bytes)"));
-                } else if msg.contains("No NTFS or ext4") || msg.contains("No partitions found") {
+                } else if msg.contains("No NTFS or Linux") || msg.contains("No partitions found") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
                 } else if msg.contains("but no forensic artifacts") {
                     crate::banner::print_info(&format!("  Skipped: {}", msg));
@@ -787,7 +787,7 @@ fn extract_images_from_zip(zip_path: &Path, temps: &mut Vec<PathBuf>) -> Result<
     Ok(firsts)
 }
 
-/// Describe partition types found in an image (for error messages when NTFS/ext4 not found)
+/// Describe partition types found in an image (for error messages when no NTFS, ext4 or XFS is found)
 fn describe_partitions<R: Read + Seek>(reader: &mut R, _image_size: u64) -> String {
     let mut types = Vec::new();
     if reader.seek(SeekFrom::Start(0)).is_err() { return String::new(); }
@@ -1296,7 +1296,7 @@ fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<Extr
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
-/// Core logic: find all partitions (NTFS + ext4) and extract forensic artifacts
+/// Core logic: find all partitions (NTFS, ext4, XFS) and extract forensic artifacts
 fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
     reader: &mut R,
     image_size: u64,
@@ -1308,16 +1308,25 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
     // Find NTFS partition offsets
     let ntfs_partitions = find_ntfs_partitions(reader, image_size).unwrap_or_default();
-    // Find ext4 partition offsets
-    let ext4_partitions = crate::parse_image_linux::find_linux_partitions_public(reader, image_size).unwrap_or_default();
+    // Find the Linux volumes (ext4, XFS) with what each one is in
+    let linux_partitions = crate::parse_image_linux::find_linux_partitions_public(reader, image_size).unwrap_or_default();
+    let linux_summary = |parts: &mut Vec<String>| {
+        for kind in [crate::parse_image_linux::LinuxFs::Ext4, crate::parse_image_linux::LinuxFs::Xfs] {
+            let n = linux_partitions.iter().filter(|(_, k)| *k == kind).count();
+            if n > 0 { parts.push(format!("{} {}", n, kind.label())); }
+        }
+    };
 
-    if ntfs_partitions.is_empty() && ext4_partitions.is_empty() {
+    // LVM partitions: their logical volumes are looked at after the plain ones
+    let lvm_partitions = crate::parse_image_linux::find_lvm_partitions_public(reader);
+
+    if ntfs_partitions.is_empty() && linux_partitions.is_empty() && lvm_partitions.is_empty() {
         // Try to report what partition types exist for debugging
         let part_info = describe_partitions(reader, image_size);
         if part_info.is_empty() {
             return Err("No partitions found (no MBR/GPT detected)".to_string());
         }
-        return Err(format!("No NTFS or ext4 found. Detected: {}", part_info));
+        return Err(format!("No NTFS or Linux (ext4, XFS) found. Detected: {}", part_info));
     }
 
     let partitions = &ntfs_partitions;
@@ -1437,7 +1446,8 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         parts.push(format!("{} NTFS", ntfs_partitions.len()));
     }
     if total_vss > 0 { parts.push(format!("{} VSS", total_vss)); }
-    if !ext4_partitions.is_empty() { parts.push(format!("{} ext4", ext4_partitions.len())); }
+    linux_summary(&mut parts);
+    if !lvm_partitions.is_empty() { parts.push(format!("{} LVM", lvm_partitions.len())); }
     crate::banner::print_info(&format!("  Partitions: {}", parts.join(", ")));
 
     let mut artifact_parts = Vec::new();
@@ -1449,27 +1459,38 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         crate::banner::print_info(&format!("  Extracted: {}", artifact_parts.join(" + ")));
     }
 
-    // Now process ext4 partitions (Linux)
+    // Now process the Linux volumes (ext4, XFS)
     let mut total_linux_logs = 0;
     let linux_logs_dir = temp_dir.join("linux_logs_extracted");
 
-    for (i, partition_offset) in ext4_partitions.iter().enumerate() {
+    for (i, (partition_offset, kind)) in linux_partitions.iter().enumerate() {
         if is_debug_mode() {
-            eprintln!("[DEBUG] ext4 partition {} at offset {:#x} ({:.2} GB)",
-                i + 1, partition_offset, *partition_offset as f64 / 1_073_741_824.0);
+            eprintln!("[DEBUG] {} partition {} at offset {:#x} ({:.2} GB)",
+                kind.label(), i + 1, partition_offset, *partition_offset as f64 / 1_073_741_824.0);
         }
 
-        match crate::parse_image_linux::extract_linux_logs_from_ext4(reader, *partition_offset, &linux_logs_dir, i) {
+        match crate::parse_image_linux::extract_linux_logs_from_partition(reader, *partition_offset, *kind, &linux_logs_dir, i) {
             Ok(count) if count > 0 => {
                 total_linux_logs += count;
-                crate::banner::print_info(&format!("  {} Linux log files extracted from ext4 partition {}", count, i));
+                crate::banner::print_info(&format!("  {} Linux log files extracted from {} partition {}", count, kind.label(), i));
             }
             Ok(_) => {
-                crate::banner::print_info(&format!("  ext4 partition {}: no log files found (auth.log, wtmp, etc.)", i));
+                crate::banner::print_info(&format!("  {} partition {}: no log files found (auth.log, wtmp, etc.)", kind.label(), i));
             }
             Err(e) => {
-                crate::banner::print_info(&format!("  ext4 partition {}: {}", i, e));
+                crate::banner::print_info(&format!("  {} partition {}: {}", kind.label(), i, e));
             }
+        }
+    }
+
+    for (li, lvm_offset) in lvm_partitions.iter().enumerate() {
+        if is_debug_mode() {
+            eprintln!("[DEBUG] LVM partition {} at offset {:#x}", li, lvm_offset);
+        }
+        let n = crate::parse_image_linux::extract_linux_logs_from_lvm(reader, *lvm_offset, li, &linux_logs_dir);
+        if n > 0 {
+            total_linux_logs += n;
+            crate::banner::print_info(&format!("  {} Linux log files extracted from the logical volumes of LVM partition {}", n, li));
         }
     }
 
@@ -1482,11 +1503,12 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
         if bitlocker_count > 0 { found.push(format!("{} BitLocker-encrypted", bitlocker_count)); }
         let readable_ntfs = ntfs_partitions.len() - bitlocker_count;
         if readable_ntfs > 0 { found.push(format!("{} NTFS", readable_ntfs)); }
-        if !ext4_partitions.is_empty() { found.push(format!("{} ext4", ext4_partitions.len())); }
+        linux_summary(&mut found);
+        if !lvm_partitions.is_empty() { found.push(format!("{} LVM", lvm_partitions.len())); }
         if found.is_empty() {
-            return Err("No NTFS or ext4 partitions found".to_string());
+            return Err("No NTFS or Linux partitions found".to_string());
         }
-        if bitlocker_count > 0 && readable_ntfs == 0 && ext4_partitions.is_empty() {
+        if bitlocker_count > 0 && readable_ntfs == 0 && linux_partitions.is_empty() && lvm_partitions.is_empty() {
             return Err(format!("All NTFS partitions are BitLocker-encrypted — recovery key required to extract artifacts"));
         }
         return Err(format!("Partitions found ({}) but no forensic artifacts inside", found.join(", ")));

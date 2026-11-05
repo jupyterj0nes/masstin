@@ -761,6 +761,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2379,6 +2388,8 @@ dependencies = [
  "reqwest",
  "rfd",
  "rpassword",
+ "rust-fs-core",
+ "rust-fs-xfs",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -3704,6 +3715,22 @@ checksum = "c247d24e63230cdb56463ae328478bd5eac8b8faa8c69461a77e8e323afac90e"
 dependencies = [
  "libc",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "rust-fs-core"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73c72ed61d0d97993e46d1e4e5df6cd6c21a4dc05085e3eb5887766e0a8e7fa"
+
+[[package]]
+name = "rust-fs-xfs"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecb06cb02c57e1e295f2d9dbf7cacf7557c78e0c453de3ffe7c89e4bcd9fd6c5"
+dependencies = [
+ "crc32c",
+ "rust-fs-core",
 ]
 
 [[package]]
