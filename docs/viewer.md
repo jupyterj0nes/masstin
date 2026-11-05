@@ -161,9 +161,9 @@ A window's size and position are not remembered; a timeline ingested from the wi
 
 ## Slow machines, servers and remote desktops
 
-The window is drawn by OpenGL (through `glow`). A Windows server, a VM without a GPU or a remote desktop session often has only Windows' generic OpenGL 1.1 driver, which is the CPU drawing pixel by pixel: the menu text can take a moment to appear, and everything is heavy. Two answers:
+The window is drawn by OpenGL (through `glow`) when there is a GPU to draw it. A Windows server, a VM without a GPU or a remote desktop session has only Windows' generic OpenGL 1.1 driver, which is the CPU drawing pixel by pixel: the menu text takes a moment to appear, and everything is heavy. So, before the window opens, the viewer looks: in a **remote desktop session**, or when the only display adapter is **Windows' basic one** (a VM or a server without a GPU driver), it draws through **wgpu** instead (Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS; without a GPU, Direct3D 12's WARP and Vulkan's software rasterisers are far quicker than the generic OpenGL), and says so in the console. Two ways to override:
 
-- **`masstin -a view --renderer wgpu`** (or `MASSTIN_VIEW_RENDERER=wgpu`) draws through Direct3D 12 on Windows (Vulkan on Linux, Metal on macOS). Without a GPU, Direct3D 12 still has WARP, Microsoft's software rasteriser, which is far quicker than the generic OpenGL. Try it first on such a machine.
+- **`masstin -a view --renderer wgpu`** or **`--renderer glow`** (or `MASSTIN_VIEW_RENDERER`) picks the backend by hand.
 - **Light mode.** When the renderer says it is software (the generic driver, llvmpipe, SwiftShader, WARP), or when ninety frames with motion on average under twelve a second, the viewer turns motion, the glow, the dot grid and the spotlight off by itself and says so in the status line. View › Style turns any of them back on. `MASSTIN_VIEW_LIGHT=1` asks for it from the start.
 
 Help › About says what is drawing the window (the OpenGL renderer and version, or wgpu's adapter), which is the first thing to look at when it is slow.
