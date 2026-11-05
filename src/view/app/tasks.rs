@@ -142,6 +142,11 @@ pub(super) struct Job {
     pub add: bool,
     /// the banner's art is over (the log starts at the separator line)
     pub past_banner: bool,
+    /// what came before the banner: kept only if the banner never comes
+    /// (masstin refused the command line before printing it)
+    prelude: Vec<String>,
+    /// the analyst pressed Stop
+    pub stopped: bool,
     /// a hunt that ended well closes its window by itself, the log kept
     pub autoclose_at: Option<std::time::Instant>,
 }
@@ -165,6 +170,7 @@ impl Job {
 
     /// Stop the child; the job ends as failed ("stopped").
     pub fn cancel(&mut self) {
+        self.stopped = true;
         if let Ok(mut c) = self.child.lock() {
             if let Some(child) = c.as_mut() {
                 let _ = child.kill();
@@ -235,7 +241,7 @@ impl Viewer {
                 Err(e) => Err(e.to_string()),
             }));
         });
-        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), ended: None, log: Vec::new(), rx, done: None, progress: Progress::default(), child: handle, open, add, past_banner: false, autoclose_at: None });
+        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), ended: None, log: Vec::new(), rx, done: None, progress: Progress::default(), child: handle, open, add, past_banner: false, prelude: Vec::new(), stopped: false, autoclose_at: None });
     }
 
     /// Drain the running job's output; on its end, read the timeline again.
@@ -255,6 +261,8 @@ impl Viewer {
                     if !job.past_banner {
                         if l.contains('─') {
                             job.past_banner = true;
+                        } else if !l.starts_with("@@pb") {
+                            job.prelude.push(l);
                         }
                         continue;
                     }
@@ -273,6 +281,11 @@ impl Viewer {
                     }
                 }
                 JobMsg::Done(r) => {
+                    let r = if job.stopped { Err("stopped".to_string()) } else { r };
+                    if !job.past_banner && job.log.is_empty() {
+                        // the command line was refused before the banner: that is the log
+                        job.log = std::mem::take(&mut job.prelude);
+                    }
                     if r.is_ok() && job.kind == JobKind::Hunt {
                         job.autoclose_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(1800));
                     }

@@ -755,11 +755,22 @@ impl Viewer {
         progress_ui(ui, job);
         if let Some(Err(e)) = &job.done {
             ui.add_space(4.0);
-            egui::Frame::new().fill(Color32::from_rgba_unmultiplied(236, 72, 96, 22)).stroke(Stroke::new(1.0, draw::fade(SIGNIFICANT, 0.7))).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, e)).color(SIGNIFICANT));
-                ui.label(egui::RichText::new("The log below says what the parser saw.").color(theme::MUTED).small());
-            });
+            if job.stopped {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(240, 170, 60, 20)).stroke(Stroke::new(1.0, draw::fade(CANDIDATE, 0.7))).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(egui::RichText::new(format!("{}  Stopped. Nothing was written; what the parser had extracted under the temp folder goes on its next run.", ic::PROHIBIT)).color(CANDIDATE));
+                });
+            } else {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(236, 72, 96, 22)).stroke(Stroke::new(1.0, draw::fade(SIGNIFICANT, 0.7))).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, e)).color(SIGNIFICANT));
+                    let said: Vec<&String> = job.log.iter().filter(|l| l.contains("Error") || l.contains("error") || l.contains("ERROR")).take(3).collect();
+                    for l in said {
+                        ui.add(egui::Label::new(egui::RichText::new(l).color(TEXT).size(12.5)).wrap());
+                    }
+                    ui.label(egui::RichText::new("The log below says what the parser saw.").color(theme::MUTED).small());
+                });
+            }
         }
         if let Some(Ok(())) = &job.done {
             ui.add_space(4.0);
@@ -1050,6 +1061,9 @@ pub(super) fn progress_ui(ui: &mut egui::Ui, job: &Job) {
         if job.done.is_none() {
             ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
             ui.label(theme::medium(format!("{}  {:.0} s", job.title, elapsed), 13.0).color(TEXT));
+        } else if job.stopped {
+            ui.label(egui::RichText::new(ic::PROHIBIT).color(CANDIDATE).size(15.0));
+            ui.label(theme::medium(format!("Stopped after {:.1} s", elapsed), 13.0).color(TEXT));
         } else if done_ok {
             ui.label(egui::RichText::new(ic::CHECK_CIRCLE).color(theme::CYAN).size(15.0));
             ui.label(theme::medium(format!("Done in {:.1} s", elapsed), 13.0).color(TEXT));
