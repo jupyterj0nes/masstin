@@ -159,6 +159,15 @@ A window's size and position are not remembered; a timeline ingested from the wi
 
 `MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `questions`, `paths=A:B[:gap_h]`, `cone=A`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p, `3` 1600 x 900), `film=FORMAT:FPS:SIZE[:file]` (film the window from here on; `cut` stops it, `quit` waits for it), `close` (shut the windows open: wizard, hunt report, paths, story, table; leave a presentation), `from=` / `to=` / `host=` / `user=` (the filter pane's fields, applied at once), `results=ok+fail+connect+logoff` (the result pills), `shot=file.png` (a screenshot of the window), `hunt=YYYY-MM-DD HH:MM:SS` (run the hunt from that start), `all=LIMIT` (the Everything view with that limit), `select=HOST`, `zoom=F`, `hud`, `motion`, `bench=N` (times the next N frames with the layout heated and prints the figures on stderr; `bench=N:cold` as it is), `wait=SECONDS` and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes; `MASSTIN_VIEW_AUTO="all=5000,wait=5,shot=big.png,bench=120,wait=10,quit"` is how the figures above were taken. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr; `MASSTIN_VIEW_HUD=1` opens with the frame budget shown.
 
+## Slow machines, servers and remote desktops
+
+The window is drawn by OpenGL (through `glow`). A Windows server, a VM without a GPU or a remote desktop session often has only Windows' generic OpenGL 1.1 driver, which is the CPU drawing pixel by pixel: the menu text can take a moment to appear, and everything is heavy. Two answers:
+
+- **`masstin -a view --renderer wgpu`** (or `MASSTIN_VIEW_RENDERER=wgpu`) draws through Direct3D 12 on Windows (Vulkan on Linux, Metal on macOS). Without a GPU, Direct3D 12 still has WARP, Microsoft's software rasteriser, which is far quicker than the generic OpenGL. Try it first on such a machine.
+- **Light mode.** When the renderer says it is software (the generic driver, llvmpipe, SwiftShader, WARP), or when ninety frames with motion on average under twelve a second, the viewer turns motion, the glow, the dot grid and the spotlight off by itself and says so in the status line. View › Style turns any of them back on. `MASSTIN_VIEW_LIGHT=1` asks for it from the start.
+
+Help › About says what is drawing the window (the OpenGL renderer and version, or wgpu's adapter), which is the first thing to look at when it is slow.
+
 ## Building without it
 
 The viewer is behind the `ui` feature, on by default. `cargo build --no-default-features` gives a parser-only binary without the window stack.

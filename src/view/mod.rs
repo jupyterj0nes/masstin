@@ -27,6 +27,8 @@ pub struct Options {
     pub focus: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+    /// `glow` (OpenGL) or `wgpu`; None means glow, unless `MASSTIN_VIEW_RENDERER` says
+    pub renderer: Option<String>,
 }
 
 /// Open the window; returns when it is closed.
@@ -66,7 +68,16 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    let native = eframe::NativeOptions { viewport, ..Default::default() };
+    let backend = opts.renderer.clone().or_else(|| std::env::var("MASSTIN_VIEW_RENDERER").ok()).unwrap_or_default().trim().to_ascii_lowercase();
+    let renderer = match backend.as_str() {
+        "wgpu" => eframe::Renderer::Wgpu,
+        "" | "glow" | "opengl" => eframe::Renderer::Glow,
+        other => return Err(Box::from(format!("unknown renderer '{}': glow (OpenGL) or wgpu", other))),
+    };
+    if renderer == eframe::Renderer::Wgpu {
+        crate::banner::print_info("Renderer: wgpu (Direct3D 12 / Vulkan / Metal)");
+    }
+    let native = eframe::NativeOptions { viewport, renderer, ..Default::default() };
     let app_opts = opts;
     eframe::run_native("masstin", native, Box::new(move |cc| Ok(Box::new(app::Viewer::new(cc, store, app_opts))))).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
     Ok(())

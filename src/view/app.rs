@@ -201,6 +201,14 @@ pub struct Viewer {
     pending_verdict: Option<u8>,
     mark_msg: String,
     status: String,
+    /// what draws the window: the OpenGL renderer / vendor / version, or wgpu's adapter
+    renderer_info: String,
+    /// motion, glow, grid and spotlight off: a software renderer, or frames measured slow
+    light_mode: bool,
+    light_checked: bool,
+    /// seconds and frames sampled while motion was on, to tell a slow renderer
+    light_dt: (f32, u32),
+    frames_seen: u64,
     // replay
     cursor: usize,
     playing: bool,
@@ -436,7 +444,80 @@ fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui:
     (Some(to_tex("masstin-logo-head", head)), Some(to_tex("masstin-logo", full)), Some(to_tex("masstin-logo-dog", big)))
 }
 
+/// What draws the window, as the backend names it.
+fn renderer_name(cc: &eframe::CreationContext<'_>) -> String {
+    if let Some(gl) = &cc.gl {
+        use eframe::glow::HasContext;
+        // SAFETY: plain GL string queries on the context eframe just made
+        let s = |p: u32| unsafe { gl.get_parameter_string(p) };
+        return format!("OpenGL · {} · {} · {}", s(eframe::glow::RENDERER), s(eframe::glow::VENDOR), s(eframe::glow::VERSION));
+    }
+    if let Some(rs) = &cc.wgpu_render_state {
+        let i = rs.adapter.get_info();
+        return format!("wgpu · {} · {:?} · {:?}", i.name, i.backend, i.device_type);
+    }
+    "an unknown renderer".to_string()
+}
+
+/// A renderer that is the CPU pretending: Windows' generic OpenGL (a server,
+/// a remote desktop, a VM without a GPU), Mesa's llvmpipe, SwiftShader, WARP.
+fn is_software_renderer(info: &str) -> bool {
+    let l = info.to_ascii_lowercase();
+    ["gdi generic", "llvmpipe", "softpipe", "swiftshader", "microsoft basic render", "warp", "software"].iter().any(|k| l.contains(k))
+}
+
 impl Viewer {
+    /// Motion, glow, grid and spotlight off, so a window drawn by the CPU
+    /// stays usable; View › Style turns any of them back on.
+    fn enter_light_mode(&mut self, why: &str) {
+        self.light_mode = true;
+        self.light_checked = true;
+        self.style.motion = false;
+        self.style.edge_glow = false;
+        self.style.grid = false;
+        self.style.vignette = false;
+        self.requery(false);
+        self.status = format!("{} · light mode: motion and effects off (View › Style turns them on; --renderer wgpu may draw faster)", why);
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] light mode: {}", why);
+        }
+    }
+
+    /// On the first frame a software renderer goes to the light mode at
+    /// once; otherwise ninety frames with motion on are timed, and a slow
+    /// average (under 12 a second) does the same.
+    fn watch_frame_cost(&mut self, dt: f32) {
+        if self.light_checked {
+            return;
+        }
+        self.frames_seen += 1;
+        if self.frames_seen == 1 {
+            if std::env::var_os("MASSTIN_VIEW_LIGHT").is_some() {
+                self.enter_light_mode("Asked for (MASSTIN_VIEW_LIGHT)");
+            } else if is_software_renderer(&self.renderer_info) {
+                let why = format!("Drawn by the CPU: {}", self.renderer_info.split(" · ").nth(1).unwrap_or(&self.renderer_info));
+                self.enter_light_mode(&why);
+            }
+            return;
+        }
+        if self.frames_seen > 20 && self.style.motion {
+            self.light_dt.0 += dt;
+            self.light_dt.1 += 1;
+            if self.light_dt.1 >= 90 {
+                let avg = self.light_dt.0 / self.light_dt.1 as f32;
+                if avg > 0.085 {
+                    let why = format!("Slow drawing, {:.0} ms a frame on {}", avg * 1000.0, self.renderer_info.split(" · ").nth(1).unwrap_or(&self.renderer_info));
+                    self.enter_light_mode(&why);
+                } else {
+                    self.light_checked = true;
+                }
+            }
+        }
+        if self.frames_seen > 600 {
+            self.light_checked = true;
+        }
+    }
+
     fn about_window(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             return;
@@ -449,6 +530,9 @@ impl Viewer {
                 }
                 ui.label(egui::RichText::new(format!("masstin {}  ·  lateral movement tracker for anything", env!("CARGO_PKG_VERSION"))).color(theme::MUTED));
                 ui.label(egui::RichText::new("The graph viewer: the timeline CSV is the truth, no database. Fonts: Inter (OFL), Phosphor icons (MIT), Press Start 2P (OFL) for the arcade.").color(theme::DIM).small());
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("Drawn by {}{}", self.renderer_info, if self.light_mode { " · light mode (motion and effects off)" } else { "" })).color(theme::DIM).small());
+                ui.label(egui::RichText::new("No GPU, or a remote desktop? `masstin -a view --renderer wgpu` draws through Direct3D 12 / Vulkan / Metal instead of OpenGL.").color(theme::DIM).small());
             });
         });
         self.show_about = open;
@@ -456,6 +540,10 @@ impl Viewer {
 
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, opts: Options) -> Viewer {
         theme::install(&cc.egui_ctx);
+        let renderer_info = renderer_name(cc);
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] renderer: {}", renderer_info);
+        }
         let logos = load_logos(&cc.egui_ctx);
 
         let mut filter = Filter::default();
@@ -509,6 +597,11 @@ impl Viewer {
             pending_verdict: None,
             mark_msg: String::new(),
             status: String::new(),
+            renderer_info,
+            light_mode: false,
+            light_checked: false,
+            light_dt: (0.0, 0),
+            frames_seen: 0,
             cursor: 0,
             playing: false,
             rate: 4.0,
@@ -3645,6 +3738,21 @@ impl Viewer {
     }
 }
 
+#[cfg(test)]
+mod renderer_tests {
+    use super::is_software_renderer;
+
+    #[test]
+    fn software_renderers_are_told_from_gpus() {
+        for s in ["OpenGL · GDI Generic · Microsoft Corporation · 1.1.0", "OpenGL · llvmpipe (LLVM 15.0.7, 256 bits) · Mesa · 4.5", "wgpu · Microsoft Basic Render Driver · Dx12 · Cpu", "OpenGL · SwiftShader · Google · 3.0"] {
+            assert!(is_software_renderer(s), "{}", s);
+        }
+        for s in ["OpenGL · NVIDIA GeForce RTX 3060/PCIe/SSE2 · NVIDIA Corporation · 4.6.0", "wgpu · AMD Radeon RX 6800 · Vulkan · DiscreteGpu", "OpenGL · Intel(R) Iris(R) Xe Graphics · Intel · 4.6.0"] {
+            assert!(!is_software_renderer(s), "{}", s);
+        }
+    }
+}
+
 fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let l2 = ab.length_sq();
@@ -3663,6 +3771,7 @@ impl eframe::App for Viewer {
         self.last_frame = now;
         self.frame_dt = dt;
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
+        self.watch_frame_cost(dt);
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.hud = !self.hud;
         }

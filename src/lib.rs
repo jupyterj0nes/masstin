@@ -307,6 +307,13 @@ pub struct Cli {
     #[arg(long)]
     focus: Option<String>,
 
+    /// For `view`: the graphics backend, `glow` (OpenGL, the default) or
+    /// `wgpu` (Direct3D 12, Vulkan or Metal; on a Windows server or over
+    /// RDP without a GPU it draws through WARP, where OpenGL has only the
+    /// slow generic driver). `MASSTIN_VIEW_RENDERER` does the same.
+    #[arg(long)]
+    renderer: Option<String>,
+
     /// For `graph-hunt` / `graph-hunt-neo4j`: reconstruct the incident from
     /// known-bad seeds (comma-separated host names, IPs or accounts). The
     /// report gets a first section with every hop the seeds took in the
@@ -614,6 +621,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                     focus: config.focus.clone(),
                     start: config.start_time.clone(),
                     end: config.end_time.clone(),
+                    renderer: config.renderer.clone(),
                 };
                 crate::view::run(opts)?;
             }
