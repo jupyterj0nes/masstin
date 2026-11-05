@@ -169,7 +169,17 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if renderer == eframe::Renderer::Wgpu {
         crate::banner::print_info(&format!("Renderer: wgpu, Direct3D 12 / Vulkan / Metal ({})", why));
     }
-    let native = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    let mut native = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    // `MASSTIN_VIEW_ADAPTER=cpu`: wgpu on the software adapter (WARP on Windows), what a
+    // remote desktop without a GPU gets; for measuring that case on a machine with one
+    if renderer == eframe::Renderer::Wgpu && std::env::var("MASSTIN_VIEW_ADAPTER").map(|v| v.eq_ignore_ascii_case("cpu")).unwrap_or(false) {
+        use eframe::wgpu;
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut create) = native.wgpu_options.wgpu_setup {
+            create.native_adapter_selector = Some(std::sync::Arc::new(|adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
+                adapters.iter().find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu).cloned().ok_or_else(|| "no software adapter (WARP, llvmpipe) to force".to_string())
+            }));
+        }
+    }
     let app_opts = opts;
     eframe::run_native("masstin", native, Box::new(move |cc| Ok(Box::new(app::Viewer::new(cc, store, app_opts))))).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
     Ok(())
