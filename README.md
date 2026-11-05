@@ -38,8 +38,10 @@
 Download the binary for your platform from the [Releases page](https://github.com/jupyterj0nes/masstin/releases/latest), or `cargo install masstin`. No runtime dependencies.
 
 ```bash
-masstin -a view            # the window: drop the evidence on it, hunt and look from there
+masstin                    # the window: drop the evidence on it, hunt and look from there
 ```
+
+Double-clicking `masstin.exe` does the same. The viewer writes nothing where it runs: a timeline's saved views, story and notes live next to the CSV with its name, the recent list under the user's configuration folder ([where things are kept →](docs/viewer.md#where-things-are-kept)).
 
 The same three steps from a terminal:
 

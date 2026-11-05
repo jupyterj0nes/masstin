@@ -3,6 +3,26 @@ use clap::Parser;
 use std::process;
 use tokio;
 
+/// A console nobody else is attached to was created for this process by
+/// a double-click: free it, so only the window stays. From a terminal the
+/// console is shared and kept.
+#[cfg(windows)]
+fn detach_own_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        fn FreeConsole() -> i32;
+    }
+    let mut ids = [0u32; 4];
+    // SAFETY: plain Win32 calls with a valid buffer and its length
+    let n = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) };
+    if n <= 1 {
+        unsafe {
+            FreeConsole();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Hidden mode: when MASSTIN_VALIDATE_EVTX is set, this process is a child
@@ -17,7 +37,16 @@ async fn main() {
         process::exit(if ok { 0 } else { 1 });
     }
 
-    let cli = Cli::parse();
+    // No arguments (a double-click on masstin.exe, or `masstin` alone): the
+    // window, on its welcome. With a console of its own and nothing to print
+    // on it, the console goes away.
+    let cli = if std::env::args_os().len() == 1 && cfg!(feature = "ui") {
+        #[cfg(windows)]
+        detach_own_console();
+        Cli::parse_from(["masstin", "-a", "view"])
+    } else {
+        Cli::parse()
+    };
 
     if let Err(e) = masstin::run(cli).await {
         eprintln!("Masstin - Error: {}", e);

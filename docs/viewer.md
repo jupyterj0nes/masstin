@@ -139,6 +139,16 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 **Film the window** (Tools menu) records the window as you use it, in real time, until *Stop filming*: the ingest wizard with its bars, a hunt, the paths, a presentation, whatever happens on it, as an MP4 next to the timeline (through `ffmpeg`'s standard input, so no frame files; a GIF when ffmpeg is not on the PATH). A frame is taken whenever one is due at 20 a second; when the window stalls, the film holds the last frame for as long as the stall lasted, so its clock stays the wall's. The demo video in the README was filmed this way, by the autopilot below.
 
+## Where things are kept
+
+Nothing is written where the binary runs. The viewer keeps:
+
+- **next to the timeline**, with its name: `<timeline>.views.json` (the saved filters with their style and arrangement, the style in use, the merged hosts, the subnets), `<timeline>.story.json` (the presentation) and `<timeline>.notes.json` (the notes on hosts, connections and the case). Copy the CSV with its three side files and the case travels whole; delete them and the viewer starts clean on that timeline. The marks (`verdict`, `notes`) are in the CSV itself.
+- **the recent timelines** in `recent.json` under the user's configuration folder: `%APPDATA%\masstin\` on Windows, `$XDG_CONFIG_HOME/masstin/` or `~/.config/masstin/` elsewhere. That is the only thing kept per user.
+- **scratch**: a timeline written for the welcome and a film started with nothing open go to `masstin/` under the system's temporary folder.
+
+A window's size and position are not remembered; a timeline ingested from the window is written where the wizard's Timeline step says (next to the evidence by default).
+
 ## Driving it from outside
 
 `MASSTIN_VIEW_AUTO` runs actions one per second once the window is up, for demos and tests: `present`, `story`, `rules`, `fit`, `questions`, `paths=A:B[:gap_h]`, `cone=A`, `record=FORMAT:FPS:SIZE` (`gif` / `png` / `mp4`; size `0` the window, `1` 720p, `2` 1080p, `3` 1600 x 900), `film=FORMAT:FPS:SIZE[:file]` (film the window from here on; `cut` stops it, `quit` waits for it), `close` (shut the windows open: wizard, hunt report, paths, story, table; leave a presentation), `from=` / `to=` / `host=` / `user=` (the filter pane's fields, applied at once), `results=ok+fail+connect+logoff` (the result pills), `shot=file.png` (a screenshot of the window), `hunt=YYYY-MM-DD HH:MM:SS` (run the hunt from that start), `all=LIMIT` (the Everything view with that limit), `select=HOST`, `zoom=F`, `hud`, `motion`, `bench=N` (times the next N frames with the layout heated and prints the figures on stderr; `bench=N:cold` as it is), `wait=SECONDS` and `quit`. `MASSTIN_VIEW_AUTO="record=gif:15:1,quit" masstin -a view -f timeline.csv` records the story at 720p and closes; `MASSTIN_VIEW_AUTO="all=5000,wait=5,shot=big.png,bench=120,wait=10,quit"` is how the figures above were taken. `MASSTIN_VIEW_DEBUG=1` prints what the viewer does on stderr; `MASSTIN_VIEW_HUD=1` opens with the frame budget shown.
