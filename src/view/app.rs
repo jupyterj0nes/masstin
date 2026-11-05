@@ -248,6 +248,7 @@ pub struct Viewer {
     export_size: usize,
     export_name: String,
     export: Option<ExportJob>,
+    film: Option<FilmJob>,
     ffmpeg: Option<bool>,
     auto: Vec<String>,
     auto_next: std::time::Instant,
@@ -400,6 +401,22 @@ struct ExportJob {
     rec: present::Recorder,
 }
 
+/// A film of the window as it is used: a screenshot whenever a frame is
+/// due at the chosen rate, in real time (a slow frame is held for the
+/// slots it missed), streamed to the encoder until it is stopped.
+struct FilmJob {
+    fps: u32,
+    started: std::time::Instant,
+    pushed: usize,
+    waiting: bool,
+    rx: std::sync::mpsc::Receiver<(usize, std::sync::Arc<egui::ColorImage>)>,
+    tx: std::sync::mpsc::Sender<(usize, std::sync::Arc<egui::ColorImage>)>,
+    restore: Option<Vec2>,
+    rec: present::Recorder,
+    /// close the window once the film is written (`quit` while filming)
+    quit_after: bool,
+}
+
 /// The logo (`resources/masstin_logo.png`, embedded): the dog's head cut
 /// out for the menu bar, and the whole picture for About.
 fn load_logos(ctx: &egui::Context) -> (Option<egui::TextureHandle>, Option<egui::TextureHandle>, Option<egui::TextureHandle>) {
@@ -527,6 +544,7 @@ impl Viewer {
             export_size: 0,
             export_name: String::new(),
             export: None,
+            film: None,
             ffmpeg: None,
             auto: std::env::var("MASSTIN_VIEW_AUTO").ok().map(|v| v.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()).unwrap_or_default(),
             auto_next: std::time::Instant::now() + std::time::Duration::from_secs(2),
@@ -916,6 +934,9 @@ impl Viewer {
 
     fn start_presentation(&mut self) {
         self.rebuild_steps();
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] presenting {} steps, {:.1} s", self.steps.len(), present::total_secs(&self.steps, &self.story));
+        }
         self.presenting = true;
         self.present_t = 0.0;
         self.present_playing = true;
@@ -2600,9 +2621,8 @@ impl Viewer {
                 painter.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
                 painter.galley(r.min + Vec2::new(20.0, 12.0), galley, TEXT);
             }
-            Some(job) => {
-                painter.text(Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0), Align2::LEFT_BOTTOM, format!("recording frame {} / {} at {} fps", job.next, job.total, job.fps), FontId::proportional(11.0), MUTED);
-            }
+            // a recording is the window itself: nothing drawn that is not the story
+            Some(_) => {}
         }
     }
 
@@ -3149,7 +3169,7 @@ impl Viewer {
             });
             ui.horizontal(|ui| {
                 ui.label("Size");
-                for (i, name) in ["this window", "1280 x 720", "1920 x 1080"].iter().enumerate() {
+                for (i, name) in ["this window", "1280 x 720", "1920 x 1080", "1600 x 900"].iter().enumerate() {
                     if ui.add(egui::Button::selectable(self.export_size == i, *name)).clicked() {
                         self.export_size = i;
                     }
@@ -3207,6 +3227,7 @@ impl Viewer {
         let restore = match self.export_size {
             1 => Some(Vec2::new(1280.0, 720.0)),
             2 => Some(Vec2::new(1920.0, 1080.0)),
+            3 => Some(Vec2::new(1600.0, 900.0)),
             _ => None,
         };
         let current = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
@@ -3221,6 +3242,115 @@ impl Viewer {
         self.export = Some(ExportJob { fps: self.export_fps, out, total: frames, next: 0, waiting: false, rx, tx, restore: if restore.is_some() { current } else { None }, rec });
         self.start_presentation();
         self.present_playing = false;
+    }
+
+    /// Film the window as it is used (Tools › Film the window, or
+    /// `MASSTIN_VIEW_AUTO=film=mp4:20:1[:file]`): a frame whenever one is
+    /// due at the rate, in real time, until Stop filming, `cut` or `quit`.
+    /// MP4 through ffmpeg's standard input; GIF with the encoder of the
+    /// story. The file goes next to the timeline, or to the temp dir
+    /// when nothing is open.
+    pub(super) fn start_film(&mut self, ctx: &egui::Context, format: Format, fps: u32, size: usize, out: Option<std::path::PathBuf>, quiet: bool) {
+        if self.film.is_some() {
+            return;
+        }
+        let format = if format == Format::Mp4 && !present::ffmpeg_available() { Format::Gif } else if format == Format::Png { Format::Gif } else { format };
+        let out = out.unwrap_or_else(|| {
+            let (dir, stem) = match self.files.first() {
+                Some(f) => {
+                    let p = std::path::Path::new(f);
+                    (p.parent().map(|d| d.to_path_buf()).unwrap_or_default(), p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "masstin".into()))
+                }
+                None => (std::env::temp_dir().join("masstin"), "masstin".to_string()),
+            };
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(format!("{}-film-{}.{}", stem, chrono::Local::now().format("%Y%m%d-%H%M%S"), if format == Format::Gif { "gif" } else { "mp4" }))
+        });
+        let fps = fps.clamp(5, 60);
+        let restore = match size {
+            1 => Some(Vec2::new(1280.0, 720.0)),
+            2 => Some(Vec2::new(1920.0, 1080.0)),
+            3 => Some(Vec2::new(1600.0, 900.0)),
+            _ => None,
+        };
+        let current = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
+        if let Some(s) = restore {
+            let ppp = ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s / ppp));
+        }
+        let rec = match format {
+            Format::Mp4 => present::Recorder::start_stream(fps, out.clone()),
+            _ => present::Recorder::start(fps, Format::Gif, out.clone()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        // a resized window needs a frame or two before it is its new size
+        let started = std::time::Instant::now() + std::time::Duration::from_millis(if restore.is_some() { 500 } else { 0 });
+        self.film = Some(FilmJob { fps, started, pushed: 0, waiting: false, rx, tx, restore: if restore.is_some() { current } else { None }, rec, quit_after: false });
+        // from the menu the status says so; the autopilot's film stays clean
+        if !quiet {
+            self.status = format!("Filming the window to {} (Tools > Stop filming)", out.display());
+        }
+        if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+            eprintln!("[view] filming the window to {}", out.display());
+        }
+    }
+
+    fn stop_film(&mut self, quit_after: bool) {
+        if let Some(job) = self.film.as_mut() {
+            job.quit_after |= quit_after;
+            job.rec.finish();
+        }
+    }
+
+    /// Drive a film: when a frame is due, ask for a screenshot; when it
+    /// comes, push it once per slot that went by.
+    fn film_step(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.film.as_mut() else { return };
+        if let Some(result) = job.rec.result() {
+            let (restore, quit) = (job.restore, job.quit_after);
+            self.film = None;
+            if let Some(size) = restore {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            self.status = match result {
+                Ok(m) => format!("Filmed: {}", m),
+                Err(e) => format!("Filming failed: {}", e),
+            };
+            if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                eprintln!("[view] {}", self.status);
+            }
+            if quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        if job.rec.finishing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        let elapsed = std::time::Instant::now().saturating_duration_since(job.started).as_secs_f32();
+        if job.waiting {
+            if let Ok((_, img)) = job.rx.try_recv() {
+                let due = (elapsed * job.fps as f32).floor() as usize;
+                // a stall (the window starved by a parser, a slow read-back) is held
+                // frozen for as long as it lasted, so the film keeps the clock's time
+                let n = due.saturating_sub(job.pushed).clamp(1, 30 * job.fps as usize);
+                for _ in 0..n {
+                    job.rec.push(img.clone());
+                }
+                job.pushed += n;
+                job.waiting = false;
+            }
+        }
+        if !job.waiting && (elapsed * job.fps as f32) as usize >= job.pushed {
+            let tx = job.tx.clone();
+            let idx = job.pushed;
+            job.waiting = true;
+            ctx.request_screenshot(move |img| {
+                let _ = tx.send((idx, img));
+            });
+        }
+        ctx.request_repaint();
     }
 
     /// `MASSTIN_VIEW_AUTO="story,record=gif:10:0,quit"`: actions run one
@@ -3238,6 +3368,11 @@ impl Viewer {
         }
         self.auto_next = now + std::time::Duration::from_secs(1);
         let cmd = self.auto.remove(0);
+        if let Some(f) = &self.film {
+            if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                eprintln!("[film] t={:.2} {}", std::time::Instant::now().saturating_duration_since(f.started).as_secs_f32(), cmd);
+            }
+        }
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
             let b = self.layout.bounds().map(|(lo, hi)| format!("({:.0},{:.0})-({:.0},{:.0})", lo.x, lo.y, hi.x, hi.y)).unwrap_or_default();
             eprintln!("[view] auto: {}  [cam ({:.0},{:.0}) -> ({:.0},{:.0}) zoom {:.2} -> {:.2} bounds {}]", cmd, self.cam.x, self.cam.y, self.cam_t.x, self.cam_t.y, self.zoom, self.zoom_t, b);
@@ -3251,7 +3386,37 @@ impl Viewer {
                 self.layout.stop();
             }
             "questions" => self.show_questions = true,
-            "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            "quit" => {
+                if self.film.is_some() {
+                    self.stop_film(true);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            "cut" => self.stop_film(false),
+            "close" => {
+                self.ingest.open = false;
+                self.show_hunt = false;
+                self.hunt_report = None;
+                self.show_story = false;
+                self.show_table = false;
+                self.show_paths = false;
+                self.show_questions = false;
+                self.show_last_log = false;
+                if self.presenting {
+                    self.stop_presentation();
+                }
+                if self.job.as_ref().map_or(false, |j| j.done.is_some()) {
+                    let j = self.job.take().unwrap();
+                    self.last_log = Some((j.command, j.log));
+                }
+                if self.overlay.is_some() {
+                    self.overlay = None;
+                    self.path_found.clear();
+                    self.path_msg.clear();
+                    self.requery(false);
+                }
+            }
             "hud" => self.hud = !self.hud,
             "motion" => self.style.motion = !self.style.motion,
             "table" => self.show_table = true,
@@ -3263,6 +3428,28 @@ impl Viewer {
                 self.run_ingest();
             }
             other if other.starts_with("ingest=") => self.ingest_with(vec![other["ingest=".len()..].to_string()]),
+            other if other.starts_with("ingest-step=") => {
+                self.ingest.open = true;
+                self.ingest.step = other["ingest-step=".len()..].parse::<usize>().unwrap_or(0).min(3);
+            }
+            other if other.starts_with("results=") => {
+                // results=ok+fail+connect+logoff: the result pills of the filter pane
+                let toks: Vec<&str> = other["results=".len()..].split('+').map(|t| t.trim()).collect();
+                for (name, k) in [("ok", R_OK), ("fail", R_FAIL), ("connect", R_CONNECT), ("logoff", R_LOGOFF)] {
+                    self.draft.results[k as usize] = toks.contains(&name);
+                }
+                self.requery(false);
+            }
+            other if other.starts_with("from=") || other.starts_with("to=") || other.starts_with("user=") || other.starts_with("host=") => {
+                match other.split_once('=') {
+                    Some(("from", v)) => self.draft.from = v.to_string(),
+                    Some(("to", v)) => self.draft.to = v.to_string(),
+                    Some(("user", v)) => self.draft.user = v.to_string(),
+                    Some((_, v)) => self.draft.host = v.to_string(),
+                    None => {}
+                }
+                self.requery(false);
+            }
             other if other.starts_with("out=") => self.ingest.output = other["out=".len()..].to_string(),
             other if other.starts_with("drop=") || other.starts_with("drop+=") => {
                 // as if the file had been dropped on the window; `drop+=` adds
@@ -3346,7 +3533,18 @@ impl Viewer {
                 self.run_cone(true);
             }
             other => {
-                if let Some(spec) = other.strip_prefix("record=") {
+                if let Some(spec) = other.strip_prefix("film=") {
+                    // film=FORMAT:FPS:SIZE[:file]  (mp4 | gif; size 0 window, 1 720p, 2 1080p)
+                    let mut parts = spec.splitn(4, ':');
+                    let format = match parts.next().unwrap_or("mp4") {
+                        "gif" => Format::Gif,
+                        _ => Format::Mp4,
+                    };
+                    let fps = parts.next().and_then(|f| f.parse().ok()).unwrap_or(20);
+                    let size = parts.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+                    let out = parts.next().filter(|s| !s.is_empty()).map(std::path::PathBuf::from);
+                    self.start_film(ctx, format, fps, size, out, true);
+                } else if let Some(spec) = other.strip_prefix("record=") {
                     let parts: Vec<&str> = spec.split(':').collect();
                     self.export_format = match parts.first().copied().unwrap_or("gif") {
                         "png" => Format::Png,
@@ -3496,6 +3694,7 @@ impl eframe::App for Viewer {
             }
             ctx.request_repaint();
         }
+        self.film_step(&ctx);
         self.autopilot(&ctx);
         if self.export.is_some() {
             self.export_step(&ctx);

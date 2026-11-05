@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `view`: **Film the window.** Tools › Film the window records the window as it is used, in real time, until Stop filming: the wizard's bars, a hunt, the paths, a presentation. An MP4 streamed into ffmpeg's standard input (no frame files), a GIF without ffmpeg; a stall is held frozen for as long as it lasted, so the film keeps the clock. The recordings get a 1600 x 900 size. For scripts: `film=FORMAT:FPS:SIZE[:file]`, `cut`, and with it `close`, `ingest-step=N`, `from=`, `to=`, `host=`, `user=`, `results=`, the commands the README's demo video is made of.
+- `view`: a machine account named as a computer (`PTR-SRV01$`) is drawn as that computer, not as a host of its own; a timeline opened from the window (ingest, drop, recent) loads its story file as one opened from the command line does; the ingest scan no longer takes `Secure-Boot-Update` (a scheduled task of Windows) for a Linux `secure` log; closing the paths window from a script leaves the paths view; the story recording no longer draws its frame counter into the frames; the child masstin of an ingest or a hunt runs below normal priority on Windows, so the window stays fluid while it takes every core.
+- README rewritten around the window: a demo video (ingest, the graph, the hunt, the paths, the story) and a 13-second GIF of a lateral movement replayed; the long parts moved to the docs.
+
 ## v1.4.0 — 2026-11-05
 
 The graph without a database, and the evidence through the window. The timeline carries the hunt's verdict in five columns of its own; `masstin -a view` opens the lateral-movement graph in a native window (filters, neighbourhoods, paths, questions, marks, a replay that presents and records), and that window now takes the evidence too: drop it, let masstin say what it is, watch the parser's bars, open the timeline. Neo4j and Memgraph become an export.

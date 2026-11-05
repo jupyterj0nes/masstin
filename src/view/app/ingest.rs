@@ -223,7 +223,7 @@ fn look_at(p: &Path, s: &mut Scan) {
         }
     } else {
         let fam = crate::parse_linux::log_family(&name);
-        if fam != "other" && fam != "evtx" {
+        if fam != "other" && fam != "evtx" && is_rotated_log_name(&name, fam) {
             *s.linux.entry(fam).or_insert(0) += 1;
         }
     }
@@ -385,6 +385,7 @@ impl Viewer {
                 self.merges = merges;
                 self.views_path = ViewsFile::path_for(&self.files[0]);
                 self.story_path = Story::path_for(&self.files[0]);
+                self.story = Story::load(&self.story_path);
                 self.notes = Notes::load(&Notes::path_for(&self.files[0]));
                 self.remembered.clear();
                 if self.draft.view == View::Findings && !self.store.edges.iter().any(|e| e.hunt != 0) {
@@ -1240,9 +1241,37 @@ pub(super) fn scratch_csv() -> String {
     std::env::temp_dir().join("masstin").join("welcome.csv").to_string_lossy().to_string()
 }
 
+/// `secure`, `secure-20261101`, `auth.log.2.gz`, `wtmp.1`, `messages`:
+/// the family's name alone or rotated. Not `Secure-Boot-Update` (a task
+/// of Windows) or `messages_old.txt`.
+fn is_rotated_log_name(name: &str, fam: &str) -> bool {
+    let base = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name).to_ascii_lowercase();
+    let rest = match fam {
+        "secure" => base.strip_prefix("auth.log").or_else(|| base.strip_prefix("secure")),
+        "audit" => base.strip_prefix("audit.log"),
+        "journal" | "lastlog" => return true,
+        f => base.strip_prefix(f),
+    };
+    let mut rest = rest.unwrap_or("");
+    for z in [".gz", ".xz", ".bz2", ".zst"] {
+        rest = rest.strip_suffix(z).unwrap_or(rest);
+    }
+    rest.is_empty() || rest == ".log" || (rest.starts_with(['.', '-', '_']) && rest[1..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotated_log_names_only() {
+        for (n, f) in [("secure", "secure"), ("secure-20261101", "secure"), ("auth.log.2.gz", "secure"), ("auth.log", "secure"), ("wtmp.1", "wtmp"), ("btmp-20261001.gz", "btmp"), ("messages", "messages"), ("audit.log.3", "audit"), ("system.journal", "journal")] {
+            assert!(is_rotated_log_name(n, f), "{}", n);
+        }
+        for (n, f) in [("Secure-Boot-Update", "secure"), ("SecureBootEncodeUEFI", "secure"), ("messages_old.txt", "messages"), ("wtmpx-notes", "wtmp"), ("securefile", "secure")] {
+            assert!(!is_rotated_log_name(n, f), "{}", n);
+        }
+    }
 
     #[test]
     fn a_folder_of_evtx_is_windows() {

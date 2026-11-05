@@ -198,7 +198,8 @@ impl Viewer {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS: the parser takes every core it is given; the window stays fluid
+                cmd.creation_flags(0x0800_0000 | 0x0000_4000);
             }
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
