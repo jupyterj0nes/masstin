@@ -3264,6 +3264,19 @@ impl Viewer {
             }
             other if other.starts_with("ingest=") => self.ingest_with(vec![other["ingest=".len()..].to_string()]),
             other if other.starts_with("out=") => self.ingest.output = other["out=".len()..].to_string(),
+            other if other.starts_with("drop=") || other.starts_with("drop+=") => {
+                // as if the file had been dropped on the window; `drop+=` adds
+                let (add, p) = match other.strip_prefix("drop+=") {
+                    Some(p) => (true, p),
+                    None => (false, &other["drop=".len()..]),
+                };
+                self.drop_files(vec![std::path::PathBuf::from(p)], add);
+            }
+            "ingest-stop" => {
+                if let Some(j) = self.job.as_mut() {
+                    j.cancel();
+                }
+            }
             other if other.starts_with("hunt=") => {
                 self.hunt_form.from = other["hunt=".len()..].to_string();
                 self.hunt_form.alpha = format!("{}", self.alpha);

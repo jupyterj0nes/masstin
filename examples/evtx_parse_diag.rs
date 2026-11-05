@@ -62,10 +62,7 @@ fn main() {
                         let mut parsed = cd.parse(settings).ok()?;
                         for rec in parsed.iter() {
                             if let Ok(record) = rec {
-                                let mut xml_buf: Vec<u8> = Vec::new();
-                                let mut out = evtx::XmlOutput::with_writer(&mut xml_buf, &evtx::ParserSettings::default());
-                                let _ = record.into_output(&mut out);
-                                let xml = String::from_utf8_lossy(&out.into_writer()).to_string();
+                                let xml = record.into_xml().map(|r| r.data).unwrap_or_default();
                                 if let Some(s) = xml.find("Provider Name=\"") {
                                     let after = &xml[s + 15..];
                                     if let Some(e) = after.find('"') {
