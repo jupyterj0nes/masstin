@@ -359,7 +359,7 @@ enum ActionType {
     /// Parse macOS logs: a .logarchive bundle (binary Unified Log) or a `log show` JSON/NDJSON export. Extracts SSH and Screen Sharing / ARD remote logons.
     #[value(alias = "parse-macos")]
     ParseMac,
-    /// Parse from forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4→Linux logs
+    /// Parse from forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4 / XFS→Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
     /// MASSIVE mode: process EVERYTHING — forensic images + triage packages + loose EVTX/logs. Point at evidence folder, get a timeline. No mercy.

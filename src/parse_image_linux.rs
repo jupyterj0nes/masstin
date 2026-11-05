@@ -1,6 +1,7 @@
 // -----------------------------------------------------------------------------
 //  Forensic image parser for Linux logs
-//  Opens E01/dd/VMDK images, finds ext4/ext3/ext2 partitions, extracts log
+//  Opens E01/dd/VMDK images, finds ext4/ext3/ext2 and XFS volumes (as
+//  partitions or LVM logical volumes), extracts log
 //  files (auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog,
 //  hostname, dpkg.log) to a temp directory, then delegates to parse_linux().
 // -----------------------------------------------------------------------------
@@ -9,6 +10,9 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use ext4_view::{Ext4, Ext4Read};
+use fs_core::BlockRead;
+use fs_xfs::Filesystem as XfsFilesystem;
+use std::sync::{Arc, Mutex};
 use crate::parse::is_debug_mode;
 use crate::parse_linux::parse_linux;
 
@@ -17,13 +21,6 @@ use crate::parse_linux::parse_linux;
 const GPT_LINUX_LVM_GUID: [u8; 16] = [
     0x79, 0xD3, 0xD6, 0xE6, 0x07, 0xF5, 0xC2, 0x44,
     0xA2, 0x3C, 0x23, 0x8F, 0x2A, 0x3D, 0xF9, 0x28,
-];
-
-/// GPT partition type GUID for Linux filesystem
-/// 0FC63DAF-8483-4772-8E79-3D69D8477DE4 in mixed-endian encoding
-const GPT_LINUX_FS_GUID: [u8; 16] = [
-    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
 
 /// ext4 superblock magic number at offset 0x438 from partition start (1024 + 56)
@@ -52,6 +49,216 @@ const EXACT_FILES: &[&str] = &[
     "/var/log/lastlog",
     "/etc/hostname",
 ];
+
+/// The file systems a Linux volume can be in, as masstin reads them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinuxFs {
+    /// ext2 / ext3 / ext4, through ext4-view
+    Ext4,
+    /// XFS (what RHEL, Rocky, Alma and Oracle Linux install by default), through rust-fs-xfs
+    Xfs,
+}
+
+impl LinuxFs {
+    pub fn label(self) -> &'static str {
+        match self {
+            LinuxFs::Ext4 => "ext4",
+            LinuxFs::Xfs => "XFS",
+        }
+    }
+}
+
+/// What file system starts at `offset`: the ext4 magic at 0x438, or `XFSB`
+/// as the first bytes of the volume.
+fn sniff_linux_fs<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<LinuxFs> {
+    if verify_ext4_superblock(reader, offset) {
+        return Some(LinuxFs::Ext4);
+    }
+    if reader.seek(SeekFrom::Start(offset)).is_ok() {
+        let mut magic = [0u8; 4];
+        if reader.read_exact(&mut magic).is_ok() && &magic == b"XFSB" {
+            return Some(LinuxFs::Xfs);
+        }
+    }
+    None
+}
+
+/// What the log extraction needs from a file system: a file by its path,
+/// and a directory listing that says what each entry is. ext4 and XFS
+/// both give it, so the list of logs taken is one.
+trait LogTree {
+    fn read_file(&self, path: &str) -> Option<Vec<u8>>;
+    /// `(name, is_dir, is_regular_file)`, without `.` and `..`
+    fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)>;
+}
+
+impl LogTree for Ext4 {
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        self.read(path).ok()
+    }
+    fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)> {
+        let Ok(entries) = self.read_dir(path) else { return Vec::new() };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().as_str().ok()?.to_string();
+                if name == "." || name == ".." {
+                    return None;
+                }
+                let ft = e.file_type().ok()?;
+                Some((name, ft.is_dir(), ft.is_regular_file()))
+            })
+            .collect()
+    }
+}
+
+impl LogTree for XfsFilesystem {
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        match self.read_path(path) {
+            Ok(d) => Some(d),
+            // /var/run is a link to /run on every current distribution
+            Err(_) => path.strip_prefix("/var/run/").and_then(|rest| self.read_path(&format!("/run/{}", rest)).ok()),
+        }
+    }
+    fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)> {
+        let Ok(entries) = self.list_path(path) else { return Vec::new() };
+        entries
+            .into_iter()
+            .filter_map(|e| {
+                let name = String::from_utf8_lossy(&e.name).to_string();
+                if name == "." || name == ".." {
+                    return None;
+                }
+                let inode = self.read_inode(e.ino).ok()?;
+                Some((name, inode.is_dir(), inode.is_regular_file()))
+            })
+            .collect()
+    }
+}
+
+/// Write one extracted file under `output_dir`, mirroring its Linux path.
+fn save_extracted(linux_path: &str, data: &[u8], output_dir: &Path) -> bool {
+    let dest = map_linux_path_to_local(linux_path, output_dir);
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match File::create(&dest).and_then(|mut f| f.write_all(data)) {
+        Ok(()) => {
+            if is_debug_mode() {
+                eprintln!("[DEBUG] Extracted: {} ({} bytes)", linux_path, data.len());
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The logs masstin takes from a Linux root: the exact files, what matches
+/// the known names under /var/log and /var/log/audit, and journald's
+/// binary journals (on modern distributions SSH authentication lives
+/// there; auth.log is nearly empty under pam_sss / SSSD).
+fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
+    let mut count = 0;
+    for path in EXACT_FILES {
+        if let Some(data) = tree.read_file(path) {
+            if save_extracted(path, &data, output_dir) {
+                count += 1;
+            }
+        }
+    }
+    for log_dir in LOG_DIRS {
+        for (name, _, is_file) in tree.list_dir(log_dir) {
+            if !is_file {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            let wanted = LOG_PREFIXES.iter().any(|p| lower.starts_with(&p.to_lowercase())) || lower == "wtmp" || lower == "btmp" || lower == "lastlog";
+            if !wanted {
+                continue;
+            }
+            let full = format!("{}/{}", log_dir, name);
+            match tree.read_file(&full) {
+                Some(data) => {
+                    if save_extracted(&full, &data, output_dir) {
+                        count += 1;
+                    }
+                }
+                None => {
+                    if is_debug_mode() {
+                        eprintln!("[DEBUG] Could not read {}", full);
+                    }
+                }
+            }
+        }
+    }
+    for (machine, is_dir, _) in tree.list_dir("/var/log/journal") {
+        if !is_dir {
+            continue;
+        }
+        let machine_dir = format!("/var/log/journal/{}", machine);
+        for (jname, _, is_file) in tree.list_dir(&machine_dir) {
+            let jlow = jname.to_lowercase();
+            if !is_file || !(jlow.ends_with(".journal") || jlow.ends_with(".journal~")) {
+                continue;
+            }
+            let full = format!("{}/{}", machine_dir, jname);
+            if let Some(data) = tree.read_file(&full) {
+                if save_extracted(&full, &data, output_dir) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// The XFS driver wants a shared block device that answers positioned
+/// reads: the same raw-pointer bridge as the ext4 wrapper below, with a
+/// lock around each seek-and-read. The `Filesystem` that holds it is
+/// dropped before `extract_logs_from_xfs_partition` returns, so the
+/// pointer never outlives the reader it points to.
+struct PtrBlockDevice<R: Read + Seek> {
+    reader: Mutex<*mut R>,
+    offset: u64,
+    size: u64,
+}
+
+// Safety: single owner of the pointer for the life of the Filesystem, every
+// access under the mutex, dropped before the borrowed reader moves.
+unsafe impl<R: Read + Seek> Send for PtrBlockDevice<R> {}
+unsafe impl<R: Read + Seek> Sync for PtrBlockDevice<R> {}
+
+impl<R: Read + Seek> BlockRead for PtrBlockDevice<R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_core::Result<()> {
+        let mut guard = self.reader.lock().map_err(|_| fs_core::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "reader lock poisoned")))?;
+        let reader = unsafe { &mut **guard };
+        reader.seek(SeekFrom::Start(self.offset + offset))?;
+        reader.read_exact(buf)?;
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Extract the logs of an XFS volume that starts at `partition_offset`.
+fn extract_logs_from_xfs_partition<R: Read + Seek + 'static>(reader: &mut R, partition_offset: u64, output_dir: &Path) -> Result<usize, String> {
+    let end = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    let size = end.saturating_sub(partition_offset);
+    let device: Arc<dyn BlockRead> = Arc::new(PtrBlockDevice { reader: Mutex::new(reader as *mut R), offset: partition_offset, size });
+    let fs = XfsFilesystem::mount(device).map_err(|e| format!("Cannot mount XFS volume: {}", e))?;
+    let count = extract_logs_from_tree(&fs, output_dir);
+    drop(fs);
+    Ok(count)
+}
+
+/// One Linux volume, whatever it is in.
+fn extract_logs_from_linux_partition<R: Read + Seek + 'static>(reader: &mut R, partition_offset: u64, kind: LinuxFs, output_dir: &Path) -> Result<usize, String> {
+    match kind {
+        LinuxFs::Ext4 => extract_logs_from_ext4_partition(reader, partition_offset, output_dir),
+        LinuxFs::Xfs => extract_logs_from_xfs_partition(reader, partition_offset, output_dir),
+    }
+}
 
 // -----------------------------------------------------------------------------
 //  Public entry point
@@ -247,31 +454,32 @@ fn extract_logs_from_seekable<R: Read + Seek + 'static>(
     _image_path: &str,
     temp_dir: &Path,
 ) -> Result<PathBuf, String> {
-    crate::banner::print_phase("1", "3", "Searching for ext4/ext3/ext2 partitions...");
+    crate::banner::print_phase("1", "3", "Searching for Linux partitions (ext4, XFS)...");
 
     let partitions = find_linux_partitions(reader, image_size)?;
 
     if partitions.is_empty() {
-        return Err("No ext4/ext3/ext2 partitions found in image".to_string());
+        return Err("No ext4/ext3/ext2 or XFS partitions found in image".to_string());
     }
 
-    crate::banner::print_phase_result(&format!("{} ext4 partition(s) found", partitions.len()));
+    let kinds: Vec<&str> = partitions.iter().map(|(_, k)| k.label()).collect();
+    crate::banner::print_phase_result(&format!("{} Linux partition(s) found ({})", partitions.len(), kinds.join(", ")));
 
     let logs_output_dir = temp_dir.join("logs_extracted");
     let _ = fs::create_dir_all(&logs_output_dir);
     let mut total_files = 0;
 
-    for (i, partition_offset) in partitions.iter().enumerate() {
+    for (i, (partition_offset, kind)) in partitions.iter().enumerate() {
         crate::banner::print_info(&format!(
-            "Partition {} at offset {:#x} ({:.2} GB)",
-            i, partition_offset,
+            "Partition {} ({}) at offset {:#x} ({:.2} GB)",
+            i, kind.label(), partition_offset,
             *partition_offset as f64 / 1_073_741_824.0
         ));
 
         let partition_dir = logs_output_dir.join(format!("partition_{}", i));
         let _ = fs::create_dir_all(&partition_dir);
 
-        match extract_logs_from_ext4_partition(reader, *partition_offset, &partition_dir) {
+        match extract_logs_from_linux_partition(reader, *partition_offset, *kind, &partition_dir) {
             Ok(count) => {
                 total_files += count;
                 crate::banner::print_info(&format!("  {} log files extracted from partition {}", count, i));
@@ -297,7 +505,7 @@ fn extract_logs_from_seekable<R: Read + Seek + 'static>(
     }
 
     if total_files == 0 {
-        return Err("No Linux log files found in any partition (ext4 or LVM)".to_string());
+        return Err("No Linux log files found in any partition (ext4, XFS or LVM)".to_string());
     }
 
     crate::banner::print_phase_result(&format!("{} log files extracted total", total_files));
@@ -313,6 +521,7 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
     output_dir: &Path,
 ) -> usize {
     let mut total = 0;
+
     let mut lvm_reader = OffsetReaderLinux::new(reader, lvm_offset);
 
     let lvm = match lvm2::Lvm2::open(&mut lvm_reader) {
@@ -339,25 +548,24 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
 
         let mut olv = lvm.open_lv(lv, &mut lvm_reader);
 
-        // Check ext4 superblock
-        let mut sb_buf = [0u8; 2];
-        if olv.seek(SeekFrom::Start(0x438)).is_err() || olv.read_exact(&mut sb_buf).is_err() {
-            continue;
-        }
-        let magic = u16::from_le_bytes(sb_buf);
-        if magic != EXT4_SUPER_MAGIC {
-            crate::banner::print_info(&format!("    Not ext4 (magic: {:#06x}), skipping", magic));
-            continue;
-        }
+        // ext4 or XFS?
+        let kind = match sniff_linux_fs(&mut olv, 0) {
+            Some(k) => k,
+            None => {
+                crate::banner::print_info("    Not ext4 or XFS (swap or a data volume?), skipping");
+                continue;
+            }
+        };
 
-        crate::banner::print_info("    ext4 confirmed — extracting logs...");
+        crate::banner::print_info(&format!("    {} confirmed — extracting logs...", kind.label()));
 
-        // Dump LV to temp file so we can pass it to extract_logs_from_ext4_partition
+        // Dump LV to temp file so we can pass it to the volume reader
         let tmp_path = std::env::temp_dir().join(format!("masstin_lvm_{}_{}.raw", lvm_index, lv_name));
         {
             if olv.seek(SeekFrom::Start(0)).is_err() { continue; }
             let mut tmp_file = match File::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
-            let mut buf = [0u8; 1048576]; // 1MB chunks
+            // on the heap: a 1 MiB array on the stack overflowed the main thread on Windows
+            let mut buf = vec![0u8; 1 << 20];
             loop {
                 match olv.read(&mut buf) {
                     Ok(0) => break,
@@ -372,7 +580,7 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
         let _ = fs::create_dir_all(&partition_dir);
 
         let mut tmp_file = match File::open(&tmp_path) { Ok(f) => f, Err(_) => continue };
-        match extract_logs_from_ext4_partition(&mut tmp_file, 0, &partition_dir) {
+        match extract_logs_from_linux_partition(&mut tmp_file, 0, kind, &partition_dir) {
             Ok(count) if count > 0 => {
                 total += count;
                 crate::banner::print_info(&format!("    {} log files extracted from LV '{}'", count, lv_name));
@@ -382,7 +590,7 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
             }
             Err(e) => {
                 if is_debug_mode() {
-                    eprintln!("[DEBUG] LV '{}' ext4 error: {}", lv_name, e);
+                    eprintln!("[DEBUG] LV '{}' {} error: {}", lv_name, kind.label(), e);
                 }
             }
         }
@@ -439,27 +647,40 @@ impl<'a, R: Read + Seek> Seek for OffsetReaderLinux<'a, R> {
 pub fn find_linux_partitions_public<R: Read + Seek>(
     reader: &mut R,
     image_size: u64,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<(u64, LinuxFs)>, String> {
     find_linux_partitions(reader, image_size)
 }
 
-/// Public wrapper for extracting Linux logs from a single ext4 partition
-pub fn extract_linux_logs_from_ext4<R: Read + Seek + 'static>(
+/// Public wrapper for the LVM partitions (MBR 0x8E, GPT LVM GUID) of an image
+pub fn find_lvm_partitions_public<R: Read + Seek>(reader: &mut R) -> Vec<u64> {
+    find_lvm_partitions(reader)
+}
+
+/// Public wrapper: every logical volume of an LVM partition that holds ext4
+/// or XFS, its logs extracted under `output_dir/lvm_<i>_lv_<name>`.
+pub fn extract_linux_logs_from_lvm<R: Read + Seek + 'static>(reader: &mut R, lvm_offset: u64, lvm_index: usize, output_dir: &Path) -> usize {
+    let _ = std::fs::create_dir_all(output_dir);
+    extract_logs_from_lvm(reader, lvm_offset, lvm_index, output_dir)
+}
+
+/// Public wrapper for extracting Linux logs from a single volume (ext4 or XFS)
+pub fn extract_linux_logs_from_partition<R: Read + Seek + 'static>(
     reader: &mut R,
     partition_offset: u64,
+    kind: LinuxFs,
     output_dir: &Path,
     partition_index: usize,
 ) -> Result<usize, String> {
     let partition_dir = output_dir.join(format!("partition_{}", partition_index));
     let _ = std::fs::create_dir_all(&partition_dir);
-    extract_logs_from_ext4_partition(reader, partition_offset, &partition_dir)
+    extract_logs_from_linux_partition(reader, partition_offset, kind, &partition_dir)
 }
 
 fn find_linux_partitions<R: Read + Seek>(
     reader: &mut R,
     _image_size: u64,
-) -> Result<Vec<u64>, String> {
-    let mut partitions = Vec::new();
+) -> Result<Vec<(u64, LinuxFs)>, String> {
+    let mut partitions: Vec<(u64, LinuxFs)> = Vec::new();
 
     reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut mbr_buf = [0u8; 512];
@@ -501,15 +722,13 @@ fn find_linux_partitions<R: Read + Seek>(
                     let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
                     let partition_byte_offset = first_lba * 512;
 
-                    // Check for Linux filesystem GUID or verify ext4 superblock
-                    if type_guid == GPT_LINUX_FS_GUID || verify_ext4_superblock(reader, partition_byte_offset) {
-                        if verify_ext4_superblock(reader, partition_byte_offset) {
-                            if is_debug_mode() {
-                                eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) -- ext4 confirmed",
-                                    i, first_lba, partition_byte_offset);
-                            }
-                            partitions.push(partition_byte_offset);
+                    // whatever the type GUID says, the superblock decides (ext4 or XFS)
+                    if let Some(kind) = sniff_linux_fs(reader, partition_byte_offset) {
+                        if is_debug_mode() {
+                            eprintln!("[DEBUG] GPT partition {} at LBA {} (offset {:#x}) -- {} confirmed",
+                                i, first_lba, partition_byte_offset, kind.label());
                         }
+                        partitions.push((partition_byte_offset, kind));
                     }
                 }
             }
@@ -528,25 +747,25 @@ fn find_linux_partitions<R: Read + Seek>(
                 // 0x83 = Linux native partition
                 if part_type == 0x83 && lba_start > 0 {
                     let offset = lba_start as u64 * 512;
-                    if verify_ext4_superblock(reader, offset) {
+                    if let Some(kind) = sniff_linux_fs(reader, offset) {
                         if is_debug_mode() {
-                            eprintln!("[DEBUG] MBR partition {} at LBA {} (offset {:#x}) -- ext4 confirmed",
-                                i, lba_start, offset);
+                            eprintln!("[DEBUG] MBR partition {} at LBA {} (offset {:#x}) -- {} confirmed",
+                                i, lba_start, offset, kind.label());
                         }
-                        partitions.push(offset);
+                        partitions.push((offset, kind));
                     }
                 }
             }
         }
     }
 
-    // Fallback: check if the image starts with ext4 directly (partition image)
+    // Fallback: the image is a bare volume (no partition table)
     if partitions.is_empty() {
-        if verify_ext4_superblock(reader, 0) {
+        if let Some(kind) = sniff_linux_fs(reader, 0) {
             if is_debug_mode() {
-                eprintln!("[DEBUG] ext4 superblock found at offset 0 (partition image)");
+                eprintln!("[DEBUG] {} superblock found at offset 0 (partition image)", kind.label());
             }
-            partitions.push(0);
+            partitions.push((0, kind));
         }
     }
 
@@ -657,161 +876,8 @@ fn extract_logs_from_ext4_partition<R: Read + Seek + 'static>(
         Ext4::load(Box::new(wrapper))
             .map_err(|e| format!("Cannot load ext4 filesystem: {}", e))?
     };
-
-    let mut count = 0;
-
-    // 1. Extract exact-path files
-    for path in EXACT_FILES {
-        match fs.read(*path) {
-            Ok(data) => {
-                let dest = map_linux_path_to_local(path, output_dir);
-                if let Some(parent) = dest.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                if let Ok(mut f) = File::create(&dest) {
-                    let _ = f.write_all(&data);
-                    count += 1;
-                    if is_debug_mode() {
-                        eprintln!("[DEBUG] Extracted: {} ({} bytes)", path, data.len());
-                    }
-                }
-            }
-            Err(_) => {
-                // File doesn't exist in this partition, that's OK
-            }
-        }
-    }
-
-    // 2. Scan /var/log/ for log files matching our prefixes
-    for log_dir in LOG_DIRS {
-        let entries = match fs.read_dir(*log_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let file_name = match entry.file_name().as_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            };
-
-            // Check if this is a directory entry we care about
-            let file_name_lower = file_name.to_lowercase();
-
-            // Skip directories (. and ..)
-            if file_name == "." || file_name == ".." {
-                continue;
-            }
-
-            // Check if the filename matches any of our log prefixes
-            let matches = LOG_PREFIXES.iter().any(|prefix| {
-                file_name_lower.starts_with(&prefix.to_lowercase())
-            });
-
-            // Also match utmp/wtmp/btmp/lastlog directly in /var/log/
-            let matches = matches
-                || file_name_lower == "wtmp"
-                || file_name_lower == "btmp"
-                || file_name_lower == "lastlog";
-
-            if !matches {
-                continue;
-            }
-
-            let full_path = format!("{}/{}", log_dir, file_name);
-
-            // Check if it's a regular file
-            match entry.file_type() {
-                Ok(ft) if ft.is_regular_file() => {}
-                _ => continue,
-            }
-
-            match fs.read(full_path.as_str()) {
-                Ok(data) => {
-                    let dest = map_linux_path_to_local(&full_path, output_dir);
-                    if let Some(parent) = dest.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if let Ok(mut f) = File::create(&dest) {
-                        let _ = f.write_all(&data);
-                        count += 1;
-                        if is_debug_mode() {
-                            eprintln!("[DEBUG] Extracted: {} ({} bytes)", full_path, data.len());
-                        }
-                    }
-                }
-                Err(e) => {
-                    if is_debug_mode() {
-                        eprintln!("[DEBUG] Could not read {}: {}", full_path, e);
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Walk /var/log/journal/<machine-id>/*.journal{,~} — systemd-journald
-    //    binary logs. On modern distros (Ubuntu 18+, RHEL 8+) this is where
-    //    SSH auth actually lives; /var/log/auth.log is nearly empty when
-    //    pam_sss / SSSD is in use.
-    if let Ok(machines) = fs.read_dir("/var/log/journal") {
-        for machine_entry in machines.flatten() {
-            let machine_name = match machine_entry.file_name().as_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            };
-            if machine_name == "." || machine_name == ".." { continue; }
-            match machine_entry.file_type() {
-                Ok(ft) if ft.is_dir() => {}
-                _ => continue,
-            }
-            let machine_dir = format!("/var/log/journal/{}", machine_name);
-            let journal_entries = match fs.read_dir(machine_dir.as_str()) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for j in journal_entries.flatten() {
-                let jname = match j.file_name().as_str() {
-                    Ok(s) => s.to_string(),
-                    Err(_) => continue,
-                };
-                let jlow = jname.to_lowercase();
-                if !(jlow.ends_with(".journal") || jlow.ends_with(".journal~")) {
-                    continue;
-                }
-                match j.file_type() {
-                    Ok(ft) if ft.is_regular_file() => {}
-                    _ => continue,
-                }
-                let full_path = format!("{}/{}", machine_dir, jname);
-                match fs.read(full_path.as_str()) {
-                    Ok(data) => {
-                        let dest = map_linux_path_to_local(&full_path, output_dir);
-                        if let Some(parent) = dest.parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        if let Ok(mut f) = File::create(&dest) {
-                            let _ = f.write_all(&data);
-                            count += 1;
-                            if is_debug_mode() {
-                                eprintln!("[DEBUG] Extracted journal: {} ({} bytes)", full_path, data.len());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if is_debug_mode() {
-                            eprintln!("[DEBUG] Could not read journal {}: {}", full_path, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    let count = extract_logs_from_tree(&fs, output_dir);
+    drop(fs);
     Ok(count)
 }
 
@@ -969,4 +1035,63 @@ fn rewrite_single_linux_filename(path: &str) -> String {
     }
 
     path.to_string()
+}
+
+#[cfg(test)]
+mod xfs_tests {
+    use super::*;
+    use fs_core::{BlockDevice, FileDevice};
+
+    const SECURE: &[u8] = b"Nov  3 10:43:56 lab-xfs sshd[1200]: Accepted publickey for vagrant from 10.10.0.50 port 51234 ssh2: ED25519 SHA256:abc\nNov  3 10:44:01 lab-xfs sshd[1200]: pam_unix(sshd:session): session opened for user vagrant by (uid=0)\n";
+
+    /// An XFS volume made by the driver itself, holding the files masstin
+    /// looks for and one it does not: the extraction takes exactly those.
+    #[test]
+    fn xfs_volume_gives_its_logs() {
+        let dir = std::env::temp_dir().join(format!("masstin_xfs_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("vol.img");
+        // the driver's formatter wants 300 MiB at least; the file stays sparse
+        File::create(&img).unwrap().set_len(320 << 20).unwrap();
+        {
+            let dev = Arc::new(FileDevice::open_rw(&img).unwrap());
+            fs_xfs::mkfs::format(&*dev, &fs_xfs::mkfs::Options::default()).expect("format");
+            let fsx = XfsFilesystem::mount_rw(dev as Arc<dyn BlockDevice>).expect("mount_rw");
+            let root = fsx.lookup_path("/").unwrap().ino;
+            let mkdir = |parent: u64, name: &str| fsx.create_directory(parent, name.as_bytes(), 0o40755).expect("dir").0;
+            let write = |parent: u64, name: &str, data: &[u8]| {
+                let (ino, _) = fsx.create_file(parent, name.as_bytes(), 0o100644).expect("file");
+                fsx.write_into_empty_file(ino, data).expect("write");
+            };
+            let etc = mkdir(root, "etc");
+            write(etc, "hostname", b"lab-xfs\n");
+            let var = mkdir(root, "var");
+            let log = mkdir(var, "log");
+            write(log, "secure", SECURE);
+            write(log, "wtmp", &[0u8; 384]);
+            write(log, "Xorg.0.log", b"not a login log\n");
+            let audit = mkdir(log, "audit");
+            write(audit, "audit.log", b"type=USER_LOGIN msg=audit(1700000000.000:1): pid=1 uid=0 auid=1000 ses=1 msg='op=login id=1000 exe=\"/usr/sbin/sshd\" hostname=10.0.0.5 addr=10.0.0.5 terminal=ssh res=success'\n");
+            let journal = mkdir(log, "journal");
+            let machine = mkdir(journal, "0123456789abcdef0123456789abcdef");
+            write(machine, "system.journal", b"LPKSHHRH");
+            fsx.unmount().expect("unmount");
+        }
+        let out = dir.join("out");
+        let mut reader = File::open(&img).unwrap();
+        assert_eq!(sniff_linux_fs(&mut reader, 0), Some(LinuxFs::Xfs));
+        assert_eq!(find_linux_partitions(&mut reader, 0).unwrap(), vec![(0, LinuxFs::Xfs)]);
+        let n = extract_logs_from_xfs_partition(&mut reader, 0, &out).expect("extract");
+        assert_eq!(fs::read_to_string(out.join("etc/hostname")).unwrap().trim(), "lab-xfs");
+        assert_eq!(fs::read(out.join("var/log/secure")).unwrap(), SECURE);
+        assert!(out.join("var/log/wtmp").is_file());
+        assert!(out.join("var/log/audit/audit.log").is_file());
+        assert!(out.join("var/log/journal/0123456789abcdef0123456789abcdef/system.journal").is_file());
+        assert!(!out.join("var/log/Xorg.0.log").exists());
+        // hostname, wtmp (as an exact file and again from the listing), secure, audit.log, the journal
+        assert_eq!(n, 6);
+        drop(reader);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

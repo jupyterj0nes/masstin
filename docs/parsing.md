@@ -125,10 +125,10 @@ Not yet read (see the roadmap): `smbd` share connections (the Unified Log messag
 
 ## Parse forensic images — auto-detect Windows and Linux
 
-**One command. Any OS. Any image format.** Masstin opens forensic disk images directly, auto-detects every partition type (NTFS or ext4), and applies the right parser to each — all without mounting, external tools, or manual OS identification.
+**One command. Any OS. Any image format.** Masstin opens forensic disk images directly, auto-detects every partition type (NTFS, ext4 or XFS, as partitions or LVM logical volumes), and applies the right parser to each — all without mounting, external tools, or manual OS identification.
 
 - **NTFS partitions** → Windows parsing: EVTX + UAL from live volume + VSS snapshot recovery
-- **ext4 partitions** → Linux parsing: auth.log, secure, messages, audit.log, wtmp, btmp, lastlog, and `/var/log/journal/` systemd-journald binary logs
+- **ext4 and XFS volumes** (XFS is what RHEL, Rocky, Alma and Oracle Linux install by default) → Linux parsing: auth.log, secure, messages, audit.log, wtmp, btmp, lastlog, and `/var/log/journal/` systemd-journald binary logs
 
 All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
 
@@ -151,7 +151,7 @@ masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o inci
 
 ## Bulk evidence processing — one command, entire incident
 
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files. Each image is opened, partitions are auto-detected (NTFS or ext4), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files. Each image is opened, partitions are auto-detected (NTFS, ext4 or XFS), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
 
 ```bash
 # Scan an entire evidence folder — finds all images, any OS

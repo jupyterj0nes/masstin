@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **XFS.** `parse-image` and `parse-massive` read XFS volumes, the file system RHEL, Rocky, Alma and Oracle Linux install by default: as a partition (GPT or MBR), as a bare volume image, or as an LVM logical volume, through the `rust-fs-xfs` driver faramir uses. The same logs come out as from ext4 (auth.log / secure, messages, audit.log, wtmp / btmp / lastlog, utmp, hostname, journald), through one walk shared by both file systems; a volume's kind is told by its superblock, whatever the partition type says. A test formats an XFS volume with the driver itself and takes the logs back.
+- `parse-image` / `parse-massive`: **LVM** logical volumes are read in the unified image path too (they were only in the old parse-image-linux path), ext4 or XFS alike; and the copy of a logical volume no longer puts a 1 MiB buffer on the stack, which overflowed the main thread on Windows before a single volume was read.
+
 ## v1.4.1 — 2026-11-05
 
 Film the window, and the README around it.

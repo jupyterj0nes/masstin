@@ -36,6 +36,8 @@ vshadow = "0.2"
 libesedb = "0.2"
 ext4-view = { version = "0.9", features = ["std"] }
 lvm2 = "0.0.3"
+rust-fs-xfs = { version = "0.14", default-features = false }
+rust-fs-core = { version = "0.3", default-features = false }
 nt_hive2 = "4"
 serde_yaml_ng = "0.10"
 ipnet = "2"
