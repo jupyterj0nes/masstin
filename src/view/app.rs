@@ -201,7 +201,7 @@ pub struct Viewer {
     pending_verdict: Option<u8>,
     mark_msg: String,
     status: String,
-    /// what draws the window: the OpenGL renderer / vendor / version, or wgpu's adapter
+    /// what draws the window: the OpenGL renderer / vendor / version, or the software rasteriser
     renderer_info: String,
     /// motion, glow, grid and spotlight off: a software renderer, or frames measured slow
     light_mode: bool,
@@ -461,10 +461,6 @@ fn renderer_name(cc: &eframe::CreationContext<'_>) -> String {
         let s = |p: u32| unsafe { gl.get_parameter_string(p) };
         return format!("OpenGL · {} · {} · {}", s(eframe::glow::RENDERER), s(eframe::glow::VENDOR), s(eframe::glow::VERSION));
     }
-    if let Some(rs) = &cc.wgpu_render_state {
-        let i = rs.adapter.get_info();
-        return format!("wgpu · {} · {:?} · {:?}", i.name, i.backend, i.device_type);
-    }
     "an unknown renderer".to_string()
 }
 
@@ -486,7 +482,7 @@ impl Viewer {
         self.style.grid = false;
         self.style.vignette = false;
         self.requery(false);
-        self.status = format!("{} · light mode: motion and effects off (View › Style turns them on; --renderer wgpu may draw faster)", why);
+        self.status = format!("{} · light mode: motion and effects off (View › Style turns them on)", why);
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
             eprintln!("[view] light mode: {}", why);
         }
@@ -541,19 +537,23 @@ impl Viewer {
                 ui.label(egui::RichText::new("The graph viewer: the timeline CSV is the truth, no database. Fonts: Inter (OFL), Phosphor icons (MIT), Press Start 2P (OFL) for the arcade.").color(theme::DIM).small());
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("Drawn by {}{}", self.renderer_info, if self.light_mode { " · light mode (motion and effects off)" } else { "" })).color(theme::DIM).small());
-                ui.label(egui::RichText::new("No GPU, or a remote desktop? `masstin -a view --renderer wgpu` draws through Direct3D 12 / Vulkan / Metal instead of OpenGL.").color(theme::DIM).small());
+                ui.label(egui::RichText::new("No GPU, or a remote desktop? masstin draws with its own CPU rasteriser there by itself; `--renderer software` or `--renderer glow` picks by hand.").color(theme::DIM).small());
             });
         });
         self.show_about = open;
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>, store: Store, opts: Options) -> Viewer {
-        theme::install(&cc.egui_ctx);
-        let renderer_info = renderer_name(cc);
+        Viewer::create(&cc.egui_ctx, renderer_name(cc), store, opts)
+    }
+
+    /// The viewer on an egui context, whatever draws it (`renderer_info` names that).
+    pub fn create(egui_ctx: &egui::Context, renderer_info: String, store: Store, opts: Options) -> Viewer {
+        theme::install(egui_ctx);
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
             eprintln!("[view] renderer: {}", renderer_info);
         }
-        let logos = load_logos(&cc.egui_ctx);
+        let logos = load_logos(egui_ctx);
 
         let mut filter = Filter::default();
         if let Some(f) = &opts.focus {
@@ -3770,7 +3770,7 @@ mod renderer_tests {
 
     #[test]
     fn software_renderers_are_told_from_gpus() {
-        for s in ["OpenGL · GDI Generic · Microsoft Corporation · 1.1.0", "OpenGL · llvmpipe (LLVM 15.0.7, 256 bits) · Mesa · 4.5", "wgpu · Microsoft Basic Render Driver · Dx12 · Cpu", "OpenGL · SwiftShader · Google · 3.0"] {
+        for s in ["OpenGL · GDI Generic · Microsoft Corporation · 1.1.0", "OpenGL · llvmpipe (LLVM 15.0.7, 256 bits) · Mesa · 4.5", "wgpu · Microsoft Basic Render Driver · Dx12 · Cpu", "OpenGL · SwiftShader · Google · 3.0", "software · masstin's CPU rasteriser · Avx2"] {
             assert!(is_software_renderer(s), "{}", s);
         }
         for s in ["OpenGL · NVIDIA GeForce RTX 3060/PCIe/SSE2 · NVIDIA Corporation · 4.6.0", "wgpu · AMD Radeon RX 6800 · Vulkan · DiscreteGpu", "OpenGL · Intel(R) Iris(R) Xe Graphics · Intel · 4.6.0"] {
@@ -3791,6 +3791,19 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+impl super::softwin::SoftApp for Viewer {
+    fn frame(&mut self, ui: &mut egui::Ui) {
+        Viewer::frame(self, ui);
+    }
+}
+
+impl Viewer {
+    /// One frame of the window, whatever draws it.
+    fn frame(&mut self, ui: &mut egui::Ui) {
         let __ui_start = std::time::Instant::now();
         self.ui_inner(ui);
         self.inside_ms = self.inside_ms * 0.8 + __ui_start.elapsed().as_secs_f32() * 1000.0 * 0.2;

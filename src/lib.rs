@@ -307,10 +307,10 @@ pub struct Cli {
     #[arg(long)]
     focus: Option<String>,
 
-    /// For `view`: the graphics backend, `glow` (OpenGL, the default) or
-    /// `wgpu` (Direct3D 12, Vulkan or Metal; on a Windows server or over
-    /// RDP without a GPU it draws through WARP, where OpenGL has only the
-    /// slow generic driver). `MASSTIN_VIEW_RENDERER` does the same.
+    /// For `view`: what draws the window, `glow` (OpenGL, a GPU) or
+    /// `software` (masstin's own CPU rasteriser). Left out, it is picked by
+    /// itself: software over a remote desktop or without a GPU driver on
+    /// Windows, OpenGL elsewhere. `MASSTIN_VIEW_RENDERER` does the same.
     #[arg(long)]
     renderer: Option<String>,
 

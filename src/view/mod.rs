@@ -17,6 +17,8 @@ pub(crate) mod theme;
 mod paths;
 mod present;
 mod query;
+pub(crate) mod soft;
+mod softwin;
 mod store;
 mod views;
 
@@ -27,30 +29,41 @@ pub struct Options {
     pub focus: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
-    /// `glow` (OpenGL) or `wgpu`; None means glow, unless `MASSTIN_VIEW_RENDERER` says
+    /// `glow` (OpenGL) or `software` (the CPU); None: picked by itself, unless
+    /// `MASSTIN_VIEW_RENDERER` says
     pub renderer: Option<String>,
+}
+
+/// What draws the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Backend {
+    /// OpenGL through eframe: a GPU
+    Glow,
+    /// the CPU rasteriser in a window of masstin's own (`softwin`)
+    Software,
 }
 
 /// What draws the window when nothing is asked for: OpenGL, unless this
 /// is a remote desktop session or the only display adapter is Windows'
-/// basic one (a VM or a server without a GPU driver). There OpenGL has
-/// only the generic 1.1 driver, the CPU pixel by pixel, while Direct3D 12
-/// still has WARP, far quicker: wgpu then. Linux and macOS keep OpenGL.
-fn pick_renderer() -> (eframe::Renderer, String) {
+/// basic one (a VM or a server without a GPU driver). There OpenGL is the
+/// generic 1.1 driver (too old for the viewer) and Direct3D is WARP, both the
+/// CPU emulating a GPU: masstin's own CPU rasteriser draws instead, about seven
+/// times quicker than WARP measured over RDP. Linux and macOS keep OpenGL.
+fn pick_renderer() -> (Backend, String) {
     #[cfg(windows)]
     {
         if remote_session() {
-            return (eframe::Renderer::Wgpu, "a remote desktop session, where OpenGL has only the generic driver".to_string());
+            return (Backend::Software, "a remote desktop session: no GPU to draw with".to_string());
         }
         let adapters = display_adapters();
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
             eprintln!("[view] display adapters: {}", if adapters.is_empty() { "none".to_string() } else { adapters.join(", ") });
         }
         if basic_display_only(&adapters) {
-            return (eframe::Renderer::Wgpu, "no GPU driver, only the basic display adapter: Direct3D 12 through its software rasteriser".to_string());
+            return (Backend::Software, "no GPU driver, only the basic display adapter".to_string());
         }
     }
-    (eframe::Renderer::Glow, String::new())
+    (Backend::Glow, String::new())
 }
 
 /// Whether this process runs in a remote desktop session (`SM_REMOTESESSION`).
@@ -159,28 +172,26 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    let backend = opts.renderer.clone().or_else(|| std::env::var("MASSTIN_VIEW_RENDERER").ok()).unwrap_or_default().trim().to_ascii_lowercase();
-    let (renderer, why) = match backend.as_str() {
-        "wgpu" => (eframe::Renderer::Wgpu, "asked for".to_string()),
-        "glow" | "opengl" => (eframe::Renderer::Glow, String::new()),
+    let asked = opts.renderer.clone().or_else(|| std::env::var("MASSTIN_VIEW_RENDERER").ok()).unwrap_or_default().trim().to_ascii_lowercase();
+    let (backend, why) = match asked.as_str() {
+        "software" | "soft" | "cpu" => (Backend::Software, "asked for".to_string()),
+        "glow" | "opengl" => (Backend::Glow, String::new()),
         "" => pick_renderer(),
-        other => return Err(Box::from(format!("unknown renderer '{}': glow (OpenGL) or wgpu", other))),
+        other => return Err(Box::from(format!("unknown renderer '{}': glow (OpenGL) or software (the CPU)", other))),
     };
-    if renderer == eframe::Renderer::Wgpu {
-        crate::banner::print_info(&format!("Renderer: wgpu, Direct3D 12 / Vulkan / Metal ({})", why));
-    }
-    let mut native = eframe::NativeOptions { viewport, renderer, ..Default::default() };
-    // `MASSTIN_VIEW_ADAPTER=cpu`: wgpu on the software adapter (WARP on Windows), what a
-    // remote desktop without a GPU gets; for measuring that case on a machine with one
-    if renderer == eframe::Renderer::Wgpu && std::env::var("MASSTIN_VIEW_ADAPTER").map(|v| v.eq_ignore_ascii_case("cpu")).unwrap_or(false) {
-        use eframe::wgpu;
-        if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut create) = native.wgpu_options.wgpu_setup {
-            create.native_adapter_selector = Some(std::sync::Arc::new(|adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
-                adapters.iter().find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu).cloned().ok_or_else(|| "no software adapter (WARP, llvmpipe) to force".to_string())
-            }));
+    let app_opts = opts;
+    match backend {
+        Backend::Software => {
+            crate::banner::print_info(&format!("Renderer: software, drawn by the CPU ({})", why));
+            let ctx = egui::Context::default();
+            let info = format!("software · masstin's CPU rasteriser · {}", soft::simd_name());
+            let viewer = app::Viewer::create(&ctx, info, store, app_opts);
+            softwin::run(viewport, ctx, viewer).map_err(Box::<dyn std::error::Error>::from)?;
+        }
+        Backend::Glow => {
+            let native = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, ..Default::default() };
+            eframe::run_native("masstin", native, Box::new(move |cc| Ok(Box::new(app::Viewer::new(cc, store, app_opts))))).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
         }
     }
-    let app_opts = opts;
-    eframe::run_native("masstin", native, Box::new(move |cc| Ok(Box::new(app::Viewer::new(cc, store, app_opts))))).map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
     Ok(())
 }

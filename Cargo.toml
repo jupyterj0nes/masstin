@@ -45,10 +45,15 @@ systemd-journal-reader = "0.1.1"
 tar = "0.4"
 chrono-tz = "0.10"
 macos-unifiedlogs = "0.7"
-eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# the window drawn without a GPU (src/view/softwin.rs): the same winit and egui-winit eframe uses
+egui-winit = { version = "0.37", optional = true, default-features = false }
+winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", optional = true, default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 egui = { version = "0.37", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 rfd = { version = "0.17", optional = true }
+strength_reduce = { version = "0.2.4", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -56,4 +61,4 @@ winresource = "0.1"
 [features]
 # the built-in graph viewer (`-a view`, a native window); off for a parser-only binary
 default = ["ui"]
-ui = ["dep:eframe", "dep:egui", "dep:image", "dep:rfd"]
+ui = ["dep:eframe", "dep:egui", "dep:image", "dep:rfd", "dep:strength_reduce", "dep:egui-winit", "dep:winit", "dep:softbuffer"]
