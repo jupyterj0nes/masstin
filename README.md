@@ -33,6 +33,9 @@
   <em>▶ <a href="resources/masstin-viewer-demo.mp4">Watch the 97-second demo</a>: a case folder dropped on the window, the wizard saying what it holds, the parser's bars, the graph, the hunt and its report, the paths and the reach from the jump box, the replay. Filmed by masstin itself (Tools › Film the window), no hand on the mouse.</em>
 </div>
 
+https://github.com/user-attachments/assets/1f28b074-1fe7-43c8-868a-64053b33c00b
+
+
 ## Quick start
 
 Download the binary for your platform from the [Releases page](https://github.com/jupyterj0nes/masstin/releases/latest), or `cargo install masstin`. No runtime dependencies.
