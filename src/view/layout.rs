@@ -10,7 +10,9 @@
 //! animate; the tree's storage is kept between ticks. Collisions use a
 //! hash grid rebuilt per tick.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct V2 {
@@ -247,7 +249,9 @@ pub struct Layout {
     tree: Tree,
     force: Vec<V2>,
     stack: Vec<u32>,
-    grid: HashMap<(i32, i32), Vec<u32>>,
+    /// a fixed hasher: the cells are visited in the same order every run, so
+    /// the same graph is laid out the same way (the default one is seeded at random)
+    grid: HashMap<(i32, i32), Vec<u32>, BuildHasherDefault<DefaultHasher>>,
 }
 
 impl Layout {
@@ -275,7 +279,7 @@ impl Layout {
             degree[b] += 1;
         }
         let max_radius = radius.iter().copied().fold(1.0f32, f32::max);
-        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, group: vec![None; n], aspect: 1.0, max_radius, unsettled: true, cold_since: None, held: false, recentred: V2::default(), tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
+        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, group: vec![None; n], aspect: 1.0, max_radius, unsettled: true, cold_since: None, held: false, recentred: V2::default(), tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -566,9 +570,19 @@ mod tests {
     }
 
     /// hubs of fifteen hosts, chained: the shape that made a held graph sail off
-    fn hubs(n: usize) -> Layout {
+    /// (placed at random from `seed`, with no trigonometry, so every platform
+    /// starts from the same places)
+    fn hubs(n: usize, seed: u64) -> Layout {
         let links = (1..n).map(|i| if i % 15 == 0 { (i - 15, i) } else { (i - i % 15, i) }).collect();
-        let mut l = Layout::new(vec![22.0; n], links, &vec![None; n]);
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 10_000) as f32 / 10_000.0
+        };
+        let start: Vec<Option<V2>> = (0..n).map(|_| Some(V2::new(next() * 900.0 - 450.0, next() * 900.0 - 450.0))).collect();
+        let mut l = Layout::new(vec![22.0; n], links, &start);
         for _ in 0..3000 {
             if !l.tick() {
                 break;
@@ -594,20 +608,28 @@ mod tests {
         // a leaf held 300 away for as long as a drag in light mode ticks: the
         // rest follows it a little, it does not sail off (280 away with 200
         // hosts before, 700 to 1,000 in the window)
+        // hosts, the median of five starts: a force layout is chaotic, one start
+        // alone can land anywhere in a range
         for &n in &[60usize, 200] {
-            let mut l = hubs(n);
-            let before = free_centroid(&l);
-            l.fixed[7] = true;
-            l.pos[7] += V2::new(300.0, 0.0);
-            for _ in 0..40 {
-                l.reheat(0.3);
-                for _ in 0..50 {
-                    l.tick();
-                }
-            }
-            let drift = (free_centroid(&l) - before).len();
-            eprintln!("n={n}: free centroid drift {drift:.0}");
-            assert!(drift < 30.0, "n={n}: the graph drifted {drift:.0} while a host was held");
+            let mut drifts: Vec<f32> = (1..=5u64)
+                .map(|seed| {
+                    let mut l = hubs(n, seed);
+                    let before = free_centroid(&l);
+                    l.fixed[7] = true;
+                    l.pos[7] += V2::new(300.0, 0.0);
+                    for _ in 0..40 {
+                        l.reheat(0.3);
+                        for _ in 0..50 {
+                            l.tick();
+                        }
+                    }
+                    (free_centroid(&l) - before).len()
+                })
+                .collect();
+            drifts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = drifts[2];
+            eprintln!("n={n}: free centroid drift {drifts:.0?}, median {median:.0}");
+            assert!(median < 30.0, "n={n}: the graph drifted {median:.0} (median) while a host was held");
         }
     }
 

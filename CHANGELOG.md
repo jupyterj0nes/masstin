@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `view`: the same graph is laid out the same way every run (the collision grid's cells were visited in a random order); the test of a held host takes the median of five starts, where one start alone could land past its bound on another machine.
+
 ## v1.4.3 — 2026-11-06
 
 The case in a file of its own, a dark window on a light Windows, and dragging in a big graph. Everything the viewer keeps about a case can go in one `.masstin` file wherever the analyst wants it, so nothing is written next to the evidence; the window stays dark on a Windows in light mode (a server reached by RDP), where the menu text went nearly black and the ingest wizard white; a dragged host is the one pressed, and it stays pinned where it is dropped.
