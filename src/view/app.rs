@@ -196,6 +196,12 @@ pub struct Viewer {
     selected: Option<Sel>,
     hovered: Option<Sel>,
     dragging: Option<usize>,
+    /// what was under the pointer when the button went down: a drag is only
+    /// told from a click 6 points later, and by then (or a frame later, over a
+    /// remote desktop) the pointer may be over another host or the background
+    press_hit: Option<Sel>,
+    /// where in the held host the pointer took it, so it does not jump
+    drag_grab: V2,
     rows: Option<(usize, Vec<RowDetail>, usize)>,
     notes_draft: String,
     pending_verdict: Option<u8>,
@@ -601,6 +607,8 @@ impl Viewer {
             selected: None,
             hovered: None,
             dragging: None,
+            press_hit: None,
+            drag_grab: V2::default(),
             rows: None,
             notes_draft: String::new(),
             pending_verdict: None,
@@ -762,9 +770,13 @@ impl Viewer {
             self.status = "Neighbourhood: name a host (or several) to expand around.".into();
             return;
         }
+        let mut pinned: HashSet<u32> = HashSet::new();
         for (i, n) in self.graph.nodes.iter().enumerate() {
             if let Some(p) = self.layout.pos.get(i) {
                 self.remembered.insert(n.host, *p);
+            }
+            if self.layout.fixed.get(i).copied().unwrap_or(false) {
+                pinned.insert(n.host);
             }
         }
         self.graph = match &self.overlay {
@@ -801,6 +813,14 @@ impl Viewer {
             }
         }).collect();
         self.layout = Layout::new(radii, links, &known);
+        if !fresh_layout {
+            // the hosts the analyst pinned stay pinned where they were (Lay out again frees them)
+            for (i, n) in g.nodes.iter().enumerate() {
+                if pinned.contains(&n.host) && known[i].is_some() {
+                    self.layout.fixed[i] = true;
+                }
+            }
+        }
         let restored = restore.is_some();
         if restored {
             // the placed hosts stay where the analyst left them; hosts the
@@ -1267,7 +1287,7 @@ impl Viewer {
         egui::Window::new("Mouse and keys").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
             egui::Grid::new("help").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
                 for (k, v) in [
-                    ("drag a host", "move it (it is held while you drag)"),
+                    ("drag a host", "move it; it stays pinned where you drop it (right click: Unpin)"),
                     ("drag the background", "pan"),
                     ("scroll / pinch", "zoom at the pointer"),
                     ("click", "inspect a host or a connection"),
@@ -1302,7 +1322,7 @@ impl Viewer {
     // ───────────────────────── UI: details pane ─────────────────────────
 
     fn legend(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Click a host or a connection. Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood.").color(MUTED));
+        ui.label(egui::RichText::new("Click a host or a connection. Drag a host to move it (it stays pinned where you drop it), drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood.").color(MUTED));
         ui.add_space(10.0);
         ui.label(egui::RichText::new("HOSTS").small().color(MUTED));
         let chip = |ui: &mut egui::Ui, fill: Color32, ring: Color32, text: &str| {
@@ -2083,8 +2103,16 @@ impl Viewer {
         let big = self.layout.len() > 1500;
         // light mode: a frame drawn by the CPU costs a quarter of a second or more, so the
         // layout does all its ticks now (microseconds each for a lab) rather than two a frame
-        let (budget, max_ticks) = if self.light_mode { (60, 2000) } else if big { (8, 1) } else { (4, 2) };
-        if self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks) {
+        // while a host is held, a few ticks a frame so the rest follows it rather than settling anew each frame
+        let (budget, max_ticks) = if self.dragging.is_some() { (4, if big { 1 } else { 3 }) } else if self.light_mode { (60, 2000) } else if big { (8, 1) } else { (4, 2) };
+        let ticking = self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks);
+        // the centring came back after a host was unpinned: the camera moves with it
+        let r = std::mem::take(&mut self.layout.recentred);
+        if r.len2() > 0.0 {
+            self.cam -= r;
+            self.cam_t -= r;
+        }
+        if ticking {
             ui.ctx().request_repaint();
         } else if self.fill_pending && !self.presenting && self.dragging.is_none() {
             // the layout settled: stretch it to the window, once per query
@@ -2153,8 +2181,15 @@ impl Viewer {
             ui.ctx().request_repaint();
             return;
         }
+        if ui.input(|i| i.pointer.any_pressed()) && resp.hovered() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            self.press_hit = origin.and_then(|o| self.hit_test(canvas, o));
+            if let (Some(Sel::Node(i)), Some(o)) = (self.press_hit, origin) {
+                self.drag_grab = self.layout.pos[i] - self.to_world(canvas, o);
+            }
+        }
         if resp.drag_started() {
-            if let Some(Sel::Node(i)) = hit {
+            if let Some(Sel::Node(i)) = self.press_hit {
                 self.dragging = Some(i);
                 self.layout.fixed[i] = true;
             } else {
@@ -2165,8 +2200,8 @@ impl Viewer {
             match self.dragging {
                 Some(i) => {
                     if let Some(p) = resp.interact_pointer_pos() {
-                        self.layout.pos[i] = self.to_world(canvas, p);
-                        self.layout.reheat(0.3);
+                        self.layout.pos[i] = self.to_world(canvas, p) + self.drag_grab;
+                        self.layout.reheat(0.2);
                         ui.ctx().request_repaint();
                     }
                 }
@@ -2178,9 +2213,9 @@ impl Viewer {
             }
         }
         if resp.drag_stopped() {
-            if let Some(i) = self.dragging.take() {
-                self.layout.fixed[i] = false;
-                self.layout.reheat(0.2);
+            // the host stays where it was dropped, pinned (right click, Unpin)
+            if self.dragging.take().is_some() {
+                self.layout.reheat(0.1);
             }
         }
         if resp.double_clicked() {
@@ -2447,6 +2482,8 @@ impl Viewer {
         let node_slot = painter.add(egui::Shape::Noop);
         let mut node_mesh = egui::epaint::Mesh::default();
         let crowd_nodes = lod || self.graph.nodes.len() > 700;
+        // pinned hosts carry a pin, unless the whole picture is (a saved arrangement, the hops)
+        let show_pins = !self.presenting && self.layout.fixed.iter().any(|&f| !f);
         for i in 0..self.graph.nodes.len() {
             let look = &self.scene.nodes[i];
             if look.hide || !self.node_visible(i) {
@@ -2549,6 +2586,12 @@ impl Viewer {
                         painter.text(p, Align2::CENTER_CENTER, g, FontId::proportional((r * 1.0).max(8.0)), draw::fade(Color32::WHITE, 0.94 * alpha));
                     }
                 }
+            }
+            if show_pins && r > 5.0 && self.layout.fixed.get(i).copied().unwrap_or(false) {
+                let at = p + Vec2::new(r * 0.78, -r * 0.78);
+                let px = (r * 0.62).clamp(10.0, 17.0);
+                painter.circle_filled(at, px * 0.62, draw::fade(BG, 0.85 * alpha));
+                painter.text(at, Align2::CENTER_CENTER, super::icons::PUSH_PIN, FontId::proportional(px), draw::fade(ACCENT, alpha));
             }
             nodes_drawn += 1;
             let anonym = self.presenting && self.story.anonymise;
@@ -3634,6 +3677,18 @@ impl Viewer {
             other if other.starts_with("select=") => {
                 let name = other["select=".len()..].to_ascii_uppercase();
                 self.selected = self.graph.nodes.iter().position(|n| self.store.hosts.name(n.host).eq_ignore_ascii_case(&name)).map(Sel::Node);
+            }
+            other if other.starts_with("pin=") => {
+                // pin=HOST:DX:DY: the host moved by (DX, DY) and pinned there, as a drag leaves it
+                let mut it = other["pin=".len()..].split(':');
+                let name = it.next().unwrap_or("").to_string();
+                let dx: f32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let dy: f32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                if let Some(i) = self.graph.nodes.iter().position(|n| self.store.hosts.name(n.host).eq_ignore_ascii_case(&name)) {
+                    self.layout.pos[i] += V2::new(dx, dy);
+                    self.layout.fixed[i] = true;
+                    self.layout.reheat(0.1);
+                }
             }
             other if other.starts_with("paths=") => {
                 let spec = &other["paths=".len()..];
