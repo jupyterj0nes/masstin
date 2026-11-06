@@ -314,6 +314,13 @@ pub struct Cli {
     #[arg(long)]
     renderer: Option<String>,
 
+    /// For `view`: the case file (`.masstin`) to open, or to start with the
+    /// timelines given by `-f`. The saved views, the style, the merged hosts,
+    /// the subnets, the presentation and the notes are kept in it instead of
+    /// next to the timelines, so nothing is written where the evidence is.
+    #[arg(long)]
+    case: Option<String>,
+
     /// For `graph-hunt` / `graph-hunt-neo4j`: reconstruct the incident from
     /// known-bad seeds (comma-separated host names, IPs or accounts). The
     /// report gets a first section with every hop the seeds took in the
@@ -622,6 +629,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                     start: config.start_time.clone(),
                     end: config.end_time.clone(),
                     renderer: config.renderer.clone(),
+                    case: config.case.clone(),
                 };
                 crate::view::run(opts)?;
             }

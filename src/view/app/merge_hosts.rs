@@ -45,7 +45,7 @@ impl Viewer {
         self.merges.push((from.clone(), into.clone()));
         self.persist();
         self.notes.add(NoteTarget::Host(into.clone()), &format!("Merged host: {} is the same machine as {}; shown as {} (undo in the inspector or Tools › Merged hosts). The timeline CSV keeps both names.", from, into, into));
-        if let Err(e) = self.notes.save() {
+        if let Err(e) = self.save_notes() {
             self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
         }
         match self.reload_store() {
@@ -66,7 +66,7 @@ impl Viewer {
         }
         self.persist();
         self.notes.add(NoteTarget::Host(from.to_uppercase()), &format!("Unmerged host: {} is its own host again.", from.to_uppercase()));
-        if let Err(e) = self.notes.save() {
+        if let Err(e) = self.save_notes() {
             self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
         }
         match self.reload_store() {

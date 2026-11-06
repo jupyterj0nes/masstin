@@ -307,7 +307,7 @@ pub struct SavedView {
     pub places: Vec<(String, f32, f32)>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ViewsFile {
     #[serde(default)]
     pub views: Vec<SavedView>,

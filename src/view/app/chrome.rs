@@ -61,6 +61,16 @@ impl Viewer {
                     self.reload();
                 }
                 ui.separator();
+                if icon_button(ui, ic::ARCHIVE, "Open case…").on_hover_text("A case file (.masstin): its timelines, and the views, style, merged hosts, subnets, story and notes kept in it").clicked() {
+                    ui.close();
+                    self.pick_case();
+                }
+                let save_case = ui.add_enabled_ui(!self.files.is_empty(), |ui| icon_button(ui, ic::FLOPPY_DISK, if self.case.is_some() { "Save case as…" } else { "Save as a case…" })).inner;
+                if save_case.on_hover_text("Keep this case in one file, wherever you choose: from then on nothing is written next to the timelines").clicked() {
+                    ui.close();
+                    self.save_case_as();
+                }
+                ui.separator();
                 if icon_button(ui, ic::DOWNLOAD_SIMPLE, "Ingest evidence…").on_hover_text("Evidence into a timeline with masstin's parsers: a folder, images, EVTX, Linux or macOS logs, a triage package. Or drop it on the window.").clicked() {
                     ui.close();
                     self.ingest.open = true;
@@ -74,23 +84,32 @@ impl Viewer {
                     self.show_merge = true;
                 }
                 ui.separator();
+                if let Some(c) = &self.case {
+                    ui.label(egui::RichText::new("Case").small().color(theme::DIM));
+                    ui.label(egui::RichText::new(format!("{}  {}", ic::ARCHIVE, c.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())).color(theme::MUTED)).on_hover_text(c.to_string_lossy());
+                }
                 if !self.files.is_empty() {
                     ui.label(egui::RichText::new("Open now").small().color(theme::DIM));
                     for f in self.files.clone() {
                         ui.label(egui::RichText::new(std::path::Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone())).color(theme::MUTED)).on_hover_text(&f);
                     }
                 }
-                let recent: Vec<String> = self.recent.iter().filter(|f| !self.files.contains(f) && std::path::Path::new(f).is_file()).take(8).cloned().collect();
+                let here = self.case.as_ref().map(|c| c.to_string_lossy().to_string());
+                let recent: Vec<String> = self.recent.iter().filter(|f| !self.files.contains(f) && here.as_ref() != Some(*f) && std::path::Path::new(f).is_file()).take(8).cloned().collect();
                 if !recent.is_empty() {
                     ui.label(egui::RichText::new("Recent").small().color(theme::DIM));
                     let mut pick: Option<String> = None;
                     for f in &recent {
                         let name = std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(f.clone());
-                        if ui.add(egui::Button::new(format!("{}  {}", ic::CLOCK, name)).frame(false)).on_hover_text(format!("{}\n(Ctrl adds it to the view)", f)).clicked() {
+                        let (glyph, hint) = if case::is_case(f) { (ic::ARCHIVE, f.clone()) } else { (ic::CLOCK, format!("{}\n(Ctrl adds it to the view)", f)) };
+                        if ui.add(egui::Button::new(format!("{}  {}", glyph, name)).frame(false)).on_hover_text(hint).clicked() {
                             pick = Some(f.clone());
                         }
                     }
-                    if let Some(f) = pick {
+                    if let Some(f) = pick.clone().filter(|f| case::is_case(f)) {
+                        ui.close();
+                        self.open_case(f.into());
+                    } else if let Some(f) = pick {
                         ui.close();
                         let add = ui.input(|i| i.modifiers.ctrl);
                         let mut files: Vec<String> = if add { self.files.clone() } else { Vec::new() };
@@ -775,7 +794,7 @@ impl Viewer {
         }
         if let Some(i) = delete {
             self.notes.notes.remove(i);
-            if let Err(e) = self.notes.save() {
+            if let Err(e) = self.save_notes() {
                 self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
             }
         }

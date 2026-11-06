@@ -8,6 +8,7 @@
 //! go straight into the CSV. No server, no browser.
 
 mod app;
+mod case;
 mod devices;
 mod draw;
 pub(crate) mod icons;
@@ -32,6 +33,9 @@ pub struct Options {
     /// `glow` (OpenGL) or `software` (the CPU); None: picked by itself, unless
     /// `MASSTIN_VIEW_RENDERER` says
     pub renderer: Option<String>,
+    /// the case file (`.masstin`) to open or start; a `.masstin` among the
+    /// files is taken as this
+    pub case: Option<String>,
 }
 
 /// What draws the window.
@@ -136,8 +140,20 @@ mod renderer_pick_tests {
 }
 
 /// Open the window; returns when it is closed.
-pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let clock = std::time::Instant::now();
+    if opts.case.is_none() {
+        if let Some(k) = opts.files.iter().position(|f| case::is_case(f)) {
+            opts.case = Some(opts.files.remove(k));
+        }
+    }
+    let mut case_merges = None;
+    if let Some(p) = opts.case.clone() {
+        let c = case::open_for(std::path::Path::new(&p), &opts.files)?;
+        crate::banner::print_info(&format!("Case: {} (the views, the style, the story and the notes are kept in it)", p));
+        opts.files = c.timelines;
+        case_merges = Some(c.views.merges);
+    }
     let store = if opts.files.is_empty() {
         crate::banner::print_phase("1", "2", "No timeline given: the window opens on its welcome (open one, or drop evidence on it)");
         store::Store::load_with(&[], opts.alpha, &[])?
@@ -146,7 +162,7 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         for f in &opts.files {
             crate::banner::print_phase_detail("File:", f);
         }
-        let merges = views::ViewsFile::load(&views::ViewsFile::path_for(&opts.files[0])).merges;
+        let merges = case_merges.unwrap_or_else(|| views::ViewsFile::load(&views::ViewsFile::path_for(&opts.files[0])).merges);
         store::Store::load_with(&opts.files, opts.alpha, &merges)?
     };
     if !opts.files.is_empty() {
@@ -162,7 +178,9 @@ pub fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
     }
     crate::banner::print_phase("2", "2", "Opening the viewer (close the window to end)");
-    let title = if opts.files.is_empty() { "masstin".to_string() } else { format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", ")) };
+    let title = if let Some(c) = &opts.case {
+        format!("masstin — {}", std::path::Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| c.clone()))
+    } else if opts.files.is_empty() { "masstin".to_string() } else { format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", ")) };
     let icon = image::load_from_memory(include_bytes!("../../resources/masstin_icon.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
