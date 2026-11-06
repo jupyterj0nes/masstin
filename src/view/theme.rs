@@ -109,7 +109,12 @@ pub fn install(ctx: &egui::Context) {
     visuals.slider_trailing_fill = true;
     visuals.handle_shape = egui::style::HandleShape::Circle;
     visuals.striped = true;
-    ctx.set_visuals(visuals);
+    // the window is dark whatever the system says: egui follows a light
+    // Windows (an RDP server, often) to its own light style otherwise, dark
+    // text over these dark panels; ours goes on both styles all the same
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_visuals_of(egui::Theme::Light, visuals.clone());
+    ctx.set_visuals_of(egui::Theme::Dark, visuals);
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = Vec2::new(8.0, 7.0);
@@ -262,4 +267,24 @@ pub fn hint(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new().fill(PANEL_2).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         ui.label(RichText::new(text).color(MUTED).size(12.5));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Windows in light mode (a server reached by RDP, often) must not get
+    /// egui's light style: its dark text over the dark panels.
+    #[test]
+    fn the_look_does_not_follow_a_light_system() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut raw = egui::RawInput::default();
+        raw.system_theme = Some(egui::Theme::Light);
+        let _ = ctx.run_ui(raw, |_| {});
+        let v = ctx.global_style().visuals.clone();
+        assert!(v.dark_mode);
+        assert_eq!(v.override_text_color, Some(TEXT));
+        assert_eq!(v.widgets.inactive.fg_stroke.color, TEXT);
+    }
 }
