@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v1.4.3 — 2026-11-06
+
+The case in a file of its own, a dark window on a light Windows, and dragging in a big graph. Everything the viewer keeps about a case can go in one `.masstin` file wherever the analyst wants it, so nothing is written next to the evidence; the window stays dark on a Windows in light mode (a server reached by RDP), where the menu text went nearly black and the ingest wizard white; a dragged host is the one pressed, and it stays pinned where it is dropped.
 
 - `view`: **the menu bar's text was nearly black on a Windows in light mode** (a server reached by RDP, often): egui followed the system to its own light style, dark text over masstin's dark panels, and the windows (the ingest wizard, the dialogs) white. The window is now dark whatever the system's theme.
 - `view`: **a case file.** Everything the viewer keeps about a case (the saved views with their arrangement, the style, the merged hosts, the subnets, the presentation, the notes) can go in one file, `<name>.masstin`, wherever the analyst wants it, instead of next to the timeline: Evidence › **Save as a case…** and **Open case…**, a `.masstin` dropped on the window or picked from the recent list, or `-a view --case FILE` (with `-f`, it starts a case on those timelines, taking what is already next to them without writing there). While a case is open nothing is written next to the timelines, so a share with the evidence stays as it was; recordings and films go next to the case file. A case and its timelines moved together are found again. The marks and a hunt's results still go in the CSV itself. Autopilot: `note=TEXT`; `motion` saves, as the checkbox does.
