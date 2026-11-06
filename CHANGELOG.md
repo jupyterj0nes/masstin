@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `view`: **dragging a host in a big graph.** A host is now taken where the button went down, not where the pointer is 6 points later when egui tells a drag from a click (by then, quick or over a remote desktop, it was over another host, which went instead, or over the background, which panned). While a host was held the centring waited and the graph sailed off in a block, because the springs do not pull both ends alike (300 units in a drag, 750 to 3,700 in light mode); letting go brought the centring back and everything, the dropped host too, jumped 100 to 400 points. The free hosts now share that push out among themselves while a host is held or pinned, the pulls of the held host and gravity kept (280 units of drift became 8). **A dropped host stays pinned where it was dropped**, with a pin on its corner; right-click it for Unpin, the background for **Unpin all**; pins survive a change of filter (Lay out again frees them). While a host is held the layout takes three ticks a frame, also in light mode, so the rest follows it instead of settling anew every frame. Autopilot: `pin=HOST:DX:DY`.
+
 ## v1.4.2 — 2026-11-05
 
 The window over a remote desktop, and XFS. Over RDP or without a GPU driver the viewer draws with its own CPU rasteriser (six frames a second became twenty-nine, at half the CPU, and nothing at all with the window still); disk images with XFS and LVM volumes give their Linux logs.

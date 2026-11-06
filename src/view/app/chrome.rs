@@ -710,7 +710,7 @@ impl Viewer {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
             Tab::Selection => match self.selected {
                 None => {
-                    theme::hint(ui, "Click a host or a connection to inspect it. Right-click for what you can do with it. Drag a host to move it, drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood.");
+                    theme::hint(ui, "Click a host or a connection to inspect it. Right-click for what you can do with it. Drag a host to move it (it stays pinned where you drop it), drag the background to pan, scroll to zoom, double-click a host to open its neighbourhood.");
                     ui.add_space(8.0);
                     self.view_summary(ui);
                 }
@@ -1226,6 +1226,12 @@ impl Viewer {
                     let f = self.draft.clone();
                     self.draft = f;
                     self.requery(true);
+                }
+                let pinned = self.layout.fixed.iter().filter(|&&f| f).count();
+                if pinned > 0 && icon_button(ui, ic::PUSH_PIN, &format!("Unpin all ({})", pinned)).on_hover_text("The pinned hosts go back to the forces").clicked() {
+                    ui.close();
+                    self.layout.fixed.iter_mut().for_each(|f| *f = false);
+                    self.layout.reheat(0.3);
                 }
                 ui.separator();
                 if icon_button(ui, ic::FIRE, "Findings").clicked() {

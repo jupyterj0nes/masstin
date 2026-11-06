@@ -239,6 +239,11 @@ pub struct Layout {
     unsettled: bool,
     /// when the forces went cold (overlaps alone are resolved from then on)
     cold_since: Option<std::time::Instant>,
+    /// a host was held or pinned on the last tick (the centring waited)
+    held: bool,
+    /// how far the centring moved everything when it came back after a hold:
+    /// the window moves its camera as much, so the picture does not jump
+    pub recentred: V2,
     tree: Tree,
     force: Vec<V2>,
     stack: Vec<u32>,
@@ -270,7 +275,7 @@ impl Layout {
             degree[b] += 1;
         }
         let max_radius = radius.iter().copied().fold(1.0f32, f32::max);
-        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, group: vec![None; n], aspect: 1.0, max_radius, unsettled: true, cold_since: None, tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
+        Layout { pos, vel: vec![V2::default(); n], fixed: vec![false; n], radius, links, degree, alpha: 1.0, link_distance: 150.0, group: vec![None; n], aspect: 1.0, max_radius, unsettled: true, cold_since: None, held: false, recentred: V2::default(), tree: Tree::new(), force: vec![V2::default(); n], stack: Vec::new(), grid: HashMap::new() }
     }
 
     pub fn len(&self) -> usize {
@@ -329,6 +334,10 @@ impl Layout {
             self.force[i] -= f;
         }
         self.stack = stack;
+        let held = self.fixed.iter().any(|&f| f);
+        // the pulls from outside the free hosts (the springs to a held one,
+        // gravity): what may move them as a whole while the centring waits
+        let mut outside = V2::default();
         // links: a spring towards the ideal distance, weaker on a busy node
         // (d3: strength 1 / the smaller degree, so a hub's forty links do not
         // crush it), the lighter end moving more
@@ -341,6 +350,9 @@ impl Layout {
             let bias = self.degree[a] as f32 / (self.degree[a] + self.degree[b]).max(1) as f32;
             self.force[a] += d * (k * (1.0 - bias));
             self.force[b] -= d * (k * bias);
+            if held && self.fixed[a] != self.fixed[b] {
+                if self.fixed[a] { outside -= d * (k * bias) } else { outside += d * (k * (1.0 - bias)) }
+            }
         }
         // gravity towards the origin, weaker along the canvas's long side so
         // the picture fills it
@@ -348,6 +360,9 @@ impl Layout {
         for i in 0..n {
             self.force[i].x -= self.pos[i].x * (gx * alpha);
             self.force[i].y -= self.pos[i].y * (gy * alpha);
+            if held && !self.fixed[i] {
+                outside -= V2::new(self.pos[i].x * gx, self.pos[i].y * gy) * alpha;
+            }
         }
         // groups: every member pulled towards its group's centre, the groups
         // pushed apart a little
@@ -391,6 +406,29 @@ impl Layout {
                 }
             }
         }
+        // the springs do not pull both ends alike, so between them the free
+        // hosts gain a push of their own; the centring takes it away, but it
+        // waits while a host is held or pinned, and the graph sailed off (by
+        // hundreds a second in light mode). Here the free hosts share that
+        // push out, the pulls from outside them kept.
+        if held {
+            let mut sum = V2::default();
+            let mut free = 0.0f32;
+            for i in 0..n {
+                if !self.fixed[i] {
+                    sum += self.force[i];
+                    free += 1.0;
+                }
+            }
+            if free > 0.0 {
+                let own = (sum - outside) * (1.0 / free);
+                for i in 0..n {
+                    if !self.fixed[i] {
+                        self.force[i] -= own;
+                    }
+                }
+            }
+        }
         // integrate
         let mut moving = false;
         for i in 0..n {
@@ -410,8 +448,9 @@ impl Layout {
         }
         // centring, as d3's forceCenter: the springs do not conserve momentum
         // (a hub's leaves take the whole pull), so without it a graph with hubs
-        // sails off; skipped while the analyst holds a host
-        if !self.fixed.iter().any(|&f| f) {
+        // sails off; skipped while the analyst holds or pinned a host (it
+        // would move that one too), the push shared out above instead
+        if !held {
             let mut c = V2::default();
             for p in &self.pos {
                 c += *p;
@@ -420,7 +459,11 @@ impl Layout {
             for p in &mut self.pos {
                 *p -= c;
             }
+            if self.held {
+                self.recentred += c;
+            }
         }
+        self.held = held;
         // collisions: push overlapping circles apart (hash grid with cells the
         // size of the largest pair, two passes)
         let cell = (self.max_radius * 2.0 + 16.0).max(1.0);
@@ -520,6 +563,52 @@ mod tests {
             l.tick();
         }
         assert_eq!(l.pos[0], V2::new(5.0, 5.0));
+    }
+
+    /// hubs of fifteen hosts, chained: the shape that made a held graph sail off
+    fn hubs(n: usize) -> Layout {
+        let links = (1..n).map(|i| if i % 15 == 0 { (i - 15, i) } else { (i - i % 15, i) }).collect();
+        let mut l = Layout::new(vec![22.0; n], links, &vec![None; n]);
+        for _ in 0..3000 {
+            if !l.tick() {
+                break;
+            }
+        }
+        l
+    }
+
+    fn free_centroid(l: &Layout) -> V2 {
+        let mut c = V2::default();
+        let mut k = 0.0;
+        for (p, f) in l.pos.iter().zip(&l.fixed) {
+            if !f {
+                c += *p;
+                k += 1.0;
+            }
+        }
+        c * (1.0 / k)
+    }
+
+    #[test]
+    fn a_held_host_does_not_set_the_graph_sailing() {
+        // a leaf held 300 away for as long as a drag in light mode ticks: the
+        // rest follows it a little, it does not sail off (280 away with 200
+        // hosts before, 700 to 1,000 in the window)
+        for &n in &[60usize, 200] {
+            let mut l = hubs(n);
+            let before = free_centroid(&l);
+            l.fixed[7] = true;
+            l.pos[7] += V2::new(300.0, 0.0);
+            for _ in 0..40 {
+                l.reheat(0.3);
+                for _ in 0..50 {
+                    l.tick();
+                }
+            }
+            let drift = (free_centroid(&l) - before).len();
+            eprintln!("n={n}: free centroid drift {drift:.0}");
+            assert!(drift < 30.0, "n={n}: the graph drifted {drift:.0} while a host was held");
+        }
     }
 
     #[test]
