@@ -286,5 +286,8 @@ mod tests {
         assert!(v.dark_mode);
         assert_eq!(v.override_text_color, Some(TEXT));
         assert_eq!(v.widgets.inactive.fg_stroke.color, TEXT);
+        // the windows (the ingest wizard, the dialogs) were white
+        assert_eq!(v.window_fill, PANEL_2);
+        assert_eq!(v.panel_fill, PANEL);
     }
 }
