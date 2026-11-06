@@ -8,6 +8,7 @@
 //! touches it, selecting opens it in the pane. The force layout runs while
 //! warm and the analyst can drag any host.
 
+mod case_ui;
 mod chrome;
 mod edge_style;
 mod labels;
@@ -25,6 +26,7 @@ use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec
 
 use super::draw;
 use super::layout::{Layout, V2};
+use super::case::{self, CaseFile};
 use super::notes::{NoteTarget, Notes};
 use super::query::{fmt_time, hunt_rank, parse_time, Filter, GEdge, GraphView, Role, View};
 use super::theme;
@@ -258,6 +260,8 @@ pub struct Viewer {
     // presentation and recording
     story: Story,
     story_path: std::path::PathBuf,
+    /// the case file in use: everything kept goes there, nothing next to the timelines
+    case: Option<std::path::PathBuf>,
     steps: Vec<Step>,
     step_of_event: Vec<usize>,
     presenting: bool,
@@ -582,16 +586,31 @@ impl Viewer {
         // with no timeline the side files go under the temp folder, so the
         // style chosen on the welcome is kept
         let first = opts.files.first().cloned().unwrap_or_else(ingest::scratch_csv);
-        if !opts.files.is_empty() {
+        // a case (opened by `run`, so it is there) holds what the side files would
+        let case_path = opts.case.clone().map(std::path::PathBuf::from);
+        let case_file = case_path.as_ref().and_then(|p| CaseFile::load(p).ok());
+        let case_path = case_path.filter(|_| case_file.is_some());
+        if let Some(p) = &case_path {
+            ingest::remember(&[p.to_string_lossy().to_string()]);
+        } else if !opts.files.is_empty() {
             ingest::remember(&opts.files);
         }
         let views_path = ViewsFile::path_for(&first);
-        let vf = ViewsFile::load(&views_path);
+        let vf = match &case_file {
+            Some(c) => c.views.clone(),
+            None => ViewsFile::load(&views_path),
+        };
         let style = vf.last_style.clone().unwrap_or_default();
         let builtin = builtin_views(store.t_max);
         let story_path = Story::path_for(&first);
-        let story = Story::load(&story_path);
-        let notes_path = first.clone();
+        let story = match &case_file {
+            Some(c) => c.story.clone(),
+            None => Story::load(&story_path),
+        };
+        let notes = match (&case_file, &case_path) {
+            (Some(c), Some(p)) => Notes { path: p.clone(), notes: c.notes.clone() },
+            _ => Notes::load(&Notes::path_for(&first)),
+        };
         let mut v = Viewer {
             store,
             files: opts.files,
@@ -647,6 +666,7 @@ impl Viewer {
             restore_places: None,
             story,
             story_path,
+            case: case_path,
             steps: Vec::new(),
             step_of_event: Vec::new(),
             presenting: false,
@@ -721,7 +741,7 @@ impl Viewer {
             canvas_rect: Rect::NOTHING,
             ctx_target: None,
             color_pick: None,
-            notes: Notes::load(&Notes::path_for(&notes_path)),
+            notes,
             note_draft: None,
             mark_dialog: None,
             row_pick: Vec::new(),
@@ -945,6 +965,12 @@ impl Viewer {
     }
 
     fn save_story(&self) {
+        if let Some(p) = &self.case {
+            if let Err(e) = self.write_case(p) {
+                eprintln!("masstin: cannot save {}: {}", p.display(), e);
+            }
+            return;
+        }
         if let Err(e) = self.story.save(&self.story_path) {
             eprintln!("masstin: cannot save {}: {}", self.story_path.display(), e);
         }
@@ -1268,7 +1294,7 @@ impl Viewer {
         });
         if save {
             self.notes.add(target, &text);
-            if let Err(e) = self.notes.save() {
+            if let Err(e) = self.save_notes() {
                 self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
             } else {
                 self.status = "Note saved".into();
@@ -1608,10 +1634,42 @@ impl Viewer {
 
     // ───────────────────────── style ─────────────────────────
 
+    fn views_now(&self) -> ViewsFile {
+        ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone(), subnets: self.subnet_defs.clone() }
+    }
+
     fn persist(&self) {
-        let vf = ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone(), subnets: self.subnet_defs.clone() };
-        if let Err(e) = vf.save(&self.views_path) {
+        if let Some(p) = &self.case {
+            if let Err(e) = self.write_case(p) {
+                eprintln!("masstin: cannot save {}: {}", p.display(), e);
+            }
+            return;
+        }
+        if let Err(e) = self.views_now().save(&self.views_path) {
             eprintln!("masstin: cannot save {}: {}", self.views_path.display(), e);
+        }
+    }
+
+    /// Everything the case keeps, written to `path`.
+    pub(super) fn write_case(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let c = CaseFile { masstin_case: 1, timelines: self.files.iter().map(|f| case::absolute(f)).collect(), views: self.views_now(), story: self.story.clone(), notes: self.notes.notes.clone() };
+        c.save(path)
+    }
+
+    /// Where recordings and films go: next to the case file when there is
+    /// one, next to the first timeline otherwise.
+    pub(super) fn out_dir(&self) -> Option<std::path::PathBuf> {
+        match &self.case {
+            Some(c) => c.parent().map(|d| d.to_path_buf()),
+            None => self.files.first().and_then(|f| std::path::Path::new(f).parent()).map(|d| d.to_path_buf()),
+        }
+    }
+
+    /// The notes, in the case file when there is one.
+    pub(super) fn save_notes(&self) -> std::io::Result<()> {
+        match &self.case {
+            Some(p) => self.write_case(p),
+            None => self.notes.save(),
         }
     }
 
@@ -3226,7 +3284,7 @@ impl Viewer {
                     }
                 }
                 ui.label(egui::RichText::new(format!("{} steps · {} rows · {:.0} s", self.steps.len(), self.graph.events.len(), total)).color(MUTED));
-                ui.label(egui::RichText::new(self.story_path.to_string_lossy()).small().color(MUTED));
+                ui.label(egui::RichText::new(self.case.as_ref().unwrap_or(&self.story_path).to_string_lossy()).small().color(MUTED));
             });
             ui.separator();
             ui.label(egui::RichText::new("STEPS   (click a row to see the graph at that moment; a blank duration means the global one)").small().color(MUTED));
@@ -3368,7 +3426,7 @@ impl Viewer {
             let stem = std::path::Path::new(&self.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
             self.export_name = format!("{}-story", stem);
         }
-        let dir = std::path::Path::new(&self.files[0]).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let dir = self.out_dir().unwrap_or_default();
         let name = self.export_name.trim().to_string();
         let out = match self.export_format {
             Format::Gif => dir.join(format!("{}.gif", name)),
@@ -3411,10 +3469,7 @@ impl Viewer {
         let format = if format == Format::Mp4 && !present::ffmpeg_available() { Format::Gif } else if format == Format::Png { Format::Gif } else { format };
         let out = out.unwrap_or_else(|| {
             let (dir, stem) = match self.files.first() {
-                Some(f) => {
-                    let p = std::path::Path::new(f);
-                    (p.parent().map(|d| d.to_path_buf()).unwrap_or_default(), p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "masstin".into()))
-                }
+                Some(f) => (self.out_dir().unwrap_or_default(), std::path::Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "masstin".into())),
                 None => (std::env::temp_dir().join("masstin"), "masstin".to_string()),
             };
             let _ = std::fs::create_dir_all(&dir);
@@ -3572,7 +3627,16 @@ impl Viewer {
                 }
             }
             "hud" => self.hud = !self.hud,
-            "motion" => self.style.motion = !self.style.motion,
+            "motion" => {
+                self.style.motion = !self.style.motion;
+                self.persist();
+            }
+            other if other.starts_with("note=") => {
+                self.notes.add(NoteTarget::Free, &other["note=".len()..]);
+                if let Err(e) = self.save_notes() {
+                    eprintln!("masstin: cannot write {}: {}", self.notes.path.display(), e);
+                }
+            }
             "table" => self.show_table = true,
             "ingest" => self.ingest.open = true,
             "ingest-go" => {

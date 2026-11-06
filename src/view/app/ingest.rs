@@ -357,6 +357,10 @@ impl Viewer {
         if paths.is_empty() {
             return;
         }
+        if let Some(c) = paths.iter().find(|p| p.is_file() && case::is_case(&p.to_string_lossy())) {
+            self.open_case(c.clone());
+            return;
+        }
         let all_timelines = paths.iter().all(|p| p.is_file() && p.extension().map_or(false, |e| e.eq_ignore_ascii_case("csv")) && is_timeline(p));
         let names: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
         if all_timelines {
@@ -377,7 +381,9 @@ impl Viewer {
         if files.is_empty() {
             return false;
         }
-        let merges = ViewsFile::load(&ViewsFile::path_for(&files[0])).merges;
+        // timelines added to the open case stay in it; others leave it
+        let in_case = self.case.is_some() && self.files.iter().all(|f| files.contains(f));
+        let merges = if in_case { self.merges.clone() } else { ViewsFile::load(&ViewsFile::path_for(&files[0])).merges };
         match Store::load_with(&files, self.alpha, &merges) {
             Ok(s) => {
                 self.store = s;
@@ -385,8 +391,11 @@ impl Viewer {
                 self.merges = merges;
                 self.views_path = ViewsFile::path_for(&self.files[0]);
                 self.story_path = Story::path_for(&self.files[0]);
-                self.story = Story::load(&self.story_path);
-                self.notes = Notes::load(&Notes::path_for(&self.files[0]));
+                if !in_case {
+                    self.case = None;
+                    self.story = Story::load(&self.story_path);
+                    self.notes = Notes::load(&Notes::path_for(&self.files[0]));
+                }
                 self.remembered.clear();
                 if self.draft.view == View::Findings && !self.store.edges.iter().any(|e| e.hunt != 0) {
                     self.draft.view = View::All;
@@ -394,7 +403,15 @@ impl Viewer {
                 self.fit_pending = true;
                 self.requery(true);
                 self.status = format!("Opened: {}", self.status);
-                remember(&self.files);
+                match self.case.clone() {
+                    Some(p) => {
+                        if let Err(e) = self.write_case(&p) {
+                            self.status = format!("cannot write the case {}: {}", p.display(), e);
+                        }
+                        remember(&[p.to_string_lossy().to_string()]);
+                    }
+                    None => remember(&self.files),
+                }
                 self.recent = load_recent();
                 true
             }
@@ -933,7 +950,7 @@ impl Viewer {
                     let dir = Path::new(f).parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
                     let r = theme::card(ui, false, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(ic::TABLE).size(16.0).color(theme::CYAN));
+                            ui.label(egui::RichText::new(if case::is_case(f) { ic::ARCHIVE } else { ic::TABLE }).size(16.0).color(theme::CYAN));
                             ui.vertical(|ui| {
                                 ui.label(theme::medium(name.clone(), 13.0).color(TEXT));
                                 ui.label(egui::RichText::new(dir).size(11.0).color(theme::DIM));
@@ -946,7 +963,11 @@ impl Viewer {
                 }
             });
             if let Some(f) = pick {
-                self.open_files(vec![f]);
+                if case::is_case(&f) {
+                    self.open_case(f.into());
+                } else {
+                    self.open_files(vec![f]);
+                }
             }
         }
         painter.text(Pos2::new(canvas.center().x, canvas.bottom() - 14.0), Align2::CENTER_BOTTOM, "Evidence › Open timeline… and Ingest evidence… do the same from the menu", FontId::proportional(11.0), theme::DIM);
