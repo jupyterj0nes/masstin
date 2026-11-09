@@ -477,15 +477,40 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     if config.action != ActionType::View {
         let asked = config.threads.or_else(|| std::env::var("MASSTIN_THREADS").ok().and_then(|s| s.trim().parse().ok()));
         let asked_images = config.parallel_images.or_else(|| std::env::var("MASSTIN_PARALLEL_IMAGES").ok().and_then(|s| s.trim().parse().ok()));
-        let d = crate::threads::decide(asked, asked_images);
+        let reads_images = matches!(config.action, ActionType::ParseImage | ActionType::ParseMassive);
+        let evidence: Vec<String> = if reads_images { config.file.iter().chain(config.directory.iter()).cloned().collect() } else { Vec::new() };
+        let d = crate::threads::decide(asked, asked_images, &evidence);
         crate::threads::install(&d);
-        let images = if matches!(config.action, ActionType::ParseImage | ActionType::ParseMassive) { format!("; images {} at a time (--parallel-images)", d.images) } else { String::new() };
-        crate::banner::print_info(&format!(
-            "Threads: {} ({}{} core{}; --threads changes it, 1 runs serial); priority {}{}",
-            d.workers,
-            if d.asked { "asked; " } else { "" },
+        let machine = format!(
+            "{} core{}, {:.1} idle now{}",
             d.cores,
             if d.cores == 1 { "" } else { "s" },
+            d.snapshot.idle_cores,
+            d.snapshot.free_memory.map(|m| format!(", {} free", crate::threads::human_bytes(m))).unwrap_or_default()
+        );
+        let threads = if d.asked {
+            format!("Threads: {} (asked; {})", d.workers, machine)
+        } else {
+            format!("Threads: up to {}, what is idle at each moment ({}; --threads fixes it, 1 runs serial)", d.workers, machine)
+        };
+        let images = if !reads_images {
+            String::new()
+        } else if let Some(n) = d.asked_images {
+            format!("; images {} at a time (asked)", n)
+        } else {
+            format!(
+                "; images at a time as {} allows ({}; --parallel-images fixes it)",
+                d.medium.label(),
+                match d.medium {
+                    crate::threads::Medium::Rotational => "one".to_string(),
+                    crate::threads::Medium::Network => "up to four".to_string(),
+                    _ => "the idle cores".to_string(),
+                }
+            )
+        };
+        crate::banner::print_info(&format!(
+            "{}; priority {}{}",
+            threads,
             if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" },
             images
         ));

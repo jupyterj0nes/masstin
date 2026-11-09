@@ -2985,7 +2985,12 @@ fn parse_files(files: &[EvtxLocation], pb: &indicatif::ProgressBar) -> Vec<Vec<L
     let budget = crate::threads::file_budget();
     let sizes: Vec<u64> = files.iter().map(file_bytes).collect();
     let mut out: Vec<Vec<LogData>> = Vec::with_capacity(files.len());
-    for wave in plan_waves(&sizes, budget, workers * 2) {
+    // each wave as wide as the machine is idle when it starts
+    let mut start = 0usize;
+    while start < files.len() {
+        let width = crate::threads::available_now() * 2;
+        let wave = plan_waves(&sizes[start..], budget, width).into_iter().next().map(|w| start + w.start..start + w.end).unwrap_or(start..files.len());
+        start = wave.end;
         if let Some(f) = files[wave.clone()].last() {
             crate::banner::progress_set_message(pb, &progress_name(f));
         }
