@@ -33,6 +33,157 @@ struct ExtractedArtifacts {
 /// Main entry point: parse forensic disk images (Windows + Linux).
 /// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4 / XFS→Linux logs.
 /// All sources are extracted to temp directories first, then parsed together into a single CSV.
+/// One image's extraction: what it was and how it went.
+struct ImageOutcome {
+    result: Result<ExtractedArtifacts, String>,
+}
+
+/// Why an image was skipped, as the summary groups it.
+fn skip_category(msg: &str) -> &'static str {
+    if msg.contains("Incomplete VMDK") || msg.contains("VMDK descriptor") {
+        "descriptor-only (missing -flat.vmdk)"
+    } else if msg.contains("streamOptimized VMDK truncated") {
+        "streamOptimized truncated"
+    } else if msg.contains("streamOptimized VMDK") {
+        "streamOptimized broken"
+    } else if msg.contains("BitLocker") {
+        "BitLocker encrypted"
+    } else if msg.contains("No partitions found") {
+        "no MBR/GPT partitions"
+    } else if msg.contains("No NTFS or Linux") {
+        "unsupported filesystem"
+    } else if msg.contains("but no forensic artifacts") {
+        "no forensic artifacts inside"
+    } else if msg.contains("Empty image") || msg.contains("empty image") {
+        "empty (0 bytes)"
+    } else {
+        "other error"
+    }
+}
+
+/// Extract one image into its temp dir, printing its block of the banner
+/// (the header, the partitions, what came out, or why it was skipped).
+fn extract_one_image(img_idx: usize, total_images: usize, image_path: &str, base_temp: &Path) -> ImageOutcome {
+    let ext = Path::new(image_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let image_name = Path::new(image_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(image_path)
+        .to_string();
+
+    // For VMDK, the descriptor file is tiny (~1 KB) but the real virtual
+    // disk lives in -flat / -s### extent files. Probe the descriptor for
+    // the declared capacity so the header shows the real disk size.
+    let size_bytes: Option<u64> = if ext == "vmdk" {
+        crate::vmdk::VmdkReader::probe_size(image_path)
+            .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+    } else if ext == "vhd" {
+        // a dynamic VHD's file size says nothing about the disk
+        crate::vhd::VhdReader::probe_size(image_path)
+            .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+    } else if ext == "vhdx" {
+        crate::vhd::VhdxReader::probe_size(image_path)
+            .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+    } else {
+        fs::metadata(image_path).ok().map(|m| m.len())
+    };
+    let file_size_str = match size_bytes {
+        Some(n) => {
+            let gb = n as f64 / 1_073_741_824.0;
+            if gb >= 1.0 { format!("{:.1} GB", gb) }
+            else { format!("{:.0} MB", n as f64 / 1_048_576.0) }
+        }
+        None => "? size".to_string(),
+    };
+
+    crate::banner::print_info("");
+    crate::banner::print_phase_result(&format!(
+        "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, ext.to_uppercase(), file_size_str
+    ));
+    crate::banner::print_info(&format!("  {}", image_path));
+
+    let temp_dir = base_temp.join(format!("{}_{}", img_idx, image_name));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let result = match ext.as_str() {
+        "e01" | "ex01" => extract_evtx_from_image_ewf(image_path, &temp_dir),
+        "vmdk" => extract_evtx_from_image_vmdk(image_path, &temp_dir),
+        "vhd" | "vhdx" => extract_evtx_from_image_vhd(image_path, &temp_dir),
+        "dd" | "raw" | "img" | "001" => extract_evtx_from_image_raw(image_path, &temp_dir),
+        _ => extract_evtx_from_image_raw(image_path, &temp_dir)
+                .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
+    };
+
+    if let Err(e) = &result {
+        let msg = e.to_string();
+        if msg.contains("Incomplete VMDK") {
+            let detail = if let Some(pos) = msg.find("flat extent '") {
+                let after = &msg[pos + 13..];
+                if let Some(end) = after.find('\'') {
+                    format!(" (needs: {})", &after[..end])
+                } else { String::new() }
+            } else { String::new() };
+            crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file{}", detail));
+        } else if msg.contains("Empty image (0 bytes)") {
+            crate::banner::print_info(&format!("  Skipped: empty image (0 bytes)"));
+        } else {
+            crate::banner::print_info(&format!("  Skipped: {}", msg));
+        }
+        if is_debug_mode() {
+            eprintln!("[DEBUG] Full error for {}: {}", image_name, msg);
+        }
+    }
+    ImageOutcome { result }
+}
+
+/// Every image extracted, in the images' order: one after another when
+/// `at_once` is one (printing as it goes, as always); else `at_once` threads
+/// take the images in turn, each one's banner lines held back and printed
+/// in order as the earliest unfinished image completes.
+fn extract_images(images: &[String], total_images: usize, base_temp: &Path, at_once: usize) -> Vec<ImageOutcome> {
+    if at_once <= 1 || images.len() <= 1 {
+        return images.iter().enumerate().map(|(i, p)| extract_one_image(i, total_images, p, base_temp)).collect();
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    // (outcome, its lines) of each image once done, and how many were printed
+    let done: Mutex<(Vec<Option<(ImageOutcome, Vec<crate::banner::Line>)>>, usize)> = Mutex::new(((0..images.len()).map(|_| None).collect(), 0));
+    std::thread::scope(|scope| {
+        for _ in 0..at_once.min(images.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= images.len() {
+                    break;
+                }
+                crate::banner::capture_start();
+                let outcome = extract_one_image(i, total_images, &images[i], base_temp);
+                let lines = crate::banner::capture_take();
+                let mut d = done.lock().unwrap();
+                d.0[i] = Some((outcome, lines));
+                // print the blocks whose turn has come, in order
+                while d.1 < images.len() {
+                    let k = d.1;
+                    match d.0[k].as_ref() {
+                        Some((_, lines)) => {
+                            crate::banner::replay(lines);
+                            d.1 += 1;
+                        }
+                        None => break,
+                    }
+                }
+            });
+        }
+    });
+    let (slots, _) = done.into_inner().unwrap();
+    slots.into_iter().map(|s| s.expect("every image extracted").0).collect()
+}
+
 pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, output: Option<&String>, include_loose_artifacts: bool) {
     let start_time = std::time::Instant::now();
 
@@ -217,63 +368,14 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     let mut skip_breakdown: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
 
-    for (img_idx, image_path) in all_image_files.iter().enumerate() {
-        let ext = Path::new(image_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+    // each image to its temp dir and its outcome, one after another, or
+    // several at a time with their banner lines held back and printed in
+    // order as each turn comes; the bookkeeping after, in the images' order,
+    // the same whatever the count
+    let outcomes: Vec<ImageOutcome> = extract_images(&all_image_files, total_images, &base_temp, crate::threads::images());
 
-        let image_name = Path::new(image_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(image_path)
-            .to_string();
-
-        // For VMDK, the descriptor file is tiny (~1 KB) but the real virtual
-        // disk lives in -flat / -s### extent files. Probe the descriptor for
-        // the declared capacity so the header shows the real disk size.
-        let size_bytes: Option<u64> = if ext == "vmdk" {
-            crate::vmdk::VmdkReader::probe_size(image_path)
-                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
-        } else if ext == "vhd" {
-            // a dynamic VHD's file size says nothing about the disk
-            crate::vhd::VhdReader::probe_size(image_path)
-                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
-        } else if ext == "vhdx" {
-            crate::vhd::VhdxReader::probe_size(image_path)
-                .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
-        } else {
-            fs::metadata(image_path).ok().map(|m| m.len())
-        };
-        let file_size_str = match size_bytes {
-            Some(n) => {
-                let gb = n as f64 / 1_073_741_824.0;
-                if gb >= 1.0 { format!("{:.1} GB", gb) }
-                else { format!("{:.0} MB", n as f64 / 1_048_576.0) }
-            }
-            None => "? size".to_string(),
-        };
-
-        crate::banner::print_info("");
-        crate::banner::print_phase_result(&format!(
-            "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, ext.to_uppercase(), file_size_str
-        ));
-        crate::banner::print_info(&format!("  {}", image_path));
-
-        let temp_dir = base_temp.join(format!("{}_{}", img_idx, image_name));
-        let _ = fs::create_dir_all(&temp_dir);
-
-        let result = match ext.as_str() {
-            "e01" | "ex01" => extract_evtx_from_image_ewf(image_path, &temp_dir),
-            "vmdk" => extract_evtx_from_image_vmdk(image_path, &temp_dir),
-            "vhd" | "vhdx" => extract_evtx_from_image_vhd(image_path, &temp_dir),
-            "dd" | "raw" | "img" | "001" => extract_evtx_from_image_raw(image_path, &temp_dir),
-            _ => extract_evtx_from_image_raw(image_path, &temp_dir)
-                    .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
-        };
-
-        match result {
+    for out in outcomes {
+        match out.result {
             Ok(artifacts) => {
                 images_processed += 1;
                 // Only add EVTX dir if it actually contains extracted files
@@ -291,49 +393,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     ntuser_dirs.push((ndir.to_string_lossy().to_string(), hostname));
                 }
             }
-            Err(e) => {
+            Err(msg) => {
                 images_skipped += 1;
-                let msg = e.to_string();
-                let category: &'static str = if msg.contains("Incomplete VMDK") || msg.contains("VMDK descriptor") {
-                    "descriptor-only (missing -flat.vmdk)"
-                } else if msg.contains("streamOptimized VMDK truncated") {
-                    "streamOptimized truncated"
-                } else if msg.contains("streamOptimized VMDK") {
-                    "streamOptimized broken"
-                } else if msg.contains("BitLocker") {
-                    "BitLocker encrypted"
-                } else if msg.contains("No partitions found") {
-                    "no MBR/GPT partitions"
-                } else if msg.contains("No NTFS or Linux") {
-                    "unsupported filesystem"
-                } else if msg.contains("but no forensic artifacts") {
-                    "no forensic artifacts inside"
-                } else if msg.contains("Empty image") || msg.contains("empty image") {
-                    "empty (0 bytes)"
-                } else {
-                    "other error"
-                };
-                *skip_breakdown.entry(category).or_insert(0) += 1;
-                if msg.contains("Incomplete VMDK") {
-                    let detail = if let Some(pos) = msg.find("flat extent '") {
-                        let after = &msg[pos + 13..];
-                        if let Some(end) = after.find('\'') {
-                            format!(" (needs: {})", &after[..end])
-                        } else { String::new() }
-                    } else { String::new() };
-                    crate::banner::print_info(&format!("  Skipped: VMDK descriptor without data file{}", detail));
-                } else if msg.contains("Empty image (0 bytes)") {
-                    crate::banner::print_info(&format!("  Skipped: empty image (0 bytes)"));
-                } else if msg.contains("No NTFS or Linux") || msg.contains("No partitions found") {
-                    crate::banner::print_info(&format!("  Skipped: {}", msg));
-                } else if msg.contains("but no forensic artifacts") {
-                    crate::banner::print_info(&format!("  Skipped: {}", msg));
-                } else {
-                    crate::banner::print_info(&format!("  Skipped: {}", msg));
-                }
-                if is_debug_mode() {
-                    eprintln!("[DEBUG] Full error for {}: {}", image_name, msg);
-                }
+                *skip_breakdown.entry(skip_category(&msg)).or_insert(0) += 1;
             }
         }
     }

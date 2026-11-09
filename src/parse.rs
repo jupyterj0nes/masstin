@@ -2494,6 +2494,113 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
     parsed_data
 }
 
+/// The files parsed, each to its rows, in the files' order. One thread
+/// takes them one by one as masstin always did. Several take them in
+/// waves: the files of a wave are read and parsed at once, spread over the
+/// pool, and a wave holds no more bytes of EVTX than the memory budget
+/// allows (a file bigger than the budget is a wave of its own), so a laptop
+/// is never asked for more than it has. No task ever waits inside the pool.
+fn parse_files(files: &[EvtxLocation], pb: &indicatif::ProgressBar) -> Vec<Vec<LogData>> {
+    let workers = crate::threads::workers();
+    let progress_name = |f: &EvtxLocation| match f {
+        EvtxLocation::File(path) => path.clone(),
+        EvtxLocation::ZipEntry { evtx_name, .. } => evtx_name.clone(),
+    };
+    if workers <= 1 || files.len() <= 1 {
+        return files
+            .iter()
+            .map(|f| {
+                crate::banner::progress_set_message(pb, &progress_name(f));
+                let rows = parselog(f.clone());
+                pb.inc(1);
+                rows
+            })
+            .collect();
+    }
+    let budget = crate::threads::file_budget();
+    let sizes: Vec<u64> = files.iter().map(file_bytes).collect();
+    let mut out: Vec<Vec<LogData>> = Vec::with_capacity(files.len());
+    for wave in plan_waves(&sizes, budget, workers * 2) {
+        if let Some(f) = files[wave.clone()].last() {
+            crate::banner::progress_set_message(pb, &progress_name(f));
+        }
+        let rows: Vec<Vec<LogData>> = files[wave]
+            .par_iter()
+            .map(|f| {
+                let rows = parselog(f.clone());
+                pb.inc(1);
+                rows
+            })
+            .collect();
+        out.extend(rows);
+    }
+    out
+}
+
+/// The waves `parse_files` takes: files in order, a wave closed when the
+/// next file would take it over `budget` bytes or `max_files` files; a file
+/// over the budget by itself is a wave alone. Every file is in one wave.
+fn plan_waves(sizes: &[u64], budget: u64, max_files: usize) -> Vec<std::ops::Range<usize>> {
+    let mut waves = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0u64;
+    for (i, &size) in sizes.iter().enumerate() {
+        let len = i - start;
+        if len > 0 && (bytes + size > budget || len >= max_files.max(1)) {
+            waves.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < sizes.len() {
+        waves.push(start..sizes.len());
+    }
+    waves
+}
+
+/// The bytes a file takes in memory when read: its size on disk, the
+/// uncompressed size of an entry of a zip, half a gigabyte assumed for an
+/// entry of a zip inside a zip (opening those costs what reading them does).
+fn file_bytes(f: &EvtxLocation) -> u64 {
+    match f {
+        EvtxLocation::File(path) if !path.contains(" -> ") => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        EvtxLocation::ZipEntry { zip_path, evtx_name } if !zip_path.contains(" -> ") => {
+            File::open(zip_path)
+                .ok()
+                .and_then(|f| zip::ZipArchive::new(f).ok())
+                .and_then(|mut z| z.by_name(evtx_name).ok().map(|e| e.size()))
+                .unwrap_or(512 << 20)
+        }
+        _ => 512 << 20,
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+
+    #[test]
+    fn waves_cover_every_file_in_order_within_the_budget() {
+        let sizes = [10u64, 20, 30, 500, 5, 5, 5, 5, 5, 1000, 1];
+        let waves = plan_waves(&sizes, 100, 3);
+        // in order, no file left out or repeated
+        let covered: Vec<usize> = waves.iter().flat_map(|w| w.clone()).collect();
+        assert_eq!(covered, (0..sizes.len()).collect::<Vec<_>>());
+        for w in &waves {
+            let bytes: u64 = sizes[w.clone()].iter().sum();
+            assert!(w.len() <= 3, "{:?}", w);
+            assert!(bytes <= 100 || w.len() == 1, "{:?} holds {} bytes", w, bytes);
+        }
+        // the files over the budget stand alone
+        assert!(waves.contains(&(3..4)));
+        assert!(waves.contains(&(9..10)));
+        assert_eq!(plan_waves(&[], 100, 3), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!(plan_waves(&[7], 100, 3), vec![0..1]);
+        assert_eq!(plan_waves(&[50, 50, 50], 100, 8), vec![0..2, 2..3]);
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // MAIN FUNCTION TO PARSE EVENTS
 // ---------------------------------------------------------------------------------------
@@ -2645,7 +2752,12 @@ pub fn parse_events_ex(
     // so the analyst can see at a glance which events came from a snapshot.
     let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
 
-    for evtxfile in &vec_filenames {
+    // the files, read and parsed: one after another on one thread, as always;
+    // on several, in waves that fit the memory budget, each wave's files
+    // spread over the pool and their rows kept in the files' order
+    let parsed_per_file: Vec<Vec<LogData>> = parse_files(&vec_filenames, &pb);
+
+    for (evtxfile, parsed_logs) in vec_filenames.iter().zip(parsed_per_file) {
         let short_name = match &evtxfile {
             EvtxLocation::File(path) => std::path::Path::new(path)
                 .file_name()
@@ -2658,13 +2770,6 @@ pub fn parse_events_ex(
                 .unwrap_or(evtx_name)
                 .to_string(),
         };
-        let progress_name = match &evtxfile {
-            EvtxLocation::File(path) => path.clone(),
-            EvtxLocation::ZipEntry { evtx_name, .. } => evtx_name.clone(),
-        };
-        crate::banner::progress_set_message(&pb, &progress_name);
-
-        let parsed_logs = parselog(evtxfile.clone());
         let count = parsed_logs.len();
         if count == 0 {
             skipped_no_events += 1;
@@ -2684,7 +2789,6 @@ pub fn parse_events_ex(
             }
         }
         log_data.extend(parsed_logs);
-        pb.inc(1);
     }
 
     pb.finish_and_clear();

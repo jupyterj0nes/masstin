@@ -325,6 +325,14 @@ pub struct Cli {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// For `parse-image` / `parse-massive`: forensic images extracted at
+    /// once. Left out, two when the run has four threads or more, one
+    /// otherwise; eight at most. An NVMe keeps up with several; a spinning
+    /// disk or a share over the network gains nothing from more than one.
+    /// `MASSTIN_PARALLEL_IMAGES` does the same.
+    #[arg(long)]
+    parallel_images: Option<usize>,
+
     /// For `view`: the case file (`.masstin`) to open, or to start with the
     /// timelines given by `-f`. The saved views, the style, the merged hosts,
     /// the subnets, the presentation and the notes are kept in it instead of
@@ -468,15 +476,18 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     // policy; the window keeps its normal priority, it is interactive
     if config.action != ActionType::View {
         let asked = config.threads.or_else(|| std::env::var("MASSTIN_THREADS").ok().and_then(|s| s.trim().parse().ok()));
-        let d = crate::threads::decide(asked);
+        let asked_images = config.parallel_images.or_else(|| std::env::var("MASSTIN_PARALLEL_IMAGES").ok().and_then(|s| s.trim().parse().ok()));
+        let d = crate::threads::decide(asked, asked_images);
         crate::threads::install(&d);
+        let images = if matches!(config.action, ActionType::ParseImage | ActionType::ParseMassive) { format!("; images {} at a time (--parallel-images)", d.images) } else { String::new() };
         crate::banner::print_info(&format!(
-            "Threads: {} ({}{} core{}; --threads changes it, 1 runs serial); priority {}",
+            "Threads: {} ({}{} core{}; --threads changes it, 1 runs serial); priority {}{}",
             d.workers,
             if d.asked { "asked; " } else { "" },
             d.cores,
             if d.cores == 1 { "" } else { "s" },
-            if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" }
+            if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" },
+            images
         ));
     }
 

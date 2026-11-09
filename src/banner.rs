@@ -548,8 +548,63 @@ fn extract_image_name_from_path(path: &str) -> String {
 //  Generic phase printing (for modules with custom flows)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Lines held back: several images extracted at once print their blocks in
+//  order, each when its turn comes, instead of interleaving
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A line of the banner held back on a thread, as it would have printed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Line {
+    Phase(String, String, String),
+    PhaseDetail(String, String),
+    PhaseResult(String),
+    Info(String),
+    Warning(String),
+    Separator,
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<Vec<Line>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From here on, this thread's banner lines are held back until `capture_take`.
+pub fn capture_start() {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// The lines held back on this thread; the capture ends.
+pub fn capture_take() -> Vec<Line> {
+    CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// Print lines held back, as they would have been.
+pub fn replay(lines: &[Line]) {
+    for l in lines {
+        match l {
+            Line::Phase(a, b, c) => print_phase(a, b, c),
+            Line::PhaseDetail(a, b) => print_phase_detail(a, b),
+            Line::PhaseResult(m) => print_phase_result(m),
+            Line::Info(m) => print_info(m),
+            Line::Warning(m) => print_warning(m),
+            Line::Separator => print_separator(),
+        }
+    }
+}
+
+fn held(line: Line) -> bool {
+    CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(line);
+            true
+        }
+        None => false,
+    })
+}
+
 pub fn print_phase(step: &str, total: &str, message: &str) {
     if is_silent() { return; }
+    if held(Line::Phase(step.to_string(), total.to_string(), message.to_string())) { return; }
     eprintln!();
     eprintln!("  {} {}",
         style(format!("[{}/{}]", step, total)).cyan().bold(),
@@ -559,11 +614,13 @@ pub fn print_phase(step: &str, total: &str, message: &str) {
 
 pub fn print_phase_detail(label: &str, value: &str) {
     if is_silent() { return; }
+    if held(Line::PhaseDetail(label.to_string(), value.to_string())) { return; }
     eprintln!("        {} {}", style(label).yellow(), value);
 }
 
 pub fn print_phase_result(message: &str) {
     if is_silent() { return; }
+    if held(Line::PhaseResult(message.to_string())) { return; }
     eprintln!("        {} {}", style("=>").green().bold(), style(message).green().bold());
 }
 
@@ -579,17 +636,48 @@ pub fn print_search_result_line(count: usize, label: &str) {
 
 pub fn print_info(message: &str) {
     if is_silent() { return; }
+    if held(Line::Info(message.to_string())) { return; }
     eprintln!("        {}", style(message).dim());
 }
 
 pub fn print_warning(message: &str) {
     if is_silent() { return; }
+    if held(Line::Warning(message.to_string())) { return; }
     eprintln!("        {}", style(message).yellow());
 }
 
 pub fn print_separator() {
     if is_silent() { return; }
+    if held(Line::Separator) { return; }
     eprintln!();
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_held_on_the_thread_and_given_back_in_order() {
+        capture_start();
+        print_info("one");
+        print_phase_result("two");
+        print_warning("three");
+        print_separator();
+        let lines = capture_take();
+        assert_eq!(lines, vec![Line::Info("one".into()), Line::PhaseResult("two".into()), Line::Warning("three".into()), Line::Separator]);
+        // the capture ended: nothing is held now
+        assert!(capture_take().is_empty());
+        // another thread's capture is its own
+        capture_start();
+        let other = std::thread::spawn(|| {
+            capture_start();
+            print_info("elsewhere");
+            capture_take()
+        }).join().unwrap();
+        print_info("here");
+        assert_eq!(other, vec![Line::Info("elsewhere".into())]);
+        assert_eq!(capture_take(), vec![Line::Info("here".into())]);
+    }
 }
 
 pub fn print_massive_warning() {
