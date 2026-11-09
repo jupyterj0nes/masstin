@@ -26,6 +26,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite output file if it exists |
 | `--threads N` | Threads for parsing (the EVTX chunks, the records into rows, the sort and the writing). Left out, the machine decides: all its cores but one, a single thread on a machine of one or two cores. `1` runs exactly as masstin ran with no parallelism. The process runs below normal priority either way (`MASSTIN_PRIORITY=normal` keeps it normal, for a server where masstin is the job). `MASSTIN_THREADS` does the same |
+| `--parallel-images N` | For `parse-image` / `parse-massive`: forensic images extracted at once. Left out, two when the run has four threads or more, one otherwise; eight at most. An NVMe keeps up with several; a spinning disk or a network share gains nothing from more than one. `MASSTIN_PARALLEL_IMAGES` does the same |
 | `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and, when `-o` is given, a sample of rejected lines in `parse-custom`) |
 | `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
 | `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](../rules/)) |
