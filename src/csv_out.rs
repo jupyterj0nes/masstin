@@ -319,6 +319,16 @@ pub(crate) fn write_timeline(rows: &[LogData], output: Option<&String>) -> io::R
     sink.flush()
 }
 
+/// Rows added to a timeline already written: the same line as the writer's.
+pub(crate) fn append_rows(path: &str, rows: &[LogData]) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    let mut f = BufWriter::new(OpenOptions::new().append(true).open(path)?);
+    for r in rows {
+        f.write_all(row_line(r).as_bytes())?;
+    }
+    f.flush()
+}
+
 /// One row as its line of the timeline, newline included.
 fn row_line(r: &LogData) -> String {
     format!(

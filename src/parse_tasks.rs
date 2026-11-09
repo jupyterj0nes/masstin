@@ -121,11 +121,12 @@ fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str) -> Option
         ip_address: src_machine.to_string(),
         logon_id: String::new(),
         filename: format!("{}:tasks:{}",
-            Path::new(base_dir).parent()
+            crate::parse::extract_image_name_from_extract_path(base_dir).unwrap_or_else(|| Path::new(base_dir).parent()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-                .unwrap_or(base_dir),
-            task_name.trim_start_matches('\\')),
+                .unwrap_or(base_dir)
+                .to_string()),
+            task_name.trim_start_matches('\\').replace('\\', "/")),
         detail,
     })
 }

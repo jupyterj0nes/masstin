@@ -721,7 +721,7 @@ pub(crate) fn source_label_for_path(path: &str) -> String {
     format!("[FOLDER]  {}", parent)
 }
 
-fn extract_image_name_from_extract_path(path: &str) -> Option<String> {
+pub(crate) fn extract_image_name_from_extract_path(path: &str) -> Option<String> {
     let normalized = path.replace('\\', "/");
     let marker = "masstin_image_extract/";
     let pos = normalized.find(marker)?;
@@ -735,6 +735,124 @@ fn extract_image_name_from_extract_path(path: &str) -> Option<String> {
         }
     }
     Some(dir_name.to_string())
+}
+
+/// The source of a row as the analyst should read it. A file taken out of
+/// a forensic image sits, while masstin runs, in a temp folder of the
+/// analyst's machine (`…/masstin_image_extract/<n>_<image>/…`); that path
+/// says nothing about the evidence and names the workstation, so the row
+/// carries the image and the place inside it instead:
+///
+/// - `HRServer.e01:live:Security.evtx`, `HRServer.e01:vss_2:Security.evtx`
+///   (partition 0; `HRServer.e01:partition_1:live:…` for another one)
+/// - `HRServer.e01:UAL:Current.mdb`
+/// - `HRServer.e01:ntuser:Administrator/NTUSER.DAT`
+/// - `HRServer.e01:tasks:Microsoft/Windows/…` (made where the task is read)
+/// - `HRServer.e01:partition_0:/var/log/auth.log` (a Linux volume)
+/// - `vol_C:live:Security.evtx` (a mounted volume's shadow copies)
+///
+/// Any other path is given back as it is: a timeline parsed from a folder
+/// names the files where the evidence sits, as it always did.
+pub(crate) fn display_source(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let (image, rest) = if let Some(pos) = normalized.find("masstin_image_extract/") {
+        let after = &normalized[pos + "masstin_image_extract/".len()..];
+        match after.split_once('/') {
+            Some((dir, rest)) => (strip_index(dir), rest),
+            None => return path.to_string(),
+        }
+    } else if let Some(pos) = normalized.find("masstin_linux_image_extract/") {
+        let after = &normalized[pos + "masstin_linux_image_extract/".len()..];
+        match after.split_once('/') {
+            Some((dir, rest)) => (strip_index(dir), rest),
+            None => return path.to_string(),
+        }
+    } else {
+        return path.to_string();
+    };
+    // Linux: <image>/linux_logs_extracted/partition_N/var/log/… (or logs_extracted/)
+    for kind in ["linux_logs_extracted/", "logs_extracted/"] {
+        if let Some(rest) = rest.strip_prefix(kind) {
+            return match rest.split_once('/') {
+                Some((partition, inside)) => format!("{}:{}:/{}", image, partition, inside),
+                None => format!("{}:{}", image, rest),
+            };
+        }
+    }
+    // Windows: <image>/evtx_extracted/partition_N[_vss_M]/[Sum/]<name>
+    if let Some(rest) = rest.strip_prefix("evtx_extracted/") {
+        let Some((place, inside)) = rest.split_once('/') else { return format!("{}:{}", image, rest) };
+        let name = inside.rsplit('/').next().unwrap_or(inside);
+        if inside.starts_with("Sum/") || name.to_ascii_lowercase().ends_with(".mdb") {
+            return format!("{}:UAL:{}", image, name);
+        }
+        let (partition, vss) = match place.split_once("_vss_") {
+            Some((p, v)) => (p, Some(v)),
+            None => (place, None),
+        };
+        let mut out = image.to_string();
+        if partition != "partition_0" {
+            out.push(':');
+            out.push_str(partition);
+        }
+        out.push(':');
+        match vss {
+            Some(v) => {
+                out.push_str("vss_");
+                out.push_str(v);
+            }
+            None => out.push_str("live"),
+        }
+        out.push(':');
+        out.push_str(name);
+        return out;
+    }
+    // Windows: <image>/ntuser_extracted/partition_N/<user>/NTUSER.DAT
+    if let Some(rest) = rest.strip_prefix("ntuser_extracted/") {
+        let inside = rest.split_once('/').map(|(_, i)| i).unwrap_or(rest);
+        return format!("{}:ntuser:{}", image, inside);
+    }
+    // Windows: <image>/tasks_extracted/partition_N/<task path>
+    if let Some(rest) = rest.strip_prefix("tasks_extracted/") {
+        let inside = rest.split_once('/').map(|(_, i)| i).unwrap_or(rest);
+        return format!("{}:tasks:{}", image, inside);
+    }
+    format!("{}:{}", image, rest)
+}
+
+/// `0_HRServer.e01` -> `HRServer.e01`: the index parse-image puts before the
+/// image's name so two images of one name get two folders.
+fn strip_index(dir: &str) -> &str {
+    match dir.split_once('_') {
+        Some((n, name)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !name.is_empty() => name,
+        _ => dir,
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn a_row_names_the_image_not_the_workstation() {
+        let t = r"C:\Users\someone\AppData\Local\Temp\masstin_image_extract\0_HRServer.e01";
+        assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0\Security.evtx", t)), "HRServer.e01:live:Security.evtx");
+        assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0_vss_2\Security.evtx", t)), "HRServer.e01:vss_2:Security.evtx");
+        assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_1\Microsoft-Windows-WinRM%4Operational.evtx", t)), "HRServer.e01:partition_1:live:Microsoft-Windows-WinRM%4Operational.evtx");
+        assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0\Sum\Current.mdb", t)), "HRServer.e01:UAL:Current.mdb");
+        assert_eq!(display_source(&format!(r"{}\ntuser_extracted\partition_0\Administrator\NTUSER.DAT", t)), "HRServer.e01:ntuser:Administrator/NTUSER.DAT");
+        assert_eq!(display_source(&format!(r"{}\tasks_extracted\partition_0\Microsoft\Windows\Evil\Task", t)), "HRServer.e01:tasks:Microsoft/Windows/Evil/Task");
+        assert_eq!(display_source(&format!(r"{}\linux_logs_extracted\partition_2\var\log\auth.log", t)), "HRServer.e01:partition_2:/var/log/auth.log");
+        assert_eq!(display_source("/tmp/masstin_linux_image_extract/srv.img/logs_extracted/partition_0/var/log/secure"), "srv.img:partition_0:/var/log/secure");
+        assert_eq!(display_source(r"C:\Temp\masstin_image_extract\vol_C:\evtx_extracted\partition_0_vss_0\Security.evtx"), "vol_C::vss_0:Security.evtx");
+        // the evidence where it sits, as it always was
+        for p in [r"D:\evidence\case\Windows\System32\winevt\Logs\Security.evtx", r"D:\triage.zip -> logs/Security.evtx", "lnx01-logs.tgz:var/log/auth.log", ""] {
+            assert_eq!(display_source(p), p);
+        }
+        assert_eq!(strip_index("12_image.E01"), "image.E01");
+        assert_eq!(strip_index("image.E01"), "image.E01");
+        assert_eq!(strip_index("_x"), "_x");
+    }
 }
 
 /// Detect a VSS snapshot index in an extracted-EVTX path.
@@ -2279,7 +2397,14 @@ pub(crate) fn report_logoff_pairing(filled: usize, dropped: usize) {
     }
 }
 
-fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {
+fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
+    // a file taken out of an image names the image, not the temp folder it
+    // sat in; live before shadow copies still holds (`live` is shorter)
+    for r in log_data.iter_mut() {
+        if r.filename.contains("masstin_image_extract") || r.filename.contains("masstin_linux_image_extract") {
+            r.filename = display_source(&r.filename);
+        }
+    }
     // before the noise filter: a logoff without its origin would be dropped
     // by --ignore-local before it could be given one
     let (log_data, filled, dropped) = pair_logoffs(log_data);
