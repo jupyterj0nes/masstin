@@ -68,6 +68,8 @@ const EXTERNAL_RING: Color32 = Color32::from_rgb(226, 182, 118);
 const SIGNIFICANT: Color32 = Color32::from_rgb(255, 92, 108);
 const CANDIDATE: Color32 = Color32::from_rgb(255, 152, 86);
 const SUSPICIOUS: Color32 = Color32::from_rgb(255, 99, 132);
+/// the warm trace a reached host keeps in a cinematic presentation
+const FOOTPRINT: Color32 = Color32::from_rgb(255, 170, 70);
 const CONFIRMED: Color32 = Color32::from_rgb(206, 146, 212);
 const BENIGN: Color32 = Color32::from_rgb(120, 214, 150);
 const EDGE_OK: Color32 = Color32::from_rgb(158, 170, 190);
@@ -2325,6 +2327,47 @@ impl Viewer {
         let cur_step = self.current_step();
         let mut keep_moving = false;
         let frame_now = std::time::Instant::now();
+        // ── cinematic: the hop under way is what is lit, the rest dims; rings mark its ends ──
+        let mut lit_nodes = lit_nodes;
+        let mut lit_edges = lit_edges;
+        let mut dimmed = dimmed;
+        let mut focus_any = focus.is_some();
+        let cine = self.presenting && self.story.cinematic;
+        let look_focus = cine && self.story.look.focus;
+        let look_footprint = cine && self.story.look.footprint;
+        let accent = self.accent();
+        let mut hop_src: HashSet<usize> = HashSet::new();
+        let mut hop_dst: HashSet<usize> = HashSet::new();
+        // when the hop started, when its line arrived, whether it is significant
+        let mut hop_times: Option<(f32, f32, bool)> = None;
+        if look_focus {
+            if let Some(k) = cur_step {
+                let st = &self.steps[k];
+                let t = self.present_t;
+                let arrived = st.start + st.dur;
+                hop_times = Some((st.start, arrived, st.significant));
+                for e in &self.graph.edges {
+                    if e.first_event >= st.from && e.first_event < st.to {
+                        if let Some(&a) = self.graph.node_of_host.get(&e.src) {
+                            hop_src.insert(a);
+                        }
+                        if let Some(&b) = self.graph.node_of_host.get(&e.dst) {
+                            hop_dst.insert(b);
+                        }
+                    }
+                }
+                let rise = ((t - st.start) / 0.25).clamp(0.0, 1.0);
+                let fall = 1.0 - ((t - arrived) / 0.7).clamp(0.0, 1.0);
+                let strength = rise.min(fall);
+                if strength > 0.01 {
+                    lit_edges = self.graph.edges.iter().enumerate().filter(|(_, e)| e.first_event >= st.from && e.first_event < st.to).map(|(k, _)| k).collect();
+                    lit_nodes = hop_src.union(&hop_dst).copied().collect();
+                    dimmed = dimmed.max(0.8 * draw::ease_out_cubic(strength));
+                    focus_any = true;
+                    keep_moving = true;
+                }
+            }
+        }
         if self.reveal_running(frame_now) {
             keep_moving = true;
         } else if self.hunt_reveal.is_some() {
@@ -2444,7 +2487,7 @@ impl Viewer {
             let stroke_color = if selected { ACCENT } else { color };
             let short = (pa - pb).length() < 14.0;
             let plain = lod && !lit && !selected;
-            let glow = !plain && (arcade || ((self.style.edge_glow || look.glow) && (look.glow || emphasised || progress < 1.0 || (lit && focus.is_some()) || (look.finding && dimmed < 0.5))));
+            let glow = !plain && (arcade || ((self.style.edge_glow || look.glow) && (look.glow || emphasised || progress < 1.0 || (lit && focus_any) || (look.finding && dimmed < 0.5))));
             if glow {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 6.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else if arcade { 0.22 } else { 0.16 } * alpha)) });
             }
@@ -2581,7 +2624,7 @@ impl Viewer {
                 if motion { 0.8 + 0.2 * (now * 2.4 + i as f32).sin() } else { 0.9 }
             } else if n.hunt_rank == 1 && dimmed < 0.5 {
                 0.12
-            } else if lit && focus.is_some() {
+            } else if lit && focus_any {
                 0.6
             } else {
                 0.0
@@ -2597,6 +2640,10 @@ impl Viewer {
                 if significant && motion {
                     keep_moving = true;
                 }
+            }
+            if look_footprint && r > 4.0 && !significant && !lit && n.hunt_rank != 1 {
+                // a host already reached keeps a warm trace: the spread, visible
+                draw::glow(&painter, p, r + 1.0, FOOTPRINT, 0.3 * alpha);
             }
             if hovered && !selected {
                 let pulse = if motion { 2.5 * (now * 5.0).sin() } else { 0.0 };
@@ -2640,6 +2687,29 @@ impl Viewer {
                     draw::orb(&painter, look.shape, p, r, fill, ring, alpha, ring_w * if significant { 1.6 } else { 1.0 });
                     if let Some(g) = look.icon {
                         painter.text(p, Align2::CENTER_CENTER, g, FontId::proportional((r * 1.0).max(8.0)), draw::fade(Color32::WHITE, 0.94 * alpha));
+                    }
+                }
+            }
+            if let Some((t_start, t_arrived, sig)) = hop_times {
+                let t = self.present_t;
+                if hop_dst.contains(&i) {
+                    // the line arrived: a ring runs out of the destination and it lights up
+                    let since = t - t_arrived;
+                    if (0.0..0.7).contains(&since) {
+                        let k = draw::ease_out_cubic(since / 0.7);
+                        let col = if sig { SIGNIFICANT } else { accent };
+                        painter.circle_stroke(p, r + 4.0 + 80.0 * z.sqrt().clamp(0.5, 1.4) * k, Stroke::new(0.6 + 3.0 * (1.0 - k), draw::fade(col, 0.9 * (1.0 - k))));
+                        draw::glow(&painter, p, r + 2.0, col, 0.9 * (1.0 - k));
+                        keep_moving = true;
+                    }
+                }
+                if hop_src.contains(&i) {
+                    // the hop leaves: a short ping at the origin
+                    let since = t - t_start;
+                    if (0.0..0.45).contains(&since) {
+                        let k = since / 0.45;
+                        painter.circle_stroke(p, r + 3.0 + 34.0 * z.sqrt().clamp(0.5, 1.4) * k, Stroke::new(0.4 + 2.0 * (1.0 - k), draw::fade(accent, 0.75 * (1.0 - k))));
+                        keep_moving = true;
                     }
                 }
             }
@@ -2772,32 +2842,81 @@ impl Viewer {
         Some(r)
     }
 
+    /// The presentation's accent: the client's colour when the cinematic
+    /// look names one, masstin's amber otherwise.
+    fn accent(&self) -> Color32 {
+        match self.story.look.accent {
+            Some([r, g, b]) if self.story.cinematic => Color32::from_rgb(r, g, b),
+            _ => ACCENT,
+        }
+    }
+
+    fn font_medium(&self, size: f32) -> FontId {
+        FontId::new(size * self.style.font_scale, egui::FontFamily::Name(theme::MEDIUM.into()))
+    }
+
+    fn font_semibold(&self, size: f32) -> FontId {
+        FontId::new(size * self.style.font_scale, egui::FontFamily::Name(theme::SEMIBOLD.into()))
+    }
+
+    /// The analyst's latest note on this connection, by the names it was written under.
+    fn note_for_edge(&self, src: u32, dst: u32, user: u32) -> Option<String> {
+        let (s, d, u) = (self.store.hosts.name(src), self.store.hosts.name(dst), self.store.users.name(user));
+        self.notes.notes.iter().rev().find_map(|n| match &n.target {
+            NoteTarget::Edge { src: ns, dst: nd, user: nu } if ns.eq_ignore_ascii_case(s) && nd.eq_ignore_ascii_case(d) && (nu.is_empty() || nu.eq_ignore_ascii_case(u)) => Some(n.text.clone()),
+            _ => None,
+        })
+    }
+
     fn presentation_overlays(&mut self, painter: &egui::Painter, canvas: Rect) {
         let fs = self.style.font_scale;
-        let cur = self.current_step();
-        // a bottom logo stays above the caption; a top-centre one pushes the title down
-        let lift = if self.story.show_caption && cur.is_some() { 64.0 * fs } else { 0.0 };
-        let logo = self.brand_overlay(painter, canvas, lift);
+        let cine = self.story.cinematic;
+        let look = self.story.look.clone();
+        let accent = self.accent();
+        let t = self.present_t;
+        let cur = present::at(&self.steps, t);
+        let bar_h = if cine && look.bar { 30.0 } else { 0.0 };
+        // a bottom logo stays above the caption and the bar; a top-centre one pushes the title down
+        let caption_h = match cur {
+            Some(_) if cine && look.lower_third => 84.0 * fs,
+            Some(_) if self.story.show_caption => 64.0 * fs,
+            _ => 0.0,
+        };
+        let logo = self.brand_overlay(painter, canvas, caption_h + bar_h);
         if !self.story.title.is_empty() {
             let top = match logo {
                 Some(r) if self.story.logo_pos == LogoPos::TopCentre => r.bottom() + 8.0,
                 _ => canvas.top() + 16.0,
             };
-            painter.text(Pos2::new(canvas.center().x, top), Align2::CENTER_TOP, &self.story.title, FontId::proportional(22.0 * fs), TEXT);
+            let font = if cine { self.font_medium(22.0) } else { FontId::proportional(22.0 * fs) };
+            let r = painter.text(Pos2::new(canvas.center().x, top), Align2::CENTER_TOP, &self.story.title, font, TEXT);
+            if cine {
+                painter.line_segment([Pos2::new(r.center().x - 22.0, r.bottom() + 6.0), Pos2::new(r.center().x + 22.0, r.bottom() + 6.0)], Stroke::new(2.0, draw::fade(accent, 0.9)));
+            }
         }
-        if let Some(k) = cur {
+        if let Some((k, p)) = cur {
             let st = self.steps[k].clone();
-            if self.story.show_clock {
-                let t = fmt_time(st.t);
-                let galley = painter.layout_no_wrap(t, FontId::monospace(20.0 * fs), TEXT);
+            let prev = if k > 0 { Some(self.steps[k - 1].clone()) } else { None };
+            // the clock rolls from the step before while the line draws: time
+            // passing, at the pace the story gives it
+            let shown_t = match &prev {
+                Some(pv) if cine && look.time && p < 1.0 => pv.t + ((st.t - pv.t) as f64 * draw::ease_out_cubic((p / 0.6).min(1.0)) as f64) as i64,
+                _ => st.t,
+            };
+            if cine && look.time {
+                self.clock_card(painter, canvas, &st, prev.as_ref(), shown_t, k, accent);
+            } else if self.story.show_clock {
+                let galley = painter.layout_no_wrap(fmt_time(st.t), FontId::monospace(20.0 * fs), TEXT);
                 let r = Rect::from_min_size(Pos2::new(canvas.right() - galley.size().x - 26.0, canvas.top() + 12.0), galley.size() + Vec2::new(16.0, 8.0));
                 painter.rect_filled(r, CornerRadius::same(6), CAPTION_BG);
                 painter.galley(r.min + Vec2::new(8.0, 4.0), galley, TEXT);
             }
-            if self.story.show_counter {
-                painter.text(Pos2::new(canvas.right() - 12.0, canvas.bottom() - 10.0), Align2::RIGHT_BOTTOM, format!("{} / {}", k + 1, self.steps.len()), FontId::proportional(12.0 * fs), MUTED);
+            if self.story.show_counter && !(cine && look.time) {
+                painter.text(Pos2::new(canvas.right() - 12.0, canvas.bottom() - 10.0 - bar_h), Align2::RIGHT_BOTTOM, format!("{} / {}", k + 1, self.steps.len()), FontId::proportional(12.0 * fs), MUTED);
             }
-            if self.story.show_caption {
+            if cine && look.lower_third {
+                self.lower_third(painter, canvas, &st, k, bar_h, accent);
+            } else if self.story.show_caption {
                 let text = match &st.caption {
                     Some(c) => c.clone(),
                     None => {
@@ -2812,17 +2931,21 @@ impl Viewer {
                     }
                 };
                 let galley = painter.layout_no_wrap(text, FontId::proportional(18.0 * fs), TEXT);
-                let r = Rect::from_center_size(Pos2::new(canvas.center().x, canvas.bottom() - 34.0), galley.size() + Vec2::new(28.0, 14.0));
+                let r = Rect::from_center_size(Pos2::new(canvas.center().x, canvas.bottom() - 34.0 - bar_h), galley.size() + Vec2::new(28.0, 14.0));
                 painter.rect_filled(r, CornerRadius::same(8), Color32::from_rgba_premultiplied(24, 26, 31, 225));
                 if st.significant || st.emphasis {
-                    painter.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.5, if st.significant { SIGNIFICANT } else { ACCENT }), egui::StrokeKind::Inside);
+                    painter.rect_stroke(r, CornerRadius::same(8), Stroke::new(1.5, if st.significant { SIGNIFICANT } else { accent }), egui::StrokeKind::Inside);
                 }
                 painter.galley(r.min + Vec2::new(14.0, 7.0), galley, TEXT);
+            }
+            if cine && look.bar {
+                self.incident_bar(painter, canvas, shown_t, accent);
             }
         }
         match &self.export {
             None => {
-                painter.text(Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0), Align2::LEFT_BOTTOM, "Space pause  ·  Left / Right step  ·  Esc leave", FontId::proportional(11.0), MUTED);
+                let hint = if cine { Pos2::new(canvas.center().x, canvas.bottom() - 8.0 - bar_h) } else { Pos2::new(canvas.left() + 12.0, canvas.bottom() - 10.0) };
+                painter.text(hint, if cine { Align2::CENTER_BOTTOM } else { Align2::LEFT_BOTTOM }, "Space pause  ·  Left / Right step  ·  Esc leave", FontId::proportional(11.0), MUTED);
             }
             Some(job) if job.rec.finishing() => {
                 let galley = painter.layout_no_wrap(format!("finishing {} frames in {}…", job.total, job.out.display()), FontId::proportional(16.0), TEXT);
@@ -2833,6 +2956,264 @@ impl Viewer {
             }
             // a recording is the window itself: nothing drawn that is not the story
             Some(_) => {}
+        }
+        // the cards cover everything, the hint too
+        if cine && look.cards {
+            self.cards(painter, canvas, t, accent);
+        }
+    }
+
+    /// The clock card, top right: the date, the time (rolling while a line
+    /// draws), the pace and whether it just changed, the counter; and a
+    /// jump in the timeline named at the top while the line draws.
+    fn clock_card(&self, painter: &egui::Painter, canvas: Rect, st: &Step, prev: Option<&Step>, shown_t: i64, k: usize, accent: Color32) {
+        let fs = self.style.font_scale;
+        let when = chrono::DateTime::from_timestamp(shown_t, 0);
+        let date = when.map(|d| d.format("%a %d %b %Y").to_string()).unwrap_or_default();
+        let time = when.map(|d| d.format("%H:%M:%S").to_string()).unwrap_or_default();
+        let since = self.present_t - st.start;
+        let change = prev.and_then(|pv| present::speed_change(pv, st)).filter(|_| since < 2.5);
+        let (speed_text, speed_col, pulse) = match change {
+            Some(faster) => (format!("{}  {}", if faster { "»  faster" } else { "«  slower" }, present::speed_label(st)), if faster { accent } else { TEXT }, 1.0 + 0.18 * (1.0 - (since / 0.6).min(1.0))),
+            None => (present::speed_label(st), draw::fade(accent, 0.9), 1.0),
+        };
+        let g_date = painter.layout_no_wrap(date, self.font_medium(12.5), MUTED);
+        let g_time = painter.layout_no_wrap(time, FontId::monospace(30.0 * fs), TEXT);
+        let g_speed = painter.layout_no_wrap(speed_text, self.font_medium(12.5 * pulse), speed_col);
+        let g_count = if self.story.show_counter { Some(painter.layout_no_wrap(format!("{} / {}", k + 1, self.steps.len()), self.font_medium(11.0), theme::DIM)) } else { None };
+        let w = [g_date.size().x, g_time.size().x, g_speed.size().x].into_iter().fold(0.0f32, f32::max) + 30.0;
+        let h = g_date.size().y + g_time.size().y + g_speed.size().y + g_count.as_ref().map_or(0.0, |g| g.size().y + 2.0) + 24.0;
+        let r = Rect::from_min_size(Pos2::new(canvas.right() - w - 18.0, canvas.top() + 14.0), Vec2::new(w, h));
+        painter.rect_filled(r, CornerRadius::same(10), Color32::from_rgba_premultiplied(18, 21, 28, 228));
+        painter.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.0, draw::fade(accent, 0.35)), egui::StrokeKind::Inside);
+        painter.rect_filled(Rect::from_min_size(r.min + Vec2::new(0.0, 10.0), Vec2::new(3.0, r.height() - 20.0)), CornerRadius::same(2), draw::fade(accent, 0.9));
+        let x = r.right() - 14.0;
+        let mut y = r.top() + 11.0;
+        let dy = g_date.size().y;
+        painter.galley(Pos2::new(x - g_date.size().x, y), g_date, MUTED);
+        y += dy + 2.0;
+        let ty = g_time.size().y;
+        painter.galley(Pos2::new(x - g_time.size().x, y), g_time, TEXT);
+        y += ty + 2.0;
+        let sy = g_speed.size().y;
+        painter.galley(Pos2::new(x - g_speed.size().x, y), g_speed, speed_col);
+        y += sy + 2.0;
+        if let Some(g) = g_count {
+            painter.galley(Pos2::new(x - g.size().x, y), g, theme::DIM);
+        }
+        // a jump in the timeline, named at the top while the line draws
+        if prev.is_some() && st.gap >= present::jump_threshold(&self.steps) {
+            let p = (since / st.dur.max(0.05)).clamp(0.0, 1.0);
+            if p < 0.85 {
+                let a = (p / 0.12).min(1.0) * (1.0 - ((p - 0.65) / 0.2).clamp(0.0, 1.0));
+                let g = painter.layout_no_wrap(format!("{}   {}", super::icons::CLOCK, present::jump_label(st.gap)), self.font_medium(15.0), draw::fade(TEXT, a));
+                let top = canvas.top() + if self.story.title.is_empty() { 22.0 } else { 58.0 * fs };
+                let pr = Rect::from_min_size(Pos2::new(canvas.center().x - g.size().x / 2.0 - 14.0, top), g.size() + Vec2::new(28.0, 12.0));
+                painter.rect_filled(pr, CornerRadius::same(8), draw::fade(Color32::from_rgb(18, 21, 28), 0.92 * a));
+                painter.rect_stroke(pr, CornerRadius::same(8), Stroke::new(1.0, draw::fade(accent, 0.6 * a)), egui::StrokeKind::Inside);
+                painter.galley(pr.min + Vec2::new(14.0, 6.0), g, TEXT);
+            }
+        }
+    }
+
+    /// The caption as a lower third, bottom left: the account in the accent,
+    /// origin and destination, the hunt's word or the analyst's verdict as a
+    /// tag, the time and the logon under, the analyst's note on the
+    /// connection when there is one. It slides in as the step starts and
+    /// fades before the next.
+    fn lower_third(&self, painter: &egui::Painter, canvas: Rect, st: &Step, k: usize, bar_h: f32, accent: Color32) {
+        let t = self.present_t;
+        let k_in = draw::ease_out_cubic(((t - st.start) / 0.35).clamp(0.0, 1.0));
+        let k_out = match self.steps.get(k + 1) {
+            Some(next) => ((next.start - t) / 0.3).clamp(0.0, 1.0),
+            None => 1.0,
+        };
+        let a = k_in * k_out;
+        if a <= 0.01 {
+            return;
+        }
+        let ei = self.graph.events[st.from] as usize;
+        let e = self.store.edges[ei];
+        let n = st.to - st.from;
+        let fmt = |font: FontId, color: Color32| egui::text::TextFormat { font_id: font, color, ..Default::default() };
+        let mut job = egui::text::LayoutJob::default();
+        match &st.caption {
+            Some(c) => job.append(c, 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a))),
+            None => {
+                let user = self.user_label(e.user);
+                if !user.is_empty() {
+                    job.append(&user, 0.0, fmt(self.font_semibold(19.0), draw::fade(accent, a)));
+                    job.append("    ", 0.0, fmt(self.font_medium(19.0), TEXT));
+                }
+                job.append(&self.host_label(e.src), 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a)));
+                job.append("  →  ", 0.0, fmt(self.font_medium(19.0), draw::fade(MUTED, a)));
+                job.append(&self.host_label(e.dst), 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a)));
+                if n > 1 {
+                    job.append(&format!("    +{} more", n - 1), 0.0, fmt(self.font_medium(14.0), draw::fade(MUTED, a)));
+                }
+            }
+        }
+        let g1 = painter.layout_job(job);
+        let mut detail = vec![fmt_time(e.t)[11..].to_string()];
+        let lt = self.store.logon_types.name(e.logon_type);
+        if !lt.is_empty() && lt != "-" {
+            detail.push(format!("logon type {}", lt));
+        }
+        if e.event_id > 0 {
+            detail.push(format!("event {}", e.event_id));
+        }
+        let g2 = painter.layout_no_wrap(detail.join("  ·  "), self.font_medium(12.5), draw::fade(MUTED, a));
+        let tag: Option<(&str, Color32)> = if e.verdict != 0 {
+            Some((VERDICT_NAMES[e.verdict as usize], match e.verdict { 1 => SUSPICIOUS, 2 => CONFIRMED, _ => MUTED }))
+        } else if e.hunt == super::store::H_SIGNIFICANT {
+            Some(("significant", SIGNIFICANT))
+        } else if e.hunt == super::store::H_CANDIDATE {
+            Some(("candidate", CANDIDATE))
+        } else {
+            None
+        };
+        let g_tag = tag.map(|(s, c)| (painter.layout_no_wrap(s.to_uppercase(), self.font_medium(10.5), draw::fade(c, a)), c));
+        let g3 = self.note_for_edge(e.src, e.dst, e.user).map(|note| {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&format!("{}  {}", super::icons::NOTE_PENCIL, note), 0.0, fmt(self.font_medium(13.5), draw::fade(TEXT, 0.92 * a)));
+            job.wrap.max_width = (canvas.width() * 0.5).max(320.0);
+            painter.layout_job(job)
+        });
+        let pad = 14.0;
+        let w1 = g1.size().x + g_tag.as_ref().map_or(0.0, |(g, _)| g.size().x + 28.0);
+        let w = w1.max(g2.size().x).max(g3.as_ref().map_or(0.0, |g| g.size().x)) + pad * 2.0 + 8.0;
+        let h = g1.size().y + g2.size().y + g3.as_ref().map_or(0.0, |g| g.size().y + 6.0) + pad * 1.5;
+        let x = canvas.left() + 24.0 - 40.0 * (1.0 - k_in);
+        let r = Rect::from_min_size(Pos2::new(x, canvas.bottom() - bar_h - 18.0 - h), Vec2::new(w, h));
+        painter.rect_filled(r, CornerRadius::same(8), draw::fade(Color32::from_rgb(18, 21, 28), 0.9 * a));
+        painter.rect_filled(Rect::from_min_size(r.min, Vec2::new(4.0, h)), CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, draw::fade(if st.significant { SIGNIFICANT } else { accent }, a));
+        let x0 = r.left() + pad + 8.0;
+        let mut y = r.top() + pad * 0.6;
+        let (h1, w1_text) = (g1.size().y, g1.size().x);
+        painter.galley(Pos2::new(x0, y), g1, TEXT);
+        if let Some((g, c)) = g_tag {
+            let tr = Rect::from_min_size(Pos2::new(x0 + w1_text + 14.0, y + (h1 - g.size().y - 6.0) / 2.0), g.size() + Vec2::new(12.0, 6.0));
+            painter.rect_stroke(tr, CornerRadius::same(4), Stroke::new(1.0, draw::fade(c, 0.85 * a)), egui::StrokeKind::Inside);
+            painter.galley(tr.min + Vec2::new(6.0, 3.0), g, c);
+        }
+        y += h1 + 3.0;
+        let h2 = g2.size().y;
+        painter.galley(Pos2::new(x0, y), g2, MUTED);
+        if let Some(g) = g3 {
+            y += h2 + 6.0;
+            painter.galley(Pos2::new(x0, y), g, TEXT);
+        }
+    }
+
+    /// The incident's span along the bottom: a track from the first hop to
+    /// the last, a tick a day, the significant hops as red dots, the head
+    /// where the story is now.
+    fn incident_bar(&self, painter: &egui::Painter, canvas: Rect, now_t: i64, accent: Color32) {
+        let (Some(first), Some(last)) = (self.steps.first(), self.steps.last()) else { return };
+        let (t0, t1) = (first.t, last.t.max(first.t + 1));
+        let (x0, x1) = (canvas.left() + 28.0, canvas.right() - 28.0);
+        let y = canvas.bottom() - 15.0;
+        let xf = |t: i64| x0 + (x1 - x0) * ((t - t0) as f32 / (t1 - t0) as f32).clamp(0.0, 1.0);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(canvas.left(), y - 15.0), canvas.max), CornerRadius::ZERO, Color32::from_rgba_premultiplied(0, 0, 0, 120));
+        painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(3.0, Color32::from_rgb(44, 50, 64)));
+        let days = (t1 - t0) / 86_400;
+        if (1..=120).contains(&days) {
+            let mut d = (t0 / 86_400 + 1) * 86_400;
+            while d < t1 {
+                let x = xf(d);
+                painter.line_segment([Pos2::new(x, y - 4.0), Pos2::new(x, y + 4.0)], Stroke::new(1.0, Color32::from_rgb(64, 72, 92)));
+                d += 86_400;
+            }
+        }
+        let xn = xf(now_t);
+        painter.line_segment([Pos2::new(x0, y), Pos2::new(xn, y)], Stroke::new(3.0, draw::fade(accent, 0.9)));
+        for s in &self.steps {
+            if s.significant {
+                painter.circle_filled(Pos2::new(xf(s.t), y), 3.5, SIGNIFICANT);
+            }
+        }
+        painter.circle_filled(Pos2::new(xn, y), 8.0, draw::fade(accent, 0.25));
+        painter.circle_filled(Pos2::new(xn, y), 4.0, accent);
+        painter.text(Pos2::new(x0, y - 7.0), Align2::LEFT_BOTTOM, &fmt_time(t0)[..10], self.font_medium(10.5), MUTED);
+        painter.text(Pos2::new(x1, y - 7.0), Align2::RIGHT_BOTTOM, &fmt_time(t1)[..10], self.font_medium(10.5), MUTED);
+    }
+
+    /// The title card before the story and the summary after it, over the
+    /// picture, fading at their edges.
+    fn cards(&self, painter: &egui::Painter, canvas: Rect, t: f32, accent: Color32) {
+        let total = present::total_secs(&self.steps, &self.story);
+        let lead = self.story.lead_in();
+        let a_in = if lead > 0.0 && t < lead { 1.0 - ((t - (lead - 0.7)) / 0.7).clamp(0.0, 1.0) } else { 0.0 };
+        let out_from = total - self.story.lead_out();
+        let a_out = if self.story.lead_out() > 0.0 && t > out_from { ((t - out_from) / 0.7).clamp(0.0, 1.0) } else { 0.0 };
+        if a_in <= 0.001 && a_out <= 0.001 {
+            return;
+        }
+        let (Some(first), Some(last)) = (self.steps.first(), self.steps.last()) else { return };
+        let a = a_in.max(a_out);
+        painter.rect_filled(canvas, CornerRadius::ZERO, draw::fade(BG, a));
+        let cx = canvas.center().x;
+        let mut y = canvas.top() + canvas.height() * 0.17;
+        if let Some((_, tex, size)) = &self.brand {
+            let w = (canvas.width() * 0.2).min(340.0);
+            let h = w * size[1] as f32 / size[0].max(1) as f32;
+            let r = Rect::from_center_size(Pos2::new(cx, y + h / 2.0), Vec2::new(w, h));
+            painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), draw::fade(Color32::WHITE, a));
+            y += h + 30.0;
+        }
+        let title = if self.story.title.is_empty() { "Lateral movement".to_string() } else { self.story.title.clone() };
+        let accounts: HashSet<u32> = self.graph.events.iter().map(|&ei| self.store.edges[ei as usize].user).filter(|&u| !self.store.users.name(u).is_empty()).collect();
+        let significant = self.steps.iter().filter(|s| s.significant).count();
+        if a_in > 0.001 {
+            // each line a little after the one before
+            let fade_in = |d: f32| ((t - d) / 0.5).clamp(0.0, 1.0) * a_in;
+            let r = painter.text(Pos2::new(cx, y), Align2::CENTER_TOP, &title, self.font_medium(38.0), draw::fade(TEXT, fade_in(0.15)));
+            painter.line_segment([Pos2::new(cx - 28.0, r.bottom() + 12.0), Pos2::new(cx + 28.0, r.bottom() + 12.0)], Stroke::new(2.0, draw::fade(accent, fade_in(0.35))));
+            let span = format!("{}   →   {}", &fmt_time(first.t)[..16], &fmt_time(last.t)[..16]);
+            let r = painter.text(Pos2::new(cx, r.bottom() + 30.0), Align2::CENTER_TOP, span, self.font_medium(17.0), draw::fade(MUTED, fade_in(0.55)));
+            let stats = format!("{} connections  ·  {} hosts  ·  {} accounts{}", self.graph.events.len(), self.graph.nodes.len(), accounts.len(), if significant > 0 { format!("  ·  {} significant", significant) } else { String::new() });
+            painter.text(Pos2::new(cx, r.bottom() + 8.0), Align2::CENTER_TOP, stats, self.font_medium(15.0), draw::fade(MUTED, fade_in(0.75)));
+            painter.text(Pos2::new(cx, canvas.bottom() - 26.0), Align2::CENTER_BOTTOM, "the movement between machines, reconstructed from the logs with masstin", self.font_medium(11.0), draw::fade(theme::DIM, fade_in(0.95)));
+        }
+        if a_out > 0.001 {
+            let r = painter.text(Pos2::new(cx, y), Align2::CENTER_TOP, &title, self.font_medium(28.0), draw::fade(TEXT, a_out));
+            painter.text(Pos2::new(cx, r.bottom() + 10.0), Align2::CENTER_TOP, "IN SHORT", self.font_medium(11.0), draw::fade(accent, a_out));
+            let days = ((last.t - first.t) as f32 / 86_400.0).max(0.0);
+            let span = if days >= 1.5 { format!("{:.0} days", days) } else { format!("{:.0} hours", (last.t - first.t) as f32 / 3600.0) };
+            let lines = [
+                format!("{} hosts reached  ·  {} accounts used", self.graph.nodes.len(), accounts.len()),
+                format!("{} connections{}", self.graph.events.len(), if significant > 0 { format!(", {} of them significant", significant) } else { String::new() }),
+                format!("{}  →  {}  ({})", &fmt_time(first.t)[..16], &fmt_time(last.t)[..16], span),
+            ];
+            let mut yy = r.bottom() + 40.0;
+            for l in lines {
+                let r = painter.text(Pos2::new(cx, yy), Align2::CENTER_TOP, l, self.font_medium(17.0), draw::fade(TEXT, a_out));
+                yy = r.bottom() + 8.0;
+            }
+            // the significant hops, up to six, in their order
+            let sig: Vec<&Step> = self.steps.iter().filter(|s| s.significant).take(6).collect();
+            if !sig.is_empty() {
+                yy += 16.0;
+                let fmt = |font: FontId, color: Color32| egui::text::TextFormat { font_id: font, color, ..Default::default() };
+                for s in sig {
+                    let ei = self.graph.events[s.from] as usize;
+                    let e = self.store.edges[ei];
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(&format!("{}    ", &fmt_time(e.t)[5..16]), 0.0, fmt(FontId::monospace(13.5 * self.style.font_scale), draw::fade(MUTED, a_out)));
+                    let user = self.user_label(e.user);
+                    if !user.is_empty() {
+                        job.append(&format!("{}    ", user), 0.0, fmt(self.font_semibold(14.5), draw::fade(accent, a_out)));
+                    }
+                    job.append(&format!("{}  →  {}", self.host_label(e.src), self.host_label(e.dst)), 0.0, fmt(self.font_medium(14.5), draw::fade(TEXT, a_out)));
+                    let g = painter.layout_job(job);
+                    let gw = g.size().x;
+                    let gh = g.size().y;
+                    painter.circle_filled(Pos2::new(cx - gw / 2.0 - 16.0, yy + gh / 2.0), 3.5, draw::fade(SIGNIFICANT, a_out));
+                    painter.galley(Pos2::new(cx - gw / 2.0, yy), g, TEXT);
+                    yy += gh + 6.0;
+                }
+            }
+            painter.text(Pos2::new(cx, canvas.bottom() - 26.0), Align2::CENTER_BOTTOM, "reconstructed from the logs with masstin", self.font_medium(11.0), draw::fade(theme::DIM, a_out));
         }
     }
 
@@ -3166,6 +3547,7 @@ impl Viewer {
                     changed |= ui.checkbox(&mut self.story.show_caption, "caption").changed();
                     changed |= ui.checkbox(&mut self.story.show_counter, "counter").changed();
                     changed |= ui.checkbox(&mut self.story.anonymise, "anonymise").on_hover_text("HOST-01, user-02, 10.x.x.3: consistent stand-ins for a talk").changed();
+                    changed |= ui.checkbox(&mut self.story.cinematic, "cinematic").on_hover_text("The look for a client: the hop under way lit, a clock at the story's pace, a lower third, the incident's bar, a title card and a summary. Its pieces and the colour are in Record…").changed();
                 });
                 ui.end_row();
                 ui.label("Logo").on_hover_text("Your company's logo on the presentation and the recording: PNG (with transparency), JPEG, WebP, BMP or GIF. The path is saved with the story.");
@@ -3413,6 +3795,52 @@ impl Viewer {
                 }
             });
             ui.add_space(8.0);
+            theme::section(ui, "The look");
+            egui::Grid::new("rec-look").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Cinematic");
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut self.story.cinematic, "on").on_hover_text("The hop under way lit and the rest dimmed, a clock that rolls at the story's pace and says when it changes, a lower third with the hunt's word, the incident's bar, a title card and a summary. Present shows the same.").changed();
+                    if self.story.cinematic {
+                        let look = &mut self.story.look;
+                        for (flag, name, hint) in [
+                            (&mut look.focus, "focus", "The rest dims while a hop draws; a ring runs out of the destination as the line arrives"),
+                            (&mut look.footprint, "footprint", "The hosts already reached keep a warm trace"),
+                            (&mut look.time, "clock", "Date, time rolling at the story's pace, the speed and when it changes, a jump in time named"),
+                            (&mut look.lower_third, "lower third", "The caption bottom left: account, hosts, the hunt's word or your verdict, your note on the connection"),
+                            (&mut look.bar, "bar", "The incident's span along the bottom, the significant hops marked"),
+                            (&mut look.cards, "cards", "A title card before the story (3.5 s) and a summary after it (7 s)"),
+                        ] {
+                            changed |= ui.checkbox(flag, name).on_hover_text(hint).changed();
+                        }
+                    }
+                });
+                ui.end_row();
+                if self.story.cinematic {
+                    ui.label("Colour");
+                    ui.horizontal(|ui| {
+                        let mut own = self.story.look.accent.is_some();
+                        if ui.checkbox(&mut own, "the client's").on_hover_text("The overlays, the focus and the cards in this colour instead of masstin's amber").changed() {
+                            self.story.look.accent = if own { Some([ACCENT.r(), ACCENT.g(), ACCENT.b()]) } else { None };
+                            changed = true;
+                        }
+                        if let Some(c) = self.story.look.accent.as_mut() {
+                            if egui::color_picker::color_edit_button_srgb(ui, c).changed() {
+                                changed = true;
+                            }
+                            for (name, rgb) in [("navy", [52, 98, 196]), ("teal", [20, 170, 160]), ("green", [60, 170, 90]), ("red", [220, 60, 70]), ("violet", [138, 96, 240]), ("orange", [240, 130, 40])] {
+                                let (r, p) = ui.allocate_painter(Vec2::new(16.0, 16.0), Sense::click());
+                                p.circle_filled(r.rect.center(), 7.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+                                if r.on_hover_text(name).clicked() {
+                                    *c = rgb;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
             theme::section(ui, "The file");
             let rec = &mut self.story.recording;
             egui::Grid::new("rec-file").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -3520,6 +3948,8 @@ impl Viewer {
             });
         });
         if changed {
+            // the cards make room before and after the steps
+            self.rebuild_steps();
             self.save_story();
         }
         if !open {
@@ -3723,6 +4153,16 @@ impl Viewer {
             "present" => self.start_presentation(),
             "story" => self.show_story = true,
             "record-dialog" => self.show_export = true,
+            "cinematic" => {
+                self.story.cinematic = !self.story.cinematic;
+                self.rebuild_steps();
+            }
+            other if other.starts_with("seek=") => {
+                // the presentation at this second, still
+                self.present_t = other["seek=".len()..].parse().unwrap_or(0.0);
+                self.present_playing = false;
+                ctx.request_repaint();
+            }
             "rules" => self.show_rules = true,
             "fit" => {
                 self.fill_pending = true;

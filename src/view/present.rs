@@ -142,11 +142,111 @@ pub struct Story {
     pub logo_always: bool,
     /// what the Record dialog last used
     pub recording: Recording,
+    /// the cinematic look, for the presentation and the recording alike
+    pub cinematic: bool,
+    pub look: Look,
+}
+
+impl Story {
+    /// Seconds before the first step: the title card, when there is one.
+    pub fn lead_in(&self) -> f32 {
+        if self.cinematic && self.look.cards { CARD_IN } else { 0.0 }
+    }
+
+    /// Seconds after the hold at the end: the summary card, when there is one.
+    pub fn lead_out(&self) -> f32 {
+        if self.cinematic && self.look.cards { CARD_OUT } else { 0.0 }
+    }
+}
+
+/// The look of a presentation and its recording when `Story::cinematic` is
+/// on: the hop under way is what the eye goes to, the time is legible and
+/// its pace felt, the picture is one a client keeps. Each piece can go.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Look {
+    /// the rest of the picture dims while a hop draws; its two hosts and
+    /// its line stay lit, a ring runs out of the destination as the line arrives
+    pub focus: bool,
+    /// the hosts already reached keep a warm trace: the spread, visible
+    pub footprint: bool,
+    /// the clock card: the date, the time rolling at the story's pace, the
+    /// speed and when it changes, a jump in the timeline named
+    pub time: bool,
+    /// the caption as a lower third sliding in, with the hunt's word and
+    /// the analyst's note on the connection
+    pub lower_third: bool,
+    /// the incident's span along the bottom, the significant hops marked,
+    /// the head where the story is
+    pub bar: bool,
+    /// a title card before the story and a summary after it
+    pub cards: bool,
+    /// the client's colour for the overlays, instead of masstin's amber
+    pub accent: Option<[u8; 3]>,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Look { focus: true, footprint: true, time: true, lower_third: true, bar: true, cards: true, accent: None }
+    }
+}
+
+/// Seconds of the title card before the story, and of the summary after it.
+pub const CARD_IN: f32 = 3.5;
+pub const CARD_OUT: f32 = 7.0;
+/// A gap in the timeline this long or longer is a jump the clock card names.
+pub const JUMP_SECS: i64 = 3 * 3600;
+
+/// A gap worth naming on the picture: three hours, or three times the
+/// story's usual gap when its hops are hours apart anyway (else every hop
+/// of a sparse month would be "10 h later").
+pub fn jump_threshold(steps: &[Step]) -> i64 {
+    let mut gaps: Vec<i64> = steps.iter().skip(1).map(|s| s.gap).collect();
+    if gaps.is_empty() {
+        return JUMP_SECS;
+    }
+    gaps.sort_unstable();
+    JUMP_SECS.max(3 * gaps[(gaps.len() - 1) / 2])
+}
+
+/// "2 days 3 h later", "14 h later", "45 min later".
+pub fn jump_label(secs: i64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    let what = if d >= 1 {
+        if h > 0 { format!("{} day{} {} h", d, if d == 1 { "" } else { "s" }, h) } else { format!("{} day{}", d, if d == 1 { "" } else { "s" }) }
+    } else if h >= 1 {
+        if m > 0 && h < 6 { format!("{} h {} min", h, m) } else { format!("{} h", h) }
+    } else {
+        format!("{} min", m.max(1))
+    };
+    format!("{} later", what)
+}
+
+/// The speed a step plays at, as the clock card says.
+pub fn speed_label(step: &Step) -> String {
+    match step.timing {
+        Timing::Fixed => format!("a hop every {} s", if (step.step_secs - step.step_secs.round()).abs() < 0.05 { format!("{:.0}", step.step_secs) } else { format!("{:.1}", step.step_secs) }),
+        Timing::Compressed => format!("time ×{:.0}  ·  {}", step.compress, clock_label(step.compress)),
+    }
+}
+
+/// Whether the pace changed from `prev` to `step` (a stretch began or
+/// ended): Some(true) faster, Some(false) slower, None the same settings.
+pub fn speed_change(prev: &Step, step: &Step) -> Option<bool> {
+    if prev.timing == step.timing && (prev.compress - step.compress).abs() < 0.5 && (prev.step_secs - step.step_secs).abs() < 0.01 {
+        return None;
+    }
+    // timeline seconds a presentation second, either way of timing
+    let rate = |s: &Step| match s.timing {
+        Timing::Compressed => s.compress,
+        Timing::Fixed => s.gap.max(1) as f32 / s.dur.max(0.05),
+    };
+    Some(rate(step) > rate(prev))
 }
 
 impl Default for Story {
     fn default() -> Self {
-        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new(), logo: String::new(), logo_pos: LogoPos::BottomRight, logo_width: 0.12, logo_opacity: 0.9, logo_always: false, recording: Recording::default() }
+        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new(), logo: String::new(), logo_pos: LogoPos::BottomRight, logo_width: 0.12, logo_opacity: 0.9, logo_always: false, recording: Recording::default(), cinematic: false, look: Look::default() }
     }
 }
 
@@ -180,6 +280,12 @@ pub struct Step {
     pub significant: bool,
     pub emphasis: bool,
     pub caption: Option<String>,
+    /// timeline seconds since the step before (0 for the first)
+    pub gap: i64,
+    /// the pace this step was given: the stretch's, or the story's
+    pub timing: Timing,
+    pub step_secs: f32,
+    pub compress: f32,
 }
 
 /// Build the steps of a presentation from the view's events (time,
@@ -214,8 +320,9 @@ pub fn build_steps(events: &[(i64, String, bool)], story: &Story) -> Vec<Step> {
         };
         let dur = ov.and_then(|o| o.secs).unwrap_or(base).max(0.05);
         let pause = ov.map(|o| o.pause_after).unwrap_or(0.0) + if sig { story.pause_significant } else { 0.0 };
-        let start = steps.last().map(|s| s.start + s.dur + s.pause).unwrap_or(0.0);
-        steps.push(Step { key: key.clone(), from: i, to: j, t: t0, start, dur, pause, significant: sig, emphasis: ov.map_or(false, |o| o.emphasis), caption: ov.and_then(|o| o.caption.clone()) });
+        let start = steps.last().map(|s| s.start + s.dur + s.pause).unwrap_or_else(|| story.lead_in());
+        let gap = prev_t.map(|p| (t0 - p).max(0)).unwrap_or(0);
+        steps.push(Step { key: key.clone(), from: i, to: j, t: t0, start, dur, pause, significant: sig, emphasis: ov.map_or(false, |o| o.emphasis), caption: ov.and_then(|o| o.caption.clone()), gap, timing, step_secs, compress });
         i = j;
     }
     steps
@@ -223,7 +330,7 @@ pub fn build_steps(events: &[(i64, String, bool)], story: &Story) -> Vec<Step> {
 
 /// Total length of the presentation in seconds.
 pub fn total_secs(steps: &[Step], story: &Story) -> f32 {
-    steps.last().map(|s| s.start + s.dur + s.pause).unwrap_or(0.0) + story.hold_end
+    steps.last().map(|s| s.start + s.dur + s.pause).unwrap_or(0.0) + story.hold_end + story.lead_out()
 }
 
 /// Where the presentation is at second `t`: the step and how far into
@@ -788,6 +895,39 @@ mod tests {
         // the last breath's time, on a still pixel
         assert_eq!((third.width, third.height, third.delay), (1, 1, 5));
         assert!(r.read_next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_cards_make_room_and_the_clock_card_has_its_words() {
+        let events = vec![(1_000_000i64, "a".to_string(), false), (1_000_600, "b".to_string(), true), (1_000_600 + 2 * 86_400 + 3 * 3600, "c".to_string(), false)];
+        let mut story = Story::default();
+        let plain = build_steps(&events, &story);
+        assert_eq!(plain[0].start, 0.0);
+        let plain_total = total_secs(&plain, &story);
+        story.cinematic = true;
+        let steps = build_steps(&events, &story);
+        assert_eq!(steps[0].start, CARD_IN);
+        assert_eq!(total_secs(&steps, &story), plain_total + CARD_IN + CARD_OUT);
+        assert_eq!(steps[2].gap, 2 * 86_400 + 3 * 3600);
+        assert!(steps[2].gap >= jump_threshold(&steps) && steps[1].gap < jump_threshold(&steps));
+        // hops ten hours apart: only a much longer gap is a jump
+        let sparse: Vec<(i64, String, bool)> = (0..20).map(|i| (i * 36_000 + if i == 10 { 5 * 86_400 } else { 0 }, format!("k{}", i), false)).collect();
+        let sparse_steps = build_steps(&sparse, &story);
+        assert_eq!(jump_threshold(&sparse_steps), 30 * 3600);
+        assert_eq!(sparse_steps.iter().filter(|s| s.gap >= jump_threshold(&sparse_steps)).count(), 1);
+        assert_eq!(jump_label(steps[2].gap), "2 days 3 h later");
+        assert_eq!(jump_label(14 * 3600), "14 h later");
+        assert_eq!(jump_label(2 * 3600 + 40 * 60), "2 h 40 min later");
+        assert_eq!(jump_label(45 * 60), "45 min later");
+        assert_eq!(speed_label(&steps[0]), "a hop every 0.8 s");
+        assert!(speed_change(&steps[0], &steps[1]).is_none());
+        // a stretch by the clock from the second event on: the pace changes there
+        story.stretches.push(Stretch { from: "1970-01-12 13:50".into(), to: String::new(), timing: Timing::Compressed, step_secs: 0.8, compress: 600.0 });
+        let steps = build_steps(&events, &story);
+        assert_eq!(steps[1].timing, Timing::Compressed);
+        assert_eq!(speed_label(&steps[1]), "time ×600  ·  10 min/s");
+        assert_eq!(speed_change(&steps[0], &steps[1]), Some(true));
+        assert!(speed_change(&steps[1], &steps[2]).is_none());
     }
 
     #[test]
