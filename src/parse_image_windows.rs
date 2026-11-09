@@ -141,16 +141,19 @@ fn extract_one_image(img_idx: usize, total_images: usize, image_path: &str, base
     ImageOutcome { result }
 }
 
-/// Every image extracted, in the images' order. As many at once as the
-/// machine allows at each moment (`threads::images_now`: the idle cores,
-/// the medium the images sit on, the memory): one after another when that
-/// is one (printing as it goes, as always); else as many threads as the
-/// pool, each taking the next image only while the images under way are
-/// fewer than the machine allows right then, each one's banner lines held
-/// back and printed in order as the earliest unfinished image completes.
+/// Every image extracted, in the images' order. How many at once is found
+/// by measuring (`threads::Readers`: the rate coming off the images, the
+/// idle cores and the free memory as the ceiling; `--parallel-images`
+/// fixes it): one after another when that stays at one (printing as it
+/// goes, as always); else as many threads as the pool, each taking the
+/// next image only while the images under way are fewer than the
+/// controller allows right then, each one's banner lines held back and
+/// printed in order as the earliest unfinished image completes.
 fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medium: crate::threads::Medium) -> Vec<ImageOutcome> {
-    let at_once = crate::threads::images_now(medium);
-    if at_once <= 1 || images.len() <= 1 {
+    let readers = crate::threads::Readers::new(medium);
+    let started = std::time::Instant::now();
+    let at_once = readers.allowed(0);
+    if (at_once <= 1 && crate::threads::asked_images().is_some()) || images.len() <= 1 || (at_once <= 1 && medium == crate::threads::Medium::Rotational && crate::threads::images_cap() <= 1) {
         return images.iter().enumerate().map(|(i, p)| extract_one_image(i, total_images, p, base_temp)).collect();
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,12 +163,12 @@ fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medi
     // (outcome, its lines) of each image once done, and how many were printed
     let done: Mutex<(Vec<Option<(ImageOutcome, Vec<crate::banner::Line>)>>, usize)> = Mutex::new(((0..images.len()).map(|_| None).collect(), 0));
     std::thread::scope(|scope| {
-        for _ in 0..crate::threads::workers().max(at_once).min(images.len()) {
+        for _ in 0..crate::threads::workers().max(2).min(images.len()) {
             scope.spawn(|| loop {
-                // wait while the machine has no room for one more
+                // wait while the controller has no room for one more
                 loop {
                     let busy = under_way.load(Ordering::SeqCst);
-                    if busy == 0 || busy < crate::threads::images_now(medium) {
+                    if busy == 0 || busy < readers.allowed(busy) {
                         if under_way.compare_exchange(busy, busy + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                             break;
                         }
@@ -201,6 +204,9 @@ fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medi
             });
         }
     });
+    if is_debug_mode() {
+        eprintln!("[images] {:.0} MB read from the images in {:.1} s, {} reader(s) allowed at the end", crate::threads::bytes_read() as f64 / 1e6, started.elapsed().as_secs_f64(), readers.allowed(0));
+    }
     let (slots, _) = done.into_inner().unwrap();
     slots.into_iter().map(|s| s.expect("every image extracted").0).collect()
 }
@@ -1320,6 +1326,24 @@ fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, Str
 }
 
 /// Extract EVTX from an E01 image
+/// A reader that counts what it reads: the controller of the images read
+/// at once measures the rate coming off the images through it.
+struct Counting<R>(R);
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        crate::threads::note_read(n as u64);
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for Counting<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
 fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
     let reader = ewf::EwfReader::open(image_path)
         .map_err(|e| format!("Cannot open E01: {}", e))?;
@@ -1329,7 +1353,7 @@ fn extract_evtx_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<Extr
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
     }
 
-    let mut buf_reader = BufReader::new(reader);
+    let mut buf_reader = BufReader::new(Counting(reader));
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
@@ -1343,7 +1367,7 @@ fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Ext
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
     }
 
-    let mut buf_reader = BufReader::new(reader);
+    let mut buf_reader = BufReader::new(Counting(reader));
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
@@ -1354,7 +1378,7 @@ fn extract_evtx_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<Extr
     if is_debug_mode() {
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
     }
-    let mut buf_reader = BufReader::new(reader);
+    let mut buf_reader = BufReader::new(Counting(reader));
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
@@ -1371,7 +1395,7 @@ fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<Extr
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
     }
 
-    let mut buf_reader = BufReader::new(file);
+    let mut buf_reader = BufReader::new(Counting(file));
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
