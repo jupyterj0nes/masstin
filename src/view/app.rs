@@ -2356,8 +2356,13 @@ impl Viewer {
                         }
                     }
                 }
-                let rise = ((t - st.start) / 0.25).clamp(0.0, 1.0);
-                let fall = 1.0 - ((t - arrived) / 0.7).clamp(0.0, 1.0);
+                // the dim holds from one hop to the next when they come close (under
+                // a second apart): a picture that dimmed and lit again at every hop
+                // would strobe, and a GIF would carry the whole picture every frame
+                let held_from_prev = k > 0 && st.start - (self.steps[k - 1].start + self.steps[k - 1].dur) < 0.9;
+                let held_to_next = self.steps.get(k + 1).map_or(false, |nx| nx.start - arrived < 0.9);
+                let rise = if held_from_prev { 1.0 } else { ((t - st.start) / 0.25).clamp(0.0, 1.0) };
+                let fall = if held_to_next { 1.0 } else { 1.0 - ((t - arrived) / 0.7).clamp(0.0, 1.0) };
                 let strength = rise.min(fall);
                 if strength > 0.01 {
                     lit_edges = self.graph.edges.iter().enumerate().filter(|(_, e)| e.first_event >= st.from && e.first_event < st.to).map(|(k, _)| k).collect();
