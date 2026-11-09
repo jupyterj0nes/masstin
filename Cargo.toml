@@ -52,6 +52,8 @@ winit = { version = "0.30", optional = true, default-features = false, features 
 softbuffer = { version = "0.4", optional = true, default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 egui = { version = "0.37", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
+gif = { version = "0.14", optional = true }
+color_quant = { version = "1.1", optional = true }
 rfd = { version = "0.17", optional = true }
 strength_reduce = { version = "0.2.4", optional = true }
 
@@ -61,4 +63,4 @@ winresource = "0.1"
 [features]
 # the built-in graph viewer (`-a view`, a native window); off for a parser-only binary
 default = ["ui"]
-ui = ["dep:eframe", "dep:egui", "dep:image", "dep:rfd", "dep:strength_reduce", "dep:egui-winit", "dep:winit", "dep:softbuffer"]
+ui = ["dep:eframe", "dep:egui", "dep:image", "dep:gif", "dep:color_quant", "dep:rfd", "dep:strength_reduce", "dep:egui-winit", "dep:winit", "dep:softbuffer"]

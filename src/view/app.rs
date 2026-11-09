@@ -41,7 +41,7 @@ use ingest::Ingest;
 use tasks::{HuntForm, Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
-use super::present::{self, Anonymiser, Format, LogoPos, Step, StepOverride, Story, Timing};
+use super::present::{self, Anonymiser, Format, LogoPos, Quality, Step, StepOverride, Story, Timing};
 use super::views::{builtin_views, palette_color, Caption, ColorBy, Field, Rule, SavedView, Shape, Style, ViewsFile};
 use super::Options;
 
@@ -270,10 +270,8 @@ pub struct Viewer {
     show_story: bool,
     anon: Anonymiser,
     show_export: bool,
-    export_fps: u32,
-    export_format: Format,
-    export_size: usize,
-    export_name: String,
+    /// the window's title, put back after a recording has shown its progress there
+    title: String,
     export: Option<ExportJob>,
     film: Option<FilmJob>,
     ffmpeg: Option<bool>,
@@ -426,6 +424,8 @@ struct ExportJob {
     tx: std::sync::mpsc::Sender<(usize, std::sync::Arc<egui::ColorImage>)>,
     restore: Option<Vec2>,
     rec: present::Recorder,
+    /// Esc: the encoder closes the file with the frames it has
+    cancelled: bool,
 }
 
 /// A film of the window as it is used: a screenshot whenever a frame is
@@ -585,6 +585,7 @@ impl Viewer {
         }
         // with no timeline the side files go under the temp folder, so the
         // style chosen on the welcome is kept
+        let title = super::window_title(&opts.case, &opts.files);
         let first = opts.files.first().cloned().unwrap_or_else(ingest::scratch_csv);
         // a case (opened by `run`, so it is there) holds what the side files would
         let case_path = opts.case.clone().map(std::path::PathBuf::from);
@@ -675,10 +676,7 @@ impl Viewer {
             show_story: false,
             anon: Anonymiser::new(),
             show_export: false,
-            export_fps: 30,
-            export_format: Format::Gif,
-            export_size: 0,
-            export_name: String::new(),
+            title,
             export: None,
             film: None,
             ffmpeg: None,
@@ -3278,10 +3276,6 @@ impl Viewer {
                 }
                 if ui.button("Record…").clicked() {
                     self.show_export = true;
-                    if self.export_name.is_empty() {
-                        let stem = std::path::Path::new(&self.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
-                        self.export_name = format!("{}-story", stem);
-                    }
                 }
                 ui.label(egui::RichText::new(format!("{} steps · {} rows · {:.0} s", self.steps.len(), self.graph.events.len(), total)).color(MUTED));
                 ui.label(egui::RichText::new(self.case.as_ref().unwrap_or(&self.story_path).to_string_lossy()).small().color(MUTED));
@@ -3360,48 +3354,164 @@ impl Viewer {
         let ffmpeg = self.ffmpeg.unwrap_or(false);
         let mut open = true;
         let mut start = false;
-        egui::Window::new("Record the story").open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(egui::RichText::new("Every frame is a screenshot of this window while the story plays, so the file shows exactly what you see. Leave the window alone while it records.").color(MUTED));
-            ui.horizontal(|ui| {
+        let mut changed = false;
+        let total = present::total_secs(&self.steps, &self.story);
+        let ppp = ctx.pixels_per_point();
+        let window_px = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size() * ppp)).unwrap_or(Vec2::new(1460.0, 900.0));
+        let out = self.export_target();
+        egui::Window::new("Record the story").open(&mut open).collapsible(false).resizable(false).default_width(620.0).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label(egui::RichText::new("The story as it plays, frame by frame, into a file: what you see is what is recorded, so leave the window alone meanwhile. Esc stops a recording and keeps what was recorded.").color(MUTED));
+            ui.add_space(8.0);
+            theme::section(ui, "On the picture");
+            egui::Grid::new("rec-picture").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Title");
+                changed |= ui.add_sized([460.0, 20.0], egui::TextEdit::singleline(&mut self.story.title).hint_text("a line at the top: the case, the date… (none)")).changed();
+                ui.end_row();
+                ui.label("Logo").on_hover_text("Your logo on the frames and on the presentation: PNG with transparency, JPEG, WebP, BMP or GIF");
+                ui.horizontal(|ui| {
+                    let logo = self.story.logo.trim().to_string();
+                    if logo.is_empty() {
+                        ui.label(egui::RichText::new("none").color(theme::DIM));
+                    } else {
+                        let name = std::path::Path::new(&logo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| logo.clone());
+                        ui.label(egui::RichText::new(name).color(TEXT)).on_hover_text(&logo);
+                    }
+                    if ui.button("Choose…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().set_title("Logo for the recording").add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]).pick_file() {
+                            self.story.logo = p.to_string_lossy().to_string();
+                            changed = true;
+                        }
+                    }
+                    if !logo.is_empty() && ui.button("None").clicked() {
+                        self.story.logo.clear();
+                        changed = true;
+                    }
+                });
+                ui.end_row();
+                if !self.story.logo.trim().is_empty() {
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("rec-logo-pos").selected_text(self.story.logo_pos.label()).show_ui(ui, |ui| {
+                            for p in LogoPos::ALL {
+                                changed |= ui.selectable_value(&mut self.story.logo_pos, p, p.label()).changed();
+                            }
+                        });
+                        ui.label(egui::RichText::new("width").color(MUTED));
+                        let mut pct = self.story.logo_width * 100.0;
+                        if ui.add(egui::DragValue::new(&mut pct).range(3.0..=60.0).speed(0.5).fixed_decimals(0).suffix(" %")).on_hover_text("of the picture's width; the height follows the image").changed() {
+                            self.story.logo_width = pct / 100.0;
+                            changed = true;
+                        }
+                        ui.label(egui::RichText::new("opacity").color(MUTED));
+                        let mut op = self.story.logo_opacity * 100.0;
+                        if ui.add(egui::DragValue::new(&mut op).range(5.0..=100.0).speed(1.0).fixed_decimals(0).suffix(" %")).on_hover_text("lower for a watermark").changed() {
+                            self.story.logo_opacity = op / 100.0;
+                            changed = true;
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            ui.add_space(8.0);
+            theme::section(ui, "The file");
+            let rec = &mut self.story.recording;
+            egui::Grid::new("rec-file").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Format");
-                for f in [Format::Gif, Format::Png, Format::Mp4] {
-                    let enabled = f != Format::Mp4 || ffmpeg;
-                    if ui.add_enabled(enabled, egui::Button::selectable(self.export_format == f, f.label())).on_disabled_hover_text("ffmpeg was not found on the PATH; record PNG frames and encode them yourself, or install ffmpeg").clicked() {
-                        self.export_format = f;
+                ui.horizontal(|ui| {
+                    for (f, hint) in [
+                        (Format::Gif, "Plays wherever a picture does. 256 colours a frame; only what changes is stored, still big for a long story."),
+                        (Format::Mp4, "H.264: small and sharp. Plays in PowerPoint, Keynote and browsers."),
+                        (Format::Png, "One PNG a frame, in a folder, to encode yourself."),
+                    ] {
+                        let enabled = f != Format::Mp4 || ffmpeg;
+                        let r = ui.add_enabled(enabled, egui::Button::selectable(rec.format == f, f.label())).on_hover_text(hint).on_disabled_hover_text("ffmpeg was not found on the PATH: install it, or record PNG frames and encode them yourself");
+                        if r.clicked() && rec.format != f {
+                            rec.format = f;
+                            rec.fps = present::nearest_fps(f, rec.fps);
+                            changed = true;
+                        }
                     }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Frames per second");
-                for f in [10u32, 15, 24, 30, 60] {
-                    if ui.add(egui::Button::selectable(self.export_fps == f, f.to_string())).clicked() {
-                        self.export_fps = f;
+                });
+                ui.end_row();
+                ui.label("Quality");
+                ui.horizontal(|ui| {
+                    for q in Quality::ALL {
+                        if ui.add(egui::Button::selectable(rec.quality == q, q.label())).on_hover_text(q.hint()).clicked() {
+                            rec.quality = q;
+                            changed = true;
+                        }
                     }
-                }
-            });
-            ui.horizontal(|ui| {
+                });
+                ui.end_row();
                 ui.label("Size");
-                for (i, name) in ["this window", "1280 x 720", "1920 x 1080", "1600 x 900"].iter().enumerate() {
-                    if ui.add(egui::Button::selectable(self.export_size == i, *name)).clicked() {
-                        self.export_size = i;
+                ui.horizontal(|ui| {
+                    for (i, name) in [(0usize, "this window"), (1, "1280 x 720"), (3, "1600 x 900"), (2, "1920 x 1080")] {
+                        if ui.add(egui::Button::selectable(rec.size == i, name)).on_hover_text("The window is resized for the recording and put back after").clicked() {
+                            rec.size = i;
+                            changed = true;
+                        }
                     }
-                }
+                });
+                ui.end_row();
+                ui.label("Frames a second");
+                ui.horizontal(|ui| {
+                    for f in present::fps_choices(rec.format) {
+                        if ui.add(egui::Button::selectable(rec.fps == *f, f.to_string())).clicked() {
+                            rec.fps = *f;
+                            changed = true;
+                        }
+                    }
+                    if rec.format == Format::Gif {
+                        ui.label(egui::RichText::new("a GIF's clock ticks in hundredths: these keep time").small().color(theme::DIM));
+                    }
+                });
+                ui.end_row();
+                ui.label("Save as");
+                ui.horizontal(|ui| {
+                    let shown = out.to_string_lossy().to_string();
+                    let n = shown.chars().count();
+                    let short = if n > 60 { format!("…{}", shown.chars().skip(n - 59).collect::<String>()) } else { shown.clone() };
+                    ui.label(egui::RichText::new(short).color(TEXT)).on_hover_text(&shown);
+                    if ui.button("Change…").clicked() {
+                        let picked = match rec.format {
+                            Format::Png => rfd::FileDialog::new().set_title("Folder for the frames").pick_folder(),
+                            f => {
+                                let ext = if f == Format::Gif { "gif" } else { "mp4" };
+                                let mut d = rfd::FileDialog::new().set_title("Record the story as").add_filter(ext.to_uppercase(), &[ext]);
+                                if let Some(dir) = out.parent() {
+                                    d = d.set_directory(dir);
+                                }
+                                if let Some(name) = out.file_name() {
+                                    d = d.set_file_name(name.to_string_lossy());
+                                }
+                                d.save_file()
+                            }
+                        };
+                        if let Some(p) = picked {
+                            rec.file = p.to_string_lossy().to_string();
+                            changed = true;
+                        }
+                    }
+                    if !rec.file.is_empty() && ui.add(egui::Button::new(egui::RichText::new(super::icons::X).color(theme::DIM)).frame(false)).on_hover_text("Back to the default: next to the case, or the timeline").clicked() {
+                        rec.file.clear();
+                        changed = true;
+                    }
+                });
+                ui.end_row();
             });
+            ui.add_space(8.0);
+            let (w, h) = match rec.size {
+                1 => (1280.0, 720.0),
+                2 => (1920.0, 1080.0),
+                3 => (1600.0, 900.0),
+                _ => (window_px.x, window_px.y),
+            };
+            let frames = (total * rec.fps as f32).ceil() as usize;
+            let (lo, hi) = present::estimate_bytes(rec.format, rec.quality, w, h, rec.fps, total);
+            ui.label(egui::RichText::new(format!("{:.0} s · {} frames at {} x {} · about {} to {} (what moves decides)", total, frames, w as u32, h as u32, present::human_bytes(lo), present::human_bytes(hi))).color(MUTED));
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("File");
-                ui.add(egui::TextEdit::singleline(&mut self.export_name).desired_width(240.0));
-                let ext = match self.export_format {
-                    Format::Gif => ".gif",
-                    Format::Png => "/ (a folder of frames)",
-                    Format::Mp4 => ".mp4",
-                };
-                ui.label(egui::RichText::new(format!("{}  next to the timeline", ext)).color(MUTED));
-            });
-            let total = present::total_secs(&self.steps, &self.story);
-            let frames = (total * self.export_fps as f32).ceil() as usize;
-            ui.label(egui::RichText::new(format!("{:.0} s · {} frames", total, frames)).color(MUTED));
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.export_name.trim().is_empty() && !self.steps.is_empty(), egui::Button::new(egui::RichText::new("Record").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
+                if ui.add_enabled(!self.steps.is_empty(), egui::Button::new(egui::RichText::new("Record").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
                     start = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -3409,6 +3519,9 @@ impl Viewer {
                 }
             });
         });
+        if changed {
+            self.save_story();
+        }
         if !open {
             self.show_export = false;
         }
@@ -3417,26 +3530,46 @@ impl Viewer {
         }
     }
 
-    /// Begin recording the story with the export settings.
+    /// Where the recording goes: the file chosen, or `<stem>-story.<ext>`
+    /// next to the case (or the timeline).
+    fn export_target(&self) -> std::path::PathBuf {
+        let rec = &self.story.recording;
+        let ext = match rec.format {
+            Format::Gif => "gif",
+            Format::Mp4 => "mp4",
+            Format::Png => "",
+        };
+        let chosen = rec.file.trim();
+        if !chosen.is_empty() {
+            let mut p = std::path::PathBuf::from(chosen);
+            if rec.format != Format::Png && p.extension().map_or(true, |e| !e.eq_ignore_ascii_case(ext)) {
+                p.set_extension(ext);
+            }
+            return p;
+        }
+        let stem = self.files.first().and_then(|f| std::path::Path::new(f).file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
+        let dir = self.out_dir().unwrap_or_default();
+        if rec.format == Format::Png {
+            dir.join(format!("{}-story", stem))
+        } else {
+            dir.join(format!("{}-story.{}", stem, ext))
+        }
+    }
+
+    /// Begin recording the story with the Record dialog's settings.
     fn start_export(&mut self, ctx: &egui::Context) {
         self.show_export = false;
         self.show_story = false;
         self.rebuild_steps();
-        if self.export_name.trim().is_empty() {
-            let stem = std::path::Path::new(&self.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
-            self.export_name = format!("{}-story", stem);
+        let rec = self.story.recording.clone();
+        let out = self.export_target();
+        if let Some(dir) = if rec.format == Format::Png { Some(out.as_path()) } else { out.parent() } {
+            let _ = std::fs::create_dir_all(dir);
         }
-        let dir = self.out_dir().unwrap_or_default();
-        let name = self.export_name.trim().to_string();
-        let out = match self.export_format {
-            Format::Gif => dir.join(format!("{}.gif", name)),
-            Format::Png => dir.join(name),
-            Format::Mp4 => dir.join(format!("{}.mp4", name)),
-        };
         let total = present::total_secs(&self.steps, &self.story);
-        let frames = ((total * self.export_fps as f32).ceil() as usize).max(1);
+        let frames = ((total * rec.fps as f32).ceil() as usize).max(1);
         let (tx, rx) = std::sync::mpsc::channel();
-        let restore = match self.export_size {
+        let restore = match rec.size {
             1 => Some(Vec2::new(1280.0, 720.0)),
             2 => Some(Vec2::new(1920.0, 1080.0)),
             3 => Some(Vec2::new(1600.0, 900.0)),
@@ -3448,10 +3581,10 @@ impl Viewer {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size / ppp));
         }
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
-            eprintln!("[view] recording {} frames at {} fps to {}", frames, self.export_fps, out.display());
+            eprintln!("[view] recording {} frames at {} fps, {:?}, {:?}, to {}", frames, rec.fps, rec.format, rec.quality, out.display());
         }
-        let rec = present::Recorder::start(self.export_fps, self.export_format, out.clone());
-        self.export = Some(ExportJob { fps: self.export_fps, out, total: frames, next: 0, waiting: false, rx, tx, restore: if restore.is_some() { current } else { None }, rec });
+        let recorder = present::Recorder::start(rec.fps, rec.format, rec.quality, out.clone());
+        self.export = Some(ExportJob { fps: rec.fps, out, total: frames, next: 0, waiting: false, rx, tx, restore: if restore.is_some() { current } else { None }, rec: recorder, cancelled: false });
         self.start_presentation();
         self.present_playing = false;
     }
@@ -3488,8 +3621,8 @@ impl Viewer {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(s / ppp));
         }
         let rec = match format {
-            Format::Mp4 => present::Recorder::start_stream(fps, out.clone()),
-            _ => present::Recorder::start(fps, Format::Gif, out.clone()),
+            Format::Mp4 => present::Recorder::start_stream(fps, Quality::Balanced, out.clone()),
+            _ => present::Recorder::start(fps, Format::Gif, Quality::Balanced, out.clone()),
         };
         let (tx, rx) = std::sync::mpsc::channel();
         // a resized window needs a frame or two before it is its new size
@@ -3589,6 +3722,7 @@ impl Viewer {
         match cmd.as_str() {
             "present" => self.start_presentation(),
             "story" => self.show_story = true,
+            "record-dialog" => self.show_export = true,
             "rules" => self.show_rules = true,
             "fit" => {
                 self.fill_pending = true;
@@ -3783,14 +3917,26 @@ impl Viewer {
                     let out = parts.next().filter(|s| !s.is_empty()).map(std::path::PathBuf::from);
                     self.start_film(ctx, format, fps, size, out, true);
                 } else if let Some(spec) = other.strip_prefix("record=") {
+                    // record=FORMAT:FPS:SIZE[:QUALITY[:FILE]]
                     let parts: Vec<&str> = spec.split(':').collect();
-                    self.export_format = match parts.first().copied().unwrap_or("gif") {
+                    let rec = &mut self.story.recording;
+                    rec.format = match parts.first().copied().unwrap_or("gif") {
                         "png" => Format::Png,
                         "mp4" => Format::Mp4,
                         _ => Format::Gif,
                     };
-                    self.export_fps = parts.get(1).and_then(|f| f.parse().ok()).unwrap_or(15);
-                    self.export_size = parts.get(2).and_then(|f| f.parse().ok()).unwrap_or(0);
+                    rec.fps = parts.get(1).and_then(|f| f.parse().ok()).unwrap_or(15);
+                    rec.size = parts.get(2).and_then(|f| f.parse().ok()).unwrap_or(0);
+                    if let Some(q) = parts.get(3) {
+                        rec.quality = match *q {
+                            "small" => Quality::Small,
+                            "best" => Quality::Best,
+                            _ => Quality::Balanced,
+                        };
+                    }
+                    if parts.len() > 4 {
+                        rec.file = parts[4..].join(":");
+                    }
                     self.start_export(ctx);
                 } else {
                     eprintln!("masstin: unknown MASSTIN_VIEW_AUTO action '{}'", other);
@@ -3801,19 +3947,23 @@ impl Viewer {
     }
 
     /// Drive a recording: one frame per repaint, screenshot taken after
-    /// the frame is drawn, encoding at the end.
+    /// the frame is drawn, encoded as it comes; the progress in the window's
+    /// title, since the frames are the window itself.
     fn export_step(&mut self, ctx: &egui::Context) {
+        let title = self.title.clone();
         let Some(job) = self.export.as_mut() else { return };
         if let Some(result) = job.rec.result() {
-            let restore = job.restore;
+            let (restore, cancelled, done, total) = (job.restore, job.cancelled, job.next, job.total);
             self.export = None;
             self.stop_presentation();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
             if let Some(size) = restore {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
-            self.status = match result {
-                Ok(m) => format!("Recorded: {}", m),
-                Err(e) => format!("Recording failed: {}", e),
+            self.status = match (result, cancelled) {
+                (Ok(m), false) => format!("Recorded: {}", m),
+                (Ok(m), true) => format!("Recording stopped after {} of {} frames, kept: {}", done, total, m),
+                (Err(e), _) => format!("Recording failed: {}", e),
             };
             if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
                 eprintln!("[view] {}", self.status);
@@ -3821,15 +3971,12 @@ impl Viewer {
             return;
         }
         if job.waiting {
-            match job.rx.try_recv() {
-                Ok((i, img)) => {
-                    if i == job.next {
-                        job.rec.push(img);
-                        job.next += 1;
-                        job.waiting = false;
-                    }
+            if let Ok((i, img)) = job.rx.try_recv() {
+                if i == job.next {
+                    job.rec.push(img);
+                    job.next += 1;
+                    job.waiting = false;
                 }
-                Err(_) => {}
             }
         }
         if job.rec.finishing() {
@@ -3839,9 +3986,13 @@ impl Viewer {
         if !job.waiting {
             if job.next >= job.total {
                 job.rec.finish();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — finishing the recording…", title)));
             } else {
                 // the frame about to be drawn
                 self.present_t = job.next as f32 / job.fps as f32;
+                if job.next % 10 == 0 {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — recording {} / {} · Esc stops", title, job.next + 1, job.total)));
+                }
                 let tx = job.tx.clone();
                 let idx = job.next;
                 job.waiting = true;
@@ -3851,6 +4002,17 @@ impl Viewer {
             }
         }
         ctx.request_repaint();
+    }
+
+    /// Esc while recording: no more frames, the encoder closes the file
+    /// with the ones it has.
+    fn cancel_export(&mut self) {
+        if let Some(job) = self.export.as_mut() {
+            if !job.rec.finishing() {
+                job.cancelled = true;
+                job.rec.finish();
+            }
+        }
     }
 }
 
@@ -4005,16 +4167,21 @@ impl Viewer {
                 ctx.request_repaint();
             }
             let (space, left, right, esc, home) = ctx.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Home)));
-            if space {
+            if esc {
+                if self.export.is_some() {
+                    self.cancel_export();
+                } else {
+                    self.stop_presentation();
+                }
+            }
+            // a recording sets its own time: the keys that move it wait
+            if space && self.export.is_none() {
                 self.present_playing = !self.present_playing;
             }
-            if esc {
-                self.stop_presentation();
-            }
-            if home {
+            if home && self.export.is_none() {
                 self.present_t = 0.0;
             }
-            if right || left {
+            if (right || left) && self.export.is_none() {
                 // steps wholly drawn at this moment; Right shows one more,
                 // Left one fewer (the time a step ends is the next one's
                 // start when there is no pause, so counting "the current
