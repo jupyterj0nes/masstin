@@ -140,11 +140,13 @@ pub struct Story {
     pub logo_width: f32,
     pub logo_opacity: f32,
     pub logo_always: bool,
+    /// what the Record dialog last used
+    pub recording: Recording,
 }
 
 impl Default for Story {
     fn default() -> Self {
-        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new(), logo: String::new(), logo_pos: LogoPos::BottomRight, logo_width: 0.12, logo_opacity: 0.9, logo_always: false }
+        Story { title: String::new(), timing: Timing::Fixed, step_secs: 0.8, compress: 600.0, min_gap: 0.3, max_gap: 3.0, group_secs: 2.0, pause_significant: 1.2, fade_old: false, show_clock: true, show_caption: true, show_counter: true, anonymise: false, hold_end: 3.0, steps: HashMap::new(), stretches: Vec::new(), logo: String::new(), logo_pos: LogoPos::BottomRight, logo_width: 0.12, logo_opacity: 0.9, logo_always: false, recording: Recording::default() }
     }
 }
 
@@ -262,7 +264,7 @@ impl Anonymiser {
 
 // ───────────────────────────── recording ────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Format {
     Gif,
     Png,
@@ -276,6 +278,299 @@ impl Format {
             Format::Png => "PNG frames",
             Format::Mp4 => "MP4 (ffmpeg)",
         }
+    }
+}
+
+/// How much of the picture a recording keeps: a GIF's colours and how
+/// small a change it redraws, an MP4's compression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Quality {
+    Small,
+    Balanced,
+    Best,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::Small, Quality::Balanced, Quality::Best];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Small => "small file",
+            Quality::Balanced => "balanced",
+            Quality::Best => "best",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Quality::Small => "64 colours a frame and only clear changes redrawn; an MP4 compressed hard. For a chat or a wiki.",
+            Quality::Balanced => "128 colours a frame; an MP4 as a video site keeps it. For a report or a talk.",
+            Quality::Best => "256 colours a frame, every change redrawn; an MP4 near lossless. For the archive, or to edit further.",
+        }
+    }
+
+    /// A GIF frame's colours (one of them stands for what did not change),
+    /// NeuQuant's sample factor (1 the finest, 30 the fastest) and the
+    /// change a pixel must make, per channel, to be drawn again.
+    fn gif(self) -> (usize, i32, i16) {
+        match self {
+            Quality::Small => (64, 10, 12),
+            Quality::Balanced => (128, 4, 6),
+            Quality::Best => (256, 1, 2),
+        }
+    }
+
+    /// x264's constant rate factor: 17 is near lossless, 28 is small.
+    fn crf(self) -> u32 {
+        match self {
+            Quality::Small => 26,
+            Quality::Balanced => 21,
+            Quality::Best => 17,
+        }
+    }
+}
+
+/// The Record dialog's settings, saved with the story (so with the case).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Recording {
+    pub format: Format,
+    pub fps: u32,
+    /// 0 the window as it is, 1 1280 x 720, 2 1920 x 1080, 3 1600 x 900
+    pub size: usize,
+    pub quality: Quality,
+    /// where it goes; empty: `<stem>-story.<ext>` next to the case or the timeline
+    pub file: String,
+}
+
+impl Default for Recording {
+    fn default() -> Self {
+        Recording { format: Format::Gif, fps: 20, size: 1, quality: Quality::Balanced, file: String::new() }
+    }
+}
+
+/// The rates a format keeps: a GIF's clock ticks in hundredths of a second,
+/// so only a rate that divides a hundred plays at the speed it was recorded
+/// (and players hold a frame for a tenth of a second when told less than two
+/// hundredths).
+pub fn fps_choices(format: Format) -> &'static [u32] {
+    match format {
+        Format::Gif => &[10, 20, 25, 33, 50],
+        Format::Mp4 | Format::Png => &[10, 15, 24, 30, 60],
+    }
+}
+
+/// The rate `format` offers nearest to `fps`.
+pub fn nearest_fps(format: Format, fps: u32) -> u32 {
+    fps_choices(format).iter().copied().min_by_key(|f| (*f as i64 - fps as i64).abs()).unwrap_or(fps)
+}
+
+/// About how big the file will be, bytes, low to high. The low end is a
+/// lateral-movement story of seventy connections measured at these settings
+/// (per frame and megapixel for a GIF and the PNG frames, per second and
+/// megapixel for an MP4: 4.0 / 4.7 / 6.4 MB the GIF small / balanced / best,
+/// 1.0 / 1.8 MB the MP4 small / balanced, 0.9 MB a PNG frame, at 720p); the
+/// high end is for a picture where much moves: a camera glide, older edges
+/// fading, motion on.
+pub fn estimate_bytes(format: Format, quality: Quality, w: f32, h: f32, fps: u32, secs: f32) -> (u64, u64) {
+    let mp = (w * h) as f64 / 1e6;
+    let frames = (secs * fps as f32).ceil().max(1.0) as f64;
+    let (lo, hi) = match format {
+        Format::Gif => {
+            let (lo, hi) = match quality {
+                Quality::Small => (GIF_BYTES[0].0, GIF_BYTES[0].1),
+                Quality::Balanced => (GIF_BYTES[1].0, GIF_BYTES[1].1),
+                Quality::Best => (GIF_BYTES[2].0, GIF_BYTES[2].1),
+            };
+            (frames * mp * lo, frames * mp * hi)
+        }
+        Format::Mp4 => {
+            let (lo, hi) = match quality {
+                Quality::Small => (MP4_BYTES[0].0, MP4_BYTES[0].1),
+                Quality::Balanced => (MP4_BYTES[1].0, MP4_BYTES[1].1),
+                Quality::Best => (MP4_BYTES[2].0, MP4_BYTES[2].1),
+            };
+            (secs.max(1.0) as f64 * mp * lo, secs.max(1.0) as f64 * mp * hi)
+        }
+        Format::Png => (frames * mp * PNG_BYTES.0, frames * mp * PNG_BYTES.1),
+    };
+    (lo as u64, hi as u64)
+}
+
+/// Bytes per frame and megapixel of a GIF, (low, high), by quality.
+const GIF_BYTES: [(f64, f64); 3] = [(3_900.0, 14_000.0), (4_600.0, 18_000.0), (6_300.0, 28_000.0)];
+/// Bytes per second and megapixel of an MP4, (low, high), by quality.
+const MP4_BYTES: [(f64, f64); 3] = [(18_000.0, 80_000.0), (34_000.0, 150_000.0), (70_000.0, 300_000.0)];
+/// Bytes per frame and megapixel of a PNG frame.
+const PNG_BYTES: (f64, f64) = (1_000_000.0, 1_600_000.0);
+
+/// `12.3 MB`, `840 KB`.
+pub fn human_bytes(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{:.1} GB", b as f64 / (1u64 << 30) as f64)
+    } else if b >= 1 << 20 {
+        format!("{:.0} MB", b as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{:.0} KB", (b as f64 / 1024.0).max(1.0))
+    }
+}
+
+fn size_note(path: &std::path::Path) -> String {
+    std::fs::metadata(path).map(|m| format!(", {}", human_bytes(m.len()))).unwrap_or_default()
+}
+
+/// A GIF written frame by frame as a screen recorder does: a frame carries
+/// only the rectangle where pixels changed, the rest of it transparent over
+/// what is already shown, with a palette of its own (the region's colours as
+/// they are when they fit, quantised otherwise); frames that change nothing
+/// lengthen the one before. A pixel is drawn again when it moved from what
+/// was last drawn by more than the quality's tolerance, so a slow fade
+/// catches up and the file does not carry every breath of a glow.
+struct GifSink<W: std::io::Write> {
+    enc: gif::Encoder<W>,
+    w: usize,
+    h: usize,
+    /// each pixel as it was when last drawn
+    base: Vec<[u8; 3]>,
+    mark: Vec<bool>,
+    started: bool,
+    colours: usize,
+    sample: i32,
+    tol: i16,
+    fps: u32,
+    /// hundredths of a second owed by rounding
+    carry: f32,
+    /// hundredths accumulated by frames that changed nothing
+    pending: u16,
+    frames: usize,
+}
+
+impl<W: std::io::Write> GifSink<W> {
+    fn new(w: W, width: usize, height: usize, fps: u32, quality: Quality) -> Result<Self, String> {
+        let mut enc = gif::Encoder::new(w, width as u16, height as u16, &[]).map_err(|e| e.to_string())?;
+        enc.set_repeat(gif::Repeat::Infinite).map_err(|e| e.to_string())?;
+        let (colours, sample, tol) = quality.gif();
+        Ok(GifSink { enc, w: width, h: height, base: vec![[0; 3]; width * height], mark: vec![false; width * height], started: false, colours, sample, tol, fps, carry: 0.0, pending: 0, frames: 0 })
+    }
+
+    /// This frame's time in hundredths, the remainder carried so a long GIF keeps its rate.
+    fn delay(&mut self) -> u16 {
+        self.carry += 100.0 / self.fps.max(1) as f32;
+        let d = self.carry.floor();
+        self.carry -= d;
+        d as u16
+    }
+
+    fn push(&mut self, img: &egui::ColorImage) -> Result<(), String> {
+        if img.width() != self.w || img.height() != self.h {
+            // another size (the window resized): left out
+            return Ok(());
+        }
+        let d = self.delay();
+        let px = &img.pixels;
+        let (mut x0, mut y0, mut x1, mut y1) = (self.w, self.h, 0usize, 0usize);
+        let mut any = false;
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let i = y * self.w + x;
+                let c = px[i];
+                let b = self.base[i];
+                let moved = !self.started || (c.r() as i16 - b[0] as i16).abs() > self.tol || (c.g() as i16 - b[1] as i16).abs() > self.tol || (c.b() as i16 - b[2] as i16).abs() > self.tol;
+                self.mark[i] = moved;
+                if moved {
+                    any = true;
+                    x0 = x0.min(x);
+                    x1 = x1.max(x + 1);
+                    y0 = y0.min(y);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        if !any {
+            self.pending = self.pending.saturating_add(d);
+            return Ok(());
+        }
+        let (bw, bh) = (x1 - x0, y1 - y0);
+        // the palette: the colours as they are when they fit, quantised otherwise
+        let mut exact: HashMap<[u8; 3], u8> = HashMap::new();
+        let mut rgba: Vec<u8> = Vec::new();
+        let mut few = true;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = y * self.w + x;
+                if self.mark[i] {
+                    let c = px[i];
+                    let k = [c.r(), c.g(), c.b()];
+                    if few && !exact.contains_key(&k) {
+                        if exact.len() + 1 >= self.colours {
+                            few = false;
+                        } else {
+                            exact.insert(k, exact.len() as u8);
+                        }
+                    }
+                    rgba.extend_from_slice(&[k[0], k[1], k[2], 255]);
+                }
+            }
+        }
+        let (mut pal, index): (Vec<u8>, Box<dyn Fn([u8; 3]) -> u8>) = if few {
+            let mut pal = vec![0u8; exact.len() * 3];
+            for (c, &i) in &exact {
+                pal[i as usize * 3..i as usize * 3 + 3].copy_from_slice(c);
+            }
+            (pal, Box::new(move |c| exact[&c]))
+        } else {
+            let nq = color_quant::NeuQuant::new(self.sample, self.colours - 1, &rgba);
+            (nq.color_map_rgb(), Box::new(move |c| nq.index_of(&[c[0], c[1], c[2], 255]) as u8))
+        };
+        let transparent = (pal.len() / 3) as u8;
+        pal.extend_from_slice(&[0, 0, 0]);
+        while pal.len() < 6 {
+            pal.extend_from_slice(&[0, 0, 0]);
+        }
+        let mut buf = Vec::with_capacity(bw * bh);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = y * self.w + x;
+                if self.mark[i] {
+                    let c = px[i];
+                    let k = [c.r(), c.g(), c.b()];
+                    buf.push(index(k));
+                    self.base[i] = k;
+                } else {
+                    buf.push(transparent);
+                }
+            }
+        }
+        let frame = gif::Frame {
+            delay: (d + self.pending).max(2),
+            dispose: gif::DisposalMethod::Keep,
+            transparent: if self.started { Some(transparent) } else { None },
+            needs_user_input: false,
+            top: y0 as u16,
+            left: x0 as u16,
+            width: bw as u16,
+            height: bh as u16,
+            interlaced: false,
+            palette: Some(pal),
+            buffer: std::borrow::Cow::Owned(buf),
+        };
+        self.enc.write_frame(&frame).map_err(|e| e.to_string())?;
+        self.pending = 0;
+        self.started = true;
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// The trailer; a last still frame carries the time of the frames that changed nothing.
+    fn finish(mut self) -> Result<usize, String> {
+        if self.pending > 0 && self.started {
+            let frame = gif::Frame { delay: self.pending.max(2), dispose: gif::DisposalMethod::Keep, transparent: Some(1), width: 1, height: 1, palette: Some(vec![0, 0, 0, 0, 0, 0]), buffer: std::borrow::Cow::Owned(vec![1]), ..Default::default() };
+            self.enc.write_frame(&frame).map_err(|e| e.to_string())?;
+        }
+        use std::io::Write;
+        let mut w = self.enc.into_inner().map_err(|e| e.to_string())?;
+        w.flush().map_err(|e| e.to_string())?;
+        Ok(self.frames)
     }
 }
 
@@ -302,7 +597,10 @@ pub(super) fn to_rgba(img: &egui::ColorImage) -> image::RgbaImage {
 }
 
 impl Recorder {
-    pub fn start(fps: u32, format: Format, out: std::path::PathBuf) -> Recorder {
+    pub fn start(fps: u32, format: Format, quality: Quality, out: std::path::PathBuf) -> Recorder {
+        if format == Format::Mp4 {
+            return Recorder::start_stream(fps, quality, out);
+        }
         // bounded: the window waits for the encoder instead of piling frames up in memory
         let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<egui::ColorImage>>(3);
         let (dtx, drx) = std::sync::mpsc::channel();
@@ -311,41 +609,30 @@ impl Recorder {
                 let mut n = 0usize;
                 match format {
                     Format::Gif => {
-                        let file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-                        let mut enc = image::codecs::gif::GifEncoder::new_with_speed(std::io::BufWriter::with_capacity(1 << 20, file), 30);
-                        enc.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| e.to_string())?;
-                        let delay = image::Delay::from_numer_denom_ms(1000, fps.max(1));
+                        let mut file = Some(std::fs::File::create(&out).map_err(|e| e.to_string())?);
+                        let mut sink: Option<GifSink<std::io::BufWriter<std::fs::File>>> = None;
                         while let Ok(f) = rx.recv() {
-                            enc.encode_frame(image::Frame::from_parts(to_rgba(&f), 0, 0, delay)).map_err(|e| e.to_string())?;
+                            let s = match sink.as_mut() {
+                                Some(s) => s,
+                                None => sink.insert(GifSink::new(std::io::BufWriter::with_capacity(1 << 20, file.take().ok_or("no file")?), f.width(), f.height(), fps, quality)?),
+                            };
+                            s.push(&f)?;
                             n += 1;
                         }
-                        Ok(format!("{} ({} frames at {} fps)", out.display(), n, fps))
+                        if let Some(s) = sink {
+                            s.finish()?;
+                        }
+                        Ok(format!("{} ({} frames at {} fps{})", out.display(), n, fps, size_note(&out)))
                     }
                     Format::Png | Format::Mp4 => {
-                        let dir = if format == Format::Png { out.clone() } else { out.with_extension("frames") };
-                        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                        std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
                         while let Ok(f) = rx.recv() {
-                            let p = dir.join(format!("frame_{:05}.png", n));
-                            to_rgba(&f).save(&p).map_err(|e| e.to_string())?;
+                            let p = out.join(format!("frame_{:05}.png", n));
+                            // RGB: the window has no transparency, and the alpha would be a quarter of the file
+                            image::DynamicImage::ImageRgba8(to_rgba(&f)).to_rgb8().save(&p).map_err(|e| e.to_string())?;
                             n += 1;
                         }
-                        if format == Format::Png {
-                            return Ok(format!("{} frames in {}", n, dir.display()));
-                        }
-                        let status = std::process::Command::new("ffmpeg")
-                            .args(["-y", "-framerate", &fps.to_string(), "-i"])
-                            .arg(dir.join("frame_%05d.png"))
-                            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"])
-                            .arg(&out)
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .map_err(|e| format!("ffmpeg: {}", e))?;
-                        if !status.success() {
-                            return Err(format!("ffmpeg failed; the frames are in {}", dir.display()));
-                        }
-                        let _ = std::fs::remove_dir_all(&dir);
-                        Ok(format!("{} ({} frames at {} fps)", out.display(), n, fps))
+                        Ok(format!("{} frames in {}", n, out.display()))
                     }
                 }
             })();
@@ -358,7 +645,7 @@ impl Recorder {
     /// (raw RGBA, no frame files): what a film of the window needs, since
     /// it has no end known beforehand. ffmpeg starts with the first frame,
     /// which sets the size; a frame of another size is left out.
-    pub fn start_stream(fps: u32, out: std::path::PathBuf) -> Recorder {
+    pub fn start_stream(fps: u32, quality: Quality, out: std::path::PathBuf) -> Recorder {
         let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<egui::ColorImage>>(8);
         let (dtx, drx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -375,7 +662,7 @@ impl Recorder {
                             .arg(format!("{}x{}", f.width(), f.height()))
                             .args(["-r", &fps.to_string(), "-i", "-", "-vf"])
                             .arg(format!("crop={}:{}:0:0", size.0, size.1))
-                            .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"])
+                            .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-crf", &quality.crf().to_string(), "-movflags", "+faststart"])
                             .arg(&out)
                             .stdin(std::process::Stdio::piped())
                             .stdout(std::process::Stdio::null())
@@ -400,7 +687,7 @@ impl Recorder {
                 if !status.success() {
                     return Err("ffmpeg failed".into());
                 }
-                Ok(format!("{} ({} frames at {} fps, {:.0} s)", out.display(), n, fps, n as f32 / fps.max(1) as f32))
+                Ok(format!("{} ({} frames at {} fps, {:.0} s{})", out.display(), n, fps, n as f32 / fps.max(1) as f32, size_note(&out)))
             })();
             let _ = dtx.send(result);
         });
@@ -458,6 +745,49 @@ mod tests {
         story.compress = 10.0;
         let s2 = build_steps(&ev, &story);
         assert!((s2[1].dur - 1.0).abs() < 1e-6, "{:?}", s2[1]);
+    }
+
+    #[test]
+    fn a_gif_carries_only_what_changed_and_keeps_its_clock() {
+        let (w, h) = (64usize, 40usize);
+        let mut pixels = vec![egui::Color32::from_rgb(12, 14, 20); w * h];
+        let frame = |px: &Vec<egui::Color32>| egui::ColorImage { size: [w, h], source_size: egui::Vec2::new(w as f32, h as f32), pixels: px.clone() };
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut sink = GifSink::new(&mut out, w, h, 20, Quality::Balanced).unwrap();
+            sink.push(&frame(&pixels)).unwrap();
+            // four still frames, then a 10 x 10 square lights up
+            for _ in 0..4 {
+                sink.push(&frame(&pixels)).unwrap();
+            }
+            for y in 10..20 {
+                for x in 30..40 {
+                    pixels[y * w + x] = egui::Color32::from_rgb(0, 200, 180);
+                }
+            }
+            sink.push(&frame(&pixels)).unwrap();
+            // a breath under the tolerance changes nothing
+            for p in pixels.iter_mut() {
+                *p = egui::Color32::from_rgb(p.r().saturating_add(2), p.g(), p.b());
+            }
+            sink.push(&frame(&pixels)).unwrap();
+            assert_eq!(sink.finish().unwrap(), 2);
+        }
+        let mut dec = gif::DecodeOptions::new();
+        dec.set_color_output(gif::ColorOutput::Indexed);
+        let mut r = dec.read_info(std::io::Cursor::new(out)).unwrap();
+        let first = r.read_next_frame().unwrap().unwrap().clone();
+        assert_eq!((first.left, first.top, first.width, first.height), (0, 0, 64, 40));
+        assert_eq!(first.delay, 5);
+        let second = r.read_next_frame().unwrap().unwrap().clone();
+        // the square alone, after the four still frames' time (5 x 5 hundredths)
+        assert_eq!((second.left, second.top, second.width, second.height), (30, 10, 10, 10));
+        assert_eq!(second.delay, 25);
+        assert!(second.transparent.is_some());
+        let third = r.read_next_frame().unwrap().unwrap().clone();
+        // the last breath's time, on a still pixel
+        assert_eq!((third.width, third.height, third.delay), (1, 1, 5));
+        assert!(r.read_next_frame().unwrap().is_none());
     }
 
     #[test]

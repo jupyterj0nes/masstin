@@ -139,6 +139,16 @@ mod renderer_pick_tests {
     }
 }
 
+/// The window's title: the case's name, or the timelines'.
+pub(crate) fn window_title(case: &Option<String>, files: &[String]) -> String {
+    let name = |f: &String| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
+    match case {
+        Some(c) => format!("masstin — {}", name(c)),
+        None if files.is_empty() => "masstin".to_string(),
+        None => format!("masstin — {}", files.iter().map(name).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 /// Open the window; returns when it is closed.
 pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let clock = std::time::Instant::now();
@@ -178,9 +188,7 @@ pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
     }
     crate::banner::print_phase("2", "2", "Opening the viewer (close the window to end)");
-    let title = if let Some(c) = &opts.case {
-        format!("masstin — {}", std::path::Path::new(c).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| c.clone()))
-    } else if opts.files.is_empty() { "masstin".to_string() } else { format!("masstin — {}", opts.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect::<Vec<_>>().join(", ")) };
+    let title = window_title(&opts.case, &opts.files);
     let icon = image::load_from_memory(include_bytes!("../../resources/masstin_icon.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width(), rgba.height());
