@@ -3028,8 +3028,12 @@ impl Viewer {
     /// fades before the next.
     fn lower_third(&self, painter: &egui::Painter, canvas: Rect, st: &Step, k: usize, bar_h: f32, accent: Color32) {
         let t = self.present_t;
-        let k_in = draw::ease_out_cubic(((t - st.start) / 0.35).clamp(0.0, 1.0));
+        // it slides in once and stays while the hops come close (under a second
+        // apart), its words changing with each; it leaves before a long gap
+        let held_from_prev = k > 0 && st.start - (self.steps[k - 1].start + self.steps[k - 1].dur) < 0.9;
+        let k_in = if held_from_prev { 1.0 } else { draw::ease_out_cubic(((t - st.start) / 0.35).clamp(0.0, 1.0)) };
         let k_out = match self.steps.get(k + 1) {
+            Some(next) if next.start - (st.start + st.dur) < 0.9 => 1.0,
             Some(next) => ((next.start - t) / 0.3).clamp(0.0, 1.0),
             None => 1.0,
         };
