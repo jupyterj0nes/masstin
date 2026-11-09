@@ -1,5 +1,6 @@
 use std::{path::PathBuf, fs::File};
 use evtx::EvtxParser;
+use rayon::prelude::*;
 extern crate serde;
 extern crate quick_xml;
 use serde::{Serialize, Deserialize};
@@ -242,7 +243,7 @@ const SYSMON_LM_PORTS: &[&str] = &["22", "135", "139", "445", "1433", "3306", "3
 pub mod parse {}
 
 // Updated LogData struct with event_type, logon_id, and detail columns.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct LogData {
     pub time_created: String,
     pub computer: String,
@@ -855,6 +856,58 @@ fn rec_from_event2(event: &Event2) -> Option<WinRec> {
 
 /// Iterate the records of one EVTX file whose id is in `ids`, as WinRecs
 /// built by `build`, and map each with `map`.
+/// A parser over an EVTX held in memory, its chunk decoder on the threads
+/// the file's size deserves (the evtx crate's own parallelism; it keeps the
+/// chunks in order, so the records come out in the file's order whatever
+/// the count), and that figure, for the rows.
+fn evtx_parser(cursor: Cursor<Vec<u8>>) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+    let threads = crate::threads::for_bytes(cursor.get_ref().len() as u64);
+    let settings = evtx::ParserSettings::default().num_threads(threads);
+    Ok((EvtxParser::from_read_seek(cursor)?.with_configuration(settings), threads))
+}
+
+/// Records a batch at a time when the rows are made on several threads: a
+/// file of millions of records never sits whole in memory as text.
+const RECORD_BATCH: usize = 4096;
+
+/// The rows of a parser's records, each through `row` (the record's XML to
+/// its row, or none). One thread takes the records one by one as they come,
+/// as masstin always did; more take them in batches spread over the pool,
+/// every batch's rows put back in the order of its records, so the result
+/// is the same rows in the same order.
+fn rows_from_records(parser: &mut EvtxParser<Cursor<Vec<u8>>>, workers: usize, row: impl Fn(&str) -> Option<LogData> + Sync) -> Vec<LogData> {
+    let records = parser.records().filter_map(|r| r.ok()).map(|r| r.data);
+    rows_from_xml(records, workers, row)
+}
+
+/// `rows_from_records` on any source of records' XML, so it can be tested
+/// without an EVTX.
+fn rows_from_xml(records: impl Iterator<Item = String>, workers: usize, row: impl Fn(&str) -> Option<LogData> + Sync) -> Vec<LogData> {
+    let mut out: Vec<LogData> = Vec::new();
+    if workers <= 1 {
+        for xml in records {
+            if let Some(x) = row(xml.as_str()) {
+                out.push(x);
+            }
+        }
+        return out;
+    }
+    let mut batch: Vec<String> = Vec::with_capacity(RECORD_BATCH);
+    for xml in records {
+        batch.push(xml);
+        if batch.len() >= RECORD_BATCH {
+            let rows: Vec<Option<LogData>> = batch.par_iter().map(|xml| row(xml)).collect();
+            out.extend(rows.into_iter().flatten());
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        let rows: Vec<Option<LogData>> = batch.par_iter().map(|xml| row(xml)).collect();
+        out.extend(rows.into_iter().flatten());
+    }
+    out
+}
+
 fn evtx_rows(
     file: &str,
     ids: &[&str],
@@ -864,20 +917,20 @@ fn evtx_rows(
     if is_debug_mode() {
         println!("[DEBUG] MASSTIN: Parsing {}", file);
     }
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+    // the file's threads: the figure its chunks got, so a small file goes serial
+    let (mut parser, threads) = match prep_parse(EvtxLocation::File(file.to_string())) {
         Ok(p) => p,
         Err(_) => return vec![],
     };
-    for record in parser.records() {
-        let r = match record { Ok(r) => r, Err(_) => continue };
-        let rec = match build(r.data.as_str()) { Some(x) => x, None => continue };
+    let mut log_data: Vec<LogData> = Vec::new();
+    let rows = rows_from_records(&mut parser, threads, |xml| {
+        let rec = build(xml)?;
         if !ids.contains(&rec.event_id.as_str()) {
-            continue;
+            return None;
         }
-        if let Some(row) = map(&rec, file) {
-            log_data.push(row);
-        }
-    }
+        map(&rec, file)
+    });
+    log_data.extend(rows);
     log_data
 }
 
@@ -1770,16 +1823,16 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
     if is_debug_mode() {
         println!("[DEBUG] MASSTIN: Parsing {} by channel", file);
     }
-    let (mut parser, mut log_data) = match prep_parse(EvtxLocation::File(file.to_string())) {
+    // the file's threads: the figure its chunks got, so a small file goes serial
+    let (mut parser, threads) = match prep_parse(EvtxLocation::File(file.to_string())) {
         Ok(p) => p,
         Err(_) => return vec![],
     };
-    for record in parser.records() {
-        let r = match record { Ok(r) => r, Err(_) => continue };
-        let xml = r.data.as_str();
+    let mut log_data: Vec<LogData> = Vec::new();
+    let rows = rows_from_records(&mut parser, threads, |xml| {
         let event_id = xml_tag_text(xml, "EventID");
         if event_id.is_empty() {
-            continue;
+            return None;
         }
         let channel = xml_tag_text(xml, "Channel");
         let family = if channel.is_empty() {
@@ -1788,21 +1841,18 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         } else {
             family_for_channel(&channel, &event_id)
         };
-        let (build, map) = match family { Some(f) => f, None => continue };
-        if let Some(rec) = build(xml) {
-            if let Some(row) = map(&rec, file) {
-                log_data.push(row);
-            }
-        }
-    }
+        let (build, map) = family?;
+        let rec = build(xml)?;
+        map(&rec, file)
+    });
+    log_data.extend(rows);
     pair_openssh(collapse_5145(log_data))
 }
 
 // ---------------------------------------------------------------------------------------
 // PREPARE PARSE (DISK FILE OR ZIP FILE)
 // ---------------------------------------------------------------------------------------
-fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, Vec<LogData>), Box<dyn Error>> {
-    let log_data: Vec<LogData> = vec![];
+fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
 
     match file {
         EvtxLocation::File(path) => {
@@ -1833,8 +1883,7 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, Vec<Lo
             file.read_to_end(&mut file_data)?;
 
             let cursor = Cursor::new(file_data);
-            let parser = EvtxParser::from_read_seek(cursor)?;
-            Ok((parser, log_data))
+            evtx_parser(cursor)
         },
         EvtxLocation::ZipEntry { zip_path, evtx_name } => {
             let zip_parts: Vec<&str> = zip_path.split(" -> ").collect();
@@ -1853,7 +1902,7 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, Vec<Lo
 // ---------------------------------------------------------------------------------------
 // OPEN EVTX FROM ZIP
 // ---------------------------------------------------------------------------------------
-fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, Vec<LogData>), Box<dyn Error>> {
+fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
     if is_debug_mode() {
         println!("[DEBUG] Opening ZIP: {}", zip_path);
     }
@@ -1888,18 +1937,18 @@ fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cur
     }
 
     let cursor = Cursor::new(file_data);
-    let parser = EvtxParser::from_read_seek(cursor)?;
+    let parsed = evtx_parser(cursor)?;
     if is_debug_mode() {
         println!("[DEBUG] EVTX {} opened successfully from ZIP.", evtx_name);
     }
 
-    Ok((parser, vec![]))
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------------------
 // OPEN EVTX FROM NESTED ZIP
 // ---------------------------------------------------------------------------------------
-fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, Vec<LogData>), Box<dyn Error>> {
+fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
     let mut current_zip_path = zip_parts[0].to_string();
     let mut nested_zip_data: Vec<u8> = vec![];
 
@@ -1963,18 +2012,55 @@ fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(E
     }
 
     let cursor = Cursor::new(evtx_data);
-    let parser = EvtxParser::from_read_seek(cursor)?;
+    let parsed = evtx_parser(cursor)?;
     if is_debug_mode() {
         println!("[DEBUG] EVTX {} opened successfully from nested ZIP.", evtx_name);
     }
 
-    Ok((parser, vec![]))
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------------------
 // CREATE POLARS DATAFRAME AND WRITE/PRINT CSV
 // ---------------------------------------------------------------------------------------
 /// UTC instant of any time_created string masstin writes, for sorting.
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    /// A row from a fake record: every third record is kept, with its
+    /// number in the detail, so order and selection are both checked.
+    fn fake_row(xml: &str) -> Option<LogData> {
+        let n: usize = xml.trim_start_matches("<r>").trim_end_matches("</r>").parse().ok()?;
+        if n % 3 != 0 {
+            return None;
+        }
+        let mut r = LogData::default();
+        r.detail = n.to_string();
+        r.event_id = "4624".into();
+        Some(r)
+    }
+
+    #[test]
+    fn many_threads_give_the_rows_of_one_in_the_same_order() {
+        let records = || (0..10_007usize).map(|i| format!("<r>{}</r>", i));
+        let serial = rows_from_xml(records(), 1, fake_row);
+        assert_eq!(serial.len(), 3336);
+        assert_eq!(serial[0].detail, "0");
+        assert_eq!(serial[1].detail, "3");
+        assert_eq!(serial.last().unwrap().detail, "10005");
+        for workers in [2usize, 4, 16] {
+            let parallel = rows_from_xml(records(), workers, fake_row);
+            let a: Vec<&str> = serial.iter().map(|r| r.detail.as_str()).collect();
+            let b: Vec<&str> = parallel.iter().map(|r| r.detail.as_str()).collect();
+            assert_eq!(a, b, "{} threads", workers);
+        }
+        // fewer records than a batch, and none at all
+        assert_eq!(rows_from_xml((0..10usize).map(|i| format!("<r>{}</r>", i)), 4, fake_row).len(), 4);
+        assert!(rows_from_xml(std::iter::empty(), 4, fake_row).is_empty());
+    }
+}
+
 fn time_sort_key(raw: &str) -> Option<chrono::NaiveDateTime> {
     use chrono::{DateTime, NaiveDateTime, Utc};
     let t = raw.trim();
@@ -2101,7 +2187,12 @@ fn write_rows(log_data: Vec<LogData>, output: Option<&String>) -> usize {
     // row at 10:00 landed before an EVTX row at 08:00 the same day. The
     // text itself is written unchanged. Unparseable times sort last.
     let mut log_data = log_data;
-    log_data.sort_by_cached_key(|x| (time_sort_key(&x.time_created), x.time_created.clone()));
+    // both sorts are stable: rows at the same instant keep their order either way
+    if crate::threads::workers() > 1 {
+        log_data.par_sort_by_cached_key(|x| (time_sort_key(&x.time_created), x.time_created.clone()));
+    } else {
+        log_data.sort_by_cached_key(|x| (time_sort_key(&x.time_created), x.time_created.clone()));
+    }
 
     if let Err(e) = crate::csv_out::write_timeline(&log_data, output) {
         match output {

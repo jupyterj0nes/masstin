@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 mod parse;
+pub mod threads;
 use tokio;
 pub use crate::parse::*;
 mod load_neo4j;
@@ -314,6 +315,16 @@ pub struct Cli {
     #[arg(long)]
     renderer: Option<String>,
 
+    /// Threads for parsing: decoding the EVTX chunks, turning the records
+    /// into rows, sorting and writing the timeline. Left out, the machine
+    /// decides: all its cores but one (a single thread on a machine of one
+    /// or two cores). `1` runs exactly as masstin ran with no parallelism.
+    /// The process runs below normal priority either way, so the desktop and
+    /// other tools come first (`MASSTIN_PRIORITY=normal` keeps it normal, for
+    /// a server where masstin is the job). `MASSTIN_THREADS` does the same.
+    #[arg(long)]
+    threads: Option<usize>,
+
     /// For `view`: the case file (`.masstin`) to open, or to start with the
     /// timelines given by `-f`. The saved views, the style, the merged hosts,
     /// the subnets, the presentation and the notes are kept in it instead of
@@ -452,6 +463,22 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     // Print banner
     let action_name = format!("{:?}", config.action);
     crate::banner::print_banner(&action_name);
+
+    // the threads of this run: the flag, the environment, or the machine's
+    // policy; the window keeps its normal priority, it is interactive
+    if config.action != ActionType::View {
+        let asked = config.threads.or_else(|| std::env::var("MASSTIN_THREADS").ok().and_then(|s| s.trim().parse().ok()));
+        let d = crate::threads::decide(asked);
+        crate::threads::install(&d);
+        crate::banner::print_info(&format!(
+            "Threads: {} ({}{} core{}; --threads changes it, 1 runs serial); priority {}",
+            d.workers,
+            if d.asked { "asked; " } else { "" },
+            d.cores,
+            if d.cores == 1 { "" } else { "s" },
+            if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" }
+        ));
+    }
 
     // Match the selected action and call the corresponding function
     match config.action {
