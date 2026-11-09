@@ -478,7 +478,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         crate::parse_linux::parse_linux_quiet(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
 
         // Rewrite log_filename paths before merging
-        rewrite_log_filenames(&win_tmp_str);
         crate::parse_image_linux::rewrite_log_filenames_linux(&linux_tmp_str);
 
         // Merge both CSVs into the final output (deduplicated, sorted by time_created)
@@ -517,9 +516,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         );
         all_task_events.clear();
         all_mountpoint_events.clear();
-        if let Some(out_path) = output {
-            rewrite_log_filenames(out_path);
-        }
     } else {
         // Linux only
         parse_linux(&empty_files, &linux_log_dirs, output);
@@ -626,19 +622,18 @@ fn extract_computer_from_csv(csv_path: &str) -> Option<String> {
 
 /// Append LogData events to an existing CSV file.
 fn append_logdata_to_csv(csv_path: &str, events: &[crate::parse::LogData]) {
-    use std::io::Write;
-    let mut file = match fs::OpenOptions::new().append(true).open(csv_path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    for e in events {
-        let line = format!("{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            e.time_created, e.computer, e.event_type, e.event_id,
-            e.logon_type, e.target_user_name, e.target_domain_name,
-            e.workstation_name, e.ip_address,
-            e.subject_user_name, e.subject_domain_name,
-            e.logon_id, e.detail, e.filename);
-        let _ = file.write_all(line.as_bytes());
+    // the same line the writer makes (quoted, with the tail), the source
+    // named by the image rather than the temp folder
+    let rows: Vec<crate::parse::LogData> = events
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            e.filename = crate::parse::display_source(&e.filename);
+            e
+        })
+        .collect();
+    if let Err(err) = crate::csv_out::append_rows(csv_path, &rows) {
+        eprintln!("[ERROR] Cannot append to {}: {}", csv_path, err);
     }
 }
 
@@ -2137,86 +2132,6 @@ fn extract_files_recursive<R: Read + Seek>(
 ///   → "HRServer.e01:vss_0:Security.evtx"
 /// "...masstin_image_extract/HRServer.e01/evtx_extracted:UAL:Current.mdb"
 ///   → "HRServer.e01:UAL:Current.mdb"
-fn rewrite_log_filenames(csv_path: &str) {
-    let content = match fs::read_to_string(csv_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let mut output = String::with_capacity(content.len());
-    for (i, line) in content.lines().enumerate() {
-        if i == 0 {
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if let Some(last_comma) = line.rfind(',') {
-            let prefix = &line[..last_comma + 1];
-            let filename_field = &line[last_comma + 1..];
-
-            if !filename_field.contains("masstin_image_extract") {
-                output.push_str(line);
-                output.push('\n');
-                continue;
-            }
-
-            // Extract image name: segment after "masstin_image_extract/" or "masstin_image_extract\"
-            let rewritten = rewrite_single_filename(filename_field);
-            output.push_str(prefix);
-            output.push_str(&rewritten);
-            output.push('\n');
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-
-    let _ = fs::write(csv_path, output);
-}
-
-fn rewrite_single_filename(path: &str) -> String {
-    // Split by path separators and "masstin_image_extract"
-    let normalized = path.replace('\\', "/");
-
-    // Find the image name (segment after masstin_image_extract/)
-    let marker = "masstin_image_extract/";
-    let after_marker = match normalized.find(marker) {
-        Some(pos) => &normalized[pos + marker.len()..],
-        None => return path.to_string(),
-    };
-
-    // after_marker = "HRServer_Disk0.e01/evtx_extracted/partition_0_vss_0/Security.evtx"
-    // or "HRServer_Disk0.e01/evtx_extracted:UAL:Current.mdb"
-    let parts: Vec<&str> = after_marker.splitn(2, '/').collect();
-    let image_name = parts[0];
-    let rest = if parts.len() > 1 { parts[1] } else { "" };
-
-    // Handle UAL paths (contain ":UAL:")
-    if rest.contains(":UAL:") {
-        let ual_part = rest.rsplit(":UAL:").next().unwrap_or(rest);
-        return format!("{}:UAL:{}", image_name, ual_part);
-    }
-
-    // Get the EVTX filename
-    let evtx_name = rest.rsplit('/').next().unwrap_or(rest);
-
-    // Determine source: live or vss_N
-    let source = if rest.contains("_vss_") {
-        if let Some(vss_pos) = rest.find("_vss_") {
-            let after_vss = &rest[vss_pos + 1..];
-            let end = after_vss.find('/').unwrap_or(after_vss.len());
-            &after_vss[..end]
-        } else {
-            "vss"
-        }
-    } else {
-        "live"
-    };
-
-    format!("{}:{}:{}", image_name, source, evtx_name)
-}
-
 /// Wrapper that adds a byte offset to all Read/Seek operations.
 /// This allows treating a partition within an image as if it were a standalone volume.
 struct OffsetReader<'a, R: Read + Seek> {

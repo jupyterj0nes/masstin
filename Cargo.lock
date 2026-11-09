@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "masstin"
-version = "1.4.3"
+version = "1.4.4"
 dependencies = [
  "blockcarve",
  "chrono",

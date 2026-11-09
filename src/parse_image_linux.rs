@@ -966,75 +966,78 @@ pub fn rewrite_log_filenames_linux(csv_path: &str) {
         Ok(c) => c,
         Err(_) => return,
     };
-
-    // Check for either standalone or unified temp path markers
     if !content.contains("masstin_linux_image_extract") && !content.contains("linux_logs_extracted") {
         return;
     }
-
+    let mut lines = content.lines();
+    let Some(header) = lines.next() else { return };
+    // the column by its name: the row carries a tail after `log_filename`
+    let Some(col) = header.split(',').position(|h| h == "log_filename") else { return };
     let mut output = String::with_capacity(content.len());
-    for (i, line) in content.lines().enumerate() {
-        if i == 0 {
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        if let Some(last_comma) = line.rfind(',') {
-            let prefix = &line[..last_comma + 1];
-            let filename_field = &line[last_comma + 1..];
-
-            if !filename_field.contains("masstin_linux_image_extract") && !filename_field.contains("linux_logs_extracted") {
-                output.push_str(line);
-                output.push('\n');
-                continue;
+    output.push_str(header);
+    output.push('\n');
+    for line in lines {
+        let mut fields = split_csv_line(line);
+        let renamed = match fields.get(col) {
+            Some(f) if f.contains("masstin_linux_image_extract") || f.contains("linux_logs_extracted") => Some(crate::csv_out::q(&crate::parse::display_source(f))),
+            _ => None,
+        };
+        match renamed {
+            Some(name) => {
+                fields[col] = name;
+                output.push_str(&fields.join(","));
             }
-
-            let rewritten = rewrite_single_linux_filename(filename_field);
-            output.push_str(prefix);
-            output.push_str(&rewritten);
-            output.push('\n');
-        } else {
-            output.push_str(line);
-            output.push('\n');
+            None => output.push_str(line),
         }
+        output.push('\n');
     }
-
     let _ = fs::write(csv_path, output);
 }
 
-fn rewrite_single_linux_filename(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
-
-    // Try standalone marker first: masstin_linux_image_extract/<image>/logs_extracted/partition_N/...
-    if let Some(pos) = normalized.find("masstin_linux_image_extract/") {
-        let after = &normalized[pos + "masstin_linux_image_extract/".len()..];
-        let parts: Vec<&str> = after.splitn(2, '/').collect();
-        let image_name = parts[0];
-        let rest = if parts.len() > 1 { parts[1] } else { "" };
-        let rest = rest.strip_prefix("logs_extracted/").unwrap_or(rest);
-        let (partition, file_path) = match rest.find('/') {
-            Some(pos) => (&rest[..pos], &rest[pos..]),
-            None => (rest, ""),
-        };
-        return format!("{}:{}:{}", image_name, partition, file_path);
+/// A CSV line as its fields, each kept exactly as written (quotes and
+/// all), so a line put back together is the line it was.
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            ',' if !quoted => fields.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
     }
+    fields.push(cur);
+    fields
+}
 
-    // Try unified marker: masstin_image_extract/<image>/linux_logs_extracted/partition_N/...
-    if let Some(pos) = normalized.find("masstin_image_extract/") {
-        let after = &normalized[pos + "masstin_image_extract/".len()..];
-        let parts: Vec<&str> = after.splitn(2, '/').collect();
-        let image_name = parts[0];
-        let rest = if parts.len() > 1 { parts[1] } else { "" };
-        let rest = rest.strip_prefix("linux_logs_extracted/").unwrap_or(rest);
-        let (partition, file_path) = match rest.find('/') {
-            Some(pos) => (&rest[..pos], &rest[pos..]),
-            None => (rest, ""),
-        };
-        return format!("{}:{}:{}", image_name, partition, file_path);
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn the_filename_column_is_found_by_name_and_the_rest_kept() {
+        let line = r#"2026-11-03 10:43:56,lab-xfs,LOGON,ACCEPT,SSH,vagrant,"",,10.10.0.50,"","",1200,"sshd, publickey",/tmp/masstin_image_extract/0_srv.e01/linux_logs_extracted/partition_0/var/log/secure,,,,,"#;
+        let fields = split_csv_line(line);
+        assert_eq!(fields.len(), 19);
+        assert_eq!(fields[12], r#""sshd, publickey""#);
+        assert_eq!(fields.join(","), line);
+        let dir = std::env::temp_dir().join(format!("masstin_rewrite_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.csv");
+        std::fs::write(&p, format!("{}\n{}\n", crate::csv_out::HEADER, line)).unwrap();
+        rewrite_log_filenames_linux(p.to_str().unwrap());
+        let back = std::fs::read_to_string(&p).unwrap();
+        let row = back.lines().nth(1).unwrap();
+        let fields = split_csv_line(row);
+        assert_eq!(fields[13], "srv.e01:partition_0:/var/log/secure");
+        assert_eq!(fields[12], r#""sshd, publickey""#);
+        assert_eq!(fields[18], "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
-
-    path.to_string()
 }
 
 #[cfg(test)]
