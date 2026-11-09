@@ -193,11 +193,11 @@ jobs:
           python .github/scripts/normalize_timeline.py out/vhdx.csv evtx-samples.vhdx | Tee-Object -Append out/hashes.txt
           # a row from an image names the image, never the runner's temp folder
           foreach ($f in "out/image.csv", "out/vhd.csv", "out/vhdx.csv") {
-            if (Select-String -Path $f -Pattern "masstin_image_extract|AppData|\\Temp\\" -Quiet) { Write-Error "::error::$f carries a path of the runner instead of the image"; exit 1 }
+            if (Select-String -Path $f -Pattern "masstin_image_extract|AppData|\\Temp\\" -Quiet) { Write-Error "::error::${f} carries a path of the runner instead of the image"; exit 1 }
             $rows = (Get-Content $f | Measure-Object -Line).Lines - 1
             $named = (Select-String -Path $f -Pattern "evtx-samples\.(raw|vhd|vhdx):(live|vss_\d+):" -AllMatches | Measure-Object).Count
-            if ($rows -gt 0 -and $named -lt $rows) { Write-Error "::error::$f: $named of $rows rows name the image"; exit 1 }
-            "image rows named after the image: $named of $rows ($f)"
+            if ($rows -gt 0 -and $named -lt $rows) { Write-Error "::error::${f}: ${named} of ${rows} rows name the image"; exit 1 }
+            "image rows named after the image: ${named} of ${rows} (${f})"
           }
 
       - name: Upload the disk images for the other operating systems
