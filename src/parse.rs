@@ -856,14 +856,46 @@ fn rec_from_event2(event: &Event2) -> Option<WinRec> {
 
 /// Iterate the records of one EVTX file whose id is in `ids`, as WinRecs
 /// built by `build`, and map each with `map`.
-/// A parser over an EVTX held in memory, its chunk decoder on the threads
-/// the file's size deserves (the evtx crate's own parallelism; it keeps the
-/// chunks in order, so the records come out in the file's order whatever
-/// the count), and that figure, for the rows.
-fn evtx_parser(cursor: Cursor<Vec<u8>>) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
-    let threads = crate::threads::for_bytes(cursor.get_ref().len() as u64);
+/// Where an EVTX is read from: the file itself, a chunk at a time, so a
+/// log of gigabytes takes no more memory than the chunks in flight; or
+/// bytes held in memory, for an entry of a zip.
+pub(crate) enum EvtxSource {
+    Disk(File),
+    Mem(Cursor<Vec<u8>>),
+}
+
+impl Read for EvtxSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            EvtxSource::Disk(f) => f.read(buf),
+            EvtxSource::Mem(c) => c.read(buf),
+        }
+    }
+}
+
+impl Seek for EvtxSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            EvtxSource::Disk(f) => f.seek(pos),
+            EvtxSource::Mem(c) => c.seek(pos),
+        }
+    }
+}
+
+/// A parser over an EVTX of `bytes`, its chunk decoder on the threads the
+/// size deserves (the evtx crate's own parallelism; it keeps the chunks in
+/// order, so the records come out in the file's order whatever the count),
+/// and that figure, for the rows.
+fn evtx_parser(source: EvtxSource, bytes: u64) -> Result<(EvtxParser<EvtxSource>, usize), Box<dyn Error>> {
+    let threads = crate::threads::for_bytes(bytes);
     let settings = evtx::ParserSettings::default().num_threads(threads);
-    Ok((EvtxParser::from_read_seek(cursor)?.with_configuration(settings), threads))
+    Ok((EvtxParser::from_read_seek(source)?.with_configuration(settings), threads))
+}
+
+/// A parser over bytes held in memory.
+fn evtx_parser_mem(data: Vec<u8>) -> Result<(EvtxParser<EvtxSource>, usize), Box<dyn Error>> {
+    let bytes = data.len() as u64;
+    evtx_parser(EvtxSource::Mem(Cursor::new(data)), bytes)
 }
 
 /// Records a batch at a time when the rows are made on several threads: a
@@ -875,7 +907,7 @@ const RECORD_BATCH: usize = 4096;
 /// as masstin always did; more take them in batches spread over the pool,
 /// every batch's rows put back in the order of its records, so the result
 /// is the same rows in the same order.
-fn rows_from_records(parser: &mut EvtxParser<Cursor<Vec<u8>>>, workers: usize, row: impl Fn(&str) -> Option<LogData> + Sync) -> Vec<LogData> {
+fn rows_from_records(parser: &mut EvtxParser<EvtxSource>, workers: usize, row: impl Fn(&str) -> Option<LogData> + Sync) -> Vec<LogData> {
     let records = parser.records().filter_map(|r| r.ok()).map(|r| r.data);
     rows_from_xml(records, workers, row)
 }
@@ -923,7 +955,17 @@ fn evtx_rows(
         Err(_) => return vec![],
     };
     let mut log_data: Vec<LogData> = Vec::new();
+    let prefilter = !scan_all_evtx();
     let rows = rows_from_records(&mut parser, threads, |xml| {
+        // the id read from the text first: a record of an id not wanted is
+        // not deserialised. A record whose id the text does not give goes
+        // the whole way, as every record always did
+        if prefilter {
+            let seen = xml_tag_text(xml, "EventID");
+            if !seen.is_empty() && !ids.contains(&seen.as_str()) {
+                return None;
+            }
+        }
         let rec = build(xml)?;
         if !ids.contains(&rec.event_id.as_str()) {
             return None;
@@ -932,6 +974,61 @@ fn evtx_rows(
     });
     log_data.extend(rows);
     log_data
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    //! Proof on real logs, when `MASSTIN_EVTX_CORPUS` names a folder of EVTX:
+    //! the id read from a record's text is the id the deserialiser gives,
+    //! for every record of every file (what the prefilter rests on), and
+    //! a file read from the disk a chunk at a time gives the records a
+    //! file held in memory gives, in the same order (what streaming rests
+    //! on). Without the variable the test passes with nothing checked.
+    use super::*;
+
+    fn evtx_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                evtx_files(&p, out);
+            } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("evtx")) {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    fn the_text_id_is_the_deserialised_id_and_the_disk_reads_as_memory_does() {
+        let Ok(dir) = std::env::var("MASSTIN_EVTX_CORPUS") else { return };
+        let mut files = Vec::new();
+        evtx_files(Path::new(&dir), &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "no EVTX under {}", dir);
+        let (mut records, mut agreed, mut built) = (0usize, 0usize, 0usize);
+        for path in &files {
+            let data = std::fs::read(path).unwrap();
+            let Ok((mut mem, _)) = evtx_parser_mem(data) else { continue };
+            let Ok((mut disk, _)) = evtx_parser(EvtxSource::Disk(File::open(path).unwrap()), std::fs::metadata(path).unwrap().len()) else { continue };
+            let from_mem: Vec<String> = mem.records().filter_map(|r| r.ok()).map(|r| r.data).collect();
+            let from_disk: Vec<String> = disk.records().filter_map(|r| r.ok()).map(|r| r.data).collect();
+            assert_eq!(from_mem.len(), from_disk.len(), "{}", path.display());
+            assert!(from_mem == from_disk, "{}: the disk read differs from the memory read", path.display());
+            for xml in &from_mem {
+                records += 1;
+                let seen = xml_tag_text(xml, "EventID");
+                for b in [build_event as BuildFn, build_event2, build_wmi] {
+                    if let Some(rec) = b(xml) {
+                        built += 1;
+                        assert_eq!(rec.event_id, seen, "{}: the text says {:?}, the deserialiser {:?}", path.display(), seen, rec.event_id);
+                        agreed += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("[corpus] {} files, {} records, {} deserialisations, {} agreed on the id", files.len(), records, built, agreed);
+        assert!(records > 0 && built > 0);
+    }
 }
 
 fn build_event(xml: &str) -> Option<WinRec> {
@@ -1881,7 +1978,7 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
 // ---------------------------------------------------------------------------------------
 // PREPARE PARSE (DISK FILE OR ZIP FILE)
 // ---------------------------------------------------------------------------------------
-fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<EvtxSource>, usize), Box<dyn Error>> {
 
     match file {
         EvtxLocation::File(path) => {
@@ -1907,12 +2004,10 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize)
             if is_debug_mode() {
                 println!("[DEBUG] Opening EVTX file in disk: {}", path);
             }
-            let mut file = File::open(&path)?;
-            let mut file_data = Vec::new();
-            file.read_to_end(&mut file_data)?;
-
-            let cursor = Cursor::new(file_data);
-            evtx_parser(cursor)
+            // read from the disk a chunk at a time: a log of gigabytes is not loaded whole
+            let file = File::open(&path)?;
+            let bytes = file.metadata()?.len();
+            evtx_parser(EvtxSource::Disk(file), bytes)
         },
         EvtxLocation::ZipEntry { zip_path, evtx_name } => {
             let zip_parts: Vec<&str> = zip_path.split(" -> ").collect();
@@ -1931,10 +2026,9 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize)
 // ---------------------------------------------------------------------------------------
 // OPEN EVTX FROM ZIP
 // ---------------------------------------------------------------------------------------
-fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<EvtxSource>, usize), Box<dyn Error>> {
     let file_data = zip_entry_bytes(zip_path, evtx_name)?;
-    let cursor = Cursor::new(file_data);
-    let parsed = evtx_parser(cursor)?;
+    let parsed = evtx_parser_mem(file_data)?;
     if is_debug_mode() {
         println!("[DEBUG] EVTX {} opened successfully from ZIP.", evtx_name);
     }
@@ -1983,10 +2077,9 @@ fn zip_entry_bytes(zip_path: &str, evtx_name: &str) -> Result<Vec<u8>, Box<dyn E
 // ---------------------------------------------------------------------------------------
 // OPEN EVTX FROM NESTED ZIP
 // ---------------------------------------------------------------------------------------
-fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(EvtxParser<EvtxSource>, usize), Box<dyn Error>> {
     let evtx_data = nested_zip_entry_bytes(zip_parts, evtx_name)?;
-    let cursor = Cursor::new(evtx_data);
-    let parsed = evtx_parser(cursor)?;
+    let parsed = evtx_parser_mem(evtx_data)?;
     if is_debug_mode() {
         println!("[DEBUG] EVTX {} opened successfully from nested ZIP.", evtx_name);
     }
