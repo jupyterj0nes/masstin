@@ -202,7 +202,6 @@ jobs:
             if ($names.Count -gt 0 -and $named -lt $names.Count) { Write-Error "::error::${f}: ${named} of $($names.Count) rows name the image"; exit 1 }
             "image rows named after the image: ${named} of $($names.Count) (${f})"
           }
-          }
 
       - name: Upload the disk images for the other operating systems
         if: runner.os == 'Windows'
