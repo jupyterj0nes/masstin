@@ -101,6 +101,16 @@ jobs:
             cmp out/hunt.csv out/hunt-$i.csv && cmp out/hunt.md out/hunt-$i.md || { echo "::error::graph-hunt-csv gave a different output on run $i"; exit 1; }
           done
           echo "graph-hunt-csv: 3 runs, identical output"
+          # the threads must not change a byte: one thread (the serial code,
+          # as masstin always ran) against the machine's threads, and the
+          # machine's threads twice; every CSV identical
+          "$BIN" -a parse-windows -d samples/EVTX-to-MITRE-Attack -o out/mitre-t1.csv --overwrite --threads 1 >/dev/null
+          "$BIN" -a parse-windows -d samples/EVTX-to-MITRE-Attack -o out/mitre-t2.csv --overwrite >/dev/null
+          "$BIN" -a parse-windows -d samples/EVTX-ATTACK-SAMPLES -o out/samples-t1.csv --overwrite --threads 1 >/dev/null
+          "$BIN" -a parse-windows -d samples/EVTX-ATTACK-SAMPLES -o out/samples-t2.csv --overwrite >/dev/null
+          cmp out/mitre.csv out/mitre-t1.csv && cmp out/mitre.csv out/mitre-t2.csv || { echo "::error::parse-windows with threads gave a different timeline (EVTX-to-MITRE-Attack)"; exit 1; }
+          cmp out/samples.csv out/samples-t1.csv && cmp out/samples.csv out/samples-t2.csv || { echo "::error::parse-windows with threads gave a different timeline (EVTX-ATTACK-SAMPLES)"; exit 1; }
+          echo "parse-windows: 1 thread and the machine's threads, identical timelines"
 
       - name: parse-mac on a log show export (all three OSes)
         shell: bash

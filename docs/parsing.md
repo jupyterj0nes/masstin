@@ -54,6 +54,12 @@ masstin -a parse-windows -d /machine1/logs -d /machine2/logs -o timeline.csv --o
 masstin -a parse-windows -f Security.evtx -f System.evtx -o timeline.csv
 ```
 
+### Threads
+
+Parsing uses the machine's cores: by default all but one (a laptop of four works with three, a server of thirty-two with thirty-one; a machine of one or two cores works with one), and the process runs below normal priority, so the desktop and the analyst's other tools come first however many cores masstin takes. `--threads N` (or `MASSTIN_THREADS`) sets the figure; `--threads 1` runs the serial code exactly as masstin always ran. Below normal priority means a machine busy with something else (a build, a scan) makes masstin wait, by design; on a server where masstin is the job, `MASSTIN_PRIORITY=normal` keeps the normal priority.
+
+The threads change nothing in the timeline: every parallel stage collects its results in the order of its inputs (the EVTX chunks in the file's order, the records in the chunk's, the rows of a batch in the records'), and the final sort is stable both ways, so the CSV is the same byte for byte with one thread or with thirty-two. The CI runs the public sample sets with one thread and with the machine's on three operating systems and compares the files; a run on a case of your own with `--threads 1` and without is the same check.
+
 <div align="center">
   <img src="../resources/masstin_cli_output.png" alt="Masstin CLI output — parse-windows"/>
 </div>

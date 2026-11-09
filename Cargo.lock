@@ -2402,6 +2402,7 @@ dependencies = [
  "ntfs",
  "once_cell",
  "quick-xml 0.42.0",
+ "rayon",
  "regex",
  "reqwest",
  "rfd",

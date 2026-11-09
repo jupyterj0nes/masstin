@@ -302,28 +302,43 @@ pub(crate) fn write_timeline(rows: &[LogData], output: Option<&String>) -> io::R
     };
     sink.write_all(HEADER.as_bytes())?;
     sink.write_all(b"\n")?;
-    for r in rows {
-        let line = format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}{}\n",
-            q(&r.time_created),
-            q(&r.computer),
-            q(&r.event_type),
-            q(&r.event_id),
-            q(&r.logon_type),
-            q(&r.target_user_name),
-            q(&r.target_domain_name),
-            q(&r.workstation_name),
-            q(&r.ip_address),
-            q(&r.subject_user_name),
-            q(&r.subject_domain_name),
-            q(&r.logon_id),
-            q(&r.detail),
-            q(&r.filename),
-            EMPTY_TAIL,
-        );
-        sink.write_all(line.as_bytes())?;
+    if crate::threads::workers() > 1 {
+        // the lines of a block made on the pool, written in the block's order
+        use rayon::prelude::*;
+        for block in rows.chunks(16_384) {
+            let lines: Vec<String> = block.par_iter().map(row_line).collect();
+            for line in &lines {
+                sink.write_all(line.as_bytes())?;
+            }
+        }
+    } else {
+        for r in rows {
+            sink.write_all(row_line(r).as_bytes())?;
+        }
     }
     sink.flush()
+}
+
+/// One row as its line of the timeline, newline included.
+fn row_line(r: &LogData) -> String {
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}{}\n",
+        q(&r.time_created),
+        q(&r.computer),
+        q(&r.event_type),
+        q(&r.event_id),
+        q(&r.logon_type),
+        q(&r.target_user_name),
+        q(&r.target_domain_name),
+        q(&r.workstation_name),
+        q(&r.ip_address),
+        q(&r.subject_user_name),
+        q(&r.subject_domain_name),
+        q(&r.logon_id),
+        q(&r.detail),
+        q(&r.filename),
+        EMPTY_TAIL,
+    )
 }
 
 /// Write a timeline that holds only the header, so a later merge step
