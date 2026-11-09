@@ -968,27 +968,56 @@ type BuildFn = fn(&str) -> Option<WinRec>;
 /// a channel (1102 is an RDP client event and also "audit log cleared" in
 /// Security; 6, 4 and 3 exist in many channels), so the channel decides the
 /// family.
+/// The channels masstin has a parser for, lower-case: `security` whole, the
+/// rest as prefixes (`microsoft-windows-winrm/` takes the Operational log
+/// and any other of that provider). `family_for_channel` and the skip rule
+/// of `parselog` read the same list.
+const FAMILY_PREFIXES: [&str; 13] = [
+    "security",
+    "microsoft-windows-smbserver/",
+    "microsoft-windows-smbclient/security",
+    "microsoft-windows-smbclient/connectivity",
+    "microsoft-windows-terminalservices-rdpclient/",
+    "microsoft-windows-terminalservices-remoteconnectionmanager/",
+    "microsoft-windows-terminalservices-localsessionmanager/",
+    "microsoft-windows-remotedesktopservices-rdpcorets/",
+    "microsoft-windows-remotedesktopservices-rdpcorecdv/",
+    "microsoft-windows-winrm/",
+    "microsoft-windows-wmi-activity/",
+    "microsoft-windows-sysmon/",
+    "openssh/",
+];
+
+fn prefix_matches(prefix: &str, channel_lower: &str) -> bool {
+    if prefix == "security" { channel_lower == "security" } else { channel_lower.starts_with(prefix) }
+}
+
+/// Whether masstin has a parser for records of this channel, whatever
+/// their event id.
+pub(crate) fn channel_has_family(channel: &str) -> bool {
+    let c = channel.to_ascii_lowercase();
+    FAMILY_PREFIXES.iter().any(|p| prefix_matches(p, &c))
+}
+
 pub(crate) fn family_for_channel(channel: &str, event_id: &str) -> Option<(BuildFn, MapFn)> {
     let c = channel.to_ascii_lowercase();
     let table: [(&str, &[&str], BuildFn, MapFn); 13] = [
-        ("security", SECURITY_EVENT_IDS, build_event, map_security),
-        ("microsoft-windows-smbserver/", SMBSERVER_EVENT_IDS, build_event2, map_smb_server),
-        ("microsoft-windows-smbclient/security", SMBCLIENT_EVENT_IDS, build_event, map_smb_client),
-        ("microsoft-windows-smbclient/connectivity", SMBCLIENT_CONNECTIVITY_EVENT_IDS, build_event, map_smb_client_connectivity),
-        ("microsoft-windows-terminalservices-rdpclient/", RDPCLIENT_EVENT_IDS, build_event, map_rdp_client),
-        ("microsoft-windows-terminalservices-remoteconnectionmanager/", RDPCONNMANAGER_EVENT_IDS, build_event2, map_rdp_connmanager),
-        ("microsoft-windows-terminalservices-localsessionmanager/", RDPLOCALSESSION_EVENT_IDS, build_event2, map_rdp_localsession),
-        ("microsoft-windows-remotedesktopservices-rdpcorets/", RDPKORE_EVENT_IDS, build_event, map_rdpkore),
-        ("microsoft-windows-remotedesktopservices-rdpcorecdv/", RDPKORE_EVENT_IDS, build_event, map_rdpkore),
-        ("microsoft-windows-winrm/", WINRM_EVENT_IDS, build_event, map_winrm),
-        ("microsoft-windows-wmi-activity/", WMI_EVENT_IDS, build_wmi, map_wmi),
-        ("microsoft-windows-sysmon/", SYSMON_EVENT_IDS, build_event, map_sysmon),
-        ("openssh/", OPENSSH_EVENT_IDS, build_event, map_openssh),
+        (FAMILY_PREFIXES[0], SECURITY_EVENT_IDS, build_event, map_security),
+        (FAMILY_PREFIXES[1], SMBSERVER_EVENT_IDS, build_event2, map_smb_server),
+        (FAMILY_PREFIXES[2], SMBCLIENT_EVENT_IDS, build_event, map_smb_client),
+        (FAMILY_PREFIXES[3], SMBCLIENT_CONNECTIVITY_EVENT_IDS, build_event, map_smb_client_connectivity),
+        (FAMILY_PREFIXES[4], RDPCLIENT_EVENT_IDS, build_event, map_rdp_client),
+        (FAMILY_PREFIXES[5], RDPCONNMANAGER_EVENT_IDS, build_event2, map_rdp_connmanager),
+        (FAMILY_PREFIXES[6], RDPLOCALSESSION_EVENT_IDS, build_event2, map_rdp_localsession),
+        (FAMILY_PREFIXES[7], RDPKORE_EVENT_IDS, build_event, map_rdpkore),
+        (FAMILY_PREFIXES[8], RDPKORE_EVENT_IDS, build_event, map_rdpkore),
+        (FAMILY_PREFIXES[9], WINRM_EVENT_IDS, build_event, map_winrm),
+        (FAMILY_PREFIXES[10], WMI_EVENT_IDS, build_wmi, map_wmi),
+        (FAMILY_PREFIXES[11], SYSMON_EVENT_IDS, build_event, map_sysmon),
+        (FAMILY_PREFIXES[12], OPENSSH_EVENT_IDS, build_event, map_openssh),
     ];
     table.iter()
-        .find(|(prefix, ids, _, _)| {
-            (if *prefix == "security" { c == "security" } else { c.starts_with(prefix) }) && ids.contains(&event_id)
-        })
+        .find(|(prefix, ids, _, _)| prefix_matches(prefix, &c) && ids.contains(&event_id))
         .map(|(_, _, b, m)| (*b, *m))
 }
 
@@ -1903,6 +1932,18 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize)
 // OPEN EVTX FROM ZIP
 // ---------------------------------------------------------------------------------------
 fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+    let file_data = zip_entry_bytes(zip_path, evtx_name)?;
+    let cursor = Cursor::new(file_data);
+    let parsed = evtx_parser(cursor)?;
+    if is_debug_mode() {
+        println!("[DEBUG] EVTX {} opened successfully from ZIP.", evtx_name);
+    }
+
+    Ok(parsed)
+}
+
+/// The bytes of `evtx_name` inside the zip at `zip_path`.
+fn zip_entry_bytes(zip_path: &str, evtx_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     if is_debug_mode() {
         println!("[DEBUG] Opening ZIP: {}", zip_path);
     }
@@ -1936,19 +1977,25 @@ fn open_evtx_from_zip(zip_path: &str, evtx_name: &str) -> Result<(EvtxParser<Cur
         return Err(format!("EVTX not found in ZIP: {}", evtx_name).into());
     }
 
-    let cursor = Cursor::new(file_data);
-    let parsed = evtx_parser(cursor)?;
-    if is_debug_mode() {
-        println!("[DEBUG] EVTX {} opened successfully from ZIP.", evtx_name);
-    }
-
-    Ok(parsed)
+    Ok(file_data)
 }
 
 // ---------------------------------------------------------------------------------------
 // OPEN EVTX FROM NESTED ZIP
 // ---------------------------------------------------------------------------------------
 fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(EvtxParser<Cursor<Vec<u8>>>, usize), Box<dyn Error>> {
+    let evtx_data = nested_zip_entry_bytes(zip_parts, evtx_name)?;
+    let cursor = Cursor::new(evtx_data);
+    let parsed = evtx_parser(cursor)?;
+    if is_debug_mode() {
+        println!("[DEBUG] EVTX {} opened successfully from nested ZIP.", evtx_name);
+    }
+
+    Ok(parsed)
+}
+
+/// The bytes of `evtx_name` inside a zip inside a zip (`zip_parts`, outer first).
+fn nested_zip_entry_bytes(zip_parts: Vec<&str>, evtx_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut current_zip_path = zip_parts[0].to_string();
     let mut nested_zip_data: Vec<u8> = vec![];
 
@@ -2011,13 +2058,7 @@ fn open_evtx_from_nested_zip(zip_parts: Vec<&str>, evtx_name: &str) -> Result<(E
         return Err(format!("EVTX not found in nested ZIP: {}", evtx_name).into());
     }
 
-    let cursor = Cursor::new(evtx_data);
-    let parsed = evtx_parser(cursor)?;
-    if is_debug_mode() {
-        println!("[DEBUG] EVTX {} opened successfully from nested ZIP.", evtx_name);
-    }
-
-    Ok(parsed)
+    Ok(evtx_data)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2409,6 +2450,203 @@ fn recurse_zip<R: Read + Seek>(
 // ---------------------------------------------------------------------------------------
 // GENERIC PARSE FUNCTION FOR A GIVEN EvtxLocation
 // ---------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------
+// AN EVTX LEFT UNREAD: A CHANNEL WITH NO PARSER, SAID BY ITS NAME AND ITS CONTENT
+// ---------------------------------------------------------------------------------------
+
+const EVTX_HEADER: usize = 4096;
+const EVTX_CHUNK: usize = 65_536;
+
+/// `MASSTIN_SCAN_ALL_EVTX`: every EVTX decoded whole, whatever its channel,
+/// as masstin always did.
+fn scan_all_evtx() -> bool {
+    std::env::var_os("MASSTIN_SCAN_ALL_EVTX").is_some()
+}
+
+/// The channel a file's name says it holds, when the name is a channel's
+/// own: `Microsoft-Windows-PowerShell%4Operational.evtx` is
+/// `Microsoft-Windows-PowerShell/Operational`, `Security.evtx` is
+/// `Security`. An archive (`Security-2024-01-02.evtx`) or a renamed file
+/// gives a name no record inside says, so the content never agrees with it.
+fn channel_of_name(file_name: &str) -> Option<String> {
+    let cut = file_name.len().checked_sub(5)?;
+    let (stem, ext) = (file_name.get(..cut)?, file_name.get(cut..)?);
+    if !ext.eq_ignore_ascii_case(".evtx") || stem.is_empty() {
+        return None;
+    }
+    Some(stem.replace("%4", "/"))
+}
+
+/// The chunks of a file of `n` a peek reads: the first, the last, and four
+/// spread between; six at most.
+fn sample_chunks(n: usize) -> Vec<usize> {
+    let mut v = Vec::new();
+    for k in 0..6usize {
+        let i = if n <= 1 { 0 } else { k * (n - 1) / 5 };
+        if n > 0 && !v.contains(&i) {
+            v.push(i);
+        }
+    }
+    v
+}
+
+/// The channel of a chunk's first record, the chunk decoded by itself on
+/// this thread. None when the chunk does not parse (unused, damaged) or
+/// the record names no channel.
+fn chunk_first_channel(chunk: &[u8]) -> Option<String> {
+    let mut data = evtx::EvtxChunkData::new(chunk.to_vec(), false).ok()?;
+    let settings = std::sync::Arc::new(evtx::ParserSettings::default().num_threads(1));
+    let mut parsed = data.parse(settings).ok()?;
+    let record = parsed.iter().next()?.ok()?;
+    let xml = record.into_xml().ok()?.data;
+    let channel = xml_tag_text(&xml, "Channel");
+    (!channel.is_empty()).then_some(channel)
+}
+
+/// The chunks of an EVTX that hold records: the count its header keeps
+/// (a log is allocated ahead of what it holds, so the file's last chunks
+/// are often blank), never more than the file has room for; the file's
+/// room when the header says nothing (a log past 65,535 chunks wraps it).
+fn used_chunks(header: &[u8], total_len: u64) -> usize {
+    if total_len < (EVTX_HEADER + EVTX_CHUNK) as u64 || header.len() < 44 || &header[..8] != b"ElfFile " {
+        return 0;
+    }
+    let by_size = ((total_len - EVTX_HEADER as u64) / EVTX_CHUNK as u64) as usize;
+    let by_header = u16::from_le_bytes([header[42], header[43]]) as usize;
+    if by_header == 0 { by_size } else { by_header.min(by_size) }
+}
+
+/// Whether the records settle the file's channel as `channel`: the first
+/// record of the first chunk, of the last in use, and of four between all
+/// say it. A log of forwarded events (each record keeps the channel it
+/// came from), a renamed file, a blank or damaged chunk, a record without
+/// a channel: any of them fails this, and the file is decoded whole, as
+/// always.
+fn content_settles_channel(mut read_chunk: impl FnMut(usize) -> Option<Vec<u8>>, header: &[u8], total_len: u64, channel: &str) -> bool {
+    let n = used_chunks(header, total_len);
+    let idx = sample_chunks(n);
+    !idx.is_empty() && idx.into_iter().all(|i| read_chunk(i).and_then(|c| chunk_first_channel(&c)).map_or(false, |c| c.eq_ignore_ascii_case(channel)))
+}
+
+/// The channel an EVTX can be left unread for: its name is a channel's own,
+/// masstin has no parser for that channel, and the records agree at six
+/// places of the file. Reads six chunks of a file on disk; decompresses an
+/// entry of a zip (the few then decoded are decompressed again).
+fn unread_channel(file: &EvtxLocation, file_name: &str) -> Option<String> {
+    if scan_all_evtx() {
+        return None;
+    }
+    let channel = channel_of_name(file_name)?;
+    if channel_has_family(&channel) {
+        return None;
+    }
+    let settled = match file {
+        EvtxLocation::File(path) if !path.contains(" -> ") => {
+            let mut f = File::open(path).ok()?;
+            let len = f.metadata().ok()?.len();
+            let mut header = vec![0u8; EVTX_HEADER];
+            f.read_exact(&mut header).ok()?;
+            content_settles_channel(
+                |i| {
+                    let mut buf = vec![0u8; EVTX_CHUNK];
+                    f.seek(SeekFrom::Start((EVTX_HEADER + i * EVTX_CHUNK) as u64)).ok()?;
+                    f.read_exact(&mut buf).ok()?;
+                    Some(buf)
+                },
+                &header,
+                len,
+                &channel,
+            )
+        }
+        other => {
+            let data = location_bytes(other)?;
+            let header = data.get(..EVTX_HEADER)?.to_vec();
+            content_settles_channel(|i| data.get(EVTX_HEADER + i * EVTX_CHUNK..EVTX_HEADER + (i + 1) * EVTX_CHUNK).map(|c| c.to_vec()), &header, data.len() as u64, &channel)
+        }
+    };
+    settled.then_some(channel)
+}
+
+/// The bytes of an EVTX kept in a zip (or a zip in a zip), as `prep_parse` reads them.
+fn location_bytes(file: &EvtxLocation) -> Option<Vec<u8>> {
+    let (zip_path, evtx_name) = match file {
+        EvtxLocation::File(path) => {
+            let parts: Vec<&str> = path.split(" -> ").collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            (parts[..parts.len() - 1].join(" -> "), parts[parts.len() - 1].to_string())
+        }
+        EvtxLocation::ZipEntry { zip_path, evtx_name } => (zip_path.clone(), evtx_name.clone()),
+    };
+    let parts: Vec<&str> = zip_path.split(" -> ").collect();
+    if parts.len() == 1 {
+        zip_entry_bytes(&zip_path, &evtx_name).ok()
+    } else {
+        nested_zip_entry_bytes(parts, &evtx_name).ok()
+    }
+}
+
+#[cfg(test)]
+mod unread_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_says_its_channel_and_the_families_are_known() {
+        assert_eq!(channel_of_name("Security.evtx").as_deref(), Some("Security"));
+        assert_eq!(channel_of_name("Microsoft-Windows-PowerShell%4Operational.evtx").as_deref(), Some("Microsoft-Windows-PowerShell/Operational"));
+        assert_eq!(channel_of_name("Windows PowerShell.EVTX").as_deref(), Some("Windows PowerShell"));
+        assert_eq!(channel_of_name("Security-2024-01-02-03-04-05.evtx").as_deref(), Some("Security-2024-01-02-03-04-05"));
+        assert_eq!(channel_of_name("notes.txt"), None);
+        assert_eq!(channel_of_name(".evtx"), None);
+        assert_eq!(channel_of_name("x"), None);
+        for c in ["Security", "security", "Microsoft-Windows-Sysmon/Operational", "Microsoft-Windows-WinRM/Operational", "OpenSSH/Operational", "Microsoft-Windows-SmbClient/Connectivity"] {
+            assert!(channel_has_family(c), "{}", c);
+        }
+        for c in ["Microsoft-Windows-PowerShell/Operational", "Windows PowerShell", "System", "Application", "ForwardedEvents", "Microsoft-Windows-TaskScheduler/Operational", ""] {
+            assert!(!channel_has_family(c), "{}", c);
+        }
+        // every family prefix is a channel with a family
+        for p in FAMILY_PREFIXES {
+            assert!(channel_has_family(p));
+        }
+    }
+
+    #[test]
+    fn the_peek_reads_six_places_and_doubts_what_it_cannot_read() {
+        assert_eq!(sample_chunks(0), Vec::<usize>::new());
+        assert_eq!(sample_chunks(1), vec![0]);
+        assert_eq!(sample_chunks(2), vec![0, 1]);
+        assert_eq!(sample_chunks(10), vec![0, 1, 3, 5, 7, 9]);
+        let big = sample_chunks(100_000);
+        assert_eq!((big[0], *big.last().unwrap(), big.len()), (0, 99_999, 6));
+        assert!(big.windows(2).all(|w| w[0] < w[1]));
+        // the header's count of chunks in use, never past the file's room
+        let mut header = vec![0u8; EVTX_HEADER];
+        header[..8].copy_from_slice(b"ElfFile ");
+        let room = (EVTX_HEADER + 241 * EVTX_CHUNK) as u64;
+        assert_eq!(used_chunks(&header, room), 241, "no count: the room");
+        header[42..44].copy_from_slice(&240u16.to_le_bytes());
+        assert_eq!(used_chunks(&header, room), 240);
+        header[42..44].copy_from_slice(&9u16.to_le_bytes());
+        assert_eq!(used_chunks(&header, room), 9);
+        header[42..44].copy_from_slice(&1000u16.to_le_bytes());
+        assert_eq!(used_chunks(&header, room), 241, "more than the room: the room");
+        assert_eq!(used_chunks(&header, 100), 0, "shorter than a chunk");
+        assert_eq!(used_chunks(b"not an evtx header at all, and long enough to be read........", room), 0);
+        // garbage chunks settle nothing; a file shorter than a chunk neither
+        let garbage = |_: usize| Some(vec![0x55u8; EVTX_CHUNK]);
+        header[42..44].copy_from_slice(&10u16.to_le_bytes());
+        assert!(!content_settles_channel(garbage, &header, room, "Windows PowerShell"));
+        assert!(!content_settles_channel(|_| None, &header, room, "Windows PowerShell"));
+        assert!(!content_settles_channel(garbage, &header, 100, "Windows PowerShell"));
+        // a channel with a parser is never a candidate, whatever the name
+        assert_eq!(unread_channel(&EvtxLocation::File("nowhere/Security.evtx".into()), "Security.evtx"), None);
+        // a channel without one, in a file that is not there: not settled
+        assert_eq!(unread_channel(&EvtxLocation::File("nowhere/Windows PowerShell.evtx".into()), "Windows PowerShell.evtx"), None);
+    }
+}
+
 pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
     let file_origin = match &file {
         EvtxLocation::File(path) => path.clone(),
@@ -2439,6 +2677,15 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
             }
             return Vec::new();
         }
+    }
+
+    // a channel masstin has no parser for, said by the name and confirmed by
+    // the records at six places of the file: left unread
+    if let Some(channel) = unread_channel(&file, &file_name) {
+        if is_debug_mode() {
+            println!("[INFO] {} left unread: no parser for channel {} here, and the records agree", file_origin, channel);
+        }
+        return Vec::new();
     }
 
     // Decide parsing based on known filenames
