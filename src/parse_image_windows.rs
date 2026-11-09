@@ -141,29 +141,50 @@ fn extract_one_image(img_idx: usize, total_images: usize, image_path: &str, base
     ImageOutcome { result }
 }
 
-/// Every image extracted, in the images' order: one after another when
-/// `at_once` is one (printing as it goes, as always); else `at_once` threads
-/// take the images in turn, each one's banner lines held back and printed
-/// in order as the earliest unfinished image completes.
-fn extract_images(images: &[String], total_images: usize, base_temp: &Path, at_once: usize) -> Vec<ImageOutcome> {
+/// Every image extracted, in the images' order. As many at once as the
+/// machine allows at each moment (`threads::images_now`: the idle cores,
+/// the medium the images sit on, the memory): one after another when that
+/// is one (printing as it goes, as always); else as many threads as the
+/// pool, each taking the next image only while the images under way are
+/// fewer than the machine allows right then, each one's banner lines held
+/// back and printed in order as the earliest unfinished image completes.
+fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medium: crate::threads::Medium) -> Vec<ImageOutcome> {
+    let at_once = crate::threads::images_now(medium);
     if at_once <= 1 || images.len() <= 1 {
         return images.iter().enumerate().map(|(i, p)| extract_one_image(i, total_images, p, base_temp)).collect();
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     let next = AtomicUsize::new(0);
+    let under_way = AtomicUsize::new(0);
     // (outcome, its lines) of each image once done, and how many were printed
     let done: Mutex<(Vec<Option<(ImageOutcome, Vec<crate::banner::Line>)>>, usize)> = Mutex::new(((0..images.len()).map(|_| None).collect(), 0));
     std::thread::scope(|scope| {
-        for _ in 0..at_once.min(images.len()) {
+        for _ in 0..crate::threads::workers().max(at_once).min(images.len()) {
             scope.spawn(|| loop {
+                // wait while the machine has no room for one more
+                loop {
+                    let busy = under_way.load(Ordering::SeqCst);
+                    if busy == 0 || busy < crate::threads::images_now(medium) {
+                        if under_way.compare_exchange(busy, busy + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            break;
+                        }
+                        continue;
+                    }
+                    if next.load(Ordering::SeqCst) >= images.len() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 if i >= images.len() {
+                    under_way.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
                 crate::banner::capture_start();
                 let outcome = extract_one_image(i, total_images, &images[i], base_temp);
                 let lines = crate::banner::capture_take();
+                under_way.fetch_sub(1, Ordering::SeqCst);
                 let mut d = done.lock().unwrap();
                 d.0[i] = Some((outcome, lines));
                 // print the blocks whose turn has come, in order
@@ -372,7 +393,8 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // several at a time with their banner lines held back and printed in
     // order as each turn comes; the bookkeeping after, in the images' order,
     // the same whatever the count
-    let outcomes: Vec<ImageOutcome> = extract_images(&all_image_files, total_images, &base_temp, crate::threads::images());
+    let medium = crate::threads::medium_of_paths(&all_image_files);
+    let outcomes: Vec<ImageOutcome> = extract_images(&all_image_files, total_images, &base_temp, medium);
 
     for out in outcomes {
         match out.result {
