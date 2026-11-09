@@ -499,13 +499,12 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             format!("; images {} at a time (asked)", n)
         } else {
             format!(
-                "; images at a time as {} allows ({}; --parallel-images fixes it)",
-                d.medium.label(),
+                "; images at a time measured as they are read ({} to start on {}, more while the rate grows, the idle cores the ceiling; --parallel-images fixes it)",
                 match d.medium {
-                    crate::threads::Medium::Rotational => "one".to_string(),
-                    crate::threads::Medium::Network => "up to four".to_string(),
-                    _ => "the idle cores".to_string(),
-                }
+                    crate::threads::Medium::Rotational => "one",
+                    _ => "two",
+                },
+                d.medium.label()
             )
         };
         crate::banner::print_info(&format!(

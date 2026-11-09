@@ -14,6 +14,7 @@
 //! runs the serial code paths exactly as they always ran; more threads give
 //! the same rows in the same order, only sooner.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -146,23 +147,143 @@ pub fn idle_workers(idle_cores: f32, workers: usize) -> usize {
     ((idle_cores - 1.0).floor().max(1.0) as usize).min(workers.max(1))
 }
 
-/// The images to read at once right now: `--parallel-images` when given;
-/// else what the medium and the moment allow: one on a spinning disk, up
-/// to four over the network, the idle cores on solid-state (or unknown)
-/// storage; and never more than the free memory gives a reader half a
-/// gigabyte for. Asked before each image starts.
-pub fn images_now(medium: Medium) -> usize {
-    if let Some(Some(n)) = ASKED_IMAGES.get() {
-        return *n;
-    }
-    let avail = available_now();
-    let by_medium = match medium {
-        Medium::Rotational => 1,
-        Medium::Network => avail.min(4),
-        Medium::Solid | Medium::Unknown => avail,
-    };
+/// `--parallel-images`, when given.
+pub fn asked_images() -> Option<usize> {
+    ASKED_IMAGES.get().copied().flatten()
+}
+
+/// The most images worth reading at once right now whatever the storage
+/// says: the idle cores, and the free memory at half a gigabyte a reader.
+pub fn images_cap() -> usize {
     let by_memory = available_memory().map(|m| (m / (512 << 20)) as usize).unwrap_or(usize::MAX);
-    by_medium.min(by_memory).max(1)
+    available_now().min(by_memory).max(1)
+}
+
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes read from the images so far: the readers count what they read
+/// (`parse_image_windows::Counting`), the controller below measures the
+/// rate.
+pub fn note_read(bytes: u64) {
+    BYTES_READ.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub fn bytes_read() -> u64 {
+    BYTES_READ.load(Ordering::Relaxed)
+}
+
+/// A window of measurement: this long with the readers steady before the
+/// rate is judged.
+pub const PROBE_WINDOW: Duration = Duration::from_secs(3);
+/// After a step back, no new growth for this long.
+const PROBE_REST: Duration = Duration::from_secs(60);
+
+/// How many images to read at once, found by measuring rather than set:
+/// readers are doubled while the bytes a second coming off the images keep
+/// growing, the last size is kept back when a doubling brings nothing, and
+/// they are halved when the rate falls; the storage's kind only says where
+/// to start (one reader on a spinning disk, two elsewhere), the idle cores
+/// and the free memory are the ceiling. `--parallel-images` fixes the
+/// figure instead. The output never depends on the count.
+pub struct Readers {
+    floor: usize,
+    target: AtomicUsize,
+    probe: Mutex<Probe>,
+}
+
+/// What the controller remembers between windows. Pure, so it is tested
+/// with made-up rates.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    /// bytes a second at the best size seen
+    best: f64,
+    /// the size that gave `best`
+    best_at: usize,
+    /// no growth tried until this moment passes
+    rest_until: Option<Instant>,
+    window_start: Instant,
+    bytes_at_start: u64,
+}
+
+impl Probe {
+    fn new() -> Probe {
+        Probe { best: 0.0, best_at: 0, rest_until: None, window_start: Instant::now(), bytes_at_start: 0 }
+    }
+
+    /// The size to read at next, given the rate a window saw with `under_way`
+    /// readers at the current `target`: doubled (within `cap`) while the rate
+    /// grows a sixth or more over the best; back to the best size when a
+    /// bigger one brought nothing; halved (down to `floor`) when the rate fell
+    /// by a third or more. A window with fewer readers than the target, or
+    /// with nothing read, judges nothing.
+    pub fn step(&mut self, target: usize, under_way: usize, rate: f64, now: Instant, floor: usize, cap: usize) -> usize {
+        if under_way < target || rate <= 0.0 {
+            return target.clamp(floor.min(cap), cap.max(floor));
+        }
+        let resting = self.rest_until.map_or(false, |t| now < t);
+        let next = if self.best == 0.0 || rate >= self.best * 1.16 {
+            // better than anything seen: keep it, and try more
+            self.best = rate;
+            self.best_at = target;
+            if resting { target } else { (target * 2).min(cap) }
+        } else if rate <= self.best * 0.66 {
+            // the storage fell behind: fewer readers, and a rest from growing
+            self.rest_until = Some(now + PROBE_REST);
+            (target / 2).max(floor)
+        } else if target > self.best_at {
+            // more readers than the best size, nothing gained: back to it, and a rest
+            self.rest_until = Some(now + PROBE_REST);
+            self.best_at
+        } else {
+            target
+        };
+        next.clamp(floor.min(cap), cap.max(floor))
+    }
+}
+
+impl Readers {
+    /// The controller for images on `medium`.
+    pub fn new(medium: Medium) -> Readers {
+        let floor = match medium {
+            Medium::Rotational => 1,
+            _ => 2,
+        };
+        let start = asked_images().unwrap_or(floor);
+        Readers { floor, target: AtomicUsize::new(start), probe: Mutex::new(Probe::new()) }
+    }
+
+    /// The readers allowed right now, with `under_way` reading. Once a window
+    /// has passed, the rate over it is judged and the target moves.
+    pub fn allowed(&self, under_way: usize) -> usize {
+        if let Some(n) = asked_images() {
+            return n;
+        }
+        let cap = images_cap();
+        let target = self.target.load(Ordering::SeqCst);
+        let mut p = self.probe.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.duration_since(p.window_start);
+        if elapsed < PROBE_WINDOW {
+            return target.min(cap).max(1);
+        }
+        let bytes = bytes_read().saturating_sub(p.bytes_at_start);
+        let rate = bytes as f64 / elapsed.as_secs_f64();
+        let next = p.step(target, under_way, rate, now, self.floor, cap);
+        p.window_start = now;
+        p.bytes_at_start = bytes_read();
+        if next != target {
+            self.target.store(next, Ordering::SeqCst);
+            if crate::parse::is_debug_mode() {
+                eprintln!("[images] {} reader(s) gave {:.0} MB/s: {} from here", target, rate / 1e6, next);
+            }
+        }
+        next.min(cap).max(1)
+    }
+
+    /// Where it starts, for the banner.
+    pub fn floor(&self) -> usize {
+        self.floor
+    }
 }
 
 /// The threads worth giving a file of `bytes`: an EVTX is decoded a 64 KiB
@@ -605,6 +726,45 @@ mod tests {
         }
         assert_eq!(human_bytes(18 << 30), "18.0 GB");
         assert_eq!(human_bytes(640 << 20), "640 MB");
+    }
+
+    #[test]
+    fn readers_grow_while_the_rate_grows_and_fall_back_when_it_does_not() {
+        let t0 = Instant::now();
+        let mut p = Probe::new();
+        // two readers give 100 MB/s: the first measurement is the best, try four
+        assert_eq!(p.step(2, 2, 100e6, t0, 2, 62), 4);
+        // four give 180: better, try eight
+        assert_eq!(p.step(4, 4, 180e6, t0, 2, 62), 8);
+        // eight give 185: nothing gained, back to four and rest
+        assert_eq!(p.step(8, 8, 185e6, t0, 2, 62), 4);
+        // during the rest a good rate does not grow
+        assert_eq!(p.step(4, 4, 300e6, t0 + Duration::from_secs(10), 2, 62), 4);
+        // the rest over, growth resumes
+        assert_eq!(p.step(4, 4, 360e6, t0 + PROBE_REST + Duration::from_secs(61), 2, 62), 8);
+        // the storage falls behind: halved, never under the floor
+        assert_eq!(p.step(8, 8, 100e6, t0 + PROBE_REST + Duration::from_secs(62), 2, 62), 4);
+        let mut q = Probe::new();
+        assert_eq!(q.step(2, 2, 100e6, t0, 1, 62), 4);
+        assert_eq!(q.step(4, 4, 10e6, t0, 1, 62), 2);
+        assert_eq!(q.step(2, 2, 5e6, t0, 1, 62), 1);
+        // a window with fewer readers than the target, or nothing read, judges nothing
+        let mut r = Probe::new();
+        assert_eq!(r.step(4, 2, 500e6, t0, 2, 62), 4);
+        assert_eq!(r.step(4, 4, 0.0, t0, 2, 62), 4);
+        // the cap holds: a 64-core server with 62 idle doubles up to 62, no further
+        let mut big = Probe::new();
+        let mut target = 2;
+        for (i, rate) in [100e6, 200e6, 400e6, 800e6, 1600e6, 3200e6, 6400e6].iter().enumerate() {
+            target = big.step(target, target, *rate, t0 + Duration::from_secs(i as u64), 2, 62);
+        }
+        assert_eq!(target, 62);
+        // a spinning disk starts at one; a fixed figure is kept whatever the rate
+        assert_eq!(Readers::new(Medium::Rotational).floor(), 1);
+        assert_eq!(Readers::new(Medium::Solid).floor(), 2);
+        assert_eq!(Readers::new(Medium::Network).floor(), 2);
+        // before `install` the pool is one, and the cap holds whatever the floor
+        assert_eq!(Readers::new(Medium::Network).allowed(0), 1);
     }
 
     #[test]
