@@ -549,6 +549,12 @@ impl Viewer {
                 edited |= r.changed();
             }
 
+            section(ui, "Time window");
+            let w = self.time_window_fields(ui, "pane");
+            changed |= w.changed;
+            apply |= w.commit;
+            ui.label(egui::RichText::new("To the second, the timeline's time (UTC). The strip's handles follow.").small().color(theme::DIM));
+
             section(ui, "Hunt");
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("score ≥").color(theme::MUTED));
@@ -922,6 +928,9 @@ impl Viewer {
                 }
             });
             r.response.on_hover_text("The drawing of each connection in the replay: instant, or a line that grows from the origin to the destination over so many seconds, the host popping in when it arrives.");
+            if tool(ui, "\u{E108}", "Time window: From and To to the second, on a calendar", self.show_when).clicked() {
+                self.show_when = !self.show_when;
+            }
             let w = (ui.available_width() - 570.0).max(160.0);
             self.histogram_brush(ui, w);
             // the brush may have applied a new window: the view can be another one now

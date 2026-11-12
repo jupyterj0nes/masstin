@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **Viewer: you choose when the account is written on the connections.** It used to vanish without a word once more than 80 connections were on screen, and came back when zooming in left fewer on screen. View › Style › Connections › *captions* now says *when not crowded* (the old rule, with the figure yours to set, 80 by default), *always* (every connection, whatever the crowd, the zoom or the overlap) or *only on hover*. A view saved with "captions only on hover" opens on hover.
+- **Viewer: the time window to the second.** From and To in the filter pane (and in a window from the calendar button of the time strip): typed or pasted, or picked on a month calendar shaded by each day's events, with the hour, minute and second, the day's first and last event. The strip's handles follow. Until now the window was set only by dragging the handles, a few minutes a pixel at best.
 - **Viewer: the Style window is as tall as the window allows.** Its connections and canvas sections sat under a short scroll and were easy to miss.
 
 ## v1.4.4 — 2026-11-09
