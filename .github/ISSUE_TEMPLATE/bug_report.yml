@@ -1,0 +1,45 @@
+name: Bug report
+description: Something masstin did wrong, or did not do
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `masstin --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options: [Windows, Linux, macOS]
+    validations:
+      required: true
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Evidence type
+      description: What masstin was given
+      options:
+        - EVTX files
+        - Disk image (E01, VMDK, VHD/VHDX, raw)
+        - Triage package
+        - Linux logs
+        - macOS Unified Log
+        - Custom logs (YAML rule)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence_details
+    attributes:
+      label: Evidence details
+      description: Anything useful about the input. Attach a sample only if it holds nothing from a real case.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command (or what you did in the window), what you expected and what you got. Paste the error if there is one.
+    validations:
+      required: true
