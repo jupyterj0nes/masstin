@@ -2,9 +2,15 @@
 name = "masstin"
 version = "1.4.4"
 edition = "2021"
-description = "Lateral movement tracker for anything! A DFIR tool that parses forensic artifacts and visualizes lateral movement in graph databases. Written by Toño Díaz (@jupyterjones)"
+description = "Lateral movement tracker for anything: every login from Windows event logs, Linux and macOS logs, forensic images (E01, VMDK, VHDX, raw; no mounting) and triage packages in one timeline, a statistical hunt over it and a graph viewer. One binary for Windows, Linux and macOS."
 authors = ["Tono Diaz (@jupyterj0nes)"]
-repository = "https://github.com/jupyterjones/masstin"
+repository = "https://github.com/jupyterj0nes/masstin"
+homepage = "https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/"
+readme = "README.md"
+keywords = ["dfir", "forensics", "lateral-movement", "incident-response", "evtx"]
+categories = ["command-line-utilities", "visualization", "parser-implementations"]
+# The demos and screenshots stay on GitHub; the crate keeps the logo and the icons the build embeds.
+exclude = ["resources/*.gif", "resources/*.mp4", "resources/viewer-window.png", "neo4j-resources/*.png", "memgraph-resources/*.png", "scripts/"]
 license = "AGPL-3.0-only"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

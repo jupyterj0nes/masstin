@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/jupyterj0nes/masstin/discussions
+    about: Ask how to do something, or propose an idea
+  - name: A security problem
+    url: https://github.com/jupyterj0nes/masstin/security/advisories/new
+    about: Report a vulnerability privately
