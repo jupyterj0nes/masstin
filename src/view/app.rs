@@ -18,6 +18,7 @@ mod subnets;
 mod tasks;
 mod ingest;
 mod table;
+mod when;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -342,6 +343,14 @@ pub struct Viewer {
     auto_apply_at: Option<std::time::Instant>,
     tab: Tab,
     brush: Option<Brush>,
+    /// the From / To fields as typed, until they read as a time
+    when_text: [String; 2],
+    /// events per day, for the calendar's shading (edge count it was made for)
+    when_days: Option<(usize, HashMap<chrono::NaiveDate, u32>)>,
+    /// the time window opened from the time strip
+    show_when: bool,
+    /// autopilot: open the calendar of this field ("pane:0", "strip:1")
+    when_open_cal: Option<String>,
     canvas_rect: Rect,
     ctx_target: Option<Sel>,
     color_pick: Option<ColorPick>,
@@ -738,6 +747,10 @@ impl Viewer {
             auto_apply_at: None,
             tab: Tab::Selection,
             brush: None,
+            when_text: [String::new(), String::new()],
+            when_days: None,
+            show_when: false,
+            when_open_cal: None,
             canvas_rect: Rect::NOTHING,
             ctx_target: None,
             color_pick: None,
@@ -4223,6 +4236,8 @@ impl Viewer {
             }
             "table" => self.show_table = true,
             "style" => self.show_labels = true,
+            "when" => self.show_when = true,
+            other if other.starts_with("when-cal=") => self.when_open_cal = Some(other["when-cal=".len()..].to_string()),
             "ingest" => self.ingest.open = true,
             "ingest-go" => {
                 if self.ingest.output.trim().is_empty() {
@@ -4712,6 +4727,7 @@ impl Viewer {
         self.table_window(&ctx);
         self.drop_overlay(&ctx);
         self.labels_window(&ctx);
+        self.when_window(&ctx);
         self.about_window(&ctx);
         self.host_window(&ctx);
         self.edge_window(&ctx);
