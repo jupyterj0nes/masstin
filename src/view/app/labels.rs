@@ -6,7 +6,7 @@
 use super::*;
 use crate::view::icons as ic;
 use crate::view::theme;
-use crate::view::views::{LabelPos, NodeStyle};
+use crate::view::views::{CaptionShow, LabelPos, NodeStyle};
 
 /// A host's rule being edited in its window (a working copy; writes go to
 /// the style on every change so the canvas shows them).
@@ -172,7 +172,10 @@ impl Viewer {
         let mut changed = false;
         let mut resize = false;
         egui::Window::new(format!("{}  Style", ic::TAG)).open(&mut open).collapsible(false).resizable(false).default_width(440.0).anchor(egui::Align2::RIGHT_TOP, Vec2::new(-20.0, 120.0)).show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height(620.0).show(ui, |ui| {
+            // as tall as the window allows: the connections and the canvas sit
+            // at the bottom and used to be hidden under a short scroll
+            let tall = (ctx.content_rect().height() - 260.0).max(260.0);
+            egui::ScrollArea::vertical().max_height(tall).min_scrolled_height(tall).show(ui, |ui| {
                 theme::section(ui, "Mode");
                 ui.horizontal_wrapped(|ui| {
                     for st in NodeStyle::ALL {
@@ -241,7 +244,24 @@ impl Viewer {
                     changed |= ui.checkbox(&mut self.style.curves, "curved").on_hover_text("Off: straight lines, except the fan of a pair with several connections").changed();
                     changed |= ui.checkbox(&mut self.style.arrows, "arrowheads").changed();
                     changed |= ui.checkbox(&mut self.style.edge_glow, "glow on findings").on_hover_text("A soft glow under the significant and candidate connections and the ones you light").changed();
-                    changed |= ui.checkbox(&mut self.style.caption_hover, "captions only on hover").on_hover_text("The account (or whatever the caption shows) only on the connection under the pointer or selected; the rest stay bare").changed();
+                });
+                ui.horizontal_wrapped(|ui| {
+                    // a view saved with the old "captions only on hover" opens on hover
+                    if self.style.caption_hover {
+                        self.style.caption_hover = false;
+                        self.style.caption_show = CaptionShow::Hover;
+                    }
+                    ui.label("captions");
+                    let r = egui::ComboBox::from_id_salt("caption-show").selected_text(self.style.caption_show.label()).width(130.0).show_ui(ui, |ui| {
+                        for m in CaptionShow::ALL {
+                            changed |= ui.selectable_value(&mut self.style.caption_show, m, m.label()).changed();
+                        }
+                    });
+                    r.response.on_hover_text("When the account (or whatever the caption shows) is written on the connections.\n\nWhen not crowded: while no more connections are on screen than the figure beside, the edge is long enough and the zoom above 60 %; a caption that would sit on another is left out. Zooming in shows more because fewer connections stay on screen.\nAlways: on every connection, whatever the crowd, the zoom or the overlap.\nOnly on hover: on the connection under the pointer or selected.\n\nThe lit and selected connections carry theirs in every mode.");
+                    if self.style.caption_show == CaptionShow::Auto {
+                        ui.label("up to");
+                        changed |= ui.add(egui::DragValue::new(&mut self.style.caption_crowd).range(0..=5000).speed(2.0).suffix(" on screen")).on_hover_text(format!("Connections on screen now: {}. Beyond the figure only the lit and selected ones keep their captions (80 by default).", self.edges_on_screen)).changed();
+                    }
                 });
                 ui.label(egui::RichText::new("What the caption says and what colours the lines are in the View menu.").color(theme::DIM).small());
 
