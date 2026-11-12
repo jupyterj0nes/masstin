@@ -2534,7 +2534,8 @@ impl Viewer {
                 animated.push(k);
             }
             // the account on the edge, like Neo4j's relationship caption
-            if !plain && self.style.caption != Caption::None && (z > 0.6 || lit) && (pa - pb).length() > 90.0 && (!(self.style.caption_hover || self.edges_on_screen > 80) || lit || selected) {
+            // when it is drawn: View › Style › Connections › captions (caption_rule)
+            if let Some(keep_clear) = super::views::caption_rule(&self.style, self.edges_on_screen, z, (pa - pb).length(), lit, selected, plain) {
                 let caption = self.edge_caption(e);
                 if !caption.is_empty() {
                     let mid = draw::bez(pa, pc, pb, 0.5);
@@ -2542,7 +2543,7 @@ impl Viewer {
                     let galley = painter.layout_no_wrap(caption, font, draw::fade(TEXT, alpha));
                     let r = Rect::from_center_size(mid, galley.size() + Vec2::new(12.0, 5.0));
                     // a caption that would sit on another is left out, unless its edge is lit
-                    if lit || !taken.iter().any(|t| t.intersects(r)) {
+                    if !keep_clear || !taken.iter().any(|t| t.intersects(r)) {
                         draw::pill(&painter, mid, galley, draw::fade(CAPTION_BG, alpha), if lit { Some(draw::fade(stroke_color, 0.6 * alpha)) } else { None }, TEXT);
                         taken.push(r);
                     }
@@ -4221,6 +4222,7 @@ impl Viewer {
                 }
             }
             "table" => self.show_table = true,
+            "style" => self.show_labels = true,
             "ingest" => self.ingest.open = true,
             "ingest-go" => {
                 if self.ingest.output.trim().is_empty() {
@@ -4291,6 +4293,17 @@ impl Viewer {
                     self.layout.reheat(1.0);
                 }
                 self.bench = Some((n, Vec::new()));
+            }
+            other if other.starts_with("captions=") => {
+                self.style.caption_hover = false;
+                self.style.caption_show = match &other["captions=".len()..] {
+                    "always" => super::views::CaptionShow::Always,
+                    "hover" => super::views::CaptionShow::Hover,
+                    _ => super::views::CaptionShow::Auto,
+                };
+            }
+            other if other.starts_with("captions-limit=") => {
+                self.style.caption_crowd = other["captions-limit=".len()..].parse().unwrap_or(80);
             }
             other if other.starts_with("shot=") => {
                 let path = std::path::PathBuf::from(&other["shot=".len()..]);

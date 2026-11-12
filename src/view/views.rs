@@ -59,6 +59,49 @@ impl Caption {
     }
 }
 
+/// When the captions on the connections are drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum CaptionShow {
+    /// while the picture is not crowded: up to `caption_crowd` connections
+    /// on screen, the edge longer than 90 px, zoom above 60 %, a caption
+    /// that would sit on another one left out; the lit and selected ones always
+    #[default]
+    Auto,
+    /// on every connection, whatever the crowd, the zoom or the overlap
+    Always,
+    /// only on the connection lit by the pointer or selected
+    Hover,
+}
+
+impl CaptionShow {
+    pub const ALL: [CaptionShow; 3] = [CaptionShow::Auto, CaptionShow::Always, CaptionShow::Hover];
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptionShow::Auto => "when not crowded",
+            CaptionShow::Always => "always",
+            CaptionShow::Hover => "only on hover",
+        }
+    }
+}
+
+/// The caption of one edge: `None` not drawn, `Some(true)` drawn unless it
+/// would sit on another caption, `Some(false)` drawn whatever it covers.
+/// `on_screen` is the number of connections on screen, `len` the edge's
+/// length on screen in pixels, `plain` an unlit edge of the reduced detail
+/// (beyond 2,500 on screen).
+pub fn caption_rule(style: &Style, on_screen: usize, zoom: f32, len: f32, lit: bool, selected: bool, plain: bool) -> Option<bool> {
+    if style.caption == Caption::None {
+        return None;
+    }
+    let mode = if style.caption_hover { CaptionShow::Hover } else { style.caption_show };
+    if mode == CaptionShow::Always {
+        return Some(false);
+    }
+    let room = !plain && (zoom > 0.6 || lit) && len > 90.0;
+    let wanted = lit || selected || (mode == CaptionShow::Auto && on_screen <= style.caption_crowd as usize);
+    (room && wanted).then_some(!lit)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Field {
     Host,
@@ -258,6 +301,13 @@ pub struct Style {
     /// the account on an edge only when the edge is hovered or selected
     #[serde(default)]
     pub caption_hover: bool,
+    /// when the captions are drawn: when not crowded, always, only on hover
+    #[serde(default)]
+    pub caption_show: CaptionShow,
+    /// the most connections on screen that still carry their captions in
+    /// the `Auto` mode; beyond it only the lit and selected ones do
+    #[serde(default = "caption_crowd")]
+    pub caption_crowd: u32,
     /// curved connections; off: straight, except the fan of a busy pair
     #[serde(default = "yes")]
     pub curves: bool,
@@ -278,6 +328,10 @@ pub struct Style {
     pub auto_size: bool,
 }
 
+fn caption_crowd() -> u32 {
+    80
+}
+
 fn edge_opacity() -> f32 {
     0.8
 }
@@ -292,7 +346,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 0.8, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Realistic, show_subnets: false, subnets_auto: true, edge_opacity: edge_opacity(), caption_hover: false, curves: true, arrows: true, edge_glow: true, grid: true, vignette: true, auto_size: true }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 0.8, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Realistic, show_subnets: false, subnets_auto: true, edge_opacity: edge_opacity(), caption_hover: false, caption_show: CaptionShow::Auto, caption_crowd: caption_crowd(), curves: true, arrows: true, edge_glow: true, grid: true, vignette: true, auto_size: true }
     }
 }
 
@@ -398,6 +452,50 @@ pub const PALETTE: [[u8; 3]; 12] = [
 
 pub fn palette_color(i: u32) -> [u8; 3] {
     PALETTE[(i as usize) % PALETTE.len()]
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    #[test]
+    fn crowded_hides_the_captions_unless_asked_always() {
+        let mut st = Style::default();
+        // the old fixed rule: up to 80 connections on screen they show, beyond only the lit
+        assert_eq!(caption_rule(&st, 80, 1.0, 200.0, false, false, false), Some(true));
+        assert_eq!(caption_rule(&st, 81, 1.0, 200.0, false, false, false), None);
+        assert_eq!(caption_rule(&st, 81, 1.0, 200.0, true, false, false), Some(false));
+        assert_eq!(caption_rule(&st, 81, 1.0, 200.0, false, true, false), Some(true));
+        // too far out, too short, reduced detail
+        assert_eq!(caption_rule(&st, 10, 0.6, 200.0, false, false, false), None);
+        assert_eq!(caption_rule(&st, 10, 1.0, 90.0, false, false, false), None);
+        assert_eq!(caption_rule(&st, 10, 1.0, 200.0, false, false, true), None);
+        // the limit is the user's
+        st.caption_crowd = 500;
+        assert_eq!(caption_rule(&st, 400, 1.0, 200.0, false, false, false), Some(true));
+        // always: every one, wherever, even on top of another
+        st.caption_show = CaptionShow::Always;
+        assert_eq!(caption_rule(&st, 5000, 0.1, 5.0, false, false, true), Some(false));
+        // hover: only the lit and the selected
+        st.caption_show = CaptionShow::Hover;
+        assert_eq!(caption_rule(&st, 3, 1.0, 200.0, false, false, false), None);
+        assert_eq!(caption_rule(&st, 3, 1.0, 200.0, true, false, false), Some(false));
+        // nothing to say, nothing drawn
+        st.caption_show = CaptionShow::Always;
+        st.caption = Caption::None;
+        assert_eq!(caption_rule(&st, 1, 1.0, 200.0, true, true, false), None);
+    }
+
+    #[test]
+    fn an_old_view_keeps_its_captions() {
+        // a style saved before the setting existed: the old rule, at 80
+        let mut st: Style = serde_json::from_str(r#"{"color_by":"Result","caption":"User","shapes_by_role":false,"node_scale":1.0,"edge_scale":0.8,"font_scale":1.0,"rules":[],"caption_hover":false}"#).unwrap();
+        assert_eq!(st.caption_show, CaptionShow::Auto);
+        assert_eq!(st.caption_crowd, 80);
+        // one saved with "captions only on hover" stays on hover
+        st.caption_hover = true;
+        assert_eq!(caption_rule(&st, 3, 1.0, 200.0, false, false, false), None);
+    }
 }
 
 #[cfg(test)]

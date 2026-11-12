@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Viewer: you choose when the account is written on the connections.** It used to vanish without a word once more than 80 connections were on screen, and came back when zooming in left fewer on screen. View › Style › Connections › *captions* now says *when not crowded* (the old rule, with the figure yours to set, 80 by default), *always* (every connection, whatever the crowd, the zoom or the overlap) or *only on hover*. A view saved with "captions only on hover" opens on hover.
+- **Viewer: the Style window is as tall as the window allows.** Its connections and canvas sections sat under a short scroll and were easy to miss.
+
 ## v1.4.4 — 2026-11-09
 
 - **A row taken out of a forensic image names the image, never the analyst's machine.** Since v1.4.0 the `log_filename` of such a row carried the temp folder the file sat in while masstin ran (`C:\\Users\\…\\Temp\\masstin_image_extract\\0_HRServer.e01\\evtx_extracted\\partition_0\\Security.evtx`): the rewrite that turned it into `HRServer.e01:live:Security.evtx` took the text after the last comma of the line, and the last column had become `notes`. The rows are now named before they are written (`<image>:live|vss_N:<file>`, `<image>:UAL:<mdb>`, `<image>:ntuser:<user>/NTUSER.DAT`, `<image>:tasks:<task>`, `<image>:partition_N:/var/log/<file>`), the scheduled-task rows name the image too (they said `tasks_extracted`), and the functional CI fails if a timeline parsed from a disk image carries a path of the runner.
