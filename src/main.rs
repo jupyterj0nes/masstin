@@ -45,7 +45,8 @@ async fn main() {
         detach_own_console();
         Cli::parse_from(["masstin", "-a", "view"])
     } else {
-        Cli::parse()
+        // `masstin parse D:\case` is `masstin -a parse D:\case`
+        Cli::parse_from(masstin::args_with_action_flag(std::env::args_os()))
     };
 
     if let Err(e) = masstin::run(cli).await {

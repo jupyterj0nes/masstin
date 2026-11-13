@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::Read;
 mod parse;
 pub mod threads;
+pub mod detect;
 use tokio;
 pub use crate::parse::*;
 mod load_neo4j;
@@ -67,9 +68,17 @@ mod view;
 #[derive(Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    /// Action to perform
+    /// Action to perform. `parse` is the one to start with: it looks at the
+    /// evidence and picks the parser itself. The action can also come first
+    /// without -a: `masstin parse D:\evidence -o timeline.csv`.
     #[arg(short, long)]
     action: ActionType,
+
+    /// Evidence to read, given without -d / -f: folders, files, disk images
+    /// and archives alike, each told apart by what it is. `masstin parse
+    /// D:\case` is `masstin -a parse -d D:\case`.
+    #[arg(value_name = "PATH")]
+    paths: Vec<String>,
 
     /// Directories to process — also accepts drive letters (D:) for mounted volumes
     #[arg(short, long)]
@@ -191,10 +200,20 @@ pub struct Cli {
     #[arg(long)]
     skip_offsets: Option<String>,
 
-    /// Path to a YAML rule file or directory for `parse-custom`.
-    /// See rules/ and docs/custom-parsers.md for the schema and contributed rules.
+    /// Path to a YAML rule file or directory for `parse-custom`, or for
+    /// `parse`: the files masstin does not recognise (a VPN, firewall or
+    /// proxy log) are read with these rules and merged into the same
+    /// timeline. See rules/ and docs/custom-parsers.md for the schema and
+    /// contributed rules.
     #[arg(long)]
     rules: Option<String>,
+
+    /// For `parse`: also carve EVTX records out of the disk images found,
+    /// unallocated space included (the records of deleted or overwritten
+    /// logs, as `carve-image` does), merged into the same timeline. Slow:
+    /// every byte of every image is read.
+    #[arg(long)]
+    carve: bool,
 
     /// Dry-run mode. For `parse-custom`: parse and show first matches + rejects, do not write CSV.
     /// When combined with any `--ignore-local` / `--exclude-*` flag on any parser action:
@@ -371,8 +390,10 @@ pub struct Cli {
 // -----------------------------------------------------------------------------
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum ActionType {
+    /// Read any evidence and pick the parser: masstin looks at what it is given (EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images, Linux logs and triages, macOS logarchives and `log show` exports, Winlogbeat JSON, masstin timelines), says what it found and which parser takes it, and runs it. Images with anything else beside them, or Windows and Linux together, go through the massive pass. --rules adds custom-parser rules for the files it does not recognise, --carve the EVTX carving of the images; both are merged into the one timeline.
+    #[value(alias = "auto")]
+    Parse,
     /// Parse Windows EVTX files and UAL databases (.mdb) from directories or individual files
-    #[value(alias = "parse")]
     ParseWindows,
     /// Load a CSV timeline into a Neo4j graph database
     #[value(alias = "load")]
@@ -422,6 +443,8 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
+    take_paths(&mut config);
+
     // Clean and normalize paths
     config.directory = {
         let mut dirs = Vec::new();
@@ -445,12 +468,31 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         files
     };
 
-    validate_folders(&config)?;
-
     // Enable or disable debug/silent mode
     crate::parse::set_debug_mode(config.debug);
     crate::parse_elastic::set_debug_mode(config.debug);
     crate::banner::set_silent_mode(config.silent);
+
+    // `parse`: look at the evidence and pick the parser. One parser: the run
+    // goes on as that action. Several (custom rules, carving, timelines
+    // beside the evidence): each writes a part, merged at the end.
+    let mut plan: Option<Vec<ParseStep>> = None;
+    let mut banner_done = false;
+    if config.action == ActionType::Parse {
+        crate::banner::print_banner("Parse");
+        banner_done = true;
+        let steps = resolve_parse(&config)?;
+        if steps.len() == 1 && steps[0].action != ActionType::Merge {
+            let st = steps.into_iter().next().unwrap();
+            config.action = st.action;
+            config.file = st.files;
+            config.directory = st.dirs;
+        } else {
+            plan = Some(steps);
+        }
+    }
+
+    validate_folders(&config)?;
 
     // Build the global noise filter from CLI flags and install it before any
     // parser action runs. If all four filter flags are off, the filter is a
@@ -470,14 +512,17 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 
     // Print banner
     let action_name = format!("{:?}", config.action);
-    crate::banner::print_banner(&action_name);
+    if !banner_done {
+        crate::banner::print_banner(&action_name);
+    }
 
     // the threads of this run: the flag, the environment, or the machine's
     // policy; the window keeps its normal priority, it is interactive
     if config.action != ActionType::View {
         let asked = config.threads.or_else(|| std::env::var("MASSTIN_THREADS").ok().and_then(|s| s.trim().parse().ok()));
         let asked_images = config.parallel_images.or_else(|| std::env::var("MASSTIN_PARALLEL_IMAGES").ok().and_then(|s| s.trim().parse().ok()));
-        let reads_images = matches!(config.action, ActionType::ParseImage | ActionType::ParseMassive);
+        let reads_images = matches!(config.action, ActionType::ParseImage | ActionType::ParseMassive)
+            || plan.as_ref().map_or(false, |p| p.iter().any(|s| matches!(s.action, ActionType::ParseImage | ActionType::ParseMassive)));
         let evidence: Vec<String> = if reads_images { config.file.iter().chain(config.directory.iter()).cloned().collect() } else { Vec::new() };
         let d = crate::threads::decide(asked, asked_images, &evidence);
         crate::threads::install(&d);
@@ -517,6 +562,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 
     // Match the selected action and call the corresponding function
     match config.action {
+        ActionType::Parse => {
+            run_parse_plan(&config, plan.take().unwrap_or_default())?;
+        }
         ActionType::ParseWindows => {
             parse_events(&config.file, &config.directory, config.output.as_ref());
         }
@@ -623,21 +671,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             );
         }
         ActionType::CarveImage => {
-            let skip_offsets: Vec<u64> = config.skip_offsets.as_deref()
-                .map(|s| s.split(',')
-                    .filter_map(|tok| {
-                        let t = tok.trim();
-                        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
-                        u64::from_str_radix(t, 16).ok()
-                    })
-                    .collect())
-                .unwrap_or_default();
-            if !skip_offsets.is_empty() {
-                eprintln!("  Skip offsets configured: {} offset(s)", skip_offsets.len());
-                for o in &skip_offsets {
-                    eprintln!("    → {:#x} ({:.2} GB)", o, *o as f64 / 1_073_741_824.0);
-                }
-            }
+            let skip_offsets = carve_skip_offsets(&config);
             crate::parse_carve::carve_image(&config.file, config.output.as_ref(), config.carve_unalloc, &skip_offsets);
         }
         ActionType::MergeNeo4jNodes => {
@@ -747,11 +781,261 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 // -----------------------------------------------------------------------------
+//   `parse`: the evidence decides the parser
+// -----------------------------------------------------------------------------
+
+/// One part of a `parse` run: a parser and what it reads.
+#[derive(Debug, Clone)]
+struct ParseStep {
+    action: ActionType,
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+/// Evidence given without -d / -f: a folder (or a drive letter) joins the
+/// directories, anything else the files.
+fn take_paths(config: &mut Cli) {
+    for p in std::mem::take(&mut config.paths) {
+        if std::path::Path::new(&p).is_dir() || crate::parse_image_windows::is_drive_letter(&p) {
+            config.directory.push(p);
+        } else {
+            config.file.push(p);
+        }
+    }
+}
+
+/// Whether a word is the name of an action (or one of its aliases), so that
+/// `masstin parse D:\case` reads as `masstin -a parse D:\case`.
+pub fn is_action_name(word: &str) -> bool {
+    !word.starts_with('-') && ActionType::from_str(word, false).is_ok()
+}
+
+/// The command line with an action named first, without -a, given its -a.
+pub fn args_with_action_flag<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<std::ffi::OsString> = args.into_iter().collect();
+    if v.len() > 1 && v[1].to_str().map_or(false, is_action_name) {
+        v.insert(1, "-a".into());
+    }
+    v
+}
+
+fn action_name(a: &ActionType) -> String {
+    a.to_possible_value().map(|v| v.get_name().to_string()).unwrap_or_else(|| format!("{:?}", a))
+}
+
+fn action_of(name: &str) -> ActionType {
+    ActionType::from_str(name, true).unwrap_or(ActionType::ParseMassive)
+}
+
+/// What `parse` will run: the detector's look at the evidence (the same one
+/// the window's ingest wizard makes, without its time limit), said on the
+/// console in words, and the parts it adds (custom rules, carving).
+fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
+    use crate::detect::{self, Limits};
+    if let Some(out) = config.output.as_ref() {
+        let op = std::path::Path::new(out);
+        if op.exists() && !config.overwrite {
+            return Err(format!("Output file {} already exists. Use --overwrite to overwrite it.", op.display()));
+        }
+        if let Some(parent) = op.parent() {
+            if parent != std::path::Path::new("") && !parent.exists() {
+                return Err(format!("Parent folder of output file {} does not exist.", op.display()));
+            }
+        }
+    }
+    if config.all_volumes {
+        crate::banner::print_phase_result("--all-volumes: every NTFS volume of this machine -> parse-image");
+        return Ok(vec![ParseStep { action: ActionType::ParseImage, files: config.file.clone(), dirs: config.directory.clone() }]);
+    }
+    if config.file.is_empty() && config.directory.is_empty() {
+        return Err("parse needs evidence to read: a folder, files, disk images or archives (masstin parse D:\\evidence -o timeline.csv).".into());
+    }
+    for f in &config.file {
+        if !std::path::Path::new(f).exists() {
+            return Err(format!("{} does not exist.", f));
+        }
+    }
+    for d in &config.directory {
+        if !std::path::Path::new(d).exists() {
+            return Err(format!("Directory {} does not exist.", d));
+        }
+    }
+    // mounted volumes are read the way parse-image reads them, never walked
+    let (volumes, dirs): (Vec<String>, Vec<String>) = config.directory.iter().cloned().partition(|d| crate::parse_image_windows::is_drive_letter(d));
+    let mut files = config.file.clone();
+    // with --rules, the files masstin does not recognise are the rules' to read
+    let mut custom = Vec::new();
+    if let Some(rules) = config.rules.as_ref() {
+        files.retain(|f| {
+            if detect::scan(&[f.clone()], Limits::QUICK).recognised() {
+                true
+            } else {
+                custom.push(f.clone());
+                false
+            }
+        });
+        if custom.is_empty() {
+            crate::banner::print_warning(&format!(
+                "--rules {}: every file given is evidence masstin reads itself; the rules read the files given one by one that it does not recognise",
+                rules
+            ));
+        }
+    }
+
+    let mut steps: Vec<ParseStep> = Vec::new();
+    let mut images: Vec<String> = Vec::new();
+    let rest: Vec<String> = files.iter().chain(dirs.iter()).cloned().collect();
+    if !rest.is_empty() {
+        let s = detect::scan(&rest, Limits::FULL);
+        let v = detect::judge(&s);
+        crate::banner::print_info(&format!(
+            "Found: {} ({} file{} in {} folder{}, {:.1} s{})",
+            s.summary(),
+            s.files,
+            if s.files == 1 { "" } else { "s" },
+            s.dirs,
+            if s.dirs == 1 { "" } else { "s" },
+            s.secs,
+            if s.truncated { "; the look stopped early, the parser goes all the way" } else { "" }
+        ));
+        match v.parser {
+            None if v.sure => {
+                crate::banner::print_phase_result(&format!("{} -> merged into one timeline (merge)", v.title));
+                steps.push(ParseStep { action: ActionType::Merge, files: s.timelines.clone(), dirs: Vec::new() });
+            }
+            None => {
+                if custom.is_empty() && volumes.is_empty() {
+                    return Err(format!(
+                        "Nothing masstin knows how to read in {}: no event logs, triage packages, disk images, Linux or macOS logs, Winlogbeat JSON or timelines. Name the parser with -a (parse-windows, parse-linux, parse-mac, parse-image, parse-massive) if the evidence is there in another shape, or read text logs (VPN, firewall, proxy) with --rules.",
+                        rest.join(", ")
+                    ));
+                }
+            }
+            Some(a) => {
+                let mut act = action_of(a);
+                // parse-windows reads EVTX and UAL files given one by one; a
+                // triage package given as a file goes through the massive pass
+                if act == ActionType::ParseWindows && files.iter().any(|f| !f.to_ascii_lowercase().ends_with(".mdb") && !is_evtx_file(f)) {
+                    act = ActionType::ParseMassive;
+                }
+                crate::banner::print_phase_result(&format!("{} -> {}: {}", v.title, action_name(&act), v.why));
+                if !v.sure {
+                    crate::banner::print_warning("Not sure of the parser: -a names one (parse-windows, parse-linux, parse-mac, parse-image, parse-massive)");
+                }
+                steps.push(ParseStep { action: act, files: files.clone(), dirs: dirs.clone() });
+                // timelines beside the evidence join the result
+                if !s.timelines.is_empty() {
+                    crate::banner::print_phase_result(&format!("{} timeline(s) beside the evidence -> merged in", s.timelines.len()));
+                    steps.push(ParseStep { action: ActionType::Merge, files: s.timelines.clone(), dirs: Vec::new() });
+                }
+            }
+        }
+        images = s.images.clone();
+    }
+    if !volumes.is_empty() {
+        crate::banner::print_phase_result(&format!("Mounted volume(s) {} -> parse-image (the live files and the shadow copies)", volumes.join(", ")));
+        match steps.iter_mut().find(|st| matches!(st.action, ActionType::ParseImage | ActionType::ParseMassive)) {
+            Some(st) => st.dirs.extend(volumes),
+            None => steps.push(ParseStep { action: ActionType::ParseImage, files: Vec::new(), dirs: volumes }),
+        }
+    }
+    if !custom.is_empty() {
+        crate::banner::print_phase_result(&format!(
+            "{} file(s) masstin does not recognise -> parse-custom with the rules in {}",
+            custom.len(),
+            config.rules.as_deref().unwrap_or("")
+        ));
+        steps.push(ParseStep { action: ActionType::ParseCustom, files: custom, dirs: Vec::new() });
+    }
+    if config.carve {
+        if images.is_empty() {
+            crate::banner::print_warning("--carve: no disk image among the evidence, nothing to carve");
+        } else {
+            crate::banner::print_phase_result(&format!("--carve: {} disk image(s) -> carve-image, the EVTX records of deleted or overwritten logs", images.len()));
+            steps.push(ParseStep { action: ActionType::CarveImage, files: images, dirs: Vec::new() });
+        }
+    } else if !images.is_empty() {
+        crate::banner::print_info("Disk images: --carve also carves the EVTX records of deleted or overwritten logs out of them");
+    }
+    if steps.is_empty() {
+        return Err("parse found nothing to run.".into());
+    }
+    Ok(steps)
+}
+
+/// The skip list of `carve-image` (`--skip-offsets`), said on the console.
+fn carve_skip_offsets(config: &Cli) -> Vec<u64> {
+    let skip_offsets: Vec<u64> = config
+        .skip_offsets
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|tok| {
+                    let t = tok.trim();
+                    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+                    u64::from_str_radix(t, 16).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !skip_offsets.is_empty() {
+        eprintln!("  Skip offsets configured: {} offset(s)", skip_offsets.len());
+        for o in &skip_offsets {
+            eprintln!("    → {:#x} ({:.2} GB)", o, *o as f64 / 1_073_741_824.0);
+        }
+    }
+    skip_offsets
+}
+
+/// A `parse` of several parts: each part writes a timeline of its own in a
+/// temporary folder, and the parts are merged (sorted, without duplicates)
+/// into the output. Timelines given as evidence are merged as they are.
+fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Error>> {
+    let tmp = std::env::temp_dir().join(format!("masstin_parse_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let mut parts: Vec<String> = Vec::new();
+    let total = steps.len();
+    for (i, st) in steps.iter().enumerate() {
+        crate::banner::print_info(&format!("Part {} of {}: {}", i + 1, total, action_name(&st.action)));
+        if st.action == ActionType::Merge {
+            parts.extend(st.files.iter().cloned());
+            continue;
+        }
+        let out = tmp.join(format!("part-{}.csv", i + 1)).to_string_lossy().to_string();
+        let o = Some(&out);
+        match st.action {
+            ActionType::ParseWindows => parse_events(&st.files, &st.dirs, o),
+            ActionType::ParseLinux => parse_linux(&st.files, &st.dirs, o),
+            ActionType::ParseMac => parse_mac(&st.files, &st.dirs, o),
+            ActionType::ParserElastic => parse_events_elastic(&st.files, &st.dirs, o),
+            ActionType::ParseImage => parse_image(&st.files, &st.dirs, config.all_volumes, o, false),
+            ActionType::ParseMassive => {
+                crate::banner::print_massive_warning();
+                parse_image(&st.files, &st.dirs, config.all_volumes, o, true)
+            }
+            ActionType::ParseCustom => crate::parse_custom::parse_custom(&st.files, config.rules.as_deref().unwrap_or(""), o, config.dry_run),
+            ActionType::CarveImage => crate::parse_carve::carve_image(&st.files, o, config.carve_unalloc, &carve_skip_offsets(config)),
+            _ => {}
+        }
+        if std::path::Path::new(&out).exists() {
+            parts.push(out);
+        }
+    }
+    crate::banner::print_info(&format!("Merging the {} part(s) into one timeline", parts.len()));
+    let r = merge_files(&parts, config.output.as_ref(), None, None, None);
+    let _ = fs::remove_dir_all(&tmp);
+    r
+}
+
+// -----------------------------------------------------------------------------
 //   Validates input configuration depending on the chosen action
 // -----------------------------------------------------------------------------
 fn validate_folders(config: &Cli) -> Result<(), String> {
     // Check the action
     match config.action {
+        // a `parse` of several parts was checked when it was resolved
+        ActionType::Parse => {}
         ActionType::ParseWindows | ActionType::ParserElastic | ActionType::ParseLinux | ActionType::ParseMac => {
             // For these actions, at least one file or directory is required
             if config.directory.is_empty() && config.file.is_empty() {
@@ -1141,5 +1425,118 @@ fn parse_cortex_time(raw: &str) -> Result<String, String> {
     match chrono::NaiveDateTime::parse_from_str(&base_part[..19], "%Y-%m-%d %H:%M:%S") {
         Ok(_) => Ok(base_part),
         Err(_) => Err("Date must be in format 'YYYY-MM-DD HH:MM:SS [-0000]'".to_string()),
+    }
+}
+#[cfg(test)]
+mod parse_auto_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("masstin_parse_auto_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut c = Cli::parse_from(args_with_action_flag(args.iter().map(|a| std::ffi::OsString::from(*a))));
+        take_paths(&mut c);
+        c
+    }
+
+    #[test]
+    fn an_action_named_first_needs_no_dash_a() {
+        let v = args_with_action_flag(["masstin", "parse", "D:/case"].map(std::ffi::OsString::from));
+        assert_eq!(v, ["masstin", "-a", "parse", "D:/case"].map(std::ffi::OsString::from).to_vec());
+        let v = args_with_action_flag(["masstin", "-a", "view"].map(std::ffi::OsString::from));
+        assert_eq!(v.len(), 3);
+        // a path is not an action
+        let v = args_with_action_flag(["masstin", "D:/case"].map(std::ffi::OsString::from));
+        assert_eq!(v.len(), 2);
+        assert!(is_action_name("parse-massive") && is_action_name("graph-hunt-csv") && is_action_name("auto"));
+        assert!(!is_action_name("timeline.csv"));
+    }
+
+    #[test]
+    fn folders_and_files_given_as_paths_are_told_apart() {
+        let d = tmp("paths");
+        let f = d.join("Security.evtx");
+        std::fs::write(&f, b"ElfFile").unwrap();
+        let c = cli(&["masstin", "parse", d.to_str().unwrap(), f.to_str().unwrap()]);
+        assert_eq!(c.directory, vec![d.to_string_lossy().to_string()]);
+        assert_eq!(c.file, vec![f.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_folder_of_evtx_is_read_by_parse_windows() {
+        let d = tmp("evtx");
+        std::fs::write(d.join("Security.evtx"), b"ElfFile").unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap()])).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, ActionType::ParseWindows);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_archive_given_as_a_file_goes_through_the_massive_pass() {
+        let d = tmp("zip");
+        let e = d.join("Security.evtx");
+        std::fs::write(&e, b"ElfFile").unwrap();
+        let z = d.join("triage.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&z).unwrap());
+            w.start_file("notes.txt", zip::write::FileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut w, b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let steps = resolve_parse(&cli(&["masstin", "parse", e.to_str().unwrap(), z.to_str().unwrap()])).unwrap();
+        assert_eq!(steps[0].action, ActionType::ParseMassive);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn text_logs_masstin_does_not_know_go_to_the_rules() {
+        let d = tmp("rules");
+        let e = d.join("Security.evtx");
+        std::fs::write(&e, b"ElfFile").unwrap();
+        let vpn = d.join("fortigate-vpn.log");
+        std::fs::write(&vpn, b"date=2026-11-10 time=01:39:00 action=tunnel-up\n").unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "parse", e.to_str().unwrap(), vpn.to_str().unwrap(), "--rules", "rules/vpn"])).unwrap();
+        let acts: Vec<ActionType> = steps.iter().map(|s| s.action.clone()).collect();
+        assert_eq!(acts, vec![ActionType::ParseWindows, ActionType::ParseCustom]);
+        assert_eq!(steps[1].files, vec![vpn.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn carving_is_asked_for_and_needs_an_image() {
+        let d = tmp("carve");
+        std::fs::write(d.join("Security.evtx"), b"ElfFile").unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap(), "--carve"])).unwrap();
+        assert_eq!(steps.len(), 1, "no image, no carving");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nothing_known_is_an_error_that_says_what_to_do() {
+        let d = tmp("nothing");
+        std::fs::write(d.join("readme.txt"), b"hello").unwrap();
+        let e = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap()])).unwrap_err();
+        assert!(e.contains("Nothing masstin knows how to read") && e.contains("-a"), "{}", e);
+        let e = resolve_parse(&cli(&["masstin", "parse"])).unwrap_err();
+        assert!(e.contains("needs evidence"), "{}", e);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn timelines_alone_are_merged() {
+        let d = tmp("timelines");
+        let t = d.join("a.csv");
+        std::fs::write(&t, format!("{}\n", crate::csv_out::HEADER)).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "parse", t.to_str().unwrap()])).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].action, ActionType::Merge);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

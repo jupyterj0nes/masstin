@@ -987,7 +987,7 @@ fn describe_partitions<R: Read + Seek>(reader: &mut R, _image_size: u64) -> Stri
 }
 
 /// Check if a string is a Windows drive letter (e.g. "D:", "D:\", "E:")
-fn is_drive_letter(s: &str) -> bool {
+pub(crate) fn is_drive_letter(s: &str) -> bool {
     let trimmed = s.trim_end_matches(&['\\', '/'][..]);
     trimmed.len() == 2
         && trimmed.as_bytes()[0].is_ascii_alphabetic()

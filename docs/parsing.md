@@ -1,6 +1,6 @@
 # Parsing evidence
 
-Every `parse-*` action, what each one reads, noise filtering, triage detection, carving and merging. Back to the [README](../README.md).
+`masstin parse`, every `parse-*` action, what each one reads, noise filtering, triage detection, carving and merging. Back to the [README](../README.md).
 
 <div align="center">
   <img src="../resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples: banner, discovery, per-folder breakdown and the timeline CSV"/>
@@ -8,6 +8,52 @@ Every `parse-*` action, what each one reads, noise filtering, triage detection, 
   <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the timeline at the end. The same run, with the same bars, happens inside the window when the evidence is dropped on it.</em>
 </div>
 
+
+## `masstin parse`: give it the evidence, it picks the parser
+
+```bash
+# a folder, an image, a triage, a mix: masstin looks first and says what it found
+masstin parse /evidence/case-2026-03 -o timeline.csv
+
+# several sources at once, folders and files alike
+masstin parse /evidence/images/srv01.E01 /evidence/kape /evidence/linux -o timeline.csv
+
+# a VPN or firewall log beside the rest: the rules read what masstin does not know
+masstin parse /evidence/case-2026-03 fortigate-vpn.log --rules rules/vpn -o timeline.csv
+
+# and the EVTX records of deleted or overwritten logs, carved from the disk images
+masstin parse /evidence/case-2026-03 --carve -o timeline.csv
+```
+
+`parse` looks at what it is given before it reads anything (the same look the window's ingest wizard makes): EVTX files, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images, Linux logs and triages, macOS `.logarchive` bundles and `log show` exports, Winlogbeat JSON, masstin timelines. It says what it found and which parser takes it, in a line each:
+
+```
+        Found: 1 disk image, 4 triage packages (KAPE), 19 EVTX files, 2 Linux triages (31 files in 9 folders, 0.1 s)
+        => An evidence folder -> parse-massive: 1 disk image with other evidence beside: ...
+```
+
+| Found | `parse` runs |
+|---|---|
+| EVTX files, UAL databases, Windows triage packages in a folder | `parse-windows` |
+| Disk images alone (E01, VMDK, VHD / VHDX, dd / raw), or a mounted volume (`D:`) | `parse-image` |
+| Disk images with anything beside them, Windows and Linux together, a triage package given as a file | `parse-massive` |
+| Linux logs, UAC and other Linux triages | `parse-linux` |
+| macOS `.logarchive` bundles, `log show` exports | `parse-mac` |
+| Winlogbeat JSON | `parser-elastic` |
+| masstin timelines alone | `merge` |
+
+The paths can be given without `-d` / `-f` (a folder is a directory, anything else a file), and the action can come first without `-a`: `masstin parse D:\case` is `masstin -a parse -d D:\case`. On evidence of one kind the timeline is byte for byte the one the named parser writes.
+
+Two things it cannot guess are options of `parse`, and their result is merged into the same timeline (each part is written to a temporary file and the parts are merged, sorted and without duplicates):
+
+- `--rules <file or folder>`: the files given one by one that masstin does not recognise (a VPN, firewall or proxy log) are read with these [custom-parser rules](custom-parsers.md).
+- `--carve`: the disk images found are also carved for EVTX records (`carve-image`, [below](#evtx-carving-last-resort-recovery-from-unallocated-space)): the events of logs deleted or overwritten. Slow: every byte of every image is read.
+
+Timelines found beside the evidence are merged in too. When nothing it knows is there, `parse` stops and says so; when it is not sure (several platforms of no common layout), it says that it is not sure and which parser it chose.
+
+## Advanced: naming the parser yourself
+
+`parse` is the one to use. The actions below are what it runs, for scripts that want one fixed, for evidence in a shape the look does not recognise, and for the options of one parser.
 
 ## Choosing the right action — what each one actually processes
 
