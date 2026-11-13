@@ -5,7 +5,8 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` \| `view`. Aliases: `parse` (parse-windows), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
+| `-a, --action` | `parse` (the evidence decides the parser, [Parsing →](parsing.md#masstin-parse-give-it-the-evidence-it-picks-the-parser)) \| `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` \| `view`. The action can come first without `-a`: `masstin parse D:\case`. Aliases: `auto` (parse), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
+| `PATH...` | Evidence given without `-d` / `-f`, after the options or the action: a folder (or a drive letter) is a directory, anything else a file |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files (repeatable): EVTX, `.mdb`, E01, VMDK, VHD/VHDX, dd/raw for the Windows and image actions; Winlogbeat JSON for `parser-elastic`; `.logarchive` or `log show` JSON for `parse-mac`; any text or JSON log for `parse-custom`; masstin CSVs for `merge`, the loaders, `graph-hunt-csv` and `view` |
 | `-o, --output` | Output file path. Without it the timeline goes to stdout |
@@ -29,7 +30,8 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--parallel-images N` | For `parse-image` / `parse-massive`: forensic images extracted at once. Left out, masstin finds the figure by measuring: it starts with one reader on a spinning disk and two anywhere else, doubles the readers while the bytes a second coming off the images keep growing, keeps the last size that helped when a doubling brings nothing, halves them when the rate falls; the idle cores and the free memory (half a gigabyte a reader) are the ceiling. `N` fixes the figure. `MASSTIN_PARALLEL_IMAGES` does the same |
 | `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and, when `-o` is given, a sample of rejected lines in `parse-custom`) |
 | `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
-| `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](../rules/)) |
+| `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](../rules/)). `parse`: the files given one by one that masstin does not recognise (VPN, firewall, proxy logs) are read with these rules, merged into the same timeline |
+| `--carve` | `parse`: the disk images found are also carved for the EVTX records of deleted or overwritten logs (`carve-image`), merged into the same timeline. Slow: every byte is read |
 | `--dry-run` | `parse-custom`: show first matches and rejected lines, write no CSV. With any filter flag on a parser action: print the filter stats and write only the CSV header |
 | `--ignore-local`, `--exclude-users`, `--exclude-hosts`, `--exclude-ips` | Noise filtering on every parser action and `merge` (see [Noise filtering](parsing.md#noise-filtering---ignore-local-and---exclude-)) |
 | `--carve-unalloc` | `carve-image`: planned unallocated-only scan; not implemented yet, the whole image is scanned and a warning says so |
