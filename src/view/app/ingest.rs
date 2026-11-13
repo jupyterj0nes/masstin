@@ -28,7 +28,7 @@ pub(super) const PARSERS: [Parser; 6] = [
     Parser { action: "parse-linux", icon: ic::TERMINAL_WINDOW, title: "Linux", desc: "auth.log / secure, wtmp, btmp, lastlog, audit.log, journal files, a UAC archive" },
     Parser { action: "parse-mac", icon: ic::LAPTOP, title: "macOS", desc: "a .logarchive bundle (the Unified Log) or a `log show` JSON export" },
     Parser { action: "parse-image", icon: ic::HARD_DRIVES, title: "Disk image", desc: "E01, dd / raw, VMDK, VHD / VHDX: the logs are read from the file system inside, shadow copies included" },
-    Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: images, triage packages and loose EVTX, in one pass, with no mercy" },
+    Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: images, Windows and Linux triages, loose EVTX and Linux logs, in one pass, with no mercy" },
     Parser { action: "parser-elastic", icon: ic::CLOUD, title: "Winlogbeat JSON", desc: "Windows events exported from Elasticsearch as Winlogbeat JSON" },
 ];
 
