@@ -2198,15 +2198,53 @@ fn register_tar_extracts(
 }
 
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
-    parse_linux_inner(files, dirs, output, false);
+    parse_linux_inner(files, &[], dirs, output, false);
 }
 
 /// Quiet mode: skip phase headers and summary (used when integrated into parse-image mixed pipeline)
 pub fn parse_linux_quiet(files: &[String], dirs: &[String], output: Option<&String>) {
-    parse_linux_inner(files, dirs, output, true);
+    parse_linux_inner(files, &[], dirs, output, true);
 }
 
-fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>, quiet: bool) {
+/// parse-massive's Linux side: the logs pulled out of images (`dirs`), plus
+/// the Linux evidence lying loose in the case folder (`files`: log files;
+/// `archives`: tarballs), each archive opened on its own so the zips of
+/// the folder, which belong to the Windows pipeline, are not walked again.
+pub fn parse_linux_with_archives(files: &[String], archives: &[String], dirs: &[String], output: Option<&String>, quiet: bool) {
+    parse_linux_inner(files, archives, dirs, output, quiet);
+}
+
+/// The Linux evidence lying loose under the folders parse-massive was given:
+/// tarballs (`.tar`, `.tar.gz`, `.tgz`: a UAC collection, a tar of `/etc` and
+/// `/var/log`) and Linux log files (`auth.log`, `secure`, `wtmp`, journals…).
+/// Returns `(archives, log files)`, sorted. Zips are not listed: the Windows
+/// side opens them.
+pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut archives = Vec::new();
+    let mut logs = Vec::new();
+    for root in dirs {
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_lowercase();
+            let path = entry.path().to_string_lossy().to_string();
+            if is_tar_archive(&lower) {
+                archives.push(path);
+            } else if is_linux_artifact(&name) {
+                logs.push(path);
+            }
+        }
+    }
+    archives.sort();
+    archives.dedup();
+    logs.sort();
+    logs.dedup();
+    (archives, logs)
+}
+
+fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], output: Option<&String>, quiet: bool) {
     let start_time = std::time::Instant::now();
 
     // Phase 1: Search for artifacts (with ZIP support)
@@ -2297,6 +2335,20 @@ fn parse_linux_inner(files: &[String], dirs: &[String], output: Option<&String>,
                 );
             }
         }
+    }
+    // Tarballs named one by one (parse-massive's loose Linux evidence).
+    for a in archives {
+        let p = Path::new(a);
+        let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if !p.is_file() || !is_tar_archive(&lower) {
+            continue;
+        }
+        let mut tar_out: Vec<TarExtract> = Vec::new();
+        extract_tar_recursive(p, &temp_dir, a, &mut tar_out);
+        register_tar_extracts(
+            tar_out, &mut archives_scanned, &mut triage_dirs,
+            &mut triages, &mut all_dirs, &mut archive_dirs,
+        );
     }
     // Nested triages live INSIDE their wrapper's extract dir: match the
     // most specific (longest) dir first when labelling sources.
@@ -2699,5 +2751,65 @@ mod repeated_tests {
         assert_eq!(lastlog_layout(&arm), Some(296));
         let (secs, line, host) = lastlog_record(&arm[296 * 1000..]);
         assert_eq!((secs, line.as_str(), host.as_str()), (1_767_254_400, "pts/1", "10.0.0.9"));
+    }
+}
+
+#[cfg(test)]
+mod loose_evidence_tests {
+    use super::{find_loose_linux_evidence, parse_linux_with_archives};
+    use std::io::Write;
+
+    fn tar_gz(path: &std::path::Path, files: &[(&str, &str)]) {
+        let f = std::fs::File::create(path).unwrap();
+        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        for (name, body) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_mtime(1_794_268_800); // 2026-11-10
+            h.set_cksum();
+            b.append_data(&mut h, name, body.as_bytes()).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// parse-massive used to read Linux logs only out of disk images: a
+    /// Linux triage lying in the case folder as a tarball was skipped
+    /// without a word. The folder's tarballs and loose Linux logs are now
+    /// found (its zips are left to the Windows side), and a tarball named
+    /// on its own is opened and parsed.
+    #[test]
+    fn loose_linux_tarballs_and_logs_are_found_and_parsed() {
+        let dir = std::env::temp_dir().join(format!("masstin_loose_linux_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("triage-linux")).unwrap();
+        std::fs::create_dir_all(dir.join("copied/var/log")).unwrap();
+        std::fs::create_dir_all(dir.join("triage-windows")).unwrap();
+
+        let tgz = dir.join("triage-linux").join("web01-triage.tgz");
+        tar_gz(&tgz, &[
+            ("etc/hostname", "web01\n"),
+            ("var/log/auth.log", "Nov 10 08:00:00 web01 sshd[100]: Accepted password for deploy from 203.0.113.45 port 55555 ssh2\n"),
+        ]);
+        std::fs::write(dir.join("copied/var/log/auth.log"), "Nov 10 09:00:00 db01 sshd[7]: Failed password for root from 198.51.100.7 port 1 ssh2\n").unwrap();
+        std::fs::write(dir.join("triage-windows").join("dc01-triage.zip"), b"not opened here").unwrap();
+        std::fs::write(dir.join("triage-windows").join("notes.txt"), b"x").unwrap();
+
+        let (archives, logs) = find_loose_linux_evidence(&[dir.to_string_lossy().to_string()]);
+        assert_eq!(archives.len(), 1, "{archives:?}");
+        assert!(archives[0].ends_with("web01-triage.tgz"));
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert!(logs[0].replace('\\', "/").ends_with("copied/var/log/auth.log"));
+
+        let out = dir.join("out.csv").to_string_lossy().to_string();
+        parse_linux_with_archives(&[], &archives, &[], Some(&out), true);
+        let mut csv = String::new();
+        std::io::Read::read_to_string(&mut std::fs::File::open(&out).unwrap(), &mut csv).unwrap();
+        let row = csv.lines().find(|l| l.contains("203.0.113.45")).unwrap_or_else(|| panic!("no row from the tarball:\n{csv}"));
+        assert!(row.contains("deploy") && row.contains("SUCCESSFUL_LOGON"), "{row}");
+        assert!(row.to_lowercase().contains("web01"), "the host comes from the tarball's /etc/hostname: {row}");
+        let _ = std::io::stdout().flush();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
