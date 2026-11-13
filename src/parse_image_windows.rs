@@ -823,6 +823,10 @@ pub(crate) fn is_first_image_segment(p: &Path) -> bool {
     if lower.ends_with(".dd") || lower.ends_with(".raw") || lower.ends_with(".img") || lower.ends_with(".001") {
         return true;
     }
+    // Hyper-V / Azure disks: one file each (a differencing .avhdx is not one)
+    if lower.ends_with(".vhd") || lower.ends_with(".vhdx") {
+        return true;
+    }
     // split-raw secondary piece (.002, .003, ...)
     if let Some((_, ext)) = lower.rsplit_once('.') {
         if ext.len() == 3 && ext != "001" && ext.bytes().all(|b| b.is_ascii_digit()) { return false; }

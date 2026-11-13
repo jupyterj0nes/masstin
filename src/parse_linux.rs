@@ -2221,12 +2221,17 @@ fn register_tar_extracts(
 }
 
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
-    parse_linux_inner(files, &[], dirs, output, false);
+    // a tarball given with -f (a UAC collection, a tar of /etc and /var/log)
+    // is opened as the archive it is, as when it lies in a folder given with
+    // -d; before, it was read as one log file and nothing matched
+    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()));
+    parse_linux_inner(&logs, &archives, dirs, output, false);
 }
 
 /// Quiet mode: skip phase headers and summary (used when integrated into parse-image mixed pipeline)
 pub fn parse_linux_quiet(files: &[String], dirs: &[String], output: Option<&String>) {
-    parse_linux_inner(files, &[], dirs, output, true);
+    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()));
+    parse_linux_inner(&logs, &archives, dirs, output, true);
 }
 
 /// parse-massive's Linux side: the logs pulled out of images (`dirs`), plus
