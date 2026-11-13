@@ -397,6 +397,45 @@ impl Store {
         }
     }
 
+    /// How many data rows a file has (every row, with an origin or not).
+    pub fn file_rows(&self, file: u16) -> usize {
+        self.files.get(file as usize).map_or(0, |f| f.offsets.len())
+    }
+
+    /// A row as the file has it, in the 19 columns of `csv_out::HEADER`:
+    /// the 14 event columns and the hunt's and the analyst's tail (empty
+    /// when the file has none; an older layout is laid out as 19).
+    pub fn raw_row(&self, file: u16, line: u32) -> std::io::Result<Vec<String>> {
+        let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
+        let at = *f.offsets.get(line as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such row"))?;
+        let mut fh = std::fs::File::open(&f.path)?;
+        fh.seek(SeekFrom::Start(at))?;
+        let mut rd = std::io::BufReader::new(fh);
+        let mut text = String::new();
+        rd.read_line(&mut text)?;
+        let trimmed = text.trim_end_matches(['\r', '\n']);
+        let mut p: Vec<Cow<str>> = Vec::with_capacity(20);
+        split_csv_into(trimmed, &mut p);
+        let fields: Vec<&str> = p.iter().map(|c| c.as_ref()).collect();
+        Ok(f.layout.to_v19(&fields))
+    }
+
+    /// The rows of a file whose text holds `needle` (any case), in the
+    /// file's order: the whole file is read once.
+    pub fn file_rows_matching(&self, file: u16, needle: &str) -> std::io::Result<Vec<u32>> {
+        let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
+        let needle = needle.to_lowercase();
+        let rd = std::io::BufReader::new(std::fs::File::open(&f.path)?);
+        let mut out = Vec::new();
+        // line 0 of the file is the header: data row k is file line k + 1
+        for (k, line) in rd.lines().enumerate().skip(1) {
+            if line?.to_lowercase().contains(&needle) {
+                out.push((k - 1) as u32);
+            }
+        }
+        Ok(out)
+    }
+
     /// The 14 event columns of a row, read from the file.
     pub fn row_fields(&self, file: u16, line: u32) -> std::io::Result<Vec<String>> {
         let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
@@ -601,6 +640,36 @@ mod tests {
         assert_eq!(merged.out_adj.of(ws).len(), 3);
         let chained = Store::load_with(&[path], 0.05, &[("10.0.0.5".into(), "10.0.0.7".into()), ("10.0.0.7".into(), "DC01".into())]).unwrap();
         assert_eq!(chained.hosts.len(), 2, "both addresses end in DC01");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_reads_back_in_its_nineteen_columns() {
+        let dir = std::env::temp_dir().join(format!("masstin-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.csv");
+        let s = [
+            csv_out::HEADER.to_string(),
+            row(1, 10, "10.0.0.7", "SRV01", "bob", "SUCCESSFUL_LOGON", ",significant,40,new origin,,"),
+            // a row without an origin: no edge, still a row of the file
+            row(1, 11, "", "SRV01", "SYSTEM", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(1, 12, "lnx-web01", "DC01", "eve", "FAILED_LOGON", ",,,,,"),
+        ]
+        .join("\n");
+        std::fs::write(&p, s).unwrap();
+        let st = Store::load(&[p.to_string_lossy().to_string()], 0.05).unwrap();
+        assert_eq!(st.file_rows(0), 3, "every row of the file, the one without an origin too");
+        let r = st.raw_row(0, 0).unwrap();
+        assert_eq!(r.len(), csv_out::COLUMNS);
+        assert_eq!(r[1], "SRV01");
+        assert_eq!(r[2], "SUCCESSFUL_LOGON");
+        assert_eq!(r[8], "10.0.0.7");
+        assert_eq!(r[14], "significant");
+        assert_eq!(r[16], "new origin");
+        assert_eq!(st.raw_row(0, 1).unwrap()[5], "SYSTEM");
+        assert_eq!(st.file_rows_matching(0, "LNX-WEB").unwrap(), vec![2]);
+        assert_eq!(st.file_rows_matching(0, "srv01").unwrap(), vec![0, 1]);
+        assert!(st.raw_row(0, 3).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

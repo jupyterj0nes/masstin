@@ -338,6 +338,11 @@ pub struct Viewer {
     table_find: String,
     table_rows: Vec<u32>,
     table_key: (String, usize, usize),
+    /// the table shows the file's own 19 columns, every row of it
+    table_csv: bool,
+    table_raw_rows: Vec<(u16, u32)>,
+    table_raw_key: (String, usize, usize),
+    table_raw_cache: HashMap<(u16, u32), Vec<String>>,
     /// timelines opened lately, for the welcome and the menu
     recent: Vec<String>,
     show_help: bool,
@@ -745,6 +750,10 @@ impl Viewer {
             table_find: String::new(),
             table_rows: Vec::new(),
             table_key: (String::new(), usize::MAX, 0),
+            table_csv: false,
+            table_raw_rows: Vec::new(),
+            table_raw_key: (String::new(), usize::MAX, 0),
+            table_raw_cache: HashMap::new(),
             recent: ingest::load_recent(),
             show_help: false,
             quick: String::new(),
@@ -4350,6 +4359,10 @@ impl Viewer {
                 }
             }
             "table" => self.show_table = true,
+            "table-csv" => {
+                self.show_table = true;
+                self.table_csv = true;
+            }
             "style" => self.show_labels = true,
             "when" => self.show_when = true,
             other if other.starts_with("when-cal=") => self.when_open_cal = Some(other["when-cal=".len()..].to_string()),
