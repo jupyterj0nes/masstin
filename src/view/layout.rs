@@ -541,6 +541,127 @@ impl Layout {
     }
 }
 
+/// The room a host takes around its centre: half its width, how far it
+/// reaches up and how far down (its name included when it hangs below or
+/// above the icon).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Room {
+    pub half_w: f32,
+    pub up: f32,
+    pub down: f32,
+}
+
+/// Pushes apart the hosts whose rooms overlap, `gap` kept between two;
+/// the held ones stay where they are. A pair is parted along the axis
+/// where it overlaps least, so the picture keeps its shape. Sweeps until
+/// nothing touches or `rounds` are spent; returns the sweeps that moved
+/// something (0 when everything had room already).
+pub fn make_room(pos: &mut [V2], room: &[Room], held: &[bool], gap: f32, rounds: usize) -> usize {
+    let n = pos.len().min(room.len());
+    let mut used = 0;
+    for _ in 0..rounds {
+        let mut moved = false;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (hi, hj) = (held.get(i).copied().unwrap_or(false), held.get(j).copied().unwrap_or(false));
+                if hi && hj {
+                    continue;
+                }
+                let d = pos[j] - pos[i];
+                // half a unit of overlap is nothing to see: it does not keep the sweeps going
+                let over_x = room[i].half_w + room[j].half_w + gap - d.x.abs();
+                if over_x <= 0.5 {
+                    continue;
+                }
+                // j below i: i's bottom against j's top; j above: the other way
+                let over_y = if d.y >= 0.0 { room[i].down + room[j].up + gap - d.y } else { room[j].down + room[i].up + gap + d.y };
+                if over_y <= 0.5 {
+                    continue;
+                }
+                let mut push = if over_x < over_y {
+                    let s = if d.x > 0.0 || (d.x == 0.0 && (i + j) % 2 == 0) { 1.0 } else { -1.0 };
+                    V2::new(s * over_x, 0.0)
+                } else {
+                    let s = if d.y >= 0.0 { 1.0 } else { -1.0 };
+                    V2::new(0.0, s * over_y)
+                };
+                // a hair more than the overlap, so a sweep settles a pair for good
+                push = push * 1.01;
+                match (hi, hj) {
+                    (true, false) => pos[j] += push,
+                    (false, true) => pos[i] -= push,
+                    _ => {
+                        pos[i] -= push * 0.5;
+                        pos[j] += push * 0.5;
+                    }
+                }
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+        used += 1;
+    }
+    used
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+
+    fn overlaps(pos: &[V2], room: &[Room], gap: f32) -> bool {
+        for i in 0..pos.len() {
+            for j in (i + 1)..pos.len() {
+                let d = pos[j] - pos[i];
+                let ox = room[i].half_w + room[j].half_w + gap - d.x.abs() > 0.5;
+                let oy = if d.y >= 0.0 { room[i].down + room[j].up + gap - d.y } else { room[j].down + room[i].up + gap + d.y } > 0.5;
+                if ox && oy {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_name_under_one_host_is_not_covered_by_the_next() {
+        // two hosts one above the other, the lower one sitting on the upper one's name
+        let room = vec![Room { half_w: 50.0, up: 30.0, down: 60.0 }; 2];
+        let mut pos = vec![V2::new(0.0, 0.0), V2::new(20.0, 70.0)];
+        assert!(overlaps(&pos, &room, 8.0));
+        let used = make_room(&mut pos, &room, &[false, false], 8.0, 50);
+        assert!(used > 0);
+        assert!(!overlaps(&pos, &room, 8.0));
+    }
+
+    #[test]
+    fn hosts_with_room_do_not_move() {
+        let room = vec![Room { half_w: 20.0, up: 20.0, down: 40.0 }; 3];
+        let start = vec![V2::new(0.0, 0.0), V2::new(200.0, 0.0), V2::new(0.0, 200.0)];
+        let mut pos = start.clone();
+        assert_eq!(make_room(&mut pos, &room, &[false; 3], 8.0, 50), 0);
+        assert_eq!(pos, start);
+    }
+
+    #[test]
+    fn a_held_host_stays_and_the_other_gives_way() {
+        let room = vec![Room { half_w: 30.0, up: 30.0, down: 30.0 }; 2];
+        let mut pos = vec![V2::new(0.0, 0.0), V2::new(10.0, 5.0)];
+        make_room(&mut pos, &room, &[true, false], 4.0, 50);
+        assert_eq!(pos[0], V2::new(0.0, 0.0));
+        assert!(!overlaps(&pos, &room, 4.0));
+    }
+
+    #[test]
+    fn a_crowd_on_one_spot_spreads_out() {
+        let room = vec![Room { half_w: 40.0, up: 25.0, down: 50.0 }; 12];
+        let mut pos: Vec<V2> = (0..12).map(|i| V2::new((i % 3) as f32 * 3.0, (i / 3) as f32 * 3.0)).collect();
+        make_room(&mut pos, &room, &[false; 12], 8.0, 400);
+        assert!(!overlaps(&pos, &room, 8.0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
