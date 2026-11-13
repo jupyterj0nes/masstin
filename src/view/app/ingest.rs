@@ -780,8 +780,14 @@ impl Viewer {
             }
         }
         theme::section(ui, "When it is done");
-        ui.checkbox(&mut self.ingest.open_here, "Open it in this window");
-        if self.ingest.open_here && !self.files.is_empty() {
+        // the table shows the timeline open in the window: asking for it opens it here
+        if self.ingest.open_table {
+            let mut on = true;
+            ui.add_enabled(false, egui::Checkbox::new(&mut on, "Open it in this window")).on_disabled_hover_text("The table shows the timeline open in this window, so it is opened here too");
+        } else {
+            ui.checkbox(&mut self.ingest.open_here, "Open it in this window");
+        }
+        if (self.ingest.open_here || self.ingest.open_table) && !self.files.is_empty() {
             ui.indent("ingest-add", |ui| {
                 ui.radio_value(&mut self.ingest.add, false, "instead of the timelines open now");
                 ui.radio_value(&mut self.ingest.add, true, "added to the timelines open now");
