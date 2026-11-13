@@ -87,17 +87,7 @@ pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: 
     let font_of = |px: f32| if mono { theme::pixel_font((px * 0.72).max(6.0)) } else { FontId::proportional(px) };
     let chars = name.chars().count().max(1) as f32;
     let fits = (r * 1.8) / (chars * 0.56);
-    let inside_ok = r > 9.0 && fits >= (base_px * 0.75).max(8.5);
-    let pos = match pos {
-        LabelPos::Auto => {
-            if inside_ok {
-                LabelPos::Inside
-            } else {
-                LabelPos::Below
-            }
-        }
-        p => p,
-    };
+    let pos = resolve_label_pos(name, r, pos, base_px);
     // a crowd shows only the names that fit inside big hosts, and the lit ones
     if crowd && !lit && !(pos == LabelPos::Inside && r > 14.0) {
         return false;
@@ -141,6 +131,65 @@ pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: 
             }
             true
         }
+    }
+}
+
+/// Where a name set to Auto goes: inside the host when it fits there at a
+/// readable size, below it otherwise.
+pub(super) fn resolve_label_pos(name: &str, r: f32, pos: LabelPos, base_px: f32) -> LabelPos {
+    if pos != LabelPos::Auto {
+        return pos;
+    }
+    let chars = name.chars().count().max(1) as f32;
+    let fits = (r * 1.8) / (chars * 0.56);
+    if r > 9.0 && fits >= (base_px * 0.75).max(8.5) {
+        LabelPos::Inside
+    } else {
+        LabelPos::Below
+    }
+}
+
+/// The room a host takes on the screen, its name included, as
+/// `paint_host_label` draws it: (half width, above the centre, below it)
+/// in pixels. The width of the text is estimated from its length.
+pub(super) fn host_extent(name: &str, r: f32, pos: LabelPos, base_px: f32) -> (f32, f32, f32) {
+    let font = base_px.clamp(7.0, 22.0);
+    let text_w = name.chars().count().max(1) as f32 * font * 0.58;
+    let text_h = font * 1.25;
+    match resolve_label_pos(name, r, pos, base_px) {
+        LabelPos::Inside | LabelPos::Auto => (r, r, r),
+        LabelPos::Band => {
+            let half = ((text_w + 18.0).max(r * 2.4)) / 2.0;
+            (half.max(r), r.max(text_h / 2.0 + 3.0), r.max(text_h / 2.0 + 3.0))
+        }
+        LabelPos::Below => (r.max((text_w + 12.0) / 2.0), r, r + 8.0 + text_h + 5.0),
+        LabelPos::Above => (r.max((text_w + 12.0) / 2.0), r + 8.0 + text_h + 5.0, r),
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_below_makes_the_host_reach_further_down() {
+        let (half, up, down) = host_extent("LEO-WORKSTATION-01", 20.0, LabelPos::Below, 12.0);
+        assert_eq!(up, 20.0);
+        assert!(down > 20.0 + 8.0 + 12.0);
+        assert!(half > 20.0, "a long name is wider than the host");
+    }
+
+    #[test]
+    fn a_name_above_reaches_up_and_inside_takes_no_room() {
+        let (_, up, down) = host_extent("DC01", 20.0, LabelPos::Above, 12.0);
+        assert!(up > down);
+        assert_eq!(host_extent("DC01", 30.0, LabelPos::Inside, 12.0), (30.0, 30.0, 30.0));
+    }
+
+    #[test]
+    fn auto_goes_where_the_painter_puts_it() {
+        assert_eq!(resolve_label_pos("DC", 30.0, LabelPos::Auto, 12.0), LabelPos::Inside);
+        assert_eq!(resolve_label_pos("A-VERY-LONG-HOST-NAME", 12.0, LabelPos::Auto, 12.0), LabelPos::Below);
     }
 }
 

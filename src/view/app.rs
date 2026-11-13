@@ -268,6 +268,10 @@ pub struct Viewer {
     steps: Vec<Step>,
     step_of_event: Vec<usize>,
     presenting: bool,
+    /// the presentation still has to give every name its room
+    room_pending: bool,
+    /// where the hosts were before the presentation moved them apart
+    before_present: Option<Vec<V2>>,
     present_t: f32,
     present_playing: bool,
     show_story: bool,
@@ -682,6 +686,8 @@ impl Viewer {
             steps: Vec::new(),
             step_of_event: Vec::new(),
             presenting: false,
+            room_pending: false,
+            before_present: None,
             present_t: 0.0,
             present_playing: false,
             show_story: false,
@@ -909,30 +915,101 @@ impl Viewer {
     /// Stretch the settled picture to the window's shape, so a tall graph
     /// uses the sides and a flat one the height; animated, then framed.
     fn fill_window(&mut self, canvas: Rect) {
+        if let Some(to) = self.fill_target(canvas) {
+            let from: Vec<V2> = self.layout.pos.clone();
+            self.layout.stop();
+            self.fill_anim = Some((from, to, self.t0.elapsed().as_secs_f32()));
+        }
+    }
+
+    /// Where `fill_window` takes the hosts; None when the picture already
+    /// has the window's shape.
+    fn fill_target(&self, canvas: Rect) -> Option<Vec<V2>> {
         let n = self.layout.len();
-        let Some((lo, hi)) = self.layout.bounds() else { return };
+        let (lo, hi) = self.layout.bounds()?;
         if n < 2 {
-            return;
+            return None;
         }
         let gw = (hi.x - lo.x).max(1.0);
         let gh = (hi.y - lo.y).max(1.0);
         let margin = 90.0;
         let inset = if self.presenting { 0.0 } else { self.legend_h + 12.0 };
         let cw = (canvas.width() - margin * 2.0).max(100.0);
-        let ch = (canvas.height() - inset - margin * 2.0).max(100.0);
+        let ch = (canvas.height() - inset - self.caption_room() - margin * 2.0).max(100.0);
         // the zoom the graph would get as it is, and the stretch that makes it
         // fill both axes at that zoom (never shrinking an axis)
         let z = (cw / gw).min(ch / gh).min(2.2);
         let sx = ((cw / z) / gw).clamp(1.0, 2.6);
         let sy = ((ch / z) / gh).clamp(1.0, 2.6);
         if (sx - 1.0).abs() < 0.03 && (sy - 1.0).abs() < 0.03 {
-            return;
+            return None;
         }
         let c = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
-        let from: Vec<V2> = self.layout.pos.clone();
-        let to: Vec<V2> = from.iter().map(|p| V2::new(c.x + (p.x - c.x) * sx, c.y + (p.y - c.y) * sy)).collect();
-        self.layout.stop();
-        self.fill_anim = Some((from, to, self.t0.elapsed().as_secs_f32()));
+        Some(self.layout.pos.iter().map(|p| V2::new(c.x + (p.x - c.x) * sx, c.y + (p.y - c.y) * sy)).collect())
+    }
+
+    /// Where a host's name is drawn: under the picture when the host is a
+    /// picture (a machine, an icon) or a bare dot, as its style says otherwise.
+    fn drawn_label_pos(&self, look: &NodeLook) -> LabelPos {
+        if (look.icon.is_some() || look.device.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) {
+            LabelPos::Below
+        } else {
+            look.label_pos
+        }
+    }
+
+    /// Moves `pos` apart so no host covers another's name at the zoom the
+    /// picture will be framed at (found again after every pass, since
+    /// spreading the hosts lowers it). Only the hosts that are drawn count.
+    fn give_names_room(&self, pos: &mut [V2], canvas: Rect, max_zoom: f32, inset: f32) -> usize {
+        let n = pos.len().min(self.graph.nodes.len()).min(self.scene.nodes.len());
+        if n < 2 || n > 400 {
+            return 0;
+        }
+        let fs = self.style.font_scale;
+        let mut moved = 0;
+        for _ in 0..4 {
+            let shown: Vec<usize> = (0..n).filter(|&i| !self.scene.nodes[i].hide).collect();
+            let mut lo = V2::new(f32::MAX, f32::MAX);
+            let mut hi = V2::new(f32::MIN, f32::MIN);
+            for &i in &shown {
+                let r = self.layout.radius.get(i).copied().unwrap_or(20.0);
+                lo.x = lo.x.min(pos[i].x - r);
+                lo.y = lo.y.min(pos[i].y - r);
+                hi.x = hi.x.max(pos[i].x + r);
+                hi.y = hi.y.max(pos[i].y + r);
+            }
+            if shown.len() < 2 {
+                return moved;
+            }
+            let w = (hi.x - lo.x).max(50.0) + 80.0;
+            let h = (hi.y - lo.y).max(50.0) + 80.0;
+            let z = (canvas.width() / w).min((canvas.height() - inset).max(50.0) / h).clamp(0.05, max_zoom);
+            let mut sub: Vec<V2> = shown.iter().map(|&i| pos[i]).collect();
+            let room: Vec<super::layout::Room> = shown.iter().map(|&i| {
+                let look = &self.scene.nodes[i];
+                let r_px = self.layout.radius.get(i).copied().unwrap_or(20.0) * z * self.style.node_scale * look.size;
+                let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
+                let name = self.host_label(self.graph.nodes[i].host);
+                let (hw, up, down) = labels::host_extent(&name, r_px, self.drawn_label_pos(look), base_px);
+                super::layout::Room { half_w: hw / z, up: up / z, down: down / z }
+            }).collect();
+            let held: Vec<bool> = shown.iter().map(|&i| self.layout.fixed.get(i).copied().unwrap_or(false) && !self.presenting).collect();
+            let used = super::layout::make_room(&mut sub, &room, &held, 10.0 / z, 200);
+            for (k, &i) in shown.iter().enumerate() {
+                pos[i] = sub[k];
+            }
+            if used == 0 {
+                break;
+            }
+            moved += used;
+        }
+        moved
+    }
+
+    /// The strip a presentation keeps clear at the bottom for its caption.
+    fn caption_room(&self) -> f32 {
+        if self.presenting && self.story.show_caption { 64.0 } else { 0.0 }
     }
 
     fn fit(&mut self, canvas: Rect, snap: bool) {
@@ -942,8 +1019,9 @@ impl Viewer {
             let max_zoom = if self.presenting { 1.8 } else { 2.2 };
             // the legend chips sit over the top of the canvas: keep it clear
             let inset = if self.presenting { 0.0 } else { self.legend_h + 12.0 };
-            self.zoom_t = (canvas.width() / w).min((canvas.height() - inset).max(50.0) / h).clamp(0.05, max_zoom);
-            self.cam_t = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0 - (inset / 2.0) / self.zoom_t);
+            let bottom = self.caption_room();
+            self.zoom_t = (canvas.width() / w).min((canvas.height() - inset - bottom).max(50.0) / h).clamp(0.05, max_zoom);
+            self.cam_t = V2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0 - (inset / 2.0) / self.zoom_t + (bottom / 2.0) / self.zoom_t);
             if snap {
                 self.zoom = self.zoom_t;
                 self.cam = self.cam_t;
@@ -1111,6 +1189,10 @@ impl Viewer {
         self.hovered = None;
         self.anon = Anonymiser::new();
         self.layout.stop();
+        // hosts close together cover each other's names: the story gives
+        // every one its room, and leaving puts them back
+        self.before_present = Some(self.layout.pos.clone());
+        self.room_pending = true;
         // the canvas is the whole window now: frame the graph again
         self.fit_pending = true;
     }
@@ -1118,6 +1200,13 @@ impl Viewer {
     fn stop_presentation(&mut self) {
         self.presenting = false;
         self.present_playing = false;
+        self.room_pending = false;
+        if let Some(pos) = self.before_present.take() {
+            if pos.len() == self.layout.pos.len() {
+                self.layout.pos = pos;
+                self.fit_pending = true;
+            }
+        }
         self.cursor = self.graph.events.len();
     }
 
@@ -2155,6 +2244,32 @@ impl Viewer {
                     break;
                 }
             }
+            if self.room_pending && self.presenting {
+                self.room_pending = false;
+                // the story has the whole window: the hosts settle again for
+                // it (a narrowed view keeps the gaps of the hosts it lost),
+                // stretch to its shape and make room for every name
+                let per_host = (canvas.width() * canvas.height() / self.layout.len().max(1) as f32).sqrt();
+                self.layout.link_distance = (per_host * 0.95).clamp(120.0, 330.0);
+                self.layout.aspect = (canvas.width() / canvas.height().max(1.0)).clamp(0.5, 2.5);
+                self.layout.reheat(0.5);
+                let start = std::time::Instant::now();
+                for _ in 0..600 {
+                    if !self.layout.tick() || start.elapsed() > std::time::Duration::from_millis(400) {
+                        break;
+                    }
+                }
+                self.layout.stop();
+                if let Some(to) = self.fill_target(canvas) {
+                    self.layout.pos = to;
+                }
+                let mut pos = self.layout.pos.clone();
+                let moved = self.give_names_room(&mut pos, canvas, 1.8, self.caption_room());
+                if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                    eprintln!("[view] presentation: names given room in {} sweep(s)", moved);
+                }
+                self.layout.pos = pos;
+            }
             self.fit(canvas, true);
             self.fit_pending = false;
         }
@@ -2744,7 +2859,7 @@ impl Viewer {
             let shown_name: &str = &shown;
             if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
                 let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
-                let pos = if (look.icon.is_some() || look.device.is_some() || self.style.node_style == NodeStyle::Minimal) && matches!(look.label_pos, LabelPos::Auto | LabelPos::Inside) { LabelPos::Below } else { look.label_pos };
+                let pos = self.drawn_label_pos(look);
                 labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod, self.style.node_style == NodeStyle::Arcade);
             }
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
