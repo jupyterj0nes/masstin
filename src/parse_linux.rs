@@ -1825,12 +1825,35 @@ fn is_linux_artifact(fname: &str) -> bool {
     matches!(lower.as_str(), "utmp" | "lastlog" | "auth.log")
         || is_rotated_name(&lower, "wtmp")
         || is_rotated_name(&lower, "btmp")
-        || lower.starts_with("secure")
-        || lower.starts_with("messages")
+        || is_log_rotation(&lower, "secure")
+        || is_log_rotation(&lower, "messages")
         || lower.starts_with("audit.log")
         || lower.starts_with("auth.log")
         || lower.ends_with(".journal")
         || lower.ends_with(".journal~")
+}
+
+/// A file named like a log that is configuration: `/etc/logrotate.d/wtmp`
+/// and `btmp` are logrotate's rules for those logs, not the logs.
+fn is_config_not_log(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("logrotate.d"))
+}
+
+/// `base` or one of its rotations, as logrotate and syslog name them:
+/// `messages`, `messages.1`, `messages.2.gz`, `messages-20261101`,
+/// `secure-20261101.gz`. A file that merely starts with the word
+/// (`messages.cpython-310.pyc`, `secure-boot.conf`) is not one.
+fn is_log_rotation(lower: &str, base: &str) -> bool {
+    let Some(rest) = lower.strip_prefix(base) else { return false };
+    let rest = rest.strip_suffix(".gz").unwrap_or(rest);
+    if rest.is_empty() {
+        return true;
+    }
+    let digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+    match rest.as_bytes()[0] {
+        b'.' | b'-' => digits(&rest[1..]),
+        _ => false,
+    }
 }
 
 /// `base` itself or a logrotate variant of it: `wtmp`, `wtmp.1`,
@@ -2232,7 +2255,7 @@ pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) 
             let path = entry.path().to_string_lossy().to_string();
             if is_tar_archive(&lower) {
                 archives.push(path);
-            } else if is_linux_artifact(&name) {
+            } else if is_linux_artifact(&name) && !is_config_not_log(entry.path()) {
                 logs.push(path);
             }
         }
@@ -2378,7 +2401,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             let p = entry.into_path();
             if !p.is_file() { continue; }
             let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if is_linux_artifact(fname) {
+            if is_linux_artifact(fname) && !is_config_not_log(&p) {
                 targets.push(p);
             }
         }
@@ -2558,7 +2581,24 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             skipped += 1;
         } else {
             parsed_count += 1;
-            let source = crate::parse::source_label_for_linux_path(&path_str, &triage_dirs);
+            let mut source = crate::parse::source_label_for_linux_path(&path_str, &triage_dirs);
+            if source.starts_with("[FOLDER]") {
+                // a log out of an archive that is no known triage: name the
+                // archive, not the temp folder it was unpacked into
+                let norm = path_str.replace('\\', "/");
+                let inside = archive_dirs
+                    .iter()
+                    .filter(|(d, _)| {
+                        let d = d.to_string_lossy().replace('\\', "/");
+                        !d.is_empty() && norm.starts_with(&d)
+                    })
+                    .max_by_key(|(d, _)| d.as_os_str().len());
+                if let Some((_, name)) = inside {
+                    let name = name.replace('\\', "/");
+                    let short = name.rsplit('/').next().unwrap_or(&name);
+                    source = format!("[ARCHIVE]  {}", short);
+                }
+            }
             let short = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2756,7 +2796,17 @@ mod repeated_tests {
 
 #[cfg(test)]
 mod loose_evidence_tests {
-    use super::{find_loose_linux_evidence, parse_linux_with_archives};
+    use super::{find_loose_linux_evidence, parse_linux_with_archives, is_linux_artifact};
+
+    #[test]
+    fn rotations_count_and_lookalikes_do_not() {
+        for n in ["messages", "messages.1", "messages.2.gz", "messages-20261101", "secure", "secure-20261101.gz", "auth.log", "auth.log.1", "wtmp", "btmp.1"] {
+            assert!(is_linux_artifact(n), "{n}");
+        }
+        for n in ["messages.cpython-310.pyc", "messages_old.txt", "secure-boot.conf", "securefile", "messages.json"] {
+            assert!(!is_linux_artifact(n), "{n}");
+        }
+    }
     use std::io::Write;
 
     fn tar_gz(path: &std::path::Path, files: &[(&str, &str)]) {
@@ -2795,6 +2845,8 @@ mod loose_evidence_tests {
         std::fs::write(dir.join("copied/var/log/auth.log"), "Nov 10 09:00:00 db01 sshd[7]: Failed password for root from 198.51.100.7 port 1 ssh2\n").unwrap();
         std::fs::write(dir.join("triage-windows").join("dc01-triage.zip"), b"not opened here").unwrap();
         std::fs::write(dir.join("triage-windows").join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("copied/etc/logrotate.d")).unwrap();
+        std::fs::write(dir.join("copied/etc/logrotate.d/wtmp"), b"/var/log/wtmp { monthly }").unwrap();
 
         let (archives, logs) = find_loose_linux_evidence(&[dir.to_string_lossy().to_string()]);
         assert_eq!(archives.len(), 1, "{archives:?}");
