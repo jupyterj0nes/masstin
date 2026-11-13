@@ -41,6 +41,8 @@ pub struct Scan {
     pub mdb: usize,
     /// archive name and the kind of triage it is
     pub triages: Vec<(String, &'static str)>,
+    /// ZIPs of no triage layout that hold EVTX files (a folder of logs zipped up)
+    pub evtx_zips: usize,
     /// archives of no known layout
     pub archives: usize,
     /// first segments of disk images
@@ -63,7 +65,7 @@ pub struct Scan {
 
 impl Scan {
     pub fn windows(&self) -> usize {
-        self.evtx + self.mdb + self.triages.iter().filter(|(_, k)| *k != "UAC").count()
+        self.evtx + self.mdb + self.evtx_zips + self.triages.iter().filter(|(_, k)| *k != "UAC").count()
     }
     pub fn linux_total(&self) -> usize {
         self.linux.values().sum::<usize>() + self.uac + self.linux_tars + self.triages.iter().filter(|(_, k)| *k == "UAC").count()
@@ -95,6 +97,9 @@ impl Scan {
         }
         if self.evtx > 0 {
             parts.push(n(self.evtx, "EVTX file", "EVTX files"));
+        }
+        if self.evtx_zips > 0 {
+            parts.push(n(self.evtx_zips, "ZIP of EVTX files", "ZIPs of EVTX files"));
         }
         if self.mdb > 0 {
             parts.push(n(self.mdb, "UAL database", "UAL databases"));
@@ -161,6 +166,9 @@ pub fn judge(s: &Scan) -> Verdict {
         let mut parts = Vec::new();
         if s.evtx > 0 {
             parts.push(n(s.evtx, "EVTX file", "EVTX files"));
+        }
+        if s.evtx_zips > 0 {
+            parts.push(n(s.evtx_zips, "ZIP of EVTX files", "ZIPs of EVTX files"));
         }
         if s.mdb > 0 {
             parts.push(n(s.mdb, "UAL database", "UAL databases"));
@@ -260,9 +268,11 @@ fn look_at(p: &Path, s: &mut Scan) {
     } else if lower.ends_with(".mdb") {
         s.mdb += 1;
     } else if lower.ends_with(".zip") {
-        let kind = crate::parse::read_zip_top_entries(p).and_then(|entries| crate::parse::detect_triage_type(&p.to_string_lossy(), &entries));
+        let entries = crate::parse::read_zip_top_entries(p);
+        let kind = entries.as_ref().and_then(|e| crate::parse::detect_triage_type(&p.to_string_lossy(), e));
         match kind {
             Some(k) => s.triages.push((name.clone(), k.short_label())),
+            None if entries.map_or(false, |e| e.iter().any(|n| n.to_ascii_lowercase().ends_with(".evtx"))) => s.evtx_zips += 1,
             None => s.archives += 1,
         }
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar") {
@@ -469,6 +479,29 @@ mod tests {
         s.linux_tars = 2;
         assert_eq!(s.summary(), "1 disk image, 2 triage packages (KAPE), 19 EVTX files, 2 Linux triages");
         assert_eq!(Scan::default().summary(), "nothing masstin knows how to read");
+    }
+
+    #[test]
+    fn a_zip_full_of_evtx_is_windows_evidence() {
+        let dir = std::env::temp_dir().join(format!("masstin_detect_evtxzip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let z = dir.join("logs.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&z).unwrap());
+            for n in ["logs/Security.evtx", "logs/System.evtx"] {
+                w.start_file(n, zip::write::FileOptions::default()).unwrap();
+                std::io::Write::write_all(&mut w, b"ElfFile").unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let s = scan(&[z.to_string_lossy().to_string()], Limits::QUICK);
+        assert_eq!((s.evtx_zips, s.archives), (1, 0));
+        let v = judge(&s);
+        assert_eq!(v.parser, Some(PARSE_WINDOWS));
+        assert!(v.sure);
+        assert_eq!(v.why, "1 ZIP of EVTX files.");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

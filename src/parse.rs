@@ -3130,14 +3130,18 @@ pub fn parse_events_ex(
     if is_debug_mode() {
         println!("[INFO] Adding individual EVTX files...");
     }
-    vec_filenames.extend(files.iter().map(|s| EvtxLocation::File(s.to_string())));
+    // a ZIP given as a file is walked like one found in a folder: its EVTX,
+    // nested ZIPs and triage layout alike
+    let is_zip = |s: &String| s.to_ascii_lowercase().ends_with(".zip");
+    vec_filenames.extend(files.iter().filter(|s| !is_zip(s)).map(|s| EvtxLocation::File(s.to_string())));
 
     if is_debug_mode() {
         println!("[INFO] Searching for EVTX files in provided directories...");
     }
     let dir_count = directories.len();
     let file_count = files.len();
-    let discovery = find_evtx_files(directories);
+    let walked: Vec<String> = directories.iter().cloned().chain(files.iter().filter(|s| is_zip(s)).cloned()).collect();
+    let discovery = find_evtx_files(&walked);
     let archives_scanned = discovery.archives_scanned;
     let archives_with_evtx = discovery.archives_with_evtx;
     let triages = discovery.triages;
