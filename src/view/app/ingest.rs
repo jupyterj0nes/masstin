@@ -72,21 +72,14 @@ impl Default for Ingest {
 
 impl Ingest {
     /// Whether the parser is the one masstin picked for sure: then the
-    /// command is a plain `masstin parse`, which makes the same choice.
+    /// command is `masstin -a parse`, which makes the same choice.
     pub fn is_auto(&self) -> bool {
         self.verdict.as_ref().map_or(false, |v| v.sure && v.parser.map(pidx) == Some(self.parser))
     }
 
     pub fn command(&self) -> Vec<String> {
-        if self.is_auto() {
-            let mut args = vec!["parse".to_string()];
-            args.extend(self.sources.iter().cloned());
-            args.push("-o".into());
-            args.push(self.output.trim().to_string());
-            args.push("--overwrite".into());
-            return args;
-        }
-        let mut args = vec!["-a".to_string(), PARSERS[self.parser].action.to_string()];
+        let action = if self.is_auto() { "parse" } else { PARSERS[self.parser].action };
+        let mut args = vec!["-a".to_string(), action.to_string()];
         for s in &self.sources {
             args.push(if Path::new(s).is_dir() { "-d" } else { "-f" }.into());
             args.push(s.clone());
@@ -517,7 +510,7 @@ impl Viewer {
     fn ingest_step_parser(&mut self, ui: &mut egui::Ui) {
         let rec = self.ingest.verdict.as_ref().and_then(|v| v.parser).map(pidx);
         let sure = self.ingest.verdict.as_ref().map_or(false, |v| v.sure);
-        ui.label(egui::RichText::new(if sure { "The parser masstin picked (masstin parse picks the same by itself), and the others in case you know better." } else { "masstin is not sure which parser this is for. Pick one." }).color(theme::MUTED));
+        ui.label(egui::RichText::new(if sure { "The parser masstin picked (masstin -a parse picks the same by itself), and the others in case you know better." } else { "masstin is not sure which parser this is for. Pick one." }).color(theme::MUTED));
         ui.add_space(6.0);
         for (i, p) in PARSERS.iter().enumerate() {
             let on = self.ingest.parser == i;
@@ -1126,7 +1119,7 @@ mod tests {
         i.output = "out.csv".into();
         i.verdict = Some(Verdict { parser: Some(detect::PARSE_MASSIVE), sure: true, title: String::new(), why: String::new() });
         i.parser = P_MASSIVE;
-        assert_eq!(i.command(), ["parse", "D:/case", "-o", "out.csv", "--overwrite"]);
+        assert_eq!(&i.command()[..2], &["-a", "parse"]);
         // another parser picked by hand: named with -a
         i.parser = P_WINDOWS;
         assert_eq!(&i.command()[..2], &["-a", "parse-windows"]);

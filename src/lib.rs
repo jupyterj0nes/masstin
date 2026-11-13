@@ -69,16 +69,9 @@ mod view;
 #[command(author, version, about)]
 pub struct Cli {
     /// Action to perform. `parse` is the one to start with: it looks at the
-    /// evidence and picks the parser itself. The action can also come first
-    /// without -a: `masstin parse D:\evidence -o timeline.csv`.
+    /// evidence given with -d / -f and picks the parser itself.
     #[arg(short, long)]
     action: ActionType,
-
-    /// Evidence to read, given without -d / -f: folders, files, disk images
-    /// and archives alike, each told apart by what it is. `masstin parse
-    /// D:\case` is `masstin -a parse -d D:\case`.
-    #[arg(value_name = "PATH")]
-    paths: Vec<String>,
 
     /// Directories to process — also accepts drive letters (D:) for mounted volumes
     #[arg(short, long)]
@@ -443,8 +436,6 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
-    take_paths(&mut config);
-
     // Clean and normalize paths
     config.directory = {
         let mut dirs = Vec::new();
@@ -792,33 +783,6 @@ struct ParseStep {
     dirs: Vec<String>,
 }
 
-/// Evidence given without -d / -f: a folder (or a drive letter) joins the
-/// directories, anything else the files.
-fn take_paths(config: &mut Cli) {
-    for p in std::mem::take(&mut config.paths) {
-        if std::path::Path::new(&p).is_dir() || crate::parse_image_windows::is_drive_letter(&p) {
-            config.directory.push(p);
-        } else {
-            config.file.push(p);
-        }
-    }
-}
-
-/// Whether a word is the name of an action (or one of its aliases), so that
-/// `masstin parse D:\case` reads as `masstin -a parse D:\case`.
-pub fn is_action_name(word: &str) -> bool {
-    !word.starts_with('-') && ActionType::from_str(word, false).is_ok()
-}
-
-/// The command line with an action named first, without -a, given its -a.
-pub fn args_with_action_flag<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Vec<std::ffi::OsString> {
-    let mut v: Vec<std::ffi::OsString> = args.into_iter().collect();
-    if v.len() > 1 && v[1].to_str().map_or(false, is_action_name) {
-        v.insert(1, "-a".into());
-    }
-    v
-}
-
 fn action_name(a: &ActionType) -> String {
     a.to_possible_value().map(|v| v.get_name().to_string()).unwrap_or_else(|| format!("{:?}", a))
 }
@@ -848,7 +812,7 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         return Ok(vec![ParseStep { action: ActionType::ParseImage, files: config.file.clone(), dirs: config.directory.clone() }]);
     }
     if config.file.is_empty() && config.directory.is_empty() {
-        return Err("parse needs evidence to read: a folder, files, disk images or archives (masstin parse D:\\evidence -o timeline.csv).".into());
+        return Err("parse needs evidence to read: a folder, files, disk images or archives (masstin -a parse -d D:\\evidence -o timeline.csv).".into());
     }
     for f in &config.file {
         if !std::path::Path::new(f).exists() {
@@ -913,9 +877,9 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
             }
             Some(a) => {
                 let mut act = action_of(a);
-                // parse-windows reads EVTX and UAL files given one by one; a
-                // triage package given as a file goes through the massive pass
-                if act == ActionType::ParseWindows && files.iter().any(|f| !f.to_ascii_lowercase().ends_with(".mdb") && !is_evtx_file(f)) {
+                // parse-windows reads EVTX, UAL and ZIP files given one by one;
+                // anything else given as a file goes through the massive pass
+                if act == ActionType::ParseWindows && files.iter().any(|f| !f.to_ascii_lowercase().ends_with(".mdb") && !f.to_ascii_lowercase().ends_with(".zip") && !is_evtx_file(f)) {
                     act = ActionType::ParseMassive;
                 }
                 crate::banner::print_phase_result(&format!("{} -> {}: {}", v.title, action_name(&act), v.why));
@@ -1050,11 +1014,12 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                     return Err(format!("File {} does not exist.", file));
                 }
                 if config.action == ActionType::ParseWindows {
-                    // Check if EVTX or MDB (UAL database)
+                    // EVTX, MDB (UAL database) or a ZIP of them (walked like a folder's)
                     let is_mdb = file.to_lowercase().ends_with(".mdb");
-                    if !is_mdb && !is_evtx_file(file) {
+                    let is_zip = file.to_lowercase().ends_with(".zip");
+                    if !is_mdb && !is_zip && !is_evtx_file(file) {
                         return Err(format!(
-                            "File {} does not appear to be an EVTX or MDB file.",
+                            "File {} does not appear to be an EVTX, MDB or ZIP file.",
                             file
                         ));
                     }
@@ -1439,47 +1404,21 @@ mod parse_auto_tests {
     }
 
     fn cli(args: &[&str]) -> Cli {
-        let mut c = Cli::parse_from(args_with_action_flag(args.iter().map(|a| std::ffi::OsString::from(*a))));
-        take_paths(&mut c);
-        c
-    }
-
-    #[test]
-    fn an_action_named_first_needs_no_dash_a() {
-        let v = args_with_action_flag(["masstin", "parse", "D:/case"].map(std::ffi::OsString::from));
-        assert_eq!(v, ["masstin", "-a", "parse", "D:/case"].map(std::ffi::OsString::from).to_vec());
-        let v = args_with_action_flag(["masstin", "-a", "view"].map(std::ffi::OsString::from));
-        assert_eq!(v.len(), 3);
-        // a path is not an action
-        let v = args_with_action_flag(["masstin", "D:/case"].map(std::ffi::OsString::from));
-        assert_eq!(v.len(), 2);
-        assert!(is_action_name("parse-massive") && is_action_name("graph-hunt-csv") && is_action_name("auto"));
-        assert!(!is_action_name("timeline.csv"));
-    }
-
-    #[test]
-    fn folders_and_files_given_as_paths_are_told_apart() {
-        let d = tmp("paths");
-        let f = d.join("Security.evtx");
-        std::fs::write(&f, b"ElfFile").unwrap();
-        let c = cli(&["masstin", "parse", d.to_str().unwrap(), f.to_str().unwrap()]);
-        assert_eq!(c.directory, vec![d.to_string_lossy().to_string()]);
-        assert_eq!(c.file, vec![f.to_string_lossy().to_string()]);
-        let _ = std::fs::remove_dir_all(&d);
+        Cli::parse_from(args)
     }
 
     #[test]
     fn a_folder_of_evtx_is_read_by_parse_windows() {
         let d = tmp("evtx");
         std::fs::write(d.join("Security.evtx"), b"ElfFile").unwrap();
-        let steps = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap()])).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-d", d.to_str().unwrap()])).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].action, ActionType::ParseWindows);
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn an_archive_given_as_a_file_goes_through_the_massive_pass() {
+    fn an_archive_of_no_known_layout_given_as_a_file_goes_through_the_massive_pass() {
         let d = tmp("zip");
         let e = d.join("Security.evtx");
         std::fs::write(&e, b"ElfFile").unwrap();
@@ -1490,7 +1429,12 @@ mod parse_auto_tests {
             std::io::Write::write_all(&mut w, b"x").unwrap();
             w.finish().unwrap();
         }
-        let steps = resolve_parse(&cli(&["masstin", "parse", e.to_str().unwrap(), z.to_str().unwrap()])).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", e.to_str().unwrap(), "-f", z.to_str().unwrap()])).unwrap();
+        assert_eq!(steps[0].action, ActionType::ParseWindows, "a ZIP is read by parse-windows");
+        // a tarball beside EVTX is not: the massive pass
+        let t = d.join("other.tgz");
+        std::fs::write(&t, b"not really").unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", e.to_str().unwrap(), "-f", t.to_str().unwrap()])).unwrap();
         assert_eq!(steps[0].action, ActionType::ParseMassive);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1502,7 +1446,7 @@ mod parse_auto_tests {
         std::fs::write(&e, b"ElfFile").unwrap();
         let vpn = d.join("fortigate-vpn.log");
         std::fs::write(&vpn, b"date=2026-11-10 time=01:39:00 action=tunnel-up\n").unwrap();
-        let steps = resolve_parse(&cli(&["masstin", "parse", e.to_str().unwrap(), vpn.to_str().unwrap(), "--rules", "rules/vpn"])).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", e.to_str().unwrap(), "-f", vpn.to_str().unwrap(), "--rules", "rules/vpn"])).unwrap();
         let acts: Vec<ActionType> = steps.iter().map(|s| s.action.clone()).collect();
         assert_eq!(acts, vec![ActionType::ParseWindows, ActionType::ParseCustom]);
         assert_eq!(steps[1].files, vec![vpn.to_string_lossy().to_string()]);
@@ -1513,7 +1457,7 @@ mod parse_auto_tests {
     fn carving_is_asked_for_and_needs_an_image() {
         let d = tmp("carve");
         std::fs::write(d.join("Security.evtx"), b"ElfFile").unwrap();
-        let steps = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap(), "--carve"])).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-d", d.to_str().unwrap(), "--carve"])).unwrap();
         assert_eq!(steps.len(), 1, "no image, no carving");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1522,9 +1466,9 @@ mod parse_auto_tests {
     fn nothing_known_is_an_error_that_says_what_to_do() {
         let d = tmp("nothing");
         std::fs::write(d.join("readme.txt"), b"hello").unwrap();
-        let e = resolve_parse(&cli(&["masstin", "parse", d.to_str().unwrap()])).unwrap_err();
+        let e = resolve_parse(&cli(&["masstin", "-a", "parse", "-d", d.to_str().unwrap()])).unwrap_err();
         assert!(e.contains("Nothing masstin knows how to read") && e.contains("-a"), "{}", e);
-        let e = resolve_parse(&cli(&["masstin", "parse"])).unwrap_err();
+        let e = resolve_parse(&cli(&["masstin", "-a", "parse"])).unwrap_err();
         assert!(e.contains("needs evidence"), "{}", e);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1534,7 +1478,7 @@ mod parse_auto_tests {
         let d = tmp("timelines");
         let t = d.join("a.csv");
         std::fs::write(&t, format!("{}\n", crate::csv_out::HEADER)).unwrap();
-        let steps = resolve_parse(&cli(&["masstin", "parse", t.to_str().unwrap()])).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", t.to_str().unwrap()])).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].action, ActionType::Merge);
         let _ = std::fs::remove_dir_all(&d);

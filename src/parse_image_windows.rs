@@ -244,7 +244,18 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Phase 1: Extract EVTX + UAL from all sources into temp directories
     let mut extracted_dirs: Vec<String> = Vec::new();
-    let mut all_image_files: Vec<String> = files.to_vec();
+    // MASSIVE mode: a file that is not a disk image (a triage or EVTX ZIP, an
+    // EVTX, a Linux tarball or log) is loose evidence, read as a folder's
+    // would be; before, a ZIP given with -f was opened as an image and its
+    // EVTX were lost
+    let mut all_image_files: Vec<String> = Vec::new();
+    for f in files {
+        if include_loose_artifacts && !is_first_image_segment(Path::new(f)) {
+            real_dirs.push(f.clone());
+        } else {
+            all_image_files.push(f.clone());
+        }
+    }
     let base_temp = std::env::temp_dir().join("masstin_image_extract");
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
@@ -746,6 +757,13 @@ const MASSIVE_IMG_TMP: &str = ".masstin_massive_img";
 /// Recursively collect `.zip` files under a directory (parse-massive).
 fn scan_for_zips(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > 10 { return; }
+    // a ZIP given as a file of its own
+    if dir.is_file() {
+        if dir.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("zip")).unwrap_or(false) {
+            out.push(dir.to_path_buf());
+        }
+        return;
+    }
     let entries = match fs::read_dir(dir) { Ok(e) => e, Err(_) => return };
     for entry in entries.flatten() {
         let p = entry.path();
