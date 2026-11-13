@@ -672,17 +672,17 @@ impl Viewer {
                     for (k, n) in kinds {
                         count_chip(ui, ic::ARCHIVE, n, k, theme::VIOLET);
                     }
-                    count_chip(ui, ic::HARD_DRIVES, s.images.len(), "disk images", theme::MAGENTA);
+                    count_chip(ui, ic::HARD_DRIVES, s.images.len(), plural(s.images.len(), "disk image", "disk images"), theme::MAGENTA);
                     for (fam, n) in &s.linux {
                         count_chip(ui, ic::TERMINAL_WINDOW, *n, fam, EDGE_OK);
                     }
-                    count_chip(ui, ic::ARCHIVE, s.uac, "UAC", EDGE_OK);
-                    count_chip(ui, ic::TERMINAL_WINDOW, s.linux_tars, "Linux triages", EDGE_OK);
+                    count_chip(ui, ic::ARCHIVE, s.uac, plural(s.uac, "UAC triage", "UAC triages"), EDGE_OK);
+                    count_chip(ui, ic::TERMINAL_WINDOW, s.linux_tars, plural(s.linux_tars, "Linux triage", "Linux triages"), EDGE_OK);
                     count_chip(ui, ic::LAPTOP, s.logarchives, "logarchive", CANDIDATE);
                     count_chip(ui, ic::LAPTOP, s.mac_json, "log show JSON", CANDIDATE);
                     count_chip(ui, ic::CLOUD, s.elastic_json, "Winlogbeat JSON", theme::VIOLET);
-                    count_chip(ui, ic::TABLE, s.timelines.len(), "timelines", theme::CYAN);
-                    count_chip(ui, ic::ARCHIVE, s.archives, "other archives", theme::DIM);
+                    count_chip(ui, ic::TABLE, s.timelines.len(), plural(s.timelines.len(), "timeline", "timelines"), theme::CYAN);
+                    count_chip(ui, ic::ARCHIVE, s.archives, plural(s.archives, "other archive", "other archives"), theme::DIM);
                 });
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("{} files in {} folders looked at in {:.1} s{}", s.files, s.dirs, s.secs, if s.truncated { "; the look stopped early, the parser goes all the way" } else { "" })).color(theme::DIM).small());
@@ -1091,6 +1091,15 @@ fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke, corner: f32) {
 
 /// `icon n what` in a pill of the category's colour: one widget, so a
 /// wrapped row moves it whole.
+/// The name of a count in the singular for one, in the plural otherwise.
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
 fn count_chip(ui: &mut egui::Ui, icon: &str, n: usize, what: &str, color: Color32) {
     if n == 0 {
         return;
@@ -1314,6 +1323,13 @@ fn is_rotated_log_name(name: &str, fam: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_of_a_kind_is_named_in_the_singular() {
+        assert_eq!(plural(1, "disk image", "disk images"), "disk image");
+        assert_eq!(plural(2, "disk image", "disk images"), "disk images");
+        assert_eq!(plural(0, "Linux triage", "Linux triages"), "Linux triages");
+    }
 
     #[test]
     fn rotated_log_names_only() {

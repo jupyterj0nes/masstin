@@ -281,7 +281,9 @@ mod tests {
         install(&ctx);
         let mut raw = egui::RawInput::default();
         raw.system_theme = Some(egui::Theme::Light);
-        let _ = ctx.run_ui(raw, |_| {});
+        // the frame's textures are never uploaded here: say so, epaint checks it on drop
+        let mut out = ctx.run_ui(raw, |_| {});
+        out.textures_delta.clear();
         let v = ctx.global_style().visuals.clone();
         assert!(v.dark_mode);
         assert_eq!(v.override_text_color, Some(TEXT));

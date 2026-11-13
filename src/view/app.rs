@@ -2750,7 +2750,7 @@ impl Viewer {
             if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
                 let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * fs).clamp(8.0, 14.0)), ACCENT);
                 let h = galley.size().y;
-                draw::pill(&painter, Pos2::new(p.x, p.y + r + 10.0 + h / 2.0), galley, draw::fade(CAPTION_BG, alpha), Some(draw::fade(ACCENT, 0.5 * alpha)), ACCENT);
+                draw::pill(&painter, Pos2::new(p.x, labels::hop_badge_y(p, r, h, look.label_pos)), galley, draw::fade(CAPTION_BG, alpha), Some(draw::fade(ACCENT, 0.5 * alpha)), ACCENT);
             }
         }
 
