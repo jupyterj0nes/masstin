@@ -144,6 +144,31 @@ pub(super) fn paint_host_label(painter: &egui::Painter, name: &str, p: Pos2, r: 
     }
 }
 
+/// Where the hop badge of a path or a cone sits: on the side of the host the
+/// name does not take, so the two never cover each other (the name goes below
+/// unless the host's style puts it above).
+pub(super) fn hop_badge_y(p: Pos2, r: f32, h: f32, name_pos: LabelPos) -> f32 {
+    if name_pos == LabelPos::Above {
+        p.y + r + 10.0 + h / 2.0
+    } else {
+        p.y - r - 10.0 - h / 2.0
+    }
+}
+
+#[cfg(test)]
+mod hop_badge_tests {
+    use super::*;
+
+    #[test]
+    fn the_badge_takes_the_side_the_name_leaves() {
+        let p = Pos2::new(100.0, 100.0);
+        for pos in [LabelPos::Auto, LabelPos::Below, LabelPos::Inside, LabelPos::Band] {
+            assert!(hop_badge_y(p, 20.0, 14.0, pos) < p.y - 20.0, "{:?}: the badge goes above", pos);
+        }
+        assert!(hop_badge_y(p, 20.0, 14.0, LabelPos::Above) > p.y + 20.0);
+    }
+}
+
 impl Viewer {
     /// The style rule that holds one host's own settings (made if missing).
     pub(super) fn host_rule_mut(&mut self, name: &str) -> &mut Rule {
