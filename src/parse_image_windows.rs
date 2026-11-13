@@ -9,7 +9,6 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use vshadow::VssVolume;
 use crate::parse::{parse_events, is_debug_mode};
-use crate::parse_linux::parse_linux;
 
 const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 const BITLOCKER_SIGNATURE: &[u8] = b"-FVE-FS-";
@@ -474,7 +473,34 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
-    if extracted_dirs.is_empty() && linux_log_dirs.is_empty() && all_task_events.is_empty() && all_mountpoint_events.is_empty() {
+    // MASSIVE mode: the Linux evidence lying loose in the case folder (a UAC
+    // tarball, a tar of /etc and /var/log, an auth.log copied out by hand).
+    // The images' Linux logs were found above; these never pass through an
+    // image, and the Windows walk below reads only EVTX and UAL.
+    let (loose_linux_archives, loose_linux_logs) = if include_loose_artifacts {
+        crate::parse_linux::find_loose_linux_evidence(&real_dirs)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if !loose_linux_archives.is_empty() || !loose_linux_logs.is_empty() {
+        crate::banner::print_phase_result(&format!(
+            "Linux evidence found: {} archive(s), {} log file(s)",
+            loose_linux_archives.len(),
+            loose_linux_logs.len()
+        ));
+        for a in &loose_linux_archives {
+            let name = Path::new(a).file_name().and_then(|n| n.to_str()).unwrap_or(a);
+            crate::banner::print_info(&format!("  {}", name));
+        }
+    }
+
+    if extracted_dirs.is_empty()
+        && linux_log_dirs.is_empty()
+        && loose_linux_archives.is_empty()
+        && loose_linux_logs.is_empty()
+        && all_task_events.is_empty()
+        && all_mountpoint_events.is_empty()
+    {
         eprintln!("[ERROR] No artifacts extracted from any source.");
         return;
     }
@@ -482,7 +508,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // Phase 2+3: Parse extracted directories and generate output CSV
     let empty_files: Vec<String> = vec![];
     let has_windows = !extracted_dirs.is_empty();
-    let has_linux = !linux_log_dirs.is_empty();
+    let has_linux = !linux_log_dirs.is_empty() || !loose_linux_archives.is_empty() || !loose_linux_logs.is_empty();
 
     if has_windows && has_linux {
         // Both OS types found — parse each separately, then merge into one CSV
@@ -503,7 +529,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         all_mountpoint_events.clear();
 
         crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
-        crate::parse_linux::parse_linux_quiet(&empty_files, &linux_log_dirs, Some(&linux_tmp_str));
+        crate::parse_linux::parse_linux_with_archives(
+            &loose_linux_logs,
+            &loose_linux_archives,
+            &linux_log_dirs,
+            Some(&linux_tmp_str),
+            true,
+        );
 
         // Rewrite log_filename paths before merging
         crate::parse_image_linux::rewrite_log_filenames_linux(&linux_tmp_str);
@@ -546,7 +578,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         all_mountpoint_events.clear();
     } else {
         // Linux only
-        parse_linux(&empty_files, &linux_log_dirs, output);
+        crate::parse_linux::parse_linux_with_archives(
+            &loose_linux_logs,
+            &loose_linux_archives,
+            &linux_log_dirs,
+            output,
+            false,
+        );
         if let Some(out_path) = output {
             crate::parse_image_linux::rewrite_log_filenames_linux(out_path);
         }
