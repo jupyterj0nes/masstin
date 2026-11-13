@@ -49,7 +49,7 @@ Two things it cannot guess are options of `parse`, and their result is merged in
 - `--rules <file or folder>`: the files given one by one that masstin does not recognise (a VPN, firewall or proxy log) are read with these [custom-parser rules](custom-parsers.md).
 - `--carve`: the disk images found are also carved for EVTX records (`carve-image`, [below](#evtx-carving-last-resort-recovery-from-unallocated-space)): the events of logs deleted or overwritten. Slow: every byte of every image is read.
 
-Timelines found beside the evidence are merged in too. When nothing it knows is there, `parse` stops and says so; when it is not sure (several platforms of no common layout), it says that it is not sure and which parser it chose.
+masstin timelines given with `-f` are merged in as they are. The ones lying inside the folders are left out, and the console says so (an earlier run's output, another case's timeline): give one with `-f` to merge it in; a folder of timelines and nothing else is merged. When nothing it knows is there, `parse` stops and says so, and when no part gives an event it writes nothing and says that too; when it is not sure (several platforms of no common layout), it says that it is not sure and which parser it chose.
 
 ## Advanced: naming the parser yourself
 

@@ -846,6 +846,19 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         }
     }
 
+    // masstin timelines given with -f are merged as they are, never handed to
+    // a parser; the ones lying inside the folders are left out (a timeline of
+    // an earlier run, of another case) unless the folders hold nothing else
+    let mut given_tl = Vec::new();
+    files.retain(|f| {
+        if detect::is_timeline(std::path::Path::new(f)) {
+            given_tl.push(f.clone());
+            false
+        } else {
+            true
+        }
+    });
+
     let mut steps: Vec<ParseStep> = Vec::new();
     let mut images: Vec<String> = Vec::new();
     let rest: Vec<String> = files.iter().chain(dirs.iter()).cloned().collect();
@@ -865,10 +878,12 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         match v.parser {
             None if v.sure => {
                 crate::banner::print_phase_result(&format!("{} -> merged into one timeline (merge)", v.title));
-                steps.push(ParseStep { action: ActionType::Merge, files: s.timelines.clone(), dirs: Vec::new() });
+                let mut all = s.timelines.clone();
+                all.extend(given_tl.drain(..));
+                steps.push(ParseStep { action: ActionType::Merge, files: all, dirs: Vec::new() });
             }
             None => {
-                if custom.is_empty() && volumes.is_empty() {
+                if custom.is_empty() && volumes.is_empty() && given_tl.is_empty() {
                     return Err(format!(
                         "Nothing masstin knows how to read in {}: no event logs, triage packages, disk images, Linux or macOS logs, Winlogbeat JSON or timelines. Name the parser with -a (parse-windows, parse-linux, parse-mac, parse-image, parse-massive) if the evidence is there in another shape, or read text logs (VPN, firewall, proxy) with --rules.",
                         rest.join(", ")
@@ -887,14 +902,24 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
                     crate::banner::print_warning("Not sure of the parser: -a names one (parse-windows, parse-linux, parse-mac, parse-image, parse-massive)");
                 }
                 steps.push(ParseStep { action: act, files: files.clone(), dirs: dirs.clone() });
-                // timelines beside the evidence join the result
                 if !s.timelines.is_empty() {
-                    crate::banner::print_phase_result(&format!("{} timeline(s) beside the evidence -> merged in", s.timelines.len()));
-                    steps.push(ParseStep { action: ActionType::Merge, files: s.timelines.clone(), dirs: Vec::new() });
+                    crate::banner::print_info(&format!(
+                        "{} masstin timeline(s) inside the folders left out (an earlier run's, another case's): give one with -f to merge it in",
+                        s.timelines.len()
+                    ));
                 }
             }
         }
         images = s.images.clone();
+    }
+    if !given_tl.is_empty() {
+        let only = steps.is_empty() && volumes.is_empty() && custom.is_empty();
+        crate::banner::print_phase_result(&if only {
+            format!("{} masstin timeline(s) -> merged into one timeline (merge)", given_tl.len())
+        } else {
+            format!("{} masstin timeline(s) given -> merged in", given_tl.len())
+        });
+        steps.push(ParseStep { action: ActionType::Merge, files: given_tl, dirs: Vec::new() });
     }
     if !volumes.is_empty() {
         crate::banner::print_phase_result(&format!("Mounted volume(s) {} -> parse-image (the live files and the shadow copies)", volumes.join(", ")));
@@ -985,6 +1010,10 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
         if std::path::Path::new(&out).exists() {
             parts.push(out);
         }
+    }
+    if parts.is_empty() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err("No events from any part: nothing to write.".into());
     }
     crate::banner::print_info(&format!("Merging the {} part(s) into one timeline", parts.len()));
     let r = merge_files(&parts, config.output.as_ref(), None, None, None);
@@ -1481,6 +1510,38 @@ mod parse_auto_tests {
         let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", t.to_str().unwrap()])).unwrap();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].action, ActionType::Merge);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_timeline_inside_the_folder_is_left_out_and_one_given_is_merged_in() {
+        let d = tmp("tl_beside");
+        std::fs::write(d.join("Security.evtx"), b"ElfFile").unwrap();
+        // an earlier run's output lying in the evidence folder
+        std::fs::write(d.join("old-run.csv"), format!("{}\n", crate::csv_out::HEADER)).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-d", d.to_str().unwrap()])).unwrap();
+        assert_eq!(steps.len(), 1, "{:?}", steps);
+        assert_eq!(steps[0].action, ActionType::ParseWindows);
+        // given with -f it joins, and is never handed to the parser
+        let other = tmp("tl_given");
+        let t = other.join("other.csv");
+        std::fs::write(&t, format!("{}\n", crate::csv_out::HEADER)).unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-d", d.to_str().unwrap(), "-f", t.to_str().unwrap()])).unwrap();
+        let acts: Vec<ActionType> = steps.iter().map(|s| s.action.clone()).collect();
+        assert_eq!(acts, vec![ActionType::ParseWindows, ActionType::Merge]);
+        assert!(steps[0].files.is_empty(), "the timeline is not a parser's input");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_vhd_is_a_disk_image() {
+        let d = tmp("vhd");
+        let v = d.join("disk.vhd");
+        std::fs::write(&v, b"conectix").unwrap();
+        let steps = resolve_parse(&cli(&["masstin", "-a", "parse", "-f", v.to_str().unwrap()])).unwrap();
+        assert_eq!(steps[0].action, ActionType::ParseImage);
+        assert!(crate::parse_image_windows::is_first_image_segment(std::path::Path::new("x.VHDX")));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
