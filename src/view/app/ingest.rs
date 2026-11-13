@@ -53,6 +53,8 @@ pub(super) struct Scan {
     /// Linux log family -> files
     pub linux: BTreeMap<&'static str, usize>,
     pub uac: usize,
+    /// tarballs of a Linux file system (etc/, var/log/...) that are not UAC
+    pub linux_tars: usize,
     pub logarchives: usize,
     pub mac_json: usize,
     pub elastic_json: usize,
@@ -69,7 +71,7 @@ impl Scan {
         self.evtx + self.mdb + self.triages.iter().filter(|(_, k)| *k != "UAC").count()
     }
     fn linux_total(&self) -> usize {
-        self.linux.values().sum::<usize>() + self.uac + self.triages.iter().filter(|(_, k)| *k == "UAC").count()
+        self.linux.values().sum::<usize>() + self.uac + self.linux_tars + self.triages.iter().filter(|(_, k)| *k == "UAC").count()
     }
     fn mac(&self) -> usize {
         self.logarchives + self.mac_json
@@ -96,7 +98,8 @@ pub(super) fn judge(s: &Scan) -> Verdict {
         return Verdict { parser: Some(P_IMAGE), sure: true, title: if img == 1 { "A disk image".into() } else { format!("{} disk images", img) }, why: "The file system inside is read directly: Windows event logs, UAL and shadow copies, or Linux logs, whichever it holds.".into() };
     }
     if img > 0 {
-        return Verdict { parser: Some(P_MASSIVE), sure: true, title: "An evidence folder".into(), why: format!("{} with other evidence beside: the massive pass takes the images, the triage packages and the loose EVTX together.", n(img, "disk image", "disk images")) };
+        let linux = if lin > 0 { ", the Linux logs and triages" } else { "" };
+        return Verdict { parser: Some(P_MASSIVE), sure: true, title: "An evidence folder".into(), why: format!("{} with other evidence beside: the massive pass takes the images, the triage packages{} and the loose EVTX together, into one timeline.", n(img, "disk image", "disk images"), linux) };
     }
     if win > 0 && lin == 0 && mac == 0 && ela == 0 {
         let mut parts = Vec::new();
@@ -130,7 +133,7 @@ pub(super) fn judge(s: &Scan) -> Verdict {
         return Verdict { parser: Some(P_ELASTIC), sure: true, title: "Winlogbeat JSON".into(), why: format!("{} exported from Elasticsearch.", n(ela, "JSON file", "JSON files")) };
     }
     if win > 0 && lin > 0 {
-        return Verdict { parser: Some(P_MASSIVE), sure: false, title: "Windows and Linux together".into(), why: "The massive pass takes the triage packages and the EVTX; loose Linux logs are parse-linux's and need a run of their own. Pick the parser, or split the folder.".into() };
+        return Verdict { parser: Some(P_MASSIVE), sure: true, title: "Windows and Linux together".into(), why: "The massive pass takes the Windows triage packages and EVTX and the Linux logs and triages side by side, into one timeline.".into() };
     }
     if win + lin + mac + ela > 0 {
         return Verdict { parser: Some(P_MASSIVE), sure: false, title: "A mix of platforms".into(), why: "Several kinds of evidence side by side. The massive pass is the safe default; one run per platform is cleaner.".into() };
@@ -203,6 +206,8 @@ fn look_at(p: &Path, s: &mut Scan) {
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar") {
         if lower.starts_with("uac-") {
             s.uac += 1;
+        } else if tar_holds_linux_files(p) {
+            s.linux_tars += 1;
         } else {
             s.archives += 1;
         }
@@ -227,6 +232,31 @@ fn look_at(p: &Path, s: &mut Scan) {
             *s.linux.entry(fam).or_insert(0) += 1;
         }
     }
+}
+
+/// Whether a tarball carries a Linux file system: among its first entries, an
+/// `etc/` or `var/log/` path. Only the head of the archive is read (a few
+/// hundred entries), so a multi-gigabyte collection costs nothing to look at.
+fn tar_holds_linux_files(p: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(p) else { return false };
+    let lower = p.to_string_lossy().to_ascii_lowercase();
+    let reader: Box<dyn std::io::Read> = if lower.ends_with(".tar") {
+        Box::new(f)
+    } else {
+        Box::new(flate2::read::GzDecoder::new(f))
+    };
+    let mut ar = tar::Archive::new(reader);
+    let Ok(entries) = ar.entries() else { return false };
+    for e in entries.take(400) {
+        let Ok(e) = e else { return false };
+        let Ok(path) = e.path() else { continue };
+        let name = path.to_string_lossy().replace('\\', "/");
+        let name = name.trim_start_matches("./").trim_start_matches('/');
+        if name.starts_with("etc/") || name.starts_with("var/log/") || name.contains("/var/log/") || name.contains("[root]/") {
+            return true;
+        }
+    }
+    false
 }
 
 fn head_of(p: &Path, n: usize) -> String {
@@ -647,6 +677,7 @@ impl Viewer {
                         count_chip(ui, ic::TERMINAL_WINDOW, *n, fam, EDGE_OK);
                     }
                     count_chip(ui, ic::ARCHIVE, s.uac, "UAC", EDGE_OK);
+                    count_chip(ui, ic::TERMINAL_WINDOW, s.linux_tars, "Linux triages", EDGE_OK);
                     count_chip(ui, ic::LAPTOP, s.logarchives, "logarchive", CANDIDATE);
                     count_chip(ui, ic::LAPTOP, s.mac_json, "log show JSON", CANDIDATE);
                     count_chip(ui, ic::CLOUD, s.elastic_json, "Winlogbeat JSON", theme::VIOLET);
@@ -1313,13 +1344,55 @@ mod tests {
     }
 
     #[test]
-    fn linux_and_windows_together_are_not_sure() {
+    fn linux_and_windows_together_go_to_the_massive_pass() {
+        // parse-massive reads the loose Linux evidence beside the Windows one
         let mut s = Scan::default();
         s.evtx = 1;
         s.linux.insert("secure", 2);
         let v = judge(&s);
         assert_eq!(v.parser, Some(P_MASSIVE));
-        assert!(!v.sure);
+        assert!(v.sure);
+    }
+
+    #[test]
+    fn a_tarball_of_a_linux_file_system_is_a_linux_triage() {
+        let dir = std::env::temp_dir().join(format!("masstin_wizard_tar_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tgz = dir.join("web01-triage.tgz");
+        {
+            let f = std::fs::File::create(&tgz).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut b = tar::Builder::new(gz);
+            for (name, body) in [("etc/hostname", "web01\n"), ("var/log/auth.log", "x\n")] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, name, body.as_bytes()).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let other = dir.join("photos.tgz");
+        {
+            let f = std::fs::File::create(&other).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut b = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, "holiday/beach.jpg", &b"x"[..]).unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let s = scan(&[dir.to_string_lossy().to_string()]);
+        assert_eq!((s.linux_tars, s.archives), (1, 1));
+        let mut s2 = s.clone();
+        s2.images.push("a.vmdk".into());
+        let v = judge(&s2);
+        assert_eq!(v.parser, Some(P_MASSIVE));
+        assert!(v.why.contains("Linux"), "{}", v.why);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
