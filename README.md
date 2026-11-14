@@ -23,7 +23,7 @@
 
 ## Three steps
 
-1. **Give it the evidence.** Drop a folder of EVTX, a KAPE / Velociraptor / UAC triage, a disk image, Linux or macOS logs on the window (or run `masstin -a parse -d <folder>` in a terminal: it picks the parser itself). Masstin says what it is, parses it with its progress bars drawn in the window, and opens the timeline: one CSV, the same columns whatever the source. [Parsing →](docs/parsing.md)
+1. **Give it the evidence.** Drop a folder of EVTX, a KAPE / Velociraptor / UAC triage, a disk image, Linux or macOS logs on the window (or run `masstin -a parse -d <folder>` in a terminal: one action for all of it). Masstin says what it is, parses it with its progress bars drawn in the window, and opens the timeline: one CSV, the same columns whatever the source. [Parsing →](docs/parsing.md)
 2. **Hunt.** `graph-hunt` tests every connection after the start of the investigation against what the network did before it, and keeps what survives a false-discovery-rate test. The only number you choose is the FDR; every finding comes with its reason in words. [graph-hunt →](docs/graph-hunt.md)
 3. **Look.** Hosts drawn as the machines they are, the accounts on the lines, the findings glowing. Neighbourhoods, time-respecting paths and reach cones between hosts, the questions an analyst asks of a login graph, marks and notes written back into the CSV, a replay you can present and record. [The viewer →](docs/viewer.md)
 
@@ -47,7 +47,7 @@ The same three steps from a terminal:
 
 ```bash
 # 1. the evidence folder (images, zips, triages, loose files): masstin says what it found
-#    and picks the parser itself -> one timeline
+#    and reads it all -> one timeline
 masstin -a parse -d /evidence/case-2026-03 -o timeline.csv
 
 # 2. what happened after the cutoff that this network had never done before?

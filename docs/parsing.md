@@ -9,13 +9,13 @@
 </div>
 
 
-## `-a parse`: give it the evidence, it picks the parser
+## `-a parse`: one action for every kind of evidence
 
 ```bash
 # a folder, an image, a triage, a mix: masstin looks first and says what it found
 masstin -a parse -d /evidence/case-2026-03 -o timeline.csv
 
-# several sources at once
+# several sources at once: folders with -d, files with -f
 masstin -a parse -f /evidence/images/srv01.E01 -f /evidence/logs.zip -d /evidence/linux -o timeline.csv
 
 # a VPN or firewall log beside the rest: the rules read what masstin does not know
@@ -25,35 +25,28 @@ masstin -a parse -d /evidence/case-2026-03 -f fortigate-vpn.log --rules rules/vp
 masstin -a parse -d /evidence/case-2026-03 --carve -o timeline.csv
 ```
 
-`parse` looks at what it is given before it reads anything (the same look the window's ingest wizard makes): EVTX files, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images, Linux logs and triages, macOS `.logarchive` bundles and `log show` exports, Winlogbeat JSON, masstin timelines. It says what it found and which parser takes it, in a line each:
+`-d` gives a folder, walked whole; `-f` gives one file, and only that file is read. Either way the evidence goes through the same pass: there is no parser to choose.
 
-```
-        Found: 1 disk image, 4 triage packages (KAPE), 19 EVTX files, 2 Linux triages (31 files in 9 folders, 0.1 s)
-        => An evidence folder -> parse-massive: 1 disk image with other evidence beside: ...
-```
+1. **The look.** `parse` first counts what it was given, the same look the window's ingest wizard makes: EVTX files, ZIPs of EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images (E01, VMDK, VHD / VHDX, dd / raw), Linux logs and triages, macOS `.logarchive` bundles and `log show` exports, Winlogbeat JSON, masstin timelines. It says so in a line:
 
-| Found | `parse` runs |
-|---|---|
-| EVTX files, UAL databases, Windows triage packages, ZIPs of EVTX | `parse-windows` |
-| Disk images alone (E01, VMDK, VHD / VHDX, dd / raw), or a mounted volume (`D:`) | `parse-image` |
-| Disk images with anything beside them, Windows and Linux together | `parse-massive` |
-| Linux logs, UAC and other Linux triages | `parse-linux` |
-| macOS `.logarchive` bundles, `log show` exports | `parse-mac` |
-| Winlogbeat JSON | `parser-elastic` |
-| masstin timelines alone | `merge` |
+   ```
+           Found: 1 disk image, 4 triage packages (KAPE), 19 EVTX files, 2 Linux triages (26 files in 6 folders, 1.5 s)
+   ```
 
-Folders go with `-d` and files with `-f`, as for every parser. On evidence of one kind the timeline is byte for byte the one the named parser writes. A ZIP given with `-f` is walked like one found in a folder: its EVTX, the ZIPs inside it, its triage layout.
+2. **The massive pass** reads the Windows evidence, the Linux evidence, the disk images (their file systems, shadow copies included) and every archive, nested or not, in one go. On evidence of one kind its timeline is the one the narrower parser writes (byte for byte on EVTX folders, KAPE triages and disk images; the same rows on Linux triages).
+3. **macOS and Winlogbeat**, which the massive pass does not read, are read by `parse-mac` and `parser-elastic` wherever the look finds them, in a folder or given with `-f`.
+4. **Timelines.** masstin timelines given with `-f` are merged in as they are. The ones lying inside the folders are left out and named on the console (an earlier run's output, another case's timeline): give one with `-f` to merge it in. A folder of timelines and nothing else is merged.
 
-Two things it cannot guess are options of `parse`, and their result is merged into the same timeline (each part is written to a temporary file and the parts are merged, sorted and without duplicates):
+Two things that cannot be guessed are options, merged into the same timeline (each part is written to a temporary file, and the parts are merged, sorted and without duplicates):
 
-- `--rules <file or folder>`: the files given one by one that masstin does not recognise (a VPN, firewall or proxy log) are read with these [custom-parser rules](custom-parsers.md).
-- `--carve`: the disk images found are also carved for EVTX records (`carve-image`, [below](#evtx-carving-last-resort-recovery-from-unallocated-space)): the events of logs deleted or overwritten. Slow: every byte of every image is read.
+- `--rules <file or folder>`: the files given with `-f` that masstin does not recognise (a VPN, firewall or proxy log) are read with these [custom-parser rules](custom-parsers.md).
+- `--carve`: the disk images found are also carved for EVTX records (`carve-image`, [below](#evtx-carving-last-resort-recovery-from-unallocated-space)): the events of logs deleted or overwritten. A carved event the live logs already hold is dropped, so only what was recovered is added, and the console says how many: `Carving: 13755 event(s), 13753 already in the live logs, 2 recovered`. A carved row names the image and the log: `dev-srv01.vmdk:carved:Security.evtx`. Slow: every byte of every image is read (a 25 GB VMDK: about eight minutes). Without `--carve`, when there are disk images, the console says that it exists.
 
-masstin timelines given with `-f` are merged in as they are. The ones lying inside the folders are left out, and the console says so (an earlier run's output, another case's timeline): give one with `-f` to merge it in; a folder of timelines and nothing else is merged. When nothing it knows is there, `parse` stops and says so, and when no part gives an event it writes nothing and says that too; when it is not sure (several platforms of no common layout), it says that it is not sure and which parser it chose.
+When nothing it knows is there, `parse` stops and says so; when no part gives an event, it writes nothing and says that too.
 
 ## Advanced: naming the parser yourself
 
-`parse` is the one to use. The actions below are what it runs, for scripts that want one fixed, for evidence in a shape the look does not recognise, and for the options of one parser.
+`parse` is the one to use. The actions below are the parsers it is made of, for scripts that want one fixed and for the options of one parser.
 
 ## Choosing the right action — what each one actually processes
 

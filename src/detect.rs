@@ -55,6 +55,10 @@ pub struct Scan {
     pub logarchives: usize,
     pub mac_json: usize,
     pub elastic_json: usize,
+    /// where the macOS logs are: `.logarchive` bundles and `log show` exports
+    pub mac_paths: Vec<String>,
+    /// where the Winlogbeat JSON files are
+    pub elastic_paths: Vec<String>,
     pub timelines: Vec<String>,
     pub files: usize,
     pub dirs: usize,
@@ -72,6 +76,12 @@ impl Scan {
     }
     pub fn mac(&self) -> usize {
         self.logarchives + self.mac_json
+    }
+
+    /// Whether the massive pass has anything to read here: Windows evidence,
+    /// Linux evidence, disk images, or archives it may find them in.
+    pub fn massive_reads(&self) -> bool {
+        self.windows() + self.linux_total() + self.images.len() + self.archives > 0
     }
 
     /// Whether anything masstin reads by itself was found (a text log of no
@@ -239,6 +249,7 @@ fn walk(dir: &Path, depth: usize, s: &mut Scan, budget: &mut usize, start: &std:
     let name = dir.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if name.ends_with(".logarchive") {
         s.logarchives += 1;
+        s.mac_paths.push(dir.to_string_lossy().to_string());
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -289,8 +300,10 @@ fn look_at(p: &Path, s: &mut Scan) {
         let head = head_of(p, 4096);
         if head.contains("\"winlog\"") || head.contains("\"event_id\"") && head.contains("\"@timestamp\"") {
             s.elastic_json += 1;
+            s.elastic_paths.push(p.to_string_lossy().to_string());
         } else if head.contains("\"eventMessage\"") || head.contains("\"processImagePath\"") || head.contains("\"subsystem\"") {
             s.mac_json += 1;
+            s.mac_paths.push(p.to_string_lossy().to_string());
         }
     } else if lower.ends_with(".csv") {
         let head = head_of(p, 2048);

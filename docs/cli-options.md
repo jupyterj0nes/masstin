@@ -5,7 +5,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 
 | Option | Description |
 |--------|-------------|
-| `-a, --action` | `parse` (the evidence decides the parser, [Parsing →](parsing.md#-a-parse-give-it-the-evidence-it-picks-the-parser)) \| `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` \| `view`. Aliases: `auto` (parse), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
+| `-a, --action` | `parse` (every kind of evidence in one pass, [Parsing →](parsing.md#-a-parse-one-action-for-every-kind-of-evidence)) \| `parse-windows` \| `parse-linux` \| `parse-mac` \| `parse-image` \| `parse-massive` \| `carve-image` \| `parser-elastic` \| `parse-cortex` \| `parse-cortex-evtx-forensics` \| `parse-custom` \| `merge` \| `load-neo4j` \| `load-memgraph` \| `merge-neo4j-nodes` \| `merge-memgraph-nodes` \| `graph-hunt` \| `graph-hunt-neo4j` \| `graph-hunt-csv` \| `view`. Aliases: `auto` (parse), `parse-macos` (parse-mac), `parse-image-windows` / `parse-image-linux` (parse-image), `load` (load-neo4j) |
 | `-d, --directory` | Directories to process — also accepts drive letters (`D:`) for mounted volumes (repeatable) |
 | `-f, --file` | Individual files (repeatable): EVTX, `.mdb`, E01, VMDK, VHD/VHDX, dd/raw for the Windows and image actions; Winlogbeat JSON for `parser-elastic`; `.logarchive` or `log show` JSON for `parse-mac`; any text or JSON log for `parse-custom`; masstin CSVs for `merge`, the loaders, `graph-hunt-csv` and `view` |
 | `-o, --output` | Output file path. Without it the timeline goes to stdout |
@@ -30,7 +30,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--debug` | Print debug information (also keeps rejected synthetic EVTX in `carve-image` and, when `-o` is given, a sample of rejected lines in `parse-custom`) |
 | `--silent` | Suppress all output for automation (Velociraptor, SOAR) |
 | `--rules PATH` | `parse-custom`: YAML rule file or directory of rules (see [`rules/`](../rules/)). `parse`: the files given one by one that masstin does not recognise (VPN, firewall, proxy logs) are read with these rules, merged into the same timeline |
-| `--carve` | `parse`: the disk images found are also carved for the EVTX records of deleted or overwritten logs (`carve-image`), merged into the same timeline. Slow: every byte is read |
+| `--carve` | `parse`: the disk images found are also carved for the EVTX records of deleted or overwritten logs (`carve-image`); the carved events the live logs already hold are dropped, the rest merged into the same timeline. Slow: every byte is read |
 | `--dry-run` | `parse-custom`: show first matches and rejected lines, write no CSV. With any filter flag on a parser action: print the filter stats and write only the CSV header |
 | `--ignore-local`, `--exclude-users`, `--exclude-hosts`, `--exclude-ips` | Noise filtering on every parser action and `merge` (see [Noise filtering](parsing.md#noise-filtering---ignore-local-and---exclude-)) |
 | `--carve-unalloc` | `carve-image`: planned unallocated-only scan; not implemented yet, the whole image is scanned and a warning says so |
