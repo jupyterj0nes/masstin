@@ -46,7 +46,7 @@ When nothing it knows is there, `parse` stops and says so; when no part gives an
 
 ## Advanced: naming the parser yourself
 
-`parse` is the one to use. The actions below are the parsers it is made of, for scripts that want one fixed and for the options of one parser.
+`parse` is the one to use. The actions below are the parsers it is made of. They are for a caller that already knows what the evidence is and does not want the look first (a workbench that classified it, a script that always gets the same kind), and for the options of one parser. One difference to keep in mind: `carve-image` on its own gives every carved event, the ones the live logs hold too; `parse --carve` keeps only what was recovered.
 
 ## Choosing the right action — what each one actually processes
 

@@ -68,8 +68,9 @@ mod view;
 #[derive(Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    /// Action to perform. `parse` is the one to start with: it looks at the
-    /// evidence given with -d / -f and picks the parser itself.
+    /// Action to perform. `parse` is the one to start with: it reads every kind
+    /// of evidence given with -d / -f. The ones marked Advanced are its parts, for
+    /// a caller that already knows what the evidence is.
     #[arg(short, long)]
     action: ActionType,
 
@@ -383,10 +384,10 @@ pub struct Cli {
 // -----------------------------------------------------------------------------
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum ActionType {
-    /// Read any evidence and pick the parser: masstin looks at what it is given (EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images, Linux logs and triages, macOS logarchives and `log show` exports, Winlogbeat JSON, masstin timelines), says what it found and which parser takes it, and runs it. Images with anything else beside them, or Windows and Linux together, go through the massive pass. --rules adds custom-parser rules for the files it does not recognise, --carve the EVTX carving of the images; both are merged into the one timeline.
+    /// The one to use: reads every kind of evidence given with -d (a folder, walked whole) and -f (one file). masstin first says what it found (EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images, Linux logs and triages, macOS logarchives and `log show` exports, Winlogbeat JSON, masstin timelines), then reads it all in one pass: Windows and Linux evidence, disk images with their shadow copies, archives nested or not; macOS logs and Winlogbeat JSON by their own parsers. Timelines given with -f are merged in. --rules reads the files it does not recognise (VPN, firewall, proxy logs) with custom-parser rules; --carve adds the EVTX records carved from the images, without the ones the live logs already hold. Every part ends in the one timeline.
     #[value(alias = "auto")]
     Parse,
-    /// Parse Windows EVTX files and UAL databases (.mdb) from directories or individual files
+    /// Advanced, a part of `parse` without its look first: Windows EVTX files and UAL databases (.mdb), loose or inside zips
     ParseWindows,
     /// Load a CSV timeline into a Neo4j graph database
     #[value(alias = "load")]
@@ -395,25 +396,25 @@ enum ActionType {
     LoadMemgraph,
     /// Merge multiple CSV timelines into a single chronological file
     Merge,
-    /// Parse Winlogbeat JSON logs exported from Elasticsearch
+    /// Advanced, a part of `parse` without its look first: Winlogbeat JSON logs exported from Elasticsearch
     ParserElastic,
     /// Query Cortex XDR API for network connections (RDP/SMB/SSH)
     ParseCortex,
     /// Query Cortex XDR API for forensic EVTX collections
     ParseCortexEvtxForensics,
-    /// Parse Linux logs: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
+    /// Advanced, a part of `parse` without its look first: Linux logs and triages: auth.log, secure, messages, audit.log, utmp, wtmp, btmp, lastlog
     ParseLinux,
-    /// Parse macOS logs: a .logarchive bundle (binary Unified Log) or a `log show` JSON/NDJSON export. Extracts SSH and Screen Sharing / ARD remote logons.
+    /// Advanced, a part of `parse` without its look first: macOS logs, a .logarchive bundle (binary Unified Log) or a `log show` JSON/NDJSON export: SSH and Screen Sharing / ARD remote logons
     #[value(alias = "parse-macos")]
     ParseMac,
-    /// Parse from forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:), or --all-volumes. Auto-detects OS: NTFS→EVTX+UAL+VSS, ext4 / XFS→Linux logs
+    /// Advanced, a part of `parse` without its look first: forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:) or --all-volumes; NTFS gives EVTX + UAL + shadow copies, ext4 / XFS the Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
-    /// MASSIVE mode: process EVERYTHING — forensic images + triage packages + loose EVTX/logs. Point at evidence folder, get a timeline. No mercy.
+    /// Advanced, a part of `parse` without its look first: the massive pass on its own: forensic images, triage packages, loose EVTX and Linux logs, archives nested or not (no macOS, no Winlogbeat)
     ParseMassive,
-    /// Carve EVTX records from disk images — recovers events from unallocated space after log deletion. Use --carve-unalloc for faster unallocated-only scan.
+    /// Advanced, a part of `parse` without its look first: EVTX records carved from disk images, the events of deleted or overwritten logs; only the carved ones, without dropping those the live logs hold (`parse --carve` does). --carve-unalloc scans the unallocated space only, faster
     CarveImage,
-    /// Parse arbitrary text logs (VPN/firewall/proxy) using YAML rule files from the rules/ library. See docs/custom-parsers.md.
+    /// Advanced, a part of `parse` without its look first: text logs (VPN, firewall, proxy) read with YAML rule files from the rules/ library (`parse --rules` does the same beside the rest). See docs/custom-parsers.md
     ParseCustom,
     /// Merge two :host nodes in a Neo4j graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Used to unify a host that appears as both an IP and a hostname after loading. No APOC required.
     MergeNeo4jNodes,
