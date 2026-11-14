@@ -761,6 +761,14 @@ pub(crate) fn display_source(path: &str) -> String {
             Some((dir, rest)) => (strip_index(dir), rest),
             None => return path.to_string(),
         }
+    } else if let Some(pos) = normalized.find("masstin_carve_extract/") {
+        // carve-image: <n>_<image>/<provider>.evtx, the synthetic EVTX built
+        // from the chunks carved out of that image
+        let after = &normalized[pos + "masstin_carve_extract/".len()..];
+        return match after.split_once('/') {
+            Some((dir, rest)) => format!("{}:carved:{}", strip_index(dir), rest.rsplit('/').next().unwrap_or(rest)),
+            None => format!("{}:carved", strip_index(after)),
+        };
     } else if let Some(pos) = normalized.find("masstin_linux_image_extract/") {
         let after = &normalized[pos + "masstin_linux_image_extract/".len()..];
         match after.split_once('/') {
@@ -845,6 +853,8 @@ mod source_tests {
         assert_eq!(display_source(&format!(r"{}\linux_logs_extracted\partition_2\var\log\auth.log", t)), "HRServer.e01:partition_2:/var/log/auth.log");
         assert_eq!(display_source("/tmp/masstin_linux_image_extract/srv.img/logs_extracted/partition_0/var/log/secure"), "srv.img:partition_0:/var/log/secure");
         assert_eq!(display_source(r"C:\Temp\masstin_image_extract\vol_C:\evtx_extracted\partition_0_vss_0\Security.evtx"), "vol_C::vss_0:Security.evtx");
+        // carved: the image and the log the chunks belong to
+        assert_eq!(display_source(r"C:\Users\someone\AppData\Local\Temp\masstin_carve_extract\0_dev-srv01.vmdk\Microsoft-Windows-Eventlog.evtx"), "dev-srv01.vmdk:carved:Microsoft-Windows-Eventlog.evtx");
         // the evidence where it sits, as it always was
         for p in [r"D:\evidence\case\Windows\System32\winevt\Logs\Security.evtx", r"D:\triage.zip -> logs/Security.evtx", "lnx01-logs.tgz:var/log/auth.log", ""] {
             assert_eq!(display_source(p), p);
@@ -2401,7 +2411,7 @@ fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
     // a file taken out of an image names the image, not the temp folder it
     // sat in; live before shadow copies still holds (`live` is shorter)
     for r in log_data.iter_mut() {
-        if r.filename.contains("masstin_image_extract") || r.filename.contains("masstin_linux_image_extract") {
+        if r.filename.contains("masstin_image_extract") || r.filename.contains("masstin_linux_image_extract") || r.filename.contains("masstin_carve_extract") {
             r.filename = display_source(&r.filename);
         }
     }
