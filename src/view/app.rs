@@ -3183,24 +3183,32 @@ impl Viewer {
         let e = self.store.edges[ei];
         let n = st.to - st.from;
         let fmt = |font: FontId, color: Color32| egui::text::TextFormat { font_id: font, color, ..Default::default() };
-        let mut job = egui::text::LayoutJob::default();
-        match &st.caption {
-            Some(c) => job.append(c, 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a))),
-            None => {
-                let user = self.user_label(e.user);
-                if !user.is_empty() {
-                    job.append(&user, 0.0, fmt(self.font_semibold(19.0), draw::fade(accent, a)));
-                    job.append("    ", 0.0, fmt(self.font_medium(19.0), TEXT));
-                }
-                job.append(&self.host_label(e.src), 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a)));
-                job.append("  →  ", 0.0, fmt(self.font_medium(19.0), draw::fade(MUTED, a)));
-                job.append(&self.host_label(e.dst), 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a)));
-                if n > 1 {
-                    job.append(&format!("    +{} more", n - 1), 0.0, fmt(self.font_medium(14.0), draw::fade(MUTED, a)));
-                }
+        // the account and the two hosts: the headline, or under the analyst's
+        // own caption so the words never hide who went where
+        let who = |size: f32| {
+            let mut job = egui::text::LayoutJob::default();
+            let user = self.user_label(e.user);
+            if !user.is_empty() {
+                job.append(&user, 0.0, fmt(self.font_semibold(size), draw::fade(accent, a)));
+                job.append("    ", 0.0, fmt(self.font_medium(size), TEXT));
             }
-        }
-        let g1 = painter.layout_job(job);
+            job.append(&self.host_label(e.src), 0.0, fmt(self.font_semibold(size), draw::fade(TEXT, a)));
+            job.append("  →  ", 0.0, fmt(self.font_medium(size), draw::fade(MUTED, a)));
+            job.append(&self.host_label(e.dst), 0.0, fmt(self.font_semibold(size), draw::fade(TEXT, a)));
+            if n > 1 {
+                job.append(&format!("    +{} more", n - 1), 0.0, fmt(self.font_medium(size * 0.74), draw::fade(MUTED, a)));
+            }
+            job
+        };
+        let (g1, g_who) = match &st.caption {
+            Some(c) => {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(c, 0.0, fmt(self.font_semibold(19.0), draw::fade(TEXT, a)));
+                job.wrap.max_width = (canvas.width() * 0.6).max(360.0);
+                (painter.layout_job(job), Some(painter.layout_job(who(14.5))))
+            }
+            None => (painter.layout_job(who(19.0)), None),
+        };
         let mut detail = vec![fmt_time(e.t)[11..].to_string()];
         let lt = self.store.logon_types.name(e.logon_type);
         if !lt.is_empty() && lt != "-" {
@@ -3228,8 +3236,8 @@ impl Viewer {
         });
         let pad = 14.0;
         let w1 = g1.size().x + g_tag.as_ref().map_or(0.0, |(g, _)| g.size().x + 28.0);
-        let w = w1.max(g2.size().x).max(g3.as_ref().map_or(0.0, |g| g.size().x)) + pad * 2.0 + 8.0;
-        let h = g1.size().y + g2.size().y + g3.as_ref().map_or(0.0, |g| g.size().y + 6.0) + pad * 1.5;
+        let w = w1.max(g2.size().x).max(g3.as_ref().map_or(0.0, |g| g.size().x)).max(g_who.as_ref().map_or(0.0, |g| g.size().x)) + pad * 2.0 + 8.0;
+        let h = g1.size().y + g_who.as_ref().map_or(0.0, |g| g.size().y + 4.0) + g2.size().y + g3.as_ref().map_or(0.0, |g| g.size().y + 6.0) + pad * 1.5;
         let x = canvas.left() + 24.0 - 40.0 * (1.0 - k_in);
         let r = Rect::from_min_size(Pos2::new(x, canvas.bottom() - bar_h - 18.0 - h), Vec2::new(w, h));
         painter.rect_filled(r, CornerRadius::same(8), draw::fade(Color32::from_rgb(18, 21, 28), 0.9 * a));
@@ -3244,6 +3252,11 @@ impl Viewer {
             painter.galley(tr.min + Vec2::new(6.0, 3.0), g, c);
         }
         y += h1 + 3.0;
+        if let Some(g) = g_who {
+            let hw = g.size().y;
+            painter.galley(Pos2::new(x0, y + 1.0), g, TEXT);
+            y += hw + 4.0;
+        }
         let h2 = g2.size().y;
         painter.galley(Pos2::new(x0, y), g2, MUTED);
         if let Some(g) = g3 {

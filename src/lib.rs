@@ -784,8 +784,21 @@ struct ParseStep {
     dirs: Vec<String>,
 }
 
-fn action_name(a: &ActionType) -> String {
-    a.to_possible_value().map(|v| v.get_name().to_string()).unwrap_or_else(|| format!("{:?}", a))
+/// What a part of `parse` reads, in words: the console of `parse` speaks of
+/// the evidence, not of the specific actions underneath.
+fn part_name(a: &ActionType) -> &'static str {
+    match a {
+        ActionType::ParseWindows => "Windows event logs and triages",
+        ActionType::ParseLinux => "Linux logs and triages",
+        ActionType::ParseMac => "macOS logs",
+        ActionType::ParserElastic => "Winlogbeat JSON",
+        ActionType::ParseImage => "disk images",
+        ActionType::ParseMassive => "the evidence: images, triages and logs in one pass",
+        ActionType::ParseCustom => "the files the rules read",
+        ActionType::CarveImage => "carving the disk images",
+        ActionType::Merge => "the timelines given",
+        _ => "evidence",
+    }
 }
 
 /// What `parse` will run: the detector's look at the evidence (the same one
@@ -805,7 +818,7 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         }
     }
     if config.all_volumes {
-        crate::banner::print_phase_result("--all-volumes: every NTFS volume of this machine -> parse-massive");
+        crate::banner::print_phase_result("--all-volumes: every NTFS volume of this machine -> read whole, shadow copies included");
         return Ok(vec![ParseStep { action: ActionType::ParseMassive, files: config.file.clone(), dirs: config.directory.clone() }]);
     }
     if config.file.is_empty() && config.directory.is_empty() {
@@ -883,17 +896,17 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
                 // everything goes through the massive pass, given with -d or with
                 // -f alike: Windows and Linux evidence, disk images, archives
                 let mf: Vec<String> = files.iter().filter(|f| !other.contains(f)).cloned().collect();
-                crate::banner::print_phase_result("Windows and Linux evidence, disk images and archives -> parse-massive, in one pass");
+                crate::banner::print_phase_result("Windows and Linux evidence, disk images and archives -> read in one pass");
                 steps.push(ParseStep { action: ActionType::ParseMassive, files: mf, dirs: dirs.clone() });
             }
             // what the massive pass does not read, each by its own parser
             if !s.mac_paths.is_empty() {
                 let (bundles, exports): (Vec<String>, Vec<String>) = s.mac_paths.iter().cloned().partition(|m| std::path::Path::new(m).is_dir());
-                crate::banner::print_phase_result(&format!("{} macOS log source(s) -> parse-mac", s.mac_paths.len()));
+                crate::banner::print_phase_result(&format!("{} macOS log source(s) -> read by the macOS parser", s.mac_paths.len()));
                 steps.push(ParseStep { action: ActionType::ParseMac, files: exports, dirs: bundles });
             }
             if !s.elastic_paths.is_empty() {
-                crate::banner::print_phase_result(&format!("{} Winlogbeat JSON file(s) -> parser-elastic", s.elastic_paths.len()));
+                crate::banner::print_phase_result(&format!("{} Winlogbeat JSON file(s) -> read by the Winlogbeat parser", s.elastic_paths.len()));
                 steps.push(ParseStep { action: ActionType::ParserElastic, files: s.elastic_paths.clone(), dirs: Vec::new() });
             }
             if steps.is_empty() && custom.is_empty() && volumes.is_empty() && given_tl.is_empty() {
@@ -921,7 +934,7 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         steps.push(ParseStep { action: ActionType::Merge, files: given_tl, dirs: Vec::new() });
     }
     if !volumes.is_empty() {
-        crate::banner::print_phase_result(&format!("Mounted volume(s) {} -> parse-massive (the live files and the shadow copies)", volumes.join(", ")));
+        crate::banner::print_phase_result(&format!("Mounted volume(s) {} -> read whole: the live files and the shadow copies", volumes.join(", ")));
         match steps.iter_mut().find(|st| st.action == ActionType::ParseMassive) {
             Some(st) => st.dirs.extend(volumes),
             None => steps.push(ParseStep { action: ActionType::ParseMassive, files: Vec::new(), dirs: volumes }),
@@ -929,7 +942,7 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
     }
     if !custom.is_empty() {
         crate::banner::print_phase_result(&format!(
-            "{} file(s) masstin does not recognise -> parse-custom with the rules in {}",
+            "{} file(s) masstin does not recognise -> read with the rules in {}",
             custom.len(),
             config.rules.as_deref().unwrap_or("")
         ));
@@ -939,7 +952,7 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
         if images.is_empty() {
             crate::banner::print_warning("--carve: no disk image among the evidence, nothing to carve");
         } else {
-            crate::banner::print_phase_result(&format!("--carve: {} disk image(s) -> carve-image, the EVTX records of deleted or overwritten logs", images.len()));
+            crate::banner::print_phase_result(&format!("--carve: {} disk image(s) -> carved for the EVTX records of deleted or overwritten logs", images.len()));
             steps.push(ParseStep { action: ActionType::CarveImage, files: images, dirs: Vec::new() });
         }
     } else if !images.is_empty() {
@@ -1020,7 +1033,7 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
     let mut parts: Vec<String> = Vec::new();
     let total = steps.len();
     for (i, st) in steps.iter().enumerate() {
-        crate::banner::print_info(&format!("Part {} of {}: {}", i + 1, total, action_name(&st.action)));
+        crate::banner::print_info(&format!("Part {} of {}: {}", i + 1, total, part_name(&st.action)));
         if st.action == ActionType::Merge {
             parts.extend(st.files.iter().cloned());
             continue;
