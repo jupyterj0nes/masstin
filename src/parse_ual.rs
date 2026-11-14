@@ -16,6 +16,15 @@ pub fn find_ual_databases(dir: &str) -> Vec<PathBuf> {
     let path = Path::new(dir);
     let mut results = Vec::new();
 
+    // A database given as a file (`parse -f Current.mdb` hands its files to the
+    // massive pass as sources to walk): the file itself
+    if path.is_file() {
+        if dir.to_ascii_lowercase().ends_with(".mdb") {
+            results.push(path.to_path_buf());
+        }
+        return results;
+    }
+
     // Check if this IS the Sum directory
     if path.file_name().and_then(|n| n.to_str()).map(|n| n.eq_ignore_ascii_case("Sum")).unwrap_or(false) {
         collect_mdb_files(path, &mut results);
@@ -337,4 +346,22 @@ fn get_text(row: &HashMap<String, EseValue>, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_database_given_as_a_file_is_found() {
+        let dir = std::env::temp_dir().join(format!("masstin_ual_file_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mdb = dir.join("Current.mdb");
+        std::fs::write(&mdb, b"x").unwrap();
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"x").unwrap();
+        assert_eq!(find_ual_databases(mdb.to_str().unwrap()), vec![mdb.clone()]);
+        assert!(find_ual_databases(txt.to_str().unwrap()).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
