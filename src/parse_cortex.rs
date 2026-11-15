@@ -197,7 +197,7 @@ pub async fn parse_cortex_data(
         }
 
         let pass_start = std::time::Instant::now();
-        let batch = run_network_query(
+        let batch = run_xql(
             &client,
             &start_query_url,
             &get_results_url,
@@ -341,6 +341,15 @@ fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
 /// when both are set (how masstin's window passes them, never on the
 /// command line), else asked on the console.
 pub(crate) fn api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
+    static ASKED: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    if let Some(pair) = ASKED.get() {
+        return Ok(pair.clone());
+    }
+    let pair = ask_key_and_id()?;
+    Ok(ASKED.get_or_init(|| pair).clone())
+}
+
+fn ask_key_and_id() -> Result<(String, String), Box<dyn Error>> {
     if let Some(pair) = key_from_env(std::env::var("CORTEX_API_KEY_ID").ok(), std::env::var("CORTEX_API_KEY").ok())? {
         crate::banner::print_phase_detail("Auth:", "API key from $CORTEX_API_KEY (id from $CORTEX_API_KEY_ID)");
         return Ok(pair);
@@ -420,7 +429,7 @@ fn get_port(record: &Value, key: &str) -> Option<i64> {
 /// all records (inline + streamed). Extracted from `parse_cortex_data` so
 /// the outer function can auto-paginate by time splitting when the API 1M
 /// cap is hit.
-async fn run_network_query(
+pub(crate) async fn run_xql(
     client: &Client,
     start_query_url: &str,
     get_results_url: &str,
@@ -509,7 +518,7 @@ async fn run_network_query(
 /// Bisects a time window expressed as "YYYY-MM-DD HH:MM:SS[ TZ]" strings.
 /// Returns the midpoint formatted identically plus the half-duration in seconds.
 /// Returns `None` if parsing fails or the window is smaller than `min_window_secs`.
-fn bisect_time_window(
+pub(crate) fn bisect_time_window(
     start: &str,
     end: &str,
     min_window_secs: i64,
@@ -884,6 +893,185 @@ fn agent_names(records: &[Value]) -> std::collections::HashMap<String, String> {
         }
     }
     seen.into_iter().filter_map(|(ip, h)| h.map(|h| (ip, h))).collect()
+}
+
+// ─── parse-cortex: every source of the tenant, one timeline ─────────────────
+
+/// What a tenant holds that masstin reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// the endpoints' network connections (`xdr_data`, NETWORK)
+    Network,
+    /// the Windows event logs the agents send by themselves (`xdr_data`, EVENT_LOG)
+    EventLog,
+    /// the event logs collected by the forensics add-on (`forensics_event_log`)
+    Forensics,
+}
+
+impl Source {
+    pub const ALL: [Source; 3] = [Source::Network, Source::EventLog, Source::Forensics];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Network => "network",
+            Source::EventLog => "eventlog",
+            Source::Forensics => "forensics",
+        }
+    }
+
+    pub fn what(self) -> &'static str {
+        match self {
+            Source::Network => "the endpoints' network connections",
+            Source::EventLog => "the Windows event logs the agents send",
+            Source::Forensics => "the event logs collected by the forensics add-on",
+        }
+    }
+}
+
+/// `--cortex-sources`: a comma-separated list of `network`, `eventlog`,
+/// `forensics` (or `all`, the default).
+pub fn sources_from(spec: Option<&str>) -> Result<Vec<Source>, String> {
+    let spec = spec.unwrap_or("all").trim().to_ascii_lowercase();
+    if spec.is_empty() || spec == "all" {
+        return Ok(Source::ALL.to_vec());
+    }
+    let mut out = Vec::new();
+    for part in spec.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        let s = match part {
+            "network" | "net" => Source::Network,
+            "eventlog" | "eventlogs" | "event-log" | "evtx" => Source::EventLog,
+            "forensics" | "forensic" => Source::Forensics,
+            other => return Err(format!("unknown Cortex source '{}': network, eventlog, forensics (or all)", other)),
+        };
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if out.is_empty() {
+        return Err("--cortex-sources names no source: network, eventlog, forensics (or all)".to_string());
+    }
+    Ok(out)
+}
+
+/// The window when none is given: the last seven days (the forensics event
+/// logs, which come from triages of any date, keep their own year).
+fn default_window() -> (String, String) {
+    let end = Utc::now();
+    let start = end - chrono::Duration::days(7);
+    let f = |d: DateTime<Utc>| d.format("%Y-%m-%d %H:%M:%S -0000").to_string();
+    (f(start), f(end))
+}
+
+/// `parse-cortex`: every source asked for, each into a part, the parts
+/// merged into one timeline. A source the tenant does not have (no forensics
+/// add-on, no permission) is said and left out; the run fails only when no
+/// source gives a row.
+#[allow(clippy::too_many_arguments)]
+pub async fn parse_cortex_sources(
+    base_url: &str,
+    output: Option<&String>,
+    debug: bool,
+    start_time: Option<&String>,
+    end_time: Option<&String>,
+    filter_ip: Option<&String>,
+    ignore_local: bool,
+    admin_ports: bool,
+    min_window_secs: i64,
+    max_passes: usize,
+    event_ids: Option<&String>,
+    sources: &[Source],
+) -> Result<(), Box<dyn Error>> {
+    let given = start_time.map_or(false, |s| !s.is_empty()) && end_time.map_or(false, |s| !s.is_empty());
+    let (def_start, def_end) = default_window();
+    let (net_start, net_end) = if given { (start_time.unwrap().clone(), end_time.unwrap().clone()) } else { (def_start, def_end) };
+    if !given {
+        crate::banner::print_info(&format!("No time window given: the last 7 days ({} to {}); the forensics event logs, the last year", net_start, net_end));
+    }
+    // the network alone is the run it always was
+    if sources == [Source::Network] {
+        return parse_cortex_data(base_url, output, debug, Some(&net_start), Some(&net_end), filter_ip, ignore_local, admin_ports, min_window_secs, max_passes).await;
+    }
+    let names: Vec<&str> = sources.iter().map(|s| s.name()).collect();
+    crate::banner::print_info(&format!("Cortex sources: {} -> one timeline", names.join(", ")));
+    let tmp = std::env::temp_dir().join(format!("masstin_cortex_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let mut parts: Vec<String> = Vec::new();
+    let mut said: Vec<String> = Vec::new();
+    crate::banner::set_parse_part(true);
+    for (i, src) in sources.iter().enumerate() {
+        crate::banner::print_info(&format!("Source {} of {}: {}", i + 1, sources.len(), src.what()));
+        let part = tmp.join(format!("{}.csv", src.name())).to_string_lossy().to_string();
+        let r: Result<(), Box<dyn Error>> = match src {
+            Source::Network => parse_cortex_data(base_url, Some(&part), debug, Some(&net_start), Some(&net_end), filter_ip, ignore_local, admin_ports, min_window_secs, max_passes).await,
+            Source::EventLog => {
+                async {
+                    let (key, id) = api_key_and_id()?;
+                    let client = Client::new();
+                    let auth = crate::cortex_auth::Auth::connect(&client, base_url, &key, &id).await?;
+                    crate::parse_cortex_eventlog::parse_cortex_eventlog_data(&client, base_url, &auth, &part, debug, &net_start, &net_end, min_window_secs, max_passes).await.map(|_| ())
+                }
+                .await
+            }
+            Source::Forensics => {
+                crate::parse_cortex_evtx_forensics::parse_cortex_evtx_forensics_data(base_url, Some(&part), debug, if given { start_time } else { None }, if given { end_time } else { None }, ignore_local, event_ids, min_window_secs, max_passes).await
+            }
+        };
+        match r {
+            Ok(()) => {
+                let rows = csv::Reader::from_path(&part).map(|mut r| r.records().count()).unwrap_or(0);
+                said.push(format!("{} {}", rows, src.name()));
+                if rows > 0 {
+                    parts.push(part);
+                }
+            }
+            Err(e) => {
+                crate::banner::print_warning(&format!("Source left out ({}): {}", src.name(), e));
+                said.push(format!("{} left out", src.name()));
+            }
+        }
+    }
+    crate::banner::set_parse_part(false);
+    if parts.is_empty() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("no source gave a row ({}): nothing to write", said.join(", ")).into());
+    }
+    crate::banner::print_info(&format!("Merging the sources into one timeline ({})", said.join(", ")));
+    let r = crate::merge::merge_files(&parts, output, None, None, None);
+    let _ = std::fs::remove_dir_all(&tmp);
+    r?;
+    if let Some(out) = output {
+        let rows = csv::Reader::from_path(out).map(|mut r| r.records().count()).unwrap_or(0);
+        crate::banner::print_phase_result(&format!("Timeline: {} ({} events: {})", crate::banner::normalize_display_path(out), rows, said.join(", ")));
+        if !ignore_local && sources.contains(&Source::EventLog) {
+            crate::banner::print_info("Most of the agents' logon events are local to their machine (console, unlocks, services): --ignore-local leaves only the ones that came from another machine");
+        }
+        crate::banner::print_load_hint(out);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn the_sources_asked_for_by_name() {
+        assert_eq!(sources_from(None).unwrap(), Source::ALL.to_vec());
+        assert_eq!(sources_from(Some("all")).unwrap(), Source::ALL.to_vec());
+        assert_eq!(sources_from(Some(" Network , forensics,network ")).unwrap(), vec![Source::Network, Source::Forensics]);
+        assert_eq!(sources_from(Some("eventlog")).unwrap(), vec![Source::EventLog]);
+        assert!(sources_from(Some("network,ual")).unwrap_err().contains("ual"));
+        assert!(sources_from(Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn the_default_window_is_a_week_ending_now() {
+        let (s, e) = default_window();
+        let p = |t: &str| chrono::DateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S %z").unwrap();
+        assert_eq!((p(&e) - p(&s)).num_days(), 7);
+        assert!(bisect_time_window(&s, &e, 300).is_some());
+    }
 }
 
 #[cfg(test)]

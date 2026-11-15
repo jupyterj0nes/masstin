@@ -16,9 +16,12 @@ use crate::view::theme;
 // ───────────────────────── Cortex XDR ─────────────────────────
 
 pub(super) struct CortexForm {
-    /// false: the network connections (`parse-cortex`); true: the Windows
-    /// event logs the forensics add-on collects (`parse-cortex-evtx-forensics`)
-    pub evtx: bool,
+    /// the tenant's sources to read (`--cortex-sources`): the endpoints'
+    /// network connections, the event logs every agent sends, the event logs
+    /// the forensics add-on collected
+    pub network: bool,
+    pub eventlog: bool,
+    pub forensics: bool,
     pub url: String,
     pub key_id: String,
     pub key: String,
@@ -36,7 +39,7 @@ pub(super) struct CortexForm {
 
 impl Default for CortexForm {
     fn default() -> Self {
-        CortexForm { evtx: false, url: String::new(), key_id: String::new(), key: String::new(), from: String::new(), to: String::new(), filter_ip: String::new(), admin_ports: false, ignore_local: false, event_ids: String::new(), min_window: "300".into(), max_passes: "200".into(), output: String::new() }
+        CortexForm { network: true, eventlog: true, forensics: true, url: String::new(), key_id: String::new(), key: String::new(), from: String::new(), to: String::new(), filter_ip: String::new(), admin_ports: false, ignore_local: true, event_ids: String::new(), min_window: "300".into(), max_passes: "200".into(), output: String::new() }
     }
 }
 
@@ -64,30 +67,45 @@ impl CortexForm {
         if self.output.trim().is_empty() {
             return Some("the timeline needs a file");
         }
+        if !(self.network || self.eventlog || self.forensics) {
+            return Some("tick at least one source to read");
+        }
         None
+    }
+
+    /// `--cortex-sources`' value; None when the three are read (the default).
+    pub fn sources(&self) -> Option<String> {
+        if self.network && self.eventlog && self.forensics {
+            return None;
+        }
+        let names: Vec<&str> = [(self.network, "network"), (self.eventlog, "eventlog"), (self.forensics, "forensics")].iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect();
+        Some(names.join(","))
     }
 
     /// The command line: no secret in it.
     pub fn command(&self) -> Vec<String> {
-        let action = if self.evtx { "parse-cortex-evtx-forensics" } else { "parse-cortex" };
-        let mut args = vec!["-a".to_string(), action.to_string(), "--cortex-url".into(), self.url.trim().trim_end_matches('/').to_string()];
+        let mut args = vec!["-a".to_string(), "parse-cortex".to_string(), "--cortex-url".into(), self.url.trim().trim_end_matches('/').to_string()];
+        if let Some(s) = self.sources() {
+            args.push("--cortex-sources".into());
+            args.push(s);
+        }
         for (flag, v) in [("--start-time", &self.from), ("--end-time", &self.to)] {
             if !v.trim().is_empty() {
                 args.push(flag.into());
                 args.push(v.trim().to_string());
             }
         }
-        if !self.filter_ip.trim().is_empty() {
+        if self.network && !self.filter_ip.trim().is_empty() {
             args.push("--filter-cortex-ip".into());
             args.push(self.filter_ip.trim().to_string());
         }
-        if !self.evtx && self.admin_ports {
+        if self.network && self.admin_ports {
             args.push("--admin-ports".into());
         }
         if self.ignore_local {
             args.push("--ignore-local".into());
         }
-        if self.evtx && !self.event_ids.trim().is_empty() {
+        if self.forensics && !self.event_ids.trim().is_empty() {
             args.push("--cortex-event-ids".into());
             args.push(self.event_ids.trim().to_string());
         }
@@ -293,10 +311,14 @@ impl Viewer {
         let mut run = false;
         let busy = self.job.is_some();
         egui::Window::new(format!("{}  Cortex XDR API", ic::CLOUD)).open(&mut open).collapsible(false).resizable(false).default_width(640.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            hint(ui, "Lateral movement straight from a Cortex XDR tenant, through its XQL API, into a timeline. The key needs the Instance Administrator role; the query spends the tenant's compute units.");
-            theme::section(ui, "What to read");
-            ui.radio_value(&mut f.evtx, false, "Network connections of the endpoints: RDP, SMB, SSH, WinRM (parse-cortex)");
-            ui.radio_value(&mut f.evtx, true, "Windows event logs collected by the forensics add-on (parse-cortex-evtx-forensics)");
+            hint(ui, "Lateral movement straight from a Cortex XDR tenant, through its XQL API, into one timeline. The key needs a role that runs XQL queries (Instance Administrator has it); the queries spend the tenant's compute units.");
+            theme::section(ui, "What to read (everything the tenant has, by default)");
+            ui.checkbox(&mut f.network, "Network connections of the endpoints: RDP, SMB, SSH, WinRM");
+            hint(ui, "      Who connected to whom, from every agent, as far back as the tenant keeps its data.");
+            ui.checkbox(&mut f.eventlog, "Windows event logs the agents send: logons, logoffs, Kerberos, NTLM, shares");
+            hint(ui, "      The accounts behind the connections (4624, 4625, 4648, 4768…), from every agent, with no triage.");
+            ui.checkbox(&mut f.forensics, "Event logs collected by the forensics add-on (triages and hunts)");
+            hint(ui, "      Whole logs of the machines triaged, with the RDP, SMB client and WinRM channels. Left out by itself where the tenant has no add-on.");
             theme::section(ui, "The tenant");
             row(ui, "API URL", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.url).desired_width(440.0).hint_text("https://api-yourtenant.xdr.eu.paloaltonetworks.com"));
@@ -314,17 +336,19 @@ impl Viewer {
                 ui.label(egui::RichText::new("to").color(theme::MUTED));
                 ui.add(egui::TextEdit::singleline(&mut f.to).desired_width(160.0).hint_text("YYYY-MM-DD HH:MM:SS"));
             });
-            row(ui, "Only this address", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut f.filter_ip).desired_width(160.0).hint_text("optional"));
-            });
-            if f.evtx {
-                row(ui, "Event IDs", |ui| {
+            hint(ui, "Empty: the last 7 days of the network and the agents' event logs, the last year of the forensics event logs.");
+            if f.network {
+                row(ui, "Only this address", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.filter_ip).desired_width(160.0).hint_text("optional (network)"));
+                });
+                ui.checkbox(&mut f.admin_ports, "Network: every admin port too, 135, 139, 1433, 3306, 5900… (--admin-ports)");
+            }
+            if f.forensics {
+                row(ui, "Forensics event IDs", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut f.event_ids).desired_width(300.0).hint_text("the default set; or 4624,4625,4648"));
                 });
-            } else {
-                ui.checkbox(&mut f.admin_ports, "Every admin port too: 135, 139, 1433, 3306, 5900… besides RDP, SMB, SSH and WinRM (--admin-ports)");
             }
-            ui.checkbox(&mut f.ignore_local, "Leave out link-local and placeholder origins too (--ignore-local)").on_hover_text("Loopback and a machine's connections to itself are always left out of the network read");
+            ui.checkbox(&mut f.ignore_local, "Leave out logons with no real origin: local sessions, unlocks, services, loopback (--ignore-local)").on_hover_text("Most of the agents' logon events are local to the machine: with this, only the ones that came from another machine stay. Untick to keep every logon.");
             egui::CollapsingHeader::new(theme::semibold("Paging (when a window hits the API's million rows)", 12.5)).id_salt("cortex-paging").show(ui, |ui| {
                 row(ui, "Smallest window (s)", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut f.min_window).desired_width(70.0));
@@ -487,7 +511,8 @@ mod tests {
         let c = cortex();
         assert_eq!(c.problem(), None);
         let args = c.command();
-        assert_eq!(args, vec!["-a", "parse-cortex", "--cortex-url", "https://api-x.xdr.eu.paloaltonetworks.com", "-o", "c.csv", "--overwrite"]);
+        // the three sources, local logons left out: the window's usual run
+        assert_eq!(args, vec!["-a", "parse-cortex", "--cortex-url", "https://api-x.xdr.eu.paloaltonetworks.com", "--ignore-local", "-o", "c.csv", "--overwrite"]);
         assert!(!args.iter().any(|a| a.contains("secret")));
         assert_eq!(c.env(), vec![("CORTEX_API_KEY_ID".to_string(), "12".to_string()), ("CORTEX_API_KEY".to_string(), "secret-key".to_string())]);
     }
@@ -500,14 +525,20 @@ mod tests {
         c.event_ids = "4624".into();
         c.min_window = "60".into();
         let s = c.command().join(" ");
-        assert!(s.contains("--start-time 2026-11-01 00:00:00 --admin-ports --cortex-min-window-secs 60 -o"));
-        c.ignore_local = true;
-        assert!(c.command().join(" ").contains("--admin-ports --ignore-local --cortex-min-window-secs"));
-        assert!(!s.contains("--cortex-event-ids"));
-        c.evtx = true;
+        assert!(s.contains("--start-time 2026-11-01 00:00:00 --admin-ports --ignore-local --cortex-event-ids 4624 --cortex-min-window-secs 60 -o"), "{}", s);
+        c.ignore_local = false;
+        assert!(c.command().join(" ").contains("--admin-ports --cortex-event-ids 4624"));
+        // only the forensics: named, and the network's options left out
+        c.network = false;
+        c.eventlog = false;
         let s = c.command().join(" ");
-        assert!(s.starts_with("-a parse-cortex-evtx-forensics"));
+        assert!(s.starts_with("-a parse-cortex --cortex-url https://api-x.xdr.eu.paloaltonetworks.com --cortex-sources forensics"), "{}", s);
         assert!(s.contains("--cortex-event-ids 4624") && !s.contains("--admin-ports"));
+        c.forensics = false;
+        assert_eq!(c.problem(), Some("tick at least one source to read"));
+        c.network = true;
+        c.eventlog = true;
+        assert_eq!(c.sources().as_deref(), Some("network,eventlog"));
         c.url = "https://x.paloaltonetworks.com".into();
         assert!(c.problem().is_some());
         c.url = "https://api-x".into();

@@ -275,19 +275,24 @@ masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
 
 ## Parse Cortex XDR
 
-Queries the Cortex XDR API directly to retrieve network connection data or EVTX forensic artifacts collected by Cortex agents.
+Reads a Cortex XDR tenant through its XQL API. One action, `parse-cortex`, reads everything the tenant holds and merges it into one timeline:
+
+- **network**: the endpoints' network connections (RDP, SMB, SSH, WinRM; `--admin-ports` adds RPC, NetBIOS, SQL, VNC). An address the tenant has an agent on is named; a machine's connections to itself are left out.
+- **eventlog**: the Windows event logs every agent sends by itself (4624, 4625, 4634, 4647, 4648, 4768-4771, 4776, 4778, 4779, 5140, 5145), for every machine with an agent, with no triage. Each event goes through `parse-windows`' own mapping, so it gives the row it would give from an EVTX. Most of them are logons local to the machine: `--ignore-local` leaves the ones that came from another.
+- **forensics**: the event logs the forensics add-on collected (triages, hunts, offline collectors), with the RDP, SMB client and WinRM channels.
+
+A source the tenant does not have is said and left out. `--cortex-sources` picks them.
 
 ```bash
-# Network connection data
-masstin -a parse-cortex --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com \
-  --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
-  -o cortex-network.csv
+# Everything the tenant has, one timeline (the key from the environment, or asked)
+export CORTEX_API_KEY_ID=12 CORTEX_API_KEY='...'
+masstin -a parse-cortex --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com   --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00"   --ignore-local -o cortex.csv
 
-# EVTX forensics collected by Cortex agents
-masstin -a parse-cortex-evtx-forensics --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com \
-  --start-time "2024-08-12 00:00:00" --end-time "2024-08-14 00:00:00" \
-  -o cortex-evtx.csv
+# Only some sources
+masstin -a parse-cortex --cortex-url https://api-xxxx.xdr.xx.paloaltonetworks.com   --cortex-sources network,eventlog -o cortex.csv
 ```
+
+Without `--start-time` / `--end-time` the network and the agents' event logs cover the last 7 days and the forensics event logs the last year. Standard and Advanced API keys both work; when the tenant refuses, masstin shows what it said. The forensics source alone is also the advanced action `parse-cortex-evtx-forensics`.
 
 `parse-cortex-evtx-forensics` queries the Cortex XDR `forensics_event_log` dataset —
 the backing store for Cortex's forensic triage feature, where the XDR forensic

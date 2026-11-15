@@ -25,6 +25,7 @@ mod csv_out;
 pub use crate::parse_elastic::*;
 mod cortex_auth;
 mod parse_cortex;
+mod parse_cortex_eventlog;
 pub use crate::parse_cortex::*;
 mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;
@@ -149,6 +150,19 @@ pub struct Cli {
     /// three-port query returns too much noise/hits the 1M API cap.
     #[arg(long)]
     admin_ports: bool,
+
+    /// For `parse-cortex`: which of the tenant's sources to read, a
+    /// comma-separated list of `network` (the endpoints' network
+    /// connections), `eventlog` (the Windows event logs every agent sends by
+    /// itself: logons, logoffs, Kerberos and NTLM, share access) and
+    /// `forensics` (the event logs collected by the forensics add-on's
+    /// triages and hunts, with the RDP, SMB and WinRM channels). Left out,
+    /// or `all`: the three, merged into one timeline; a source the tenant
+    /// does not have is said and left out. With no --start-time / --end-time
+    /// the network and the agents' event logs cover the last 7 days, the
+    /// forensics event logs the last year.
+    #[arg(long)]
+    cortex_sources: Option<String>,
 
     /// For `parse-cortex`: minimum time window (in seconds) the auto-pagination
     /// splitter is allowed to produce. When a query saturates the API 1M cap,
@@ -604,8 +618,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             parse_events_elastic(&config.file, &config.directory, config.output.as_ref());
         }
         ActionType::ParseCortex => {
-            parse_cortex_data(
-        config.cortex_url.as_ref().unwrap(),
+            let sources = crate::parse_cortex::sources_from(config.cortex_sources.as_deref())?;
+            crate::parse_cortex::parse_cortex_sources(
+                config.cortex_url.as_ref().unwrap(),
                 config.output.as_ref(),
                 config.debug,
                 config.start_time.as_ref(),
@@ -615,6 +630,8 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.admin_ports,
                 config.cortex_min_window_secs,
                 config.cortex_max_passes,
+                config.cortex_event_ids.as_ref(),
+                &sources,
             )
             .await?;
         }
