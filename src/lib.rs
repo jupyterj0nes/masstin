@@ -26,6 +26,7 @@ pub use crate::parse_elastic::*;
 mod cortex_auth;
 mod parse_cortex;
 mod parse_cortex_eventlog;
+mod parse_cortex_artifacts;
 pub use crate::parse_cortex::*;
 mod parse_cortex_evtx_forensics;
 pub use crate::parse_cortex_evtx_forensics::*;

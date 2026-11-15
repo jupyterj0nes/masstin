@@ -166,7 +166,7 @@ fn load_server_hostname(mdb_files: &[PathBuf]) -> String {
 }
 
 /// Map UAL role name to a protocol/event_id for the masstin timeline
-fn role_to_event_id(role_name: &str) -> &'static str {
+pub(crate) fn role_to_event_id(role_name: &str) -> &'static str {
     let lower = role_name.to_lowercase();
     if lower.contains("file server") { return "SMB"; }
     if lower.contains("remote desktop") || lower.contains("remote access") { return "RDP"; }
@@ -180,7 +180,7 @@ fn role_to_event_id(role_name: &str) -> &'static str {
 }
 
 /// Map UAL role to Windows logon type for correlation with EVTX events
-fn role_to_logon_type(role_name: &str) -> &'static str {
+pub(crate) fn role_to_logon_type(role_name: &str) -> &'static str {
     let lower = role_name.to_lowercase();
     if lower.contains("remote desktop") || lower.contains("remote access") { return "10"; }
     // All other network-based roles = type 3 (Network logon)

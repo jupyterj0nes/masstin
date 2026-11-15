@@ -117,7 +117,7 @@ pub async fn parse_cortex_evtx_forensics_data(
     //   WinRM:          6
     //   WMI-Activity:   5858
     // --cortex-event-ids overrides to narrow (e.g. "4624,4625,4648").
-    let default_ids = "4624,4625,4634,4647,4648,4768,4769,4770,4771,4776,4778,4779,5140,31001,30803,30804,30805,30806,30807,30808,1009,551,1024,1102,1149,21,22,24,25,131,6,5858";
+    let default_ids = "4624,4625,4634,4647,4648,4768,4769,4770,4771,4776,4778,4779,5140,31001,30803,30804,30805,30806,30807,30808,1009,551,1024,1102,1149,21,22,24,25,131,140,6,5858";
     let event_ids_clause: String = match event_ids {
         Some(raw) => raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(","),
         None => default_ids.to_string(),
@@ -182,7 +182,7 @@ pub async fn parse_cortex_evtx_forensics_data(
                     | alter lt = if(
                         event_id in (4624,4625,4634), arrayindex(regextract(message, "(?i)(?:Logon Type|Tipo de inicio de sesión|Anmeldetyp|Type d.ouverture de session|Tipo di accesso):[ \t]*(\d+)"), 0),
                         event_id = 4648, "runas",
-                        event_id in (21,22,24,25,1024,1102,1149,131,4778,4779), "10",
+                        event_id in (21,22,24,25,1024,1102,1149,131,140,4778,4779), "10",
                         event_id in (6,5858), "",
                         "3")
                     | alter srcip = if(
@@ -191,10 +191,12 @@ pub async fn parse_cortex_evtx_forensics_data(
                         event_id in (4768,4769,4770,4771,4778,4779), arrayindex(regextract(message, "(?i)Client Address:[ \t]*([\w.:-][\w.:%-]*)"), 0),
                         event_id = 5140, arrayindex(regextract(message, "(?i)(?:Source Address|Dirección de origen|Quelladresse|Adresse source|Indirizzo di origine):[ \t]*([\w.:-]+)"), 0),
                         event_id = 131, arrayindex(regextract(message, "(?i)from client\s+([^:\s]+)"), 0),
+                        event_id = 140, arrayindex(regextract(message, "(?i)IP address of\s+([0-9a-fA-F.:]+[0-9a-fA-F])"), 0),
                         event_id = 5858, arrayindex(regextract(message, "ClientMachine\s*=\s*([\w.\-$]+)"), 0))
                     | alter process = if(
                         event_id in (4624,4648), arrayindex(regextract(message, "(?i)(?:Process Name|Nombre de proceso|Prozessname|Nom du processus|Nome processo|Nome del processo):[ \t]*([^\s][^\r\n]*)"), 0),
                         event_id = 5140, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):[ \t]*(\S+)"), 0),
+                        event_id in (4769,4770), arrayindex(regextract(message, "(?i)(?:Service Name|Nombre de servicio|Dienstname|Nom du service|Nome servizio):[ \t]*(\S+)"), 0),
                         event_id = 5858, arrayindex(regextract(message, "Operation\s*=\s*([^;]{{1,120}})"), 0),
                         event_id = 6,    arrayindex(regextract(message, "(?i)connection\s*[:=]?\s*(\S+)"), 0),
                         event_id = 4625, arrayindex(regextract(message, "(?i)(?:Sub Status|Subestado|Unterstatus|Sous-état|Sottostato):[ \t]*(0x[0-9a-f]+)"), 0))
@@ -221,7 +223,7 @@ pub async fn parse_cortex_evtx_forensics_data(
                         event_id in (4624,4625,4648), arrayindex(regextract(message, "(?si)(?:New Logon:.*?Account Domain|Nuevo inicio de sesión:.*?Dominio de cuenta|Neue Anmeldung:.*?Kontodomäne|Nouvelle ouverture de session:.*?Domaine du compte|Nuovo accesso:.*?Dominio account|Account For Which Logon Failed:.*?Account Domain|Cuenta con error de inicio de sesión:.*?Dominio de cuenta|Konto, für das die Anmeldung fehlschlug:.*?Kontodomäne|Compte pour lequel l.ouverture de session a échoué:.*?Domaine du compte|Account per cui l.accesso non è riuscito:.*?Dominio account|Account Whose Credentials Were Used:.*?Account Domain|Cuenta cuyas credenciales se usaron:.*?Dominio de cuenta|Konto, dessen Anmeldeinformationen verwendet wurden:.*?Kontodomäne|Compte dont les informations d.identification ont été utilisées:.*?Domaine du compte|Account le cui credenziali sono state usate:.*?Dominio account):[ \t]*([\w.\-$]+)"), 0),
                         event_id in (1009,551,31001,21,22,24,25), arrayindex(regextract(message, "(?:User Name|Nombre de.? usuario|Benutzername|Nom d.utilisateur|Nome utente|User|Usuario):\s([^\s\\]+)\\(?:[^\s]+)"), 0))
                     | alter dst_host = if(
-                        event_id in (4624,4625,4634,4647,4768,4769,4770,4771,4776,4778,4779,5140,21,22,24,25,1149,131,5858), host_name,
+                        event_id in (4624,4625,4634,4647,4768,4769,4770,4771,4776,4778,4779,5140,21,22,24,25,1149,131,140,5858), host_name,
                         event_id = 4648, arrayindex(regextract(message, "(?i)(?:Target Server Name|Nombre de servidor de destino|Zielservername|Nom du serveur cible|Nome del server di destinazione):[ \t]*\\*([\w.-]+)"), 0),
                         event_id in (31001,30803,30804,30805,30806,30807), arrayindex(regextract(message, "(?i)(?:Server Name|Nombre de servidor|Servername|Nom du serveur|Nome del server):\s\\*(.+)"), 0),
                         event_id = 30808, arrayindex(regextract(message, "(?i)(?:Share Name|Nombre del recurso compartido|Freigabename|Nom du partage|Nome condivisione):\s\\*(.+)"), 0),
@@ -231,12 +233,15 @@ pub async fn parse_cortex_evtx_forensics_data(
                     | alter status = if(
                         event_id in (4768,4769), arrayindex(regextract(message, "(?i)(?:Result Code|Failure Code):[ \t]*(0x[0-9a-fA-F]+)"), 0),
                         event_id = 4776, arrayindex(regextract(message, "(?i)Error Code:[ \t]*(0x[0-9a-fA-F]+)"), 0))
+                    | alter logon_id = if(
+                        event_id = 4624, arrayindex(regextract(message, "(?si)(?:New Logon|Nuevo inicio de sesión|Neue Anmeldung|Nouvelle ouverture de session|Nuovo accesso):.*?(?:Logon ID|Id\. de inicio de sesión|Anmelde-ID|ID d.ouverture de session|ID accesso):[ \t]*(0x[0-9a-fA-F]+)"), 0),
+                        event_id in (4634,4647,4778,4779,5140), arrayindex(regextract(message, "(?i)(?:Logon ID|Id\. de inicio de sesión|Anmelde-ID|ID d.ouverture de session|ID accesso):[ \t]*(0x[0-9a-fA-F]+)"), 0))
                     | alter Timestamp  = to_timestamp(event_generated, "millis")
                     {time_filter}
-                    | filter ((`source_host` not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost") or srcip not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost")) and dst_host not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost"))
-                    | filter (dst_host != source_host) and (dst_host != srcip )
+                    | filter event_id in (4634,4647) or ((`source_host` not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost") or srcip not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost")) and dst_host not in ("","-","LOCAL", "127.0.0.1", "::1",null,"localhost"))
+                    | filter event_id in (4634,4647) or ((dst_host != source_host) and (dst_host != srcip ))
                     {ignore_local_post_clause}
-                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process, status"#)
+                    | fields Timestamp, dst_host, event_id, subject_name, subject_domain, target_user, target_domain,lt, source_host, srcip, process, status, logon_id"#)
     };
 
     // Phase 2: Query API
@@ -607,8 +612,17 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     // canonical masstin CSV header, so indices are fixed.
     let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut dups = 0usize;
-    for record in records {
-        let row = process_record(record, debug);
+    // The logons kept are the ones that came from another machine; a logoff
+    // names no origin, so it is kept when it ends one of those sessions
+    // (same host, same session id) and left out otherwise.
+    let rows: Vec<Vec<String>> = records.iter().map(|r| process_record(r, debug)).collect();
+    let sessions: std::collections::HashSet<(String, String)> = rows.iter().filter(|r| r.len() >= 14 && r[2] != "LOGOFF" && !r[11].is_empty()).map(|r| (r[1].to_ascii_lowercase(), r[11].to_ascii_lowercase())).collect();
+    let mut orphans = 0usize;
+    for row in rows {
+        if row.len() >= 14 && (row[3] == "4634" || row[3] == "4647") && !sessions.contains(&(row[1].to_ascii_lowercase(), row[11].to_ascii_lowercase())) {
+            orphans += 1;
+            continue;
+        }
         if !seen.insert(row.clone()) {
             dups += 1;
             continue;
@@ -639,6 +653,9 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     wtr.flush()?;
     if dups > 0 {
         crate::banner::print_info(&format!("{} event(s) collected more than once (a host triaged twice) written once", dups));
+    }
+    if orphans > 0 {
+        crate::banner::print_info(&format!("{} logoff(s) of sessions that did not come from another machine left out", orphans));
     }
     Ok(())
 }
@@ -743,6 +760,8 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         "21" | "22" | "25" | "1149" => "SUCCESSFUL_LOGON".to_string(),
         "24" => "LOGOFF".to_string(),
         "1024" | "1102" | "131" => "CONNECT".to_string(),
+        // RdpCoreTS 140: the NLA failure, before any logon event is written
+        "140" => "FAILED_LOGON".to_string(),
         // 1009: server denied anonymous access; 31001: client failed to authenticate
         "1009" | "31001" => "FAILED_LOGON".to_string(),
         "30803" | "30804" | "30805" | "30806" | "30807" | "30808" => "CONNECT".to_string(),
@@ -757,6 +776,10 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     // Operation for 5858, connection for 6). Final wrapping happens here.
     let detail = match event_id.as_str() {
         "4624" | "4648" => process.clone(),
+        // the service the ticket was issued for: the real destination of
+        // the move (the row's destination is the KDC), as parse-windows
+        "4769" | "4770" => process.clone(),
+        "140" => "NLA: user name or password not correct".to_string(),
         "4625" => {
             if process.is_empty() {
                 String::new()
@@ -793,8 +816,9 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         if d.is_empty() || !target_domain_name.trim().is_empty() { (u, target_domain_name) } else { (u, d) }
     };
 
-    // logon_id empty for Cortex forensics
-    let logon_id = "".to_string();
+    // the session id, to pair a logon with its end (4624 / 4634 / 4647 /
+    // 4778 / 4779 / 5140); other events carry none
+    let logon_id = record.get("logon_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
 
     // Nombre del log fijo
     let log_filename = "cortex_evtx_forensics".to_string();
@@ -907,6 +931,34 @@ mod tests {
         assert_eq!((r[5].as_str(), r[6].as_str()), ("ana", "CORP"));
         let r = rec(serde_json::json!({"event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "target_domain": "CORP", "lt": "3"}));
         assert_eq!((r[5].as_str(), r[6].as_str()), ("ana", "CORP"));
+    }
+
+    #[test]
+    fn a_logoff_is_kept_when_it_ends_a_session_of_the_timeline() {
+        let logon = serde_json::json!({"Timestamp": 1700000000000i64, "event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "lt": "3", "logon_id": "0x1F4A"});
+        let its_end = serde_json::json!({"Timestamp": 1700000600000i64, "event_id": "4634", "dst_host": "srv1", "target_user": "ana", "lt": "3", "logon_id": "0x1f4a"});
+        let local_end = serde_json::json!({"Timestamp": 1700000700000i64, "event_id": "4634", "dst_host": "SRV1", "target_user": "bob", "lt": "2", "logon_id": "0x9999"});
+        let other_host = serde_json::json!({"Timestamp": 1700000800000i64, "event_id": "4647", "dst_host": "SRV2", "target_user": "ana", "logon_id": "0x1f4a"});
+        let p = std::env::temp_dir().join(format!("masstin_cortex_for_s_{}.csv", std::process::id()));
+        write_processed_csv(&[logon, its_end, local_end, other_host], p.to_str().unwrap(), false).unwrap();
+        let rows: Vec<Vec<String>> = csv::Reader::from_path(&p).unwrap().records().map(|r| r.unwrap().iter().map(|s| s.to_string()).collect()).collect();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(rows.len(), 2, "{:?}", rows);
+        assert_eq!((rows[0][3].as_str(), rows[0][11].as_str()), ("4624", "0x1F4A"));
+        assert_eq!((rows[1][2].as_str(), rows[1][3].as_str(), rows[1][11].as_str()), ("LOGOFF", "4634", "0x1f4a"));
+    }
+
+    #[test]
+    fn the_nla_failure_is_a_failed_logon_from_the_client() {
+        let r = rec(serde_json::json!({"event_id": "140", "dst_host": "SRV1", "srcip": "10.0.0.5", "lt": "10"}));
+        assert_eq!((r[2].as_str(), r[4].as_str(), r[8].as_str()), ("FAILED_LOGON", "10", "10.0.0.5"));
+        assert_eq!(r[12], "NLA: user name or password not correct");
+    }
+
+    #[test]
+    fn a_kerberos_ticket_names_its_service() {
+        let r = rec(serde_json::json!({"event_id": "4769", "dst_host": "DC01", "srcip": "10.0.0.5", "target_user": "ana@CORP.LOCAL", "status": "0x0", "process": "cifs/FS01"}));
+        assert_eq!(r[12], "cifs/FS01");
     }
 
     #[test]

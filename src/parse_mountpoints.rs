@@ -87,7 +87,7 @@ fn open_hive(path: &Path) -> Result<(Vec<u8>, HiveImage), String> {
 }
 
 /// `##SERVER#SHARE` -> (`\\SERVER\SHARE`, `SERVER`), for network share keys only.
-fn share_of(key_name: &str) -> Option<(String, String)> {
+pub(crate) fn share_of(key_name: &str) -> Option<(String, String)> {
     if !key_name.starts_with("##") {
         return None;
     }
@@ -208,7 +208,7 @@ fn collect_ntuser_files(dir: &Path, results: &mut Vec<std::path::PathBuf>) {
 }
 
 /// If the server name looks like an IP address, return it
-fn extract_ip_if_present(server: &str) -> String {
+pub(crate) fn extract_ip_if_present(server: &str) -> String {
     if server.chars().all(|c| c.is_ascii_digit() || c == '.') && server.contains('.') {
         server.to_string()
     } else {

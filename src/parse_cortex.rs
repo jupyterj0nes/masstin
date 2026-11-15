@@ -1017,6 +1017,26 @@ pub async fn parse_cortex_sources(
                 crate::parse_cortex_evtx_forensics::parse_cortex_evtx_forensics_data(base_url, Some(&part), debug, if given { start_time } else { None }, if given { end_time } else { None }, ignore_local, event_ids, min_window_secs, max_passes).await
             }
         };
+        // with the forensics event logs: User Access Logging and MountPoints2,
+        // the other artefacts of the add-on masstin reads from a disk
+        if *src == Source::Forensics {
+            let extra = tmp.join("forensics-artifacts.csv").to_string_lossy().to_string();
+            let a: Result<usize, Box<dyn Error>> = async {
+                let (key, id) = api_key_and_id()?;
+                let client = Client::new();
+                let auth = crate::cortex_auth::Auth::connect(&client, base_url, &key, &id).await?;
+                crate::parse_cortex_artifacts::parse_cortex_artifacts_data(&client, base_url, &auth, &extra, debug, if given { start_time } else { None }, if given { end_time } else { None }).await
+            }
+            .await;
+            match a {
+                Ok(n) if n > 0 => {
+                    said.push(format!("{} forensics artefacts (UAL, MountPoints2)", n));
+                    parts.push(extra);
+                }
+                Ok(_) => {}
+                Err(e) => crate::banner::print_warning(&format!("Forensics artefacts (UAL, MountPoints2) left out: {}", e)),
+            }
+        }
         match r {
             Ok(()) => {
                 let rows = csv::Reader::from_path(&part).map(|mut r| r.records().count()).unwrap_or(0);

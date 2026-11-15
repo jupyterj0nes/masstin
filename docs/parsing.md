@@ -279,7 +279,7 @@ Reads a Cortex XDR tenant through its XQL API. One action, `parse-cortex`, reads
 
 - **network**: the endpoints' network connections (RDP, SMB, SSH, WinRM; `--admin-ports` adds RPC, NetBIOS, SQL, VNC). An address the tenant has an agent on is named; a machine's connections to itself are left out.
 - **eventlog**: the Windows event logs every agent sends by itself (4624, 4625, 4634, 4647, 4648, 4768-4771, 4776, 4778, 4779, 5140, 5145), for every machine with an agent, with no triage. Each event goes through `parse-windows`' own mapping, so it gives the row it would give from an EVTX. Most of them are logons local to the machine: `--ignore-local` leaves the ones that came from another.
-- **forensics**: the event logs the forensics add-on collected (triages, hunts, offline collectors), with the RDP, SMB client and WinRM channels.
+- **forensics**: the event logs the forensics add-on collected (triages, hunts, offline collectors), with the RDP, SMB client and WinRM channels. With them, the add-on's User Access Logging records and the shares mounted (MountPoints2 in the registry). Session ids are read, so a logon has its logoff. Not available this way: 5145, OpenSSH, scheduled tasks.
 
 A source the tenant does not have is said and left out. `--cortex-sources` picks them.
 
