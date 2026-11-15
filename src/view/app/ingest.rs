@@ -25,11 +25,11 @@ pub(super) struct Parser {
 }
 
 pub(super) const PARSERS: [Parser; 6] = [
-    Parser { action: "parse-windows", icon: ic::DESKTOP, title: "Windows", desc: "EVTX files, triage packages (KAPE, Velociraptor, Cortex XDR) and User Access Logging databases (.mdb), loose or zipped" },
+    Parser { action: "parse-windows", icon: ic::DESKTOP, title: "Windows", desc: "EVTX files, triage packages (KAPE, Velociraptor, a Cortex XDR offline collector) and User Access Logging databases (.mdb), loose or zipped" },
     Parser { action: "parse-linux", icon: ic::TERMINAL_WINDOW, title: "Linux", desc: "auth.log / secure, wtmp, btmp, lastlog, audit.log, journal files, a UAC archive" },
     Parser { action: "parse-mac", icon: ic::LAPTOP, title: "macOS", desc: "a .logarchive bundle (the Unified Log) or a `log show` JSON export" },
     Parser { action: "parse-image", icon: ic::HARD_DRIVES, title: "Disk image", desc: "E01, dd / raw, VMDK, VHD / VHDX: the logs are read from the file system inside, shadow copies included" },
-    Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: images, Windows and Linux triages, loose EVTX and Linux logs, in one pass, with no mercy" },
+    Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: disk images, Windows and Linux triages, loose EVTX and Linux logs, read together into one timeline" },
     Parser { action: "parser-elastic", icon: ic::CLOUD, title: "Winlogbeat JSON", desc: "Windows events exported from Elasticsearch as Winlogbeat JSON" },
 ];
 
@@ -68,11 +68,17 @@ pub(super) struct Ingest {
     /// `--rules`: a YAML rule file or folder for the logs masstin does not
     /// know (a VPN, a firewall, a proxy)
     pub rules: String,
+    /// noise left out of the timeline: `--ignore-local`, `--exclude-users`,
+    /// `--exclude-hosts`, `--exclude-ips`
+    pub ignore_local: bool,
+    pub exclude_users: String,
+    pub exclude_hosts: String,
+    pub exclude_ips: String,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new() }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new() }
     }
 }
 
@@ -88,9 +94,10 @@ impl Ingest {
         self.scan.as_ref().map_or(false, |s| !s.images.is_empty())
     }
 
-    /// Carving asked for, on evidence that has images to carve.
+    /// Carving asked for, on evidence that has images to carve (or may: a
+    /// look that stopped early may not have reached them).
     pub fn carve_on(&self) -> bool {
-        self.carve && self.has_images()
+        self.carve && (self.has_images() || self.scan.as_ref().map_or(false, |s| s.truncated))
     }
 
     /// Rules given for the logs masstin does not know.
@@ -118,6 +125,15 @@ impl Ingest {
         }
         if self.carve_on() {
             args.push("--carve".into());
+        }
+        if self.ignore_local {
+            args.push("--ignore-local".into());
+        }
+        for (flag, v) in [("--exclude-users", &self.exclude_users), ("--exclude-hosts", &self.exclude_hosts), ("--exclude-ips", &self.exclude_ips)] {
+            if !v.trim().is_empty() {
+                args.push(flag.into());
+                args.push(v.trim().to_string());
+            }
         }
         args.push("-o".into());
         args.push(self.output.trim().to_string());
@@ -158,6 +174,10 @@ impl Viewer {
         self.ingest.output.clear();
         self.ingest.carve = false;
         self.ingest.rules.clear();
+        self.ingest.ignore_local = false;
+        self.ingest.exclude_users.clear();
+        self.ingest.exclude_hosts.clear();
+        self.ingest.exclude_ips.clear();
         self.start_scan();
     }
 
@@ -550,9 +570,14 @@ impl Viewer {
         let rec = self.ingest.verdict.as_ref().and_then(|v| v.parser).map(pidx);
         let sure = self.ingest.verdict.as_ref().map_or(false, |v| v.sure);
         ui.label(egui::RichText::new(if sure { "The parser masstin picked (masstin -a parse picks the same by itself), and the others in case you know better." } else { "masstin is not sure which parser this is for. Pick one." }).color(theme::MUTED));
+        // carving or rules make it `masstin -a parse`, whatever card is lit
+        let overridden = self.ingest.uses_parse() && !self.ingest.is_auto();
+        if overridden {
+            ui.label(egui::RichText::new(format!("{}  With carving or rules below, masstin -a parse runs: it reads what it knows by itself, and the rest with the rules. The cards do not apply.", ic::INFO)).color(theme::CYAN).size(12.5));
+        }
         ui.add_space(6.0);
         for (i, p) in PARSERS.iter().enumerate() {
-            let on = self.ingest.parser == i;
+            let on = self.ingest.parser == i && !overridden;
             let r = theme::card(ui, on, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(p.icon).size(22.0).color(if on { theme::ACCENT } else { theme::MUTED }));
@@ -576,7 +601,7 @@ impl Viewer {
             }
         }
         // what only `masstin -a parse` does: carve the images, read the rest with rules
-        if self.ingest.has_images() {
+        if self.ingest.has_images() || self.ingest.scan.as_ref().map_or(false, |s| s.truncated) {
             theme::section(ui, "Deleted logs");
             ui.checkbox(&mut self.ingest.carve, "Carve the disk images for the records of deleted or overwritten logs");
             ui.label(egui::RichText::new("Every byte of every image is read, unallocated space included, for event log records. What the live logs already hold is dropped; what they lost joins the same timeline (--carve). Slow: minutes per image.").color(theme::MUTED).size(12.0));
@@ -601,10 +626,6 @@ impl Viewer {
         });
         if self.ingest.rules_on() && !Path::new(self.ingest.rules.trim()).exists() {
             ui.label(egui::RichText::new(format!("{}  no such file or folder; the parser will fail", ic::WARNING)).color(SIGNIFICANT).small());
-        }
-        if self.ingest.uses_parse() && !self.ingest.is_auto() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(format!("{}  With these options masstin -a parse runs: it reads what it knows by itself, whatever is picked above, and the rest with the rules.", ic::INFO)).color(theme::CYAN).size(12.0));
         }
     }
 
@@ -644,6 +665,21 @@ impl Viewer {
         }
         ui.checkbox(&mut self.ingest.open_table, "Show its rows as a table");
         ui.checkbox(&mut self.ingest.open_external, "Open it with the system's CSV application").on_hover_text("Whatever opens .csv files on this machine: a spreadsheet, an editor");
+        let leaving = self.ingest.ignore_local || !(self.ingest.exclude_users.trim().is_empty() && self.ingest.exclude_hosts.trim().is_empty() && self.ingest.exclude_ips.trim().is_empty());
+        egui::CollapsingHeader::new(theme::semibold(if leaving { "Leave out the noise (on)" } else { "Leave out the noise (optional)" }, 12.5)).id_salt("ingest-noise").default_open(leaving).show(ui, |ui| {
+            ui.label(egui::RichText::new("Rows dropped before they are written: the timeline holds the rest. Leave it all empty to keep everything.").color(theme::MUTED).size(12.0));
+            ui.checkbox(&mut self.ingest.ignore_local, "Logons with no real origin: loopback, LOCAL, empty or placeholder sources (--ignore-local)");
+            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, flag: &str| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([120.0, 20.0], egui::Label::new(egui::RichText::new(label).color(TEXT)));
+                    ui.add(egui::TextEdit::singleline(value).desired_width(420.0).hint_text(hint)).on_hover_text(flag);
+                });
+            };
+            field(ui, "Accounts", &mut self.ingest.exclude_users, "svc_backup, *$ (machine accounts), *admin*, @accounts.txt", "--exclude-users: the subject and the target account, any case; * wildcards; @file reads one per line");
+            field(ui, "Hosts", &mut self.ingest.exclude_hosts, "JUMP01, *-MON, @jumpboxes.txt", "--exclude-hosts: origin and destination names; * wildcards; @file reads one per line");
+            field(ui, "Addresses", &mut self.ingest.exclude_ips, "10.0.0.5, 10.0.0.0/24, fe80::/10, @scanners.txt", "--exclude-ips: the origin address; single addresses or CIDR ranges; @file reads one per line");
+            ui.label(egui::RichText::new("Commas between entries; * matches anything; @file.txt reads a list from a file, one entry a line. The console says how many rows each rule dropped.").color(theme::DIM).small());
+        });
         theme::section(ui, "The command");
         ui.add(egui::Label::new(egui::RichText::new(self.ingest.command_line()).monospace().size(11.5).color(theme::MUTED)).wrap());
         ui.label(egui::RichText::new("The same line works in a terminal or a script.").color(theme::DIM).small());
@@ -898,7 +934,7 @@ impl Viewer {
 // ───────────────────────── widgets ─────────────────────────
 
 /// The steps of the wizard as numbered dots joined by a line.
-fn stepper(ui: &mut egui::Ui, step: usize, labels: &[&str]) {
+pub(super) fn stepper(ui: &mut egui::Ui, step: usize, labels: &[&str]) {
     let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), 46.0), Sense::hover());
     let n = labels.len();
     let pad = 40.0;
@@ -1263,5 +1299,20 @@ mod tests {
         i.carve = true;
         i.rules = "D:/my rules".into();
         assert_eq!(i.command_line(), "masstin -a parse -f D:/case --rules \"D:/my rules\" --carve -o out.csv --overwrite");
+    }
+    #[test]
+    fn the_noise_filters_go_on_the_command_line_trimmed() {
+        let mut i = Ingest::default();
+        i.parser = P_WINDOWS;
+        i.sources = vec!["no-such-file.evtx".into()];
+        i.output = "out.csv".into();
+        assert!(!i.command().iter().any(|a| a.starts_with("--exclude") || a == "--ignore-local"));
+        i.ignore_local = true;
+        i.exclude_users = " svc_*, *$ ".into();
+        i.exclude_ips = "10.0.0.0/8".into();
+        let c = i.command();
+        let s = c.join(" ");
+        assert!(s.contains("--ignore-local --exclude-users svc_*, *$ --exclude-ips 10.0.0.0/8 -o out.csv"));
+        assert!(!s.contains("--exclude-hosts"));
     }
 }

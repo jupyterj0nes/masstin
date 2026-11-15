@@ -16,6 +16,7 @@ mod merge_hosts;
 mod report;
 mod subnets;
 mod tasks;
+mod hunt;
 mod ingest;
 mod table;
 mod when;
@@ -39,7 +40,8 @@ use report::HuntReport;
 use subnets::SubnetGroup;
 use super::views::{LabelPos, NodeStyle};
 use ingest::Ingest;
-use tasks::{HuntForm, Job, MergeForm};
+use hunt::HuntForm;
+use tasks::{Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
 use super::present::{self, Anonymiser, Format, LogoPos, Quality, Step, StepOverride, Story, Timing};
@@ -371,6 +373,8 @@ pub struct Viewer {
     // work in progress: a child masstin, the hunt's reveal
     job: Option<Job>,
     hunt_form: HuntForm,
+    /// the report the last hunt was asked to write
+    hunt_last_report: Option<String>,
     /// the ingest wizard
     ingest: Ingest,
     merge_form: MergeForm,
@@ -774,9 +778,10 @@ impl Viewer {
             mark_dialog: None,
             row_pick: Vec::new(),
             job: None,
-            hunt_form: HuntForm { from: String::new(), end: String::new(), alpha: String::new() },
+            hunt_form: HuntForm::default(),
+            hunt_last_report: None,
             ingest: Ingest::default(),
-            merge_form: MergeForm { inputs: Vec::new(), output: String::new() },
+            merge_form: MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() },
             hunt_sweep: None,
             hunt_reveal: None,
             reveal_rank: Vec::new(),

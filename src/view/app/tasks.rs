@@ -168,15 +168,50 @@ pub(super) struct Job {
     pub autoclose_at: Option<std::time::Instant>,
 }
 
-pub(super) struct HuntForm {
-    pub from: String,
-    pub end: String,
-    pub alpha: String,
-}
-
 pub(super) struct MergeForm {
     pub inputs: Vec<String>,
     pub output: String,
+    /// only the events in this window (`--start-time` / `--end-time`)
+    pub from: String,
+    pub to: String,
+    /// an earlier timeline whose verdicts and notes are copied over (`--carry-marks`)
+    pub carry: String,
+}
+
+impl MergeForm {
+    pub fn command(&self) -> Vec<String> {
+        let mut args = vec!["-a".to_string(), "merge".to_string()];
+        for f in &self.inputs {
+            args.push("-f".into());
+            args.push(f.clone());
+        }
+        for (flag, v) in [("--start-time", &self.from), ("--end-time", &self.to), ("--carry-marks", &self.carry)] {
+            if !v.trim().is_empty() {
+                args.push(flag.into());
+                args.push(v.trim().to_string());
+            }
+        }
+        args.push("-o".into());
+        args.push(self.output.trim().to_string());
+        args.push("--overwrite".into());
+        args
+    }
+
+    /// What stops the merge, said for the analyst.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.inputs.len() < 2 {
+            return Some("two timelines at least");
+        }
+        if self.output.trim().is_empty() {
+            return Some("the merged timeline needs a file");
+        }
+        for t in [&self.from, &self.to] {
+            if !t.trim().is_empty() && parse_time(t).is_none() {
+                return Some("the times are full dates and times: YYYY-MM-DD HH:MM:SS");
+            }
+        }
+        None
+    }
 }
 
 impl Job {
@@ -350,74 +385,6 @@ impl Viewer {
         }
     }
 
-    // ───────────────────────── the hunt ─────────────────────────
-
-    pub(super) fn hunt_window(&mut self, ctx: &egui::Context) {
-        if !self.show_hunt {
-            return;
-        }
-        if self.hunt_form.from.is_empty() {
-            // a sensible start: the window's From, or the last third of the timeline
-            self.hunt_form.from = if !self.filter.from.trim().is_empty() { self.filter.from.clone() } else { fmt_time(self.store.t_min + (self.store.t_max - self.store.t_min) * 2 / 3) };
-            self.hunt_form.alpha = format!("{}", self.alpha);
-        }
-        let mut open = true;
-        let mut run = std::mem::take(&mut self.hunt_autorun);
-        egui::Window::new(format!("{}  Hunt", ic::DETECTIVE)).open(&mut open).collapsible(false).resizable(false).default_width(520.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
-            ui.label(egui::RichText::new("The statistical hunt of graph-hunt-csv, on the timeline(s) open here: every new connection after the start of the investigation is tested against what the network did before it, and each row gets its state, score and explanation in the hunt columns.").color(theme::MUTED));
-            ui.add_space(8.0);
-            egui::Grid::new("hunt-form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Investigation from");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.hunt_form.from).desired_width(170.0).hint_text("YYYY-MM-DD HH:MM:SS"));
-                    if ui.small_button("window's From").on_hover_text("Take the time strip's left handle").clicked() {
-                        self.hunt_form.from = if self.filter.from.trim().is_empty() { fmt_time(self.store.t_min) } else { self.filter.from.clone() };
-                    }
-                });
-                ui.end_row();
-                ui.label("Until (optional)");
-                ui.add(egui::TextEdit::singleline(&mut self.hunt_form.end).desired_width(170.0).hint_text("YYYY-MM-DD HH:MM:SS"));
-                ui.end_row();
-                ui.label("Alpha (false discovery rate)");
-                ui.add(egui::TextEdit::singleline(&mut self.hunt_form.alpha).desired_width(80.0));
-                ui.end_row();
-            });
-            ui.add_space(4.0);
-            let baseline_days = parse_time(&self.hunt_form.from).map(|t| ((t - self.store.t_min) as f64 / 86400.0).max(0.0)).unwrap_or(0.0);
-            ui.label(egui::RichText::new(format!("Baseline before that start: {:.1} day(s). The verdicts and notes already written are kept.", baseline_days)).color(theme::DIM).small());
-            ui.add_space(8.0);
-            let ok = parse_time(&self.hunt_form.from).is_some() && self.hunt_form.alpha.parse::<f64>().map_or(false, |a| a > 0.0 && a < 1.0) && (self.hunt_form.end.trim().is_empty() || parse_time(&self.hunt_form.end).is_some());
-            ui.horizontal(|ui| {
-                if ui.add_enabled(ok && self.job.is_none(), egui::Button::new(theme::semibold(format!("{}  Run the hunt", ic::DETECTIVE), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
-                    run = true;
-                }
-                if !ok {
-                    ui.label(egui::RichText::new("the start needs a full date and time; alpha is between 0 and 1").color(CANDIDATE).small());
-                }
-            });
-        });
-        if run {
-            let mut args = vec!["-a".to_string(), "graph-hunt-csv".to_string()];
-            for f in &self.files {
-                args.push("-f".into());
-                args.push(f.clone());
-            }
-            args.push("--investigation-from".into());
-            args.push(self.hunt_form.from.trim().to_string());
-            if !self.hunt_form.end.trim().is_empty() {
-                args.push("--end-time".into());
-                args.push(self.hunt_form.end.trim().to_string());
-            }
-            args.push("--alpha".into());
-            args.push(self.hunt_form.alpha.trim().to_string());
-            self.start_job(JobKind::Hunt, "Hunting".into(), args, Vec::new(), false);
-            self.show_hunt = false;
-            self.hunt_sweep = Some(std::time::Instant::now());
-        } else {
-            self.show_hunt = open;
-        }
-    }
-
     /// After a hunt: the findings of the view appear one after another, in
     /// time order, each with a flash.
     fn begin_reveal(&mut self) {
@@ -500,22 +467,49 @@ impl Viewer {
                     }
                 }
             });
-            ui.add_space(6.0);
-            let ok = self.merge_form.inputs.len() >= 2 && !self.merge_form.output.trim().is_empty();
-            if ui.add_enabled(ok && self.job.is_none(), egui::Button::new(theme::semibold(format!("{}  Merge", ic::STACK), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
-                run = true;
+            let out = self.merge_form.output.trim();
+            if !out.is_empty() && std::path::Path::new(out).exists() {
+                ui.label(egui::RichText::new(format!("{}  this file exists and will be written over", ic::WARNING)).color(CANDIDATE).small());
             }
+            egui::CollapsingHeader::new(theme::semibold("Only a time window, marks from an earlier timeline (optional)", 12.5)).id_salt("merge-more").default_open(!(self.merge_form.from.is_empty() && self.merge_form.to.is_empty() && self.merge_form.carry.is_empty())).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Events from").color(theme::MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.merge_form.from).desired_width(160.0).hint_text("the first"));
+                    ui.label(egui::RichText::new("to").color(theme::MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.merge_form.to).desired_width(160.0).hint_text("the last"));
+                    if ui.small_button("the window's").on_hover_text("The time window of the view").clicked() {
+                        self.merge_form.from = self.filter.from.clone();
+                        self.merge_form.to = self.filter.to.clone();
+                    }
+                });
+                ui.label(egui::RichText::new("YYYY-MM-DD HH:MM:SS, UTC; empty keeps every event (--start-time, --end-time).").color(theme::DIM).small());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Marks from").color(theme::MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.merge_form.carry).desired_width(380.0).hint_text("an earlier timeline of the same evidence"));
+                    if ui.button(format!("{}  File…", ic::ARCHIVE)).clicked() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() {
+                            self.merge_form.carry = p.to_string_lossy().to_string();
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new("Its verdicts and notes are copied onto the same rows of the result (--carry-marks).").color(theme::DIM).small());
+            });
+            ui.add_space(6.0);
+            let problem = self.merge_form.problem();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(problem.is_none() && self.job.is_none(), egui::Button::new(theme::semibold(format!("{}  Merge", ic::STACK), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
+                    run = true;
+                }
+                if let Some(p) = problem {
+                    ui.label(egui::RichText::new(p).color(CANDIDATE).small());
+                }
+            });
+            let line = self.merge_form.command();
+            ui.add(egui::Label::new(egui::RichText::new(format!("masstin {}", line.iter().map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }).collect::<Vec<_>>().join(" "))).monospace().size(10.5).color(theme::DIM)).wrap());
         });
         if run {
             let out = self.merge_form.output.trim().to_string();
-            let mut args = vec!["-a".to_string(), "merge".to_string()];
-            for f in &self.merge_form.inputs {
-                args.push("-f".into());
-                args.push(f.clone());
-            }
-            args.push("-o".into());
-            args.push(out.clone());
-            args.push("--overwrite".into());
+            let args = self.merge_form.command();
             self.start_job(JobKind::Merge, "Merging".into(), args, vec![out], false);
             self.show_merge = false;
         } else {
@@ -616,6 +610,20 @@ pub(super) const REVEAL_SECS: f32 = 3.0;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_merge_command_carries_its_window_and_marks() {
+        let mut m = MergeForm { inputs: vec!["a.csv".into(), "b.csv".into()], output: "m.csv".into(), from: String::new(), to: String::new(), carry: String::new() };
+        assert_eq!(m.command(), vec!["-a", "merge", "-f", "a.csv", "-f", "b.csv", "-o", "m.csv", "--overwrite"]);
+        assert_eq!(m.problem(), None);
+        m.from = "2026-11-10 00:00:00".into();
+        m.carry = " old.csv ".into();
+        assert_eq!(m.command().join(" "), "-a merge -f a.csv -f b.csv --start-time 2026-11-10 00:00:00 --carry-marks old.csv -o m.csv --overwrite");
+        m.to = "later".into();
+        assert!(m.problem().is_some());
+        m.inputs.pop();
+        assert_eq!(m.problem(), Some("two timelines at least"));
+    }
     use super::*;
 
     fn read(lines: &[&str]) -> Progress {

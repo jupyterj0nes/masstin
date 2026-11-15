@@ -132,6 +132,14 @@ impl Viewer {
                     ui.close();
                     self.hunt_report = Some(self.build_report());
                 }
+                if let Some(r) = self.hunt_last_report.clone().filter(|r| std::path::Path::new(r).is_file()) {
+                    if icon_button(ui, ic::ARCHIVE, "The analyst's report…").on_hover_text(format!("The Markdown report the last hunt wrote: {}", r)).clicked() {
+                        ui.close();
+                        if let Err(e) = super::ingest::open_external(&r) {
+                            self.status = format!("Cannot open {}: {}", r, e);
+                        }
+                    }
+                }
                 ui.separator();
                 if icon_button(ui, ic::FIRE, "Findings only").clicked() {
                     ui.close();
@@ -265,7 +273,7 @@ impl Viewer {
                     self.open_agentc00pr();
                 }
                 ui.separator();
-                if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merged hosts… ({})", self.merges.len())).clicked() {
+                if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merged hosts… ({})", self.merges.len())).on_hover_text("Two names of the same machine drawn as one host, in this view and case only: the timeline CSV is not changed").clicked() {
                     ui.close();
                     self.show_merges = true;
                 }
