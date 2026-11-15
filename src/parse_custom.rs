@@ -756,8 +756,9 @@ fn apply_extract(
             true
         }
         Extract::Keyvalue { pair_separator, kv_separator, trim } => {
-            for pair in input.split(pair_separator.as_str()) {
-                let pair = if *trim { pair.trim() } else { pair };
+            // a quoted value keeps its spaces (msg="SSL tunnel up")
+            for pair in kv_pairs(input, pair_separator, kv_separator) {
+                let pair = if *trim { pair.trim() } else { pair.as_str() };
                 if let Some(pos) = pair.find(kv_separator.as_str()) {
                     let key = pair[..pos].trim().to_string();
                     let val = pair[pos + kv_separator.len()..].trim();
@@ -940,6 +941,16 @@ mod tests {
     const FORTI: &str = r#"date=2026-11-10 time=00:41:02 devname="FGT-LEO" type="event" subtype="vpn" action="ssl-login-fail" remip=203.0.113.45 user="admin" reason="sslvpn_login_permission_denied" msg="SSL user failed to logged in"
 date=2026-11-10 time=08:02:11 devname="FGT-LEO" type="event" subtype="vpn" action="tunnel-up" remip=198.51.100.7 user="ana.ruiz" tunneltype="ssl-web" group="vpn-users"
 date=2026-11-10 time=09:00:00 devname="FGT-LEO" type="event" subtype="system" action="update" msg="nothing to do with vpn""#;
+
+    #[test]
+    fn a_quoted_value_keeps_its_spaces() {
+        let ex = Extract::Keyvalue { pair_separator: " ".into(), kv_separator: "=".into(), trim: true };
+        let mut ctx = HashMap::new();
+        apply_extract(&ex, None, r#"user="ana" msg="SSL tunnel up" remip=1.2.3.4"#, &mut ctx);
+        assert_eq!(ctx.get("msg").map(|s| s.as_str()), Some("SSL tunnel up"));
+        assert_eq!(ctx.get("remip").map(|s| s.as_str()), Some("1.2.3.4"));
+        assert_eq!(ctx.get("user").map(|s| s.as_str()), Some("ana"));
+    }
 
     #[test]
     fn every_library_rule_reads_as_yaml_and_compiles() {
