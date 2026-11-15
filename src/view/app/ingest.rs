@@ -74,11 +74,18 @@ pub(super) struct Ingest {
     pub exclude_users: String,
     pub exclude_hosts: String,
     pub exclude_ips: String,
+    /// only the carving (`carve-image`): the images' file systems not read
+    pub carve_only: bool,
+    /// advanced: `--threads`, `--parallel-images`, `--skip-offsets`, `--debug`
+    pub threads: String,
+    pub parallel_images: String,
+    pub skip_offsets: String,
+    pub debug: bool,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new() }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
     }
 }
 
@@ -112,7 +119,34 @@ impl Ingest {
         self.is_auto() || self.carve_on() || self.rules_on()
     }
 
+    /// Only the carving can be asked for: every source is a file and the
+    /// look found images among them.
+    pub fn carve_only_possible(&self) -> bool {
+        self.has_images() && self.sources.iter().all(|s| !Path::new(s).is_dir())
+    }
+
+    /// The run is `carve-image`: carving alone, the file systems not read.
+    pub fn carve_only_on(&self) -> bool {
+        self.carve_on() && self.carve_only && self.carve_only_possible()
+    }
+
     pub fn command(&self) -> Vec<String> {
+        if self.carve_only_on() {
+            let mut args = vec!["-a".to_string(), "carve-image".to_string()];
+            for s in &self.sources {
+                args.push("-f".into());
+                args.push(s.clone());
+            }
+            if !self.skip_offsets.trim().is_empty() {
+                args.push("--skip-offsets".into());
+                args.push(self.skip_offsets.trim().to_string());
+            }
+            self.push_advanced(&mut args);
+            args.push("-o".into());
+            args.push(self.output.trim().to_string());
+            args.push("--overwrite".into());
+            return args;
+        }
         let action = if self.uses_parse() { "parse" } else { PARSERS[self.parser].action };
         let mut args = vec!["-a".to_string(), action.to_string()];
         for s in &self.sources {
@@ -135,10 +169,36 @@ impl Ingest {
                 args.push(v.trim().to_string());
             }
         }
+        if self.carve_on() && !self.skip_offsets.trim().is_empty() {
+            args.push("--skip-offsets".into());
+            args.push(self.skip_offsets.trim().to_string());
+        }
+        self.push_advanced(&mut args);
         args.push("-o".into());
         args.push(self.output.trim().to_string());
         args.push("--overwrite".into());
         args
+    }
+
+    /// `--threads`, `--parallel-images`, `--debug`, when set.
+    fn push_advanced(&self, args: &mut Vec<String>) {
+        if let Ok(n) = self.threads.trim().parse::<usize>() {
+            if n > 0 {
+                args.push("--threads".into());
+                args.push(n.to_string());
+            }
+        }
+        if self.has_images() {
+            if let Ok(n) = self.parallel_images.trim().parse::<usize>() {
+                if n > 0 {
+                    args.push("--parallel-images".into());
+                    args.push(n.to_string());
+                }
+            }
+        }
+        if self.debug {
+            args.push("--debug".into());
+        }
     }
 
     pub fn command_line(&self) -> String {
@@ -178,6 +238,11 @@ impl Viewer {
         self.ingest.exclude_users.clear();
         self.ingest.exclude_hosts.clear();
         self.ingest.exclude_ips.clear();
+        self.ingest.carve_only = false;
+        self.ingest.threads.clear();
+        self.ingest.parallel_images.clear();
+        self.ingest.skip_offsets.clear();
+        self.ingest.debug = false;
         self.start_scan();
     }
 
@@ -291,7 +356,7 @@ impl Viewer {
     pub(super) fn run_ingest(&mut self) {
         let args = self.ingest.command();
         let out = self.ingest.output.trim().to_string();
-        let title = if self.ingest.uses_parse() { "Parsing".to_string() } else { format!("Parsing with {}", PARSERS[self.ingest.parser].action) };
+        let title = if self.ingest.carve_only_on() { "Carving".to_string() } else if self.ingest.uses_parse() { "Parsing".to_string() } else { format!("Parsing with {}", PARSERS[self.ingest.parser].action) };
         self.start_job(JobKind::Ingest, title, args, vec![out], self.ingest.add);
         self.ingest.step = 3;
         self.ingest.log_open = false;
@@ -573,7 +638,8 @@ impl Viewer {
         // carving or rules make it `masstin -a parse`, whatever card is lit
         let overridden = self.ingest.uses_parse() && !self.ingest.is_auto();
         if overridden {
-            ui.label(egui::RichText::new(format!("{}  With carving or rules below, masstin -a parse runs: it reads what it knows by itself, and the rest with the rules. The cards do not apply.", ic::INFO)).color(theme::CYAN).size(12.5));
+            let note = if self.ingest.carve_only_on() { "Only the carving runs (masstin -a carve-image): the cards do not apply." } else { "With carving or rules below, masstin -a parse runs: it reads what it knows by itself, and the rest with the rules. The cards do not apply." };
+            ui.label(egui::RichText::new(format!("{}  {}", ic::INFO, note)).color(theme::CYAN).size(12.5));
         }
         ui.add_space(6.0);
         for (i, p) in PARSERS.iter().enumerate() {
@@ -604,6 +670,12 @@ impl Viewer {
         if self.ingest.has_images() || self.ingest.scan.as_ref().map_or(false, |s| s.truncated) {
             theme::section(ui, "Deleted logs");
             ui.checkbox(&mut self.ingest.carve, "Carve the disk images for the records of deleted or overwritten logs");
+            if self.ingest.carve && self.ingest.carve_only_possible() {
+                ui.indent("carve-only", |ui| {
+                    ui.radio_value(&mut self.ingest.carve_only, false, "as well as the logs on the file system (the usual)");
+                    ui.radio_value(&mut self.ingest.carve_only, true, "only the carving: the file system is not read (carve-image)");
+                });
+            }
             ui.label(egui::RichText::new("Every byte of every image is read, unallocated space included, for event log records. What the live logs already hold is dropped; what they lost joins the same timeline (--carve). Slow: minutes per image.").color(theme::MUTED).size(12.0));
         }
         theme::section(ui, "Logs masstin does not know");
@@ -679,6 +751,33 @@ impl Viewer {
             field(ui, "Hosts", &mut self.ingest.exclude_hosts, "JUMP01, *-MON, @jumpboxes.txt", "--exclude-hosts: origin and destination names; * wildcards; @file reads one per line");
             field(ui, "Addresses", &mut self.ingest.exclude_ips, "10.0.0.5, 10.0.0.0/24, fe80::/10, @scanners.txt", "--exclude-ips: the origin address; single addresses or CIDR ranges; @file reads one per line");
             ui.label(egui::RichText::new("Commas between entries; * matches anything; @file.txt reads a list from a file, one entry a line. The console says how many rows each rule dropped.").color(theme::DIM).small());
+        });
+        let advanced = self.ingest.debug || !(self.ingest.threads.trim().is_empty() && self.ingest.parallel_images.trim().is_empty() && self.ingest.skip_offsets.trim().is_empty());
+        egui::CollapsingHeader::new(theme::semibold(if advanced { "Advanced (on)" } else { "Advanced (optional)" }, 12.5)).id_salt("ingest-advanced").default_open(advanced).show(ui, |ui| {
+            ui.label(egui::RichText::new("Left empty, masstin decides by itself; these are for a slow disk, a busy machine or an image that hangs.").color(theme::MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Threads").color(TEXT)));
+                ui.add(egui::TextEdit::singleline(&mut self.ingest.threads).desired_width(60.0).hint_text("auto"));
+                ui.label(egui::RichText::new("all cores but one by default; 1 runs serial (--threads)").color(theme::DIM).small());
+            });
+            if self.ingest.has_images() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Images at once").color(TEXT)));
+                    ui.add(egui::TextEdit::singleline(&mut self.ingest.parallel_images).desired_width(60.0).hint_text("auto"));
+                    ui.label(egui::RichText::new("1 for a spinning disk or a network share; measured by default (--parallel-images)").color(theme::DIM).small());
+                });
+            }
+            if self.ingest.carve_on() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Skip these offsets").color(TEXT)));
+                    ui.add(egui::TextEdit::singleline(&mut self.ingest.skip_offsets).desired_width(300.0).hint_text("0x6478b6000, 0x7a0000000"));
+                });
+                ui.label(egui::RichText::new("For a damaged E01 whose carving hangs: each offset (hex) skips 32 MB there (--skip-offsets).").color(theme::DIM).small());
+            }
+            ui.checkbox(&mut self.ingest.debug, "Say more in the parser's log (--debug)");
+            if !self.ingest.threads.trim().is_empty() && self.ingest.threads.trim().parse::<usize>().map_or(true, |n| n == 0) {
+                ui.label(egui::RichText::new(format!("{}  threads is a whole number, 1 or more; it is left out", ic::WARNING)).color(CANDIDATE).small());
+            }
         });
         theme::section(ui, "The command");
         ui.add(egui::Label::new(egui::RichText::new(self.ingest.command_line()).monospace().size(11.5).color(theme::MUTED)).wrap());
@@ -1314,5 +1413,36 @@ mod tests {
         let s = c.join(" ");
         assert!(s.contains("--ignore-local --exclude-users svc_*, *$ --exclude-ips 10.0.0.0/8 -o out.csv"));
         assert!(!s.contains("--exclude-hosts"));
+    }
+    #[test]
+    fn carving_alone_is_carve_image_on_image_files() {
+        let mut i = with_scan(1, Some(Verdict { parser: Some(detect::PARSE_IMAGE), sure: true, title: String::new(), why: String::new() }));
+        i.sources = vec!["no-such-disk.vmdk".into()];
+        i.parser = P_IMAGE;
+        i.carve = true;
+        i.carve_only = true;
+        i.skip_offsets = " 0x6478b6000 ".into();
+        assert_eq!(i.command(), vec!["-a", "carve-image", "-f", "no-such-disk.vmdk", "--skip-offsets", "0x6478b6000", "-o", "out.csv", "--overwrite"]);
+        // a folder among the sources: carving alone is not offered, parse --carve runs
+        i.sources = vec![std::env::temp_dir().to_string_lossy().to_string()];
+        assert!(!i.carve_only_possible());
+        assert_eq!(&i.command()[..2], &["-a", "parse"]);
+    }
+
+    #[test]
+    fn the_advanced_knobs_only_when_set_and_valid() {
+        let mut i = with_scan(1, Some(Verdict { parser: Some(detect::PARSE_IMAGE), sure: true, title: String::new(), why: String::new() }));
+        i.parser = P_IMAGE;
+        let plain = i.command();
+        i.threads = "0".into();
+        i.parallel_images = "x".into();
+        assert_eq!(i.command(), plain);
+        i.threads = " 4 ".into();
+        i.parallel_images = "1".into();
+        i.debug = true;
+        i.skip_offsets = "0x10".into(); // no carving: no skip list
+        let s = i.command().join(" ");
+        assert!(s.contains("--threads 4 --parallel-images 1 --debug -o out.csv"));
+        assert!(!s.contains("--skip-offsets"));
     }
 }
