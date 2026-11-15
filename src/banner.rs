@@ -3,6 +3,40 @@ use indicatif::{ProgressBar, ProgressStyle, ProgressDrawTarget};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// Set while `parse` runs one of its parts: a part writes to a temporary
+/// file that is merged at the end, so its summary names no output and
+/// suggests no graph load (the final timeline gets both).
+static PARSE_PART: AtomicBool = AtomicBool::new(false);
+
+pub fn set_parse_part(on: bool) {
+    PARSE_PART.store(on, Ordering::Relaxed);
+}
+
+pub fn in_parse_part() -> bool {
+    PARSE_PART.load(Ordering::Relaxed)
+}
+
+/// What a summary says as its output: the path, or that the part is merged.
+pub fn output_label(path: &str) -> String {
+    if in_parse_part() {
+        "a part of the timeline, merged at the end".to_string()
+    } else {
+        normalize_display_path(path)
+    }
+}
+
+/// The graph-load commands for a timeline, unless it is a part of `parse`.
+pub fn print_load_hint(path: &str) {
+    if in_parse_part() || is_silent() {
+        return;
+    }
+    let pretty = normalize_display_path(path);
+    print_info("");
+    print_info("Load into graph (pick one):");
+    print_info(&format!("  Memgraph:  masstin -a load-memgraph -f {} --database localhost:7687", pretty));
+    print_info(&format!("  Neo4j:     masstin -a load-neo4j   -f {} --database bolt://localhost:7687 --user neo4j", pretty));
+}
+
 /// `MASSTIN_PROGRESS_PIPE=1`: the bars and the spinners are written as
 /// plain lines on stderr, one per redraw, each prefixed `@@pb ` (an empty
 /// `@@pb` clears), for a program that runs masstin as a child and draws
@@ -657,6 +691,17 @@ mod capture_tests {
     use super::*;
 
     #[test]
+    fn a_part_of_parse_names_no_temporary_output() {
+        set_parse_part(true);
+        let part = output_label("D:/tmp/masstin_parse_1/part-1.csv");
+        set_parse_part(false);
+        let whole = output_label("D:/case/timeline.csv");
+        assert_eq!(part, "a part of the timeline, merged at the end");
+        assert!(!part.contains("part-1.csv"));
+        assert!(whole.ends_with("timeline.csv"));
+    }
+
+    #[test]
     fn lines_are_held_on_the_thread_and_given_back_in_order() {
         capture_start();
         print_info("one");
@@ -804,7 +849,7 @@ pub fn print_summary(total_events: usize, parsed_files: usize, skipped: usize, o
         style(total_events).green().bold(),
     );
     if let Some(path) = output_path {
-        let pretty = normalize_display_path(path);
+        let pretty = output_label(path);
         eprintln!("  {} {}", style("Output:").bold(), style(pretty).green());
     } else {
         eprintln!("  {} {}", style("Output:").bold(), style("stdout").green());

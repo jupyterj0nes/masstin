@@ -1032,6 +1032,9 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
     fs::create_dir_all(&tmp)?;
     let mut parts: Vec<String> = Vec::new();
     let total = steps.len();
+    // the parts write to the temporary folder: their summaries name no output
+    // and suggest no graph load; the merged timeline gets both at the end
+    crate::banner::set_parse_part(true);
     for (i, st) in steps.iter().enumerate() {
         crate::banner::print_info(&format!("Part {} of {}: {}", i + 1, total, part_name(&st.action)));
         if st.action == ActionType::Merge {
@@ -1078,6 +1081,7 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
             Err(e) => crate::banner::print_warning(&format!("Carving: the carved events could not be compared with the live ones ({}); all are kept", e)),
         }
     }
+    crate::banner::set_parse_part(false);
     if parts.is_empty() {
         let _ = fs::remove_dir_all(&tmp);
         return Err("No events from any part: nothing to write.".into());
@@ -1085,6 +1089,13 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
     crate::banner::print_info(&format!("Merging the {} part(s) into one timeline", parts.len()));
     let r = merge_files(&parts, config.output.as_ref(), None, None, None);
     let _ = fs::remove_dir_all(&tmp);
+    if r.is_ok() {
+        if let Some(out) = config.output.as_ref() {
+            let rows = csv::Reader::from_path(out).map(|mut r| r.records().count()).unwrap_or(0);
+            crate::banner::print_phase_result(&format!("Timeline: {} ({} events)", crate::banner::normalize_display_path(out), rows));
+            crate::banner::print_load_hint(out);
+        }
+    }
     r
 }
 

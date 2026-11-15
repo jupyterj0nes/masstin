@@ -290,16 +290,8 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
     eprintln!("    Images scanned:   {}", files.len());
     eprintln!("    Scan time:        {:.2}s", start_time.elapsed().as_secs_f64());
     if let Some(out) = output {
-        let pretty = crate::banner::normalize_display_path(out);
-        eprintln!("    Output:           {}", pretty);
-        crate::banner::print_info("");
-        crate::banner::print_info("Load into graph (pick one):");
-        crate::banner::print_info(&format!(
-            "  Memgraph:  masstin -a load-memgraph -f {} --database localhost:7687", pretty
-        ));
-        crate::banner::print_info(&format!(
-            "  Neo4j:     masstin -a load-neo4j   -f {} --database bolt://localhost:7687 --user neo4j", pretty
-        ));
+        eprintln!("    Output:           {}", crate::banner::output_label(out));
+        crate::banner::print_load_hint(out);
     }
 }
 

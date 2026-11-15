@@ -452,7 +452,7 @@ pub fn parse_custom(
         if let Err(e) = write_csv(out_path, &all_records) {
             crate::banner::print_warning(&format!("  Error writing output: {}", e));
         } else {
-            crate::banner::print_info(&format!("  Wrote {} records to {}", all_records.len(), out_path));
+            crate::banner::print_info(&format!("  Wrote {} records to {}", all_records.len(), crate::banner::output_label(out_path)));
         }
 
         // Write rejected lines alongside the output, in debug mode only

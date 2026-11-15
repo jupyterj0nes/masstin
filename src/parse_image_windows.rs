@@ -528,6 +528,10 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         let win_tmp_str = win_tmp.to_string_lossy().to_string();
         let linux_tmp_str = linux_tmp.to_string_lossy().to_string();
 
+        // the two halves write to temporary files merged below: their
+        // summaries name no output (the merged timeline is the output)
+        let was_part = crate::banner::in_parse_part();
+        crate::banner::set_parse_part(true);
         crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
         crate::parse::parse_events_ex(
             &empty_files,
@@ -547,6 +551,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             Some(&linux_tmp_str),
             true,
         );
+        crate::banner::set_parse_part(was_part);
 
         // Rewrite log_filename paths before merging
         crate::parse_image_linux::rewrite_log_filenames_linux(&linux_tmp_str);
@@ -617,11 +622,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Suggest graph database loading
     if let Some(out_path) = output {
-        crate::banner::print_info("");
-        let pretty = crate::banner::normalize_display_path(out_path);
-        crate::banner::print_info("Load into graph (pick one):");
-        crate::banner::print_info(&format!("  Memgraph:  masstin -a load-memgraph -f {} --database localhost:7687", pretty));
-        crate::banner::print_info(&format!("  Neo4j:     masstin -a load-neo4j   -f {} --database bolt://localhost:7687 --user neo4j", pretty));
+        crate::banner::print_load_hint(out_path);
     }
 
     // Cleanup temp directories
