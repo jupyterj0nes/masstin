@@ -12,7 +12,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--database` | Graph database URL (e.g., `localhost:7687`) |
 | `-u, --user` | Database user. Required by `load-neo4j` and `merge-neo4j-nodes`; `graph-hunt-neo4j` defaults to `neo4j`; optional (empty) on the Memgraph actions |
 | `--db` | Target database name on the graph server (default `neo4j` for Neo4j actions, `memgraph` for Memgraph). Useful in multi-database Neo4j 5.x/2026.x setups. |
-| `--cortex-url` | Cortex XDR API base URL, starting with `https://api-`. The API key and its numeric id are asked on the console, or read from `CORTEX_API_KEY` and `CORTEX_API_KEY_ID` when both are set (a script, or masstin's window, never puts the key on a command line) |
+| `--cortex-url` | Cortex XDR API base URL, starting with `https://api-`. The API key and its numeric id are asked on the console, or read from `CORTEX_API_KEY` and `CORTEX_API_KEY_ID` when both are set (a script, or masstin's window, never puts the key on a command line). Standard and Advanced keys both work: masstin asks the tenant which kind it is (`CORTEX_API_KEY_TYPE=standard\|advanced` skips the question) |
 | `--start-time` | Filter start: `"YYYY-MM-DD HH:MM:SS"` (Cortex actions, `merge`, `load-neo4j` / `load-memgraph`) |
 | `--end-time` | Filter end: `"YYYY-MM-DD HH:MM:SS"` (same scope as `--start-time`); for `graph-hunt*`, the end of the hunted window |
 | `--ungrouped` | For `load-neo4j` / `load-memgraph`: emit one edge per CSV row instead of grouping |

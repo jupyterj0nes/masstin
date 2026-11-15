@@ -23,6 +23,7 @@ use serde_json::Value;
 mod parse_elastic;
 mod csv_out;
 pub use crate::parse_elastic::*;
+mod cortex_auth;
 mod parse_cortex;
 pub use crate::parse_cortex::*;
 mod parse_cortex_evtx_forensics;

@@ -98,7 +98,7 @@ pub async fn parse_cortex_evtx_forensics_data(
     let get_stream_url = format!("{}/public_api/v1/xql/get_query_results_stream", base_url.trim_end_matches('/'));
 
     // Headers
-    let headers = build_headers(&token, &x_xdr_auth_id)?;
+    let headers = crate::cortex_auth::Auth::connect(&client, base_url, &token, &x_xdr_auth_id).await?;
 
     // Event IDs pushed into XQL. Default set now matches the canonical list from
     // parse-windows (src/parse.rs constants) so that `parse-cortex-evtx-forensics`
@@ -421,7 +421,7 @@ async fn run_forensics_query(
     start_query_url: &str,
     get_results_url: &str,
     get_stream_url: &str,
-    headers: &HeaderMap,
+    headers: &crate::cortex_auth::Auth,
     query_string: &str,
     debug: bool,
 ) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -435,11 +435,11 @@ async fn run_forensics_query(
     }
 
     let resp = client.post(start_query_url)
-        .headers(headers.clone())
+        .headers(headers.fresh())
         .json(&payload)
         .send().await?;
     if resp.status() != 200 {
-        return Err(format!("start_xql_query failed with status: {}", resp.status()).into());
+        return Err(crate::cortex_auth::refusal(resp, "the query (start_xql_query)").await.into());
     }
     let resp_json: Value = resp.json().await?;
     let query_id = resp_json
@@ -461,10 +461,13 @@ async fn run_forensics_query(
             eprintln!("[DEBUG] Poll attempt {}", attempt + 1);
         }
         let poll_resp = client.post(get_results_url)
-            .headers(headers.clone())
+            .headers(headers.fresh())
             .json(&poll_payload)
             .send().await?;
-        if poll_resp.status() != 200 { break; }
+        if poll_resp.status() != 200 {
+            spinner.finish_and_clear();
+            return Err(crate::cortex_auth::refusal(poll_resp, "the results (get_query_results)").await.into());
+        }
         let poll_json: Value = poll_resp.json().await?;
         let status = poll_json.pointer("/reply/status").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
 
@@ -482,7 +485,8 @@ async fn run_forensics_query(
         } else if status == "PENDING" || status == "RUNNING" {
             sleep(Duration::from_secs(5)).await;
         } else {
-            break;
+            spinner.finish_and_clear();
+            return Err(crate::cortex_auth::query_failure(status, &poll_json).into());
         }
     }
     spinner.finish_and_clear();
@@ -515,7 +519,7 @@ fn epoch_to_str(epoch: i64) -> String {
 async fn fetch_stream_data(
     client: &Client,
     url: &str,
-    headers: &HeaderMap,
+    headers: &crate::cortex_auth::Auth,
     stream_id: &str,
     debug: bool
 ) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -530,13 +534,13 @@ async fn fetch_stream_data(
     }
 
     let resp = client.post(url)
-        .headers(headers.clone())
+        .headers(headers.fresh())
         .json(&payload)
         .send()
         .await?;
 
     if resp.status() != 200 {
-        return Err(format!("get_query_results_stream failed: {}", resp.status()).into());
+        return Err(crate::cortex_auth::refusal(resp, "the stream (get_query_results_stream)").await.into());
     }
 
     let bytes = resp.bytes().await?;
@@ -601,8 +605,14 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     // (--ignore-local / --exclude-*) by reconstructing a minimal LogData
     // view of the processed row — FINAL_COLUMNS order matches the
     // canonical masstin CSV header, so indices are fixed.
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut dups = 0usize;
     for record in records {
         let row = process_record(record, debug);
+        if !seen.insert(row.clone()) {
+            dups += 1;
+            continue;
+        }
         if row.len() >= 14 {
             let ld = crate::parse::LogData {
                 time_created: row[0].clone(),
@@ -627,6 +637,9 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
         wtr.write_record(row.iter().map(|s| s.as_str()).chain(std::iter::repeat("").take(crate::csv_out::TAIL_COLUMNS.len())))?;
     }
     wtr.flush()?;
+    if dups > 0 {
+        crate::banner::print_info(&format!("{} event(s) collected more than once (a host triaged twice) written once", dups));
+    }
     Ok(())
 }
 
@@ -769,6 +782,17 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         _ => String::new(),
     };
 
+    // as parse-windows does: a UNC reference (`\\srv\share`, the SMB client
+    // channels' server and share names) keeps its server as the destination
+    // and the share goes to the detail; an account written `user@realm` or
+    // `DOMAIN\user` is split into account and domain
+    let (dst_computer, share) = crate::parse::split_unc(&dst_computer);
+    let detail = if detail.trim().is_empty() { share } else { detail };
+    let (target_user_name, target_domain_name) = {
+        let (u, d) = crate::parse::split_account(&target_user_name);
+        if d.is_empty() || !target_domain_name.trim().is_empty() { (u, target_domain_name) } else { (u, d) }
+    };
+
     // logon_id empty for Cortex forensics
     let logon_id = "".to_string();
 
@@ -862,6 +886,38 @@ mod tests {
         assert_eq!(r[8], "10.23.123.11");
         let r = rec(serde_json::json!({"event_id": "5858", "dst_host": "SRV02.corp", "srcip": "WS07", "target_user": "alice"}));
         assert_eq!((r[7].as_str(), r[8].as_str()), ("WS07", ""));
+    }
+
+    #[test]
+    fn a_unc_destination_keeps_its_server_and_the_share_is_the_detail() {
+        let r = rec(serde_json::json!({"event_id": "30808", "dst_host": "fs01.corp.local\\Finance$", "source_host": "WS07"}));
+        assert_eq!((r[1].as_str(), r[12].as_str()), ("fs01.corp.local", "Finance$"));
+        let r = rec(serde_json::json!({"event_id": "30804", "dst_host": "\\\\FS01\\IPC$", "source_host": "WS07"}));
+        assert_eq!((r[1].as_str(), r[12].as_str()), ("FS01", "IPC$"));
+        let r = rec(serde_json::json!({"event_id": "30803", "dst_host": "10.0.0.9", "source_host": "WS07"}));
+        assert_eq!((r[1].as_str(), r[12].as_str()), ("10.0.0.9", ""));
+    }
+
+    #[test]
+    fn an_account_with_its_realm_is_split() {
+        let r = rec(serde_json::json!({"event_id": "4769", "dst_host": "DC01", "srcip": "10.0.0.5", "target_user": "ana@CORP.LOCAL", "status": "0x0"}));
+        assert_eq!((r[5].as_str(), r[6].as_str()), ("ana", "CORP.LOCAL"));
+        // a domain the event gives wins over the realm in the name
+        let r = rec(serde_json::json!({"event_id": "1149", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana@corp.local", "target_domain": "CORP"}));
+        assert_eq!((r[5].as_str(), r[6].as_str()), ("ana", "CORP"));
+        let r = rec(serde_json::json!({"event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "target_domain": "CORP", "lt": "3"}));
+        assert_eq!((r[5].as_str(), r[6].as_str()), ("ana", "CORP"));
+    }
+
+    #[test]
+    fn an_event_collected_twice_is_written_once() {
+        let a = serde_json::json!({"Timestamp": 1700000000000i64, "event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "lt": "3"});
+        let b = serde_json::json!({"Timestamp": 1700000001000i64, "event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "lt": "3"});
+        let p = std::env::temp_dir().join(format!("masstin_cortex_for_{}.csv", std::process::id()));
+        write_processed_csv(&[a.clone(), a, b], p.to_str().unwrap(), false).unwrap();
+        let n = csv::Reader::from_path(&p).unwrap().records().count();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(n, 2);
     }
 
     #[test]

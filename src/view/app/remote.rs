@@ -26,6 +26,8 @@ pub(super) struct CortexForm {
     pub to: String,
     pub filter_ip: String,
     pub admin_ports: bool,
+    /// `--ignore-local`: link-local and placeholder origins left out too
+    pub ignore_local: bool,
     pub event_ids: String,
     pub min_window: String,
     pub max_passes: String,
@@ -34,7 +36,7 @@ pub(super) struct CortexForm {
 
 impl Default for CortexForm {
     fn default() -> Self {
-        CortexForm { evtx: false, url: String::new(), key_id: String::new(), key: String::new(), from: String::new(), to: String::new(), filter_ip: String::new(), admin_ports: false, event_ids: String::new(), min_window: "300".into(), max_passes: "200".into(), output: String::new() }
+        CortexForm { evtx: false, url: String::new(), key_id: String::new(), key: String::new(), from: String::new(), to: String::new(), filter_ip: String::new(), admin_ports: false, ignore_local: false, event_ids: String::new(), min_window: "300".into(), max_passes: "200".into(), output: String::new() }
     }
 }
 
@@ -81,6 +83,9 @@ impl CortexForm {
         }
         if !self.evtx && self.admin_ports {
             args.push("--admin-ports".into());
+        }
+        if self.ignore_local {
+            args.push("--ignore-local".into());
         }
         if self.evtx && !self.event_ids.trim().is_empty() {
             args.push("--cortex-event-ids".into());
@@ -319,6 +324,7 @@ impl Viewer {
             } else {
                 ui.checkbox(&mut f.admin_ports, "Every admin port too: 135, 139, 1433, 3306, 5900… besides RDP, SMB, SSH and WinRM (--admin-ports)");
             }
+            ui.checkbox(&mut f.ignore_local, "Leave out link-local and placeholder origins too (--ignore-local)").on_hover_text("Loopback and a machine's connections to itself are always left out of the network read");
             egui::CollapsingHeader::new(theme::semibold("Paging (when a window hits the API's million rows)", 12.5)).id_salt("cortex-paging").show(ui, |ui| {
                 row(ui, "Smallest window (s)", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut f.min_window).desired_width(70.0));
@@ -495,6 +501,8 @@ mod tests {
         c.min_window = "60".into();
         let s = c.command().join(" ");
         assert!(s.contains("--start-time 2026-11-01 00:00:00 --admin-ports --cortex-min-window-secs 60 -o"));
+        c.ignore_local = true;
+        assert!(c.command().join(" ").contains("--admin-ports --ignore-local --cortex-min-window-secs"));
         assert!(!s.contains("--cortex-event-ids"));
         c.evtx = true;
         let s = c.command().join(" ");

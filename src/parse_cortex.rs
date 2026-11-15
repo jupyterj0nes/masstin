@@ -81,7 +81,7 @@ pub async fn parse_cortex_data(
     );
 
     // Typically, XDR sets "x-xdr-auth-id" to a static integer, e.g., "5"
-    let headers = build_headers(&token, &x_xdr_auth_id)?;
+    let headers = crate::cortex_auth::Auth::connect(&client, base_url, &token, &x_xdr_auth_id).await?;
 
 
     let filter_ip_clause = match filter_ip {
@@ -105,12 +105,12 @@ pub async fn parse_cortex_data(
     // --ignore-local pushed server-side: exclude loopback, link-local and
     // self-connections (same src/dst IP) so we don't drag that noise across
     // the 1M API cap. Post-filter `filter::should_keep_record` still runs.
-    let ignore_local_clause = if ignore_local {
-        r#"filter ((`action_local_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost")) and (`action_remote_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost"))) |
-        filter (action_local_ip != action_remote_ip) |"#.to_string()
-    } else {
-        String::new()
-    };
+    // A connection of a machine to itself (loopback, or its own address on
+    // both ends) is never lateral movement: left out in the query, so it
+    // does not count against the API's cap either, whatever --ignore-local.
+    let _ = ignore_local;
+    let ignore_local_clause = r#"filter ((`action_local_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost")) and (`action_remote_ip` not in ("127.0.0.1","::1","0.0.0.0","localhost"))) |
+        filter (action_local_ip != action_remote_ip) |"#.to_string();
 
     let build_query = |s: &str, e: &str| -> String {
         format!(
@@ -127,9 +127,7 @@ pub async fn parse_cortex_data(
     // Phase 2: Query API
     crate::banner::print_phase("2", "3", "Querying Cortex XDR Network API...");
     crate::banner::print_phase_detail("Ports:", port_list);
-    if ignore_local {
-        crate::banner::print_phase_detail("Ignore local:", "loopback, link-local, self-connections filtered server-side");
-    }
+    crate::banner::print_phase_detail("Left out:", "loopback and a machine's connections to itself (never lateral movement)");
     if filter_ip.is_some() {
         crate::banner::print_phase_detail("Filter IP:", filter_ip.unwrap());
     }
@@ -427,7 +425,7 @@ async fn run_network_query(
     start_query_url: &str,
     get_results_url: &str,
     get_stream_url: &str,
-    headers: &HeaderMap,
+    headers: &crate::cortex_auth::Auth,
     query_string: &str,
     debug: bool,
 ) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -442,12 +440,12 @@ async fn run_network_query(
 
     let resp = client
         .post(start_query_url)
-        .headers(headers.clone())
+        .headers(headers.fresh())
         .json(&query_payload)
         .send()
         .await?;
     if resp.status() != 200 {
-        return Err(format!("Unexpected status from start_xql_query: {}", resp.status()).into());
+        return Err(crate::cortex_auth::refusal(resp, "the query (start_xql_query)").await.into());
     }
     let resp_json: Value = resp.json().await?;
     let query_id = match resp_json.get("reply") {
@@ -469,12 +467,13 @@ async fn run_network_query(
         }
         let poll_resp = client
             .post(get_results_url)
-            .headers(headers.clone())
+            .headers(headers.fresh())
             .json(&poll_payload)
             .send()
             .await?;
         if poll_resp.status() != 200 {
-            break;
+            spinner.finish_and_clear();
+            return Err(crate::cortex_auth::refusal(poll_resp, "the results (get_query_results)").await.into());
         }
         let poll_json: Value = poll_resp.json().await?;
         let status = poll_json
@@ -499,7 +498,8 @@ async fn run_network_query(
         } else if status == "PENDING" || status == "RUNNING" {
             sleep(Duration::from_secs(5)).await;
         } else {
-            break;
+            spinner.finish_and_clear();
+            return Err(crate::cortex_auth::query_failure(status, &poll_json).into());
         }
     }
     spinner.finish_and_clear();
@@ -541,7 +541,7 @@ fn bisect_time_window(
 pub async fn fetch_stream_data(
     client: &Client,
     stream_url: &str,
-    headers: &HeaderMap,
+    headers: &crate::cortex_auth::Auth,
     stream_id: &str,
     debug: bool,
 ) -> Result<Vec<Value>, Box<dyn Error>> {
@@ -560,7 +560,7 @@ pub async fn fetch_stream_data(
     // Send the request.
     let resp = client
         .post(stream_url)
-        .headers(headers.clone())
+        .headers(headers.fresh())
         .json(&payload)
         .send()
         .await?;
@@ -723,8 +723,11 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     // Determine logon_type using local_port first, then remote_port.
     fn lt_for(p: i64) -> Option<&'static str> {
         match p {
-            3389 | 5900 => Some("10"),
-            445 | 135 | 139 | 5985 | 5986 | 1433 | 3306 => Some("3"),
+            3389 => Some("10"),
+            445 | 135 | 139 => Some("3"),
+            5985 | 5986 => Some("WinRM"),
+            1433 | 3306 => Some("SQL"),
+            5900 => Some("VNC"),
             22 => Some("SSH"),
             _ => None,
         }
@@ -747,8 +750,15 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         ("".to_string(), action_remote_ip.clone())
     };
 
-    // detail: use actor_process_command_line, replacing commas with semicolons.
-    let detail = actor_process_command_line.replace(",", ";");
+    // detail: the service port, then the process's command line (commas as
+    // semicolons).
+    let service_port = if is_dst_port { local_port } else { remote_port };
+    let cmd = actor_process_command_line.replace(",", ";");
+    let detail = match service_port {
+        Some(p) if cmd.trim().is_empty() => format!("port {}", p),
+        Some(p) => format!("port {} | {}", p, cmd),
+        None => cmd,
+    };
 
     // event_type fixed for Cortex network.
     let event_type = "CONNECT".to_string();
@@ -789,8 +799,35 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     // noise filter (--ignore-local / --exclude-*) by reconstructing a
     // minimal LogData view of the processed row — FINAL_COLUMNS order
     // matches the canonical masstin CSV header, so indices are fixed.
+    let names = agent_names(records);
+    let mut named = 0usize;
+    let mut selfs = 0usize;
+    let mut dups = 0usize;
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     for record in records {
-        let processed = process_record(record, debug);
+        let mut processed = process_record(record, debug);
+        if processed.len() >= 14 {
+            // an address Cortex has an agent on is named: the same connection
+            // seen by the client's agent and by the server's is then one edge
+            if let Some(n) = names.get(processed[1].as_str()) {
+                processed[1] = n.clone();
+                named += 1;
+            }
+            if processed[7].is_empty() {
+                if let Some(n) = names.get(processed[8].as_str()) {
+                    processed[7] = n.clone();
+                    named += 1;
+                }
+            }
+            if !processed[7].is_empty() && processed[7].eq_ignore_ascii_case(&processed[1]) {
+                selfs += 1;
+                continue;
+            }
+            if !seen.insert(processed.clone()) {
+                dups += 1;
+                continue;
+            }
+        }
         if processed.len() >= 14 {
             let ld = crate::parse::LogData {
                 time_created: processed[0].clone(),
@@ -816,5 +853,96 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     }
 
     wtr.flush()?;
+    if named + selfs + dups > 0 {
+        crate::banner::print_info(&format!(
+            "{} address(es) named from the agents' own records; {} connection(s) of a machine to itself and {} duplicate(s) left out",
+            named, selfs, dups
+        ));
+    }
     Ok(())
+}
+
+/// address -> host name, from the records themselves: every record carries
+/// the agent's name and its local address. An address seen under two names
+/// (DHCP, NAT) is left as an address.
+fn agent_names(records: &[Value]) -> std::collections::HashMap<String, String> {
+    let mut seen: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    for r in records {
+        let host = r.get("agent_hostname").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let ip = r.get("action_local_ip").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if host.is_empty() || ip.is_empty() {
+            continue;
+        }
+        match seen.get(ip) {
+            None => {
+                seen.insert(ip.to_string(), Some(host.to_string()));
+            }
+            Some(Some(h)) if !h.eq_ignore_ascii_case(host) => {
+                seen.insert(ip.to_string(), None);
+            }
+            _ => {}
+        }
+    }
+    seen.into_iter().filter_map(|(ip, h)| h.map(|h| (ip, h))).collect()
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rec(host: &str, lip: &str, lport: i64, rip: &str, rport: i64, user: &str) -> Value {
+        json!({"_time": 1794000000000i64, "agent_hostname": host, "action_local_ip": lip, "action_local_port": lport,
+               "action_remote_ip": rip, "action_remote_port": rport, "actor_primary_username": user, "actor_process_command_line": "x.exe"})
+    }
+
+    fn rows(records: &[Value]) -> Vec<Vec<String>> {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let p = std::env::temp_dir().join(format!("masstin_cortex_net_{}_{}.csv", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        write_processed_csv(records, p.to_str().unwrap(), false).unwrap();
+        let mut rdr = csv::Reader::from_path(&p).unwrap();
+        let out = rdr.records().map(|r| r.unwrap().iter().map(|s| s.to_string()).collect()).collect();
+        let _ = std::fs::remove_file(&p);
+        out
+    }
+
+    #[test]
+    fn both_ends_of_a_connection_become_the_same_named_edge() {
+        // the client's agent sees it going out, the server's agent coming in
+        let recs = vec![rec("WS1", "10.0.0.5", 50123, "10.0.0.9", 3389, "CORP\\ana"), rec("SRV9", "10.0.0.9", 3389, "10.0.0.5", 50123, "NT AUTHORITY\\NETWORK SERVICE")];
+        let r = rows(&recs);
+        assert_eq!(r.len(), 2);
+        for row in &r {
+            assert_eq!((row[1].as_str(), row[7].as_str(), row[8].as_str()), ("SRV9", "WS1", "10.0.0.5"), "{:?}", row);
+            assert_eq!(row[4], "10");
+            assert!(row[12].starts_with("port 3389 | "), "{}", row[12]);
+        }
+    }
+
+    #[test]
+    fn an_address_under_two_names_stays_an_address() {
+        let recs = vec![rec("A", "10.0.0.7", 50000, "10.0.0.9", 445, "u"), rec("B", "10.0.0.7", 50001, "10.0.0.9", 445, "u")];
+        assert!(agent_names(&recs).get("10.0.0.7").is_none());
+        assert_eq!(rows(&recs)[0][1], "10.0.0.9");
+    }
+
+    #[test]
+    fn a_machine_reaching_itself_and_exact_duplicates_are_left_out() {
+        let recs = vec![
+            rec("SQL1", "10.0.0.20", 1433, "10.0.0.21", 50000, "svc"), // SQL1 serving its own second address
+            rec("SQL1", "10.0.0.21", 50000, "10.0.0.20", 1433, "svc"),
+            rec("WS1", "10.0.0.5", 50123, "10.0.0.9", 445, "ana"),
+            rec("WS1", "10.0.0.5", 50123, "10.0.0.9", 445, "ana"),
+        ];
+        let r = rows(&recs);
+        assert_eq!(r.len(), 1, "{:?}", r);
+        assert_eq!(r[0][7], "WS1");
+    }
+
+    #[test]
+    fn the_service_gives_the_logon_type() {
+        let lt = |port: i64| process_record(&rec("S", "10.0.0.1", port, "10.0.0.2", 50000, "u"), false)[4].clone();
+        assert_eq!((lt(3389).as_str(), lt(445).as_str(), lt(22).as_str()), ("10", "3", "SSH"));
+        assert_eq!((lt(1433).as_str(), lt(5900).as_str(), lt(5985).as_str()), ("SQL", "VNC", "WinRM"));
+    }
 }
