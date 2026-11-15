@@ -1708,13 +1708,30 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     }
     let no_origins: Vec<u32> = Vec::new();
     let mut home_cache: HashMap<(i32, u32), f64> = HashMap::new();
-    let base_pairs: Vec<(usize, usize)> = ix_pair.m.keys().filter(|(o, d)| o != d).map(|(o, d)| (*o as usize, *d as usize)).collect();
+    // The reference graph holds the pairs seen BEFORE the cutoff only. The
+    // index also holds the window days (they are reference for novelty);
+    // with them in this graph a window day's logins were already part of
+    // the reference, its centrality change was always zero and its own
+    // edges shaped the communities it was judged against.
+    let mut base_pairs: Vec<(usize, usize)> = Vec::new();
     let mut unique_by_day: BTreeMap<i32, HashSet<(usize, usize)>> = BTreeMap::new();
-    for ((o, d), c0) in &ix_pair.m {
-        if o != d && c0.n == 1 {
-            unique_by_day.entry(c0.first).or_default().insert((*o as usize, *d as usize));
+    for k in ix_pair.m.keys() {
+        let (o, d) = *k;
+        if o == d {
+            continue;
         }
+        // a pair seen on one baseline day only is what that day adds
+        match ix_pair.baseline(k, cutoff_day) {
+            (0, _, _) => continue,
+            (1, Some(first), _) => {
+                unique_by_day.entry(first).or_default().insert((o as usize, d as usize));
+            }
+            _ => {}
+        }
+        base_pairs.push((o as usize, d as usize));
     }
+    // the map's order must not reach the graph algorithms
+    base_pairs.sort_unstable();
     let nodes_of = |edges: &[(usize, usize)]| -> HashSet<usize> { edges.iter().flat_map(|(a, b)| [*a, *b]).collect() };
     let g_base = DiGraph::from_edges(ne, &base_pairs);
     let base_nodes = nodes_of(&base_pairs);
@@ -3198,6 +3215,40 @@ mod tests {
         assert!(camp("C").is_empty(), "C: {:?}", camp("C"));
         assert!(camp("D").is_empty(), "D: {:?}", camp("D"));
         assert!(lines.iter().any(|l| l.starts_with("Campaigns: 2 candidate pair(s)") && l.contains("1 overlap")), "{:?}", lines);
+    }
+
+    #[test]
+    fn a_window_day_changes_the_centrality_of_its_destinations() {
+        // baseline days 1..=20: ADM reaches T and S every day, eight
+        // workstations reach S every day, and one new machine a day reaches
+        // S (so the null of new connections is not empty). Window day 21:
+        // the eight workstations all log in to T for the first time. T's
+        // PageRank rises against the baseline graph; the window's own
+        // logins must not be part of that reference.
+        let zs: Vec<String> = (1..=20).map(|k| format!("Z{}", k)).collect();
+        let ws: Vec<String> = (1..=8).map(|k| format!("W{}", k)).collect();
+        let mut rows: Vec<(i32, i64, &str, &str, &str, &str)> = Vec::new();
+        for day in 1..=20 {
+            rows.push((day, 8, "ADM", "T", "ADM1", "SUCCESSFUL_LOGON"));
+            rows.push((day, 8, "ADM", "S", "ADM1", "SUCCESSFUL_LOGON"));
+            for w in &ws {
+                rows.push((day, 9, w.as_str(), "S", "U1", "SUCCESSFUL_LOGON"));
+            }
+            rows.push((day, 12, zs[(day - 1) as usize].as_str(), "S", "U1", "SUCCESSFUL_LOGON"));
+        }
+        rows.push((21, 8, "ADM", "T", "ADM1", "SUCCESSFUL_LOGON"));
+        rows.push((21, 8, "ADM", "S", "ADM1", "SUCCESSFUL_LOGON"));
+        for w in &ws {
+            rows.push((21, 10, w.as_str(), "T", "U1", "SUCCESSFUL_LOGON"));
+        }
+        let mut c = corpus(&rows);
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let (out, _lines, _alpha, _stories, _seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
+        let to_t: Vec<&Conn> = out.iter().filter(|r| r.dest == "T" && r.origin.starts_with('W')).collect();
+        assert_eq!(to_t.len(), 8);
+        for r in to_t {
+            assert!(r.why.contains("the destination's PageRank rose that day"), "{}: {}", r.origin, r.why);
+        }
     }
 
     #[test]
