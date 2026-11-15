@@ -679,6 +679,13 @@ impl Viewer {
             ui.label(egui::RichText::new("Every byte of every image is read, unallocated space included, for event log records. What the live logs already hold is dropped; what they lost joins the same timeline (--carve). Slow: minutes per image.").color(theme::MUTED).size(12.0));
         }
         theme::section(ui, "Logs masstin does not know");
+        let unknown = self.ingest.sources.iter().find(|s| Path::new(s.as_str()).is_file()).cloned();
+        if let Some(log) = unknown.filter(|_| !self.ingest.verdict.as_ref().map_or(false, |v| v.sure)) {
+            if ui.button(format!("{}  Build a rule for it in the rule studio…", ic::TERMINAL_WINDOW)).on_hover_text("The log's lines on one side, the rule on the other, the rows it writes underneath; saved, it comes back here as --rules").clicked() {
+                self.studio.load(&log);
+                self.studio.open = true;
+            }
+        }
         ui.label(egui::RichText::new("A VPN, a firewall, a proxy: YAML rules say how to read them, and their rows join the same timeline (--rules). masstin's rules folder has rules for several products.").color(theme::MUTED).size(12.0));
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ingest.rules).desired_width(400.0).hint_text("a rule file (.yaml) or a folder of rules"));

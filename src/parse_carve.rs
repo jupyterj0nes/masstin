@@ -24,8 +24,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The child that validates one carved EVTX: the same binary, silent, and
 /// on Windows with no console of its own. A carve started from the window
 /// (which has no console) would otherwise open a console for every carved
-/// file, hundreds or thousands of them, flashing on the screen and leaving
-/// the desktop unable to draw new OpenGL windows until the next sign-in.
+/// file, hundreds or thousands of them, flashing on the screen.
 fn validator_command(exe: &Path, evtx: &str) -> Command {
     let mut cmd = Command::new(exe);
     cmd.env("MASSTIN_VALIDATE_EVTX", evtx).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());

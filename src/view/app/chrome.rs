@@ -255,6 +255,11 @@ impl Viewer {
             });
             ui.menu_button("Tools", |ui| {
                 ui.set_min_width(260.0);
+                if icon_button(ui, ic::TERMINAL_WINDOW, "Rule studio (custom logs)…").on_hover_text("A rule for a log masstin does not know (a VPN, a firewall, a proxy), built against the log itself: its lines, the fields, the timeline's columns and the rows it writes, live").clicked() {
+                    ui.close();
+                    self.studio.open = true;
+                }
+                ui.separator();
                 if icon_button(ui, ic::PATH, "Paths and reach…").clicked() {
                     ui.close();
                     self.show_paths = true;

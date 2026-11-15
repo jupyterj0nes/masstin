@@ -10,7 +10,7 @@
 //   rules/ for the community rule library (Palo Alto, Cisco, Fortinet, ...).
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -65,7 +65,7 @@ pub struct Parser {
     pub extract: Extract,
     #[serde(default)]
     pub sub_extract: Option<SubExtract>,
-    pub map: HashMap<String, String>,
+    pub map: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -86,7 +86,7 @@ pub enum Extract {
         delimiter: String,
         #[serde(default)]
         quote: Option<String>,
-        fields_by_index: HashMap<u32, String>,
+        fields_by_index: BTreeMap<u32, String>,
     },
     Regex {
         pattern: String,
@@ -109,7 +109,7 @@ pub enum Extract {
     ///     eid:  "winlog.event_id"      # nested
     Json {
         #[serde(default)]
-        fields: HashMap<String, String>,
+        fields: BTreeMap<String, String>,
     },
 }
 
@@ -152,7 +152,7 @@ struct CompiledParser {
     sub_extract: Option<SubExtract>,
     extract_regex: Option<Regex>,
     sub_extract_regex: Option<Regex>,
-    map: HashMap<String, String>,
+    map: BTreeMap<String, String>,
 }
 
 fn compile_rule_file(path: &Path, rf: RuleFile) -> Result<CompiledRuleFile, String> {
@@ -329,57 +329,19 @@ pub fn parse_custom(
             }
             file_lines += 1;
 
-            let mut matched = false;
-            'rules: for rf in &rules {
-                if !prefilter_accepts(rf.prefilter.as_ref(), &line) {
-                    continue;
+            let out = eval_line(&rules, &line, &fname, lineno + 1, &year_bound);
+            let matched = out.parser.is_some();
+            if let Some(name) = &out.parser_name {
+                match out.verdict {
+                    Verdict::NoDestination => no_destination += 1,
+                    Verdict::NoOrigin => no_origin += 1,
+                    _ => {}
                 }
-                for p in &rf.parsers {
-                    if !parser_matches(p, &line) {
-                        continue;
-                    }
-                    // Extract
-                    let mut ctx: HashMap<String, String> = HashMap::new();
-                    ctx.insert("__source_file".to_string(), fname.clone());
-                    ctx.insert("__line_number".to_string(), (lineno + 1).to_string());
-                    ctx.insert("__year_bound".to_string(), year_bound.clone());
-
-                    if !apply_extract(&p.extract, p.extract_regex.as_ref(), &line, &mut ctx) {
-                        continue;
-                    }
-
-                    // Sub-extract
-                    if let Some(se) = &p.sub_extract {
-                        if let Some(value) = ctx.get(&se.field).cloned() {
-                            let sub_input: String = match &se.strip_before {
-                                Some(needle) => match value.find(needle.as_str()) {
-                                    Some(pos) => value[pos + needle.len()..].to_string(),
-                                    None => value,
-                                },
-                                None => value,
-                            };
-                            apply_extract(&se.extract, p.sub_extract_regex.as_ref(), &sub_input, &mut ctx);
-                        }
-                    }
-
-                    // Map into LogData
-                    let record = build_log_data(&p.map, &ctx, &fname);
-                    // every masstin row has an origin and a destination; a
-                    // line that names neither source nor target is counted,
-                    // not written
-                    let blank = |v: &str| { let t = v.trim(); t.is_empty() || t == "-" };
-                    if blank(&record.computer) {
-                        no_destination += 1;
-                    } else if blank(&record.workstation_name) && blank(&record.ip_address) {
-                        no_origin += 1;
-                    } else {
-                        all_records.push(record);
-                    }
-                    *per_parser_hits.entry(p.name.clone()).or_insert(0) += 1;
-                    file_matched += 1;
-                    matched = true;
-                    break 'rules;
+                if let Some(rec) = out.record.filter(|_| out.verdict == Verdict::Row) {
+                    all_records.push(rec);
                 }
+                *per_parser_hits.entry(name.clone()).or_insert(0) += 1;
+                file_matched += 1;
             }
 
             if !matched {
@@ -471,6 +433,250 @@ pub fn parse_custom(
         // no -o: the timeline goes to stdout, as with every other parser
         crate::banner::print_warning(&format!("  Error writing output: {}", e));
     }
+}
+
+// ─── One line through the rules (parse-custom and the rule studio) ──────────
+
+/// What became of a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// a row of the timeline
+    Row,
+    /// matched, but names no origin: not written
+    NoOrigin,
+    /// matched, but names no destination: not written
+    NoDestination,
+    /// no sub-parser took it
+    Rejected,
+}
+
+/// A line's result: which sub-parser took it (rule file, parser), the
+/// variables it extracted, the row it made.
+#[derive(Debug, Clone)]
+pub struct LineOutcome {
+    pub parser: Option<(usize, usize)>,
+    pub parser_name: Option<String>,
+    pub ctx: HashMap<String, String>,
+    pub record: Option<LogData>,
+    pub verdict: Verdict,
+}
+
+/// Rules ready to run: what the studio previews with, the same code the
+/// command line runs.
+pub struct Engine {
+    rules: Vec<CompiledRuleFile>,
+}
+
+impl Engine {
+    /// One rule file, as edited in the studio.
+    pub fn from_rule(rf: RuleFile) -> Result<Engine, String> {
+        Ok(Engine { rules: vec![compile_rule_file(Path::new("<studio>"), rf)?] })
+    }
+
+    pub fn eval(&self, line: &str, fname: &str, lineno: usize, year_bound: &str) -> LineOutcome {
+        eval_line(&self.rules, line, fname, lineno, year_bound)
+    }
+}
+
+fn eval_line(rules: &[CompiledRuleFile], line: &str, fname: &str, lineno: usize, year_bound: &str) -> LineOutcome {
+    for (fi, rf) in rules.iter().enumerate() {
+        if !prefilter_accepts(rf.prefilter.as_ref(), line) {
+            continue;
+        }
+        for (pi, p) in rf.parsers.iter().enumerate() {
+            if !parser_matches(p, line) {
+                continue;
+            }
+            let mut ctx: HashMap<String, String> = HashMap::new();
+            ctx.insert("__source_file".to_string(), fname.to_string());
+            ctx.insert("__line_number".to_string(), lineno.to_string());
+            ctx.insert("__year_bound".to_string(), year_bound.to_string());
+            if !apply_extract(&p.extract, p.extract_regex.as_ref(), line, &mut ctx) {
+                continue;
+            }
+            if let Some(se) = &p.sub_extract {
+                if let Some(value) = ctx.get(&se.field).cloned() {
+                    let sub_input: String = match &se.strip_before {
+                        Some(needle) => match value.find(needle.as_str()) {
+                            Some(pos) => value[pos + needle.len()..].to_string(),
+                            None => value,
+                        },
+                        None => value,
+                    };
+                    apply_extract(&se.extract, p.sub_extract_regex.as_ref(), &sub_input, &mut ctx);
+                }
+            }
+            let record = build_log_data(&p.map, &ctx, fname);
+            // every masstin row has an origin and a destination; a line that
+            // names neither source nor target is counted, not written
+            let blank = |v: &str| {
+                let t = v.trim();
+                t.is_empty() || t == "-"
+            };
+            let verdict = if blank(&record.computer) {
+                Verdict::NoDestination
+            } else if blank(&record.workstation_name) && blank(&record.ip_address) {
+                Verdict::NoOrigin
+            } else {
+                Verdict::Row
+            };
+            return LineOutcome { parser: Some((fi, pi)), parser_name: Some(p.name.clone()), ctx, record: Some(record), verdict };
+        }
+    }
+    LineOutcome { parser: None, parser_name: None, ctx: HashMap::new(), record: None, verdict: Verdict::Rejected }
+}
+
+/// The fields an extractor takes out of a line, in the line's order, for the
+/// studio's field table (a CSV's columns named by position, `#0`, `#1`…).
+pub fn fields_of(ex: &Extract, line: &str) -> Result<Vec<(String, String)>, String> {
+    match ex {
+        Extract::Csv { delimiter, quote, .. } => Ok(split_csv(line, delimiter, quote.as_deref())
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (format!("#{}", i), v.trim().to_string()))
+            .collect()),
+        Extract::Keyvalue { pair_separator, kv_separator, trim } => {
+            let mut out = Vec::new();
+            for pair in kv_pairs(line, pair_separator, kv_separator) {
+                let pair = if *trim { pair.trim() } else { pair.as_str() };
+                if let Some(pos) = pair.find(kv_separator.as_str()) {
+                    let key = pair[..pos].trim().to_string();
+                    let val = pair[pos + kv_separator.len()..].trim().trim_matches('"').trim_matches('\'').trim().to_string();
+                    if !key.is_empty() {
+                        out.push((key, val));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Extract::Json { .. } => {
+            let v: JsonValue = serde_json::from_str(line.trim()).map_err(|e| format!("not a JSON object: {}", e))?;
+            let mut out = Vec::new();
+            flatten_json("", &v, &mut out);
+            Ok(out)
+        }
+        Extract::Regex { pattern } => {
+            let re = Regex::new(pattern).map_err(|e| e.to_string())?;
+            let caps = re.captures(line).ok_or("the pattern does not match this line")?;
+            Ok(re.capture_names().flatten().filter_map(|n| caps.name(n).map(|m| (n.to_string(), m.as_str().to_string()))).collect())
+        }
+    }
+}
+
+/// The key=value pairs of a line, a quoted value kept whole even when it
+/// holds the pair separator (`msg="SSL tunnel up"`).
+fn kv_pairs(line: &str, pair_sep: &str, kv_sep: &str) -> Vec<String> {
+    if pair_sep != " " {
+        return line.split(pair_sep).map(|s| s.to_string()).collect();
+    }
+    let _ = kv_sep;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for c in line.chars() {
+        if c == '"' {
+            in_quote = !in_quote;
+        }
+        if c == ' ' && !in_quote {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn flatten_json(prefix: &str, v: &JsonValue, out: &mut Vec<(String, String)>) {
+    match v {
+        JsonValue::Object(m) => {
+            for (k, x) in m {
+                let path = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                flatten_json(&path, x, out);
+            }
+        }
+        other => {
+            if let Some(s) = json_scalar(other) {
+                out.push((prefix.to_string(), s));
+            }
+        }
+    }
+}
+
+/// The likely extractor for these lines: JSON objects, key=value pairs, a
+/// delimited row (`,` `;` `|` or tab), or free text (a regex to write).
+pub fn guess_extract(lines: &[String]) -> Extract {
+    let sample: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).take(200).collect();
+    let n = sample.len().max(1) as f64;
+    let share = |f: &dyn Fn(&str) -> bool| sample.iter().filter(|l| f(l)).count() as f64 / n;
+    if share(&|l| l.starts_with('{') && serde_json::from_str::<JsonValue>(l).is_ok()) > 0.8 {
+        return Extract::Json { fields: BTreeMap::new() };
+    }
+    let kv_re = Regex::new(r#"(^|\s)[A-Za-z_][\w.-]*="#).unwrap();
+    if share(&|l| kv_re.find_iter(l).count() >= 3) > 0.8 {
+        return Extract::Keyvalue { pair_separator: " ".into(), kv_separator: "=".into(), trim: true };
+    }
+    let kv_colon = Regex::new(r#"(^|[\s;])[A-Za-z_][\w.-]*:""#).unwrap();
+    if share(&|l| kv_colon.find_iter(l).count() >= 3) > 0.8 {
+        return Extract::Keyvalue { pair_separator: ";".into(), kv_separator: ":".into(), trim: true };
+    }
+    for d in [",", "\t", "|", ";"] {
+        let counts: Vec<usize> = sample.iter().map(|l| l.matches(d).count()).collect();
+        if let (Some(min), Some(max)) = (counts.iter().min(), counts.iter().max()) {
+            if *min >= 3 && max - min <= 1 {
+                return Extract::Csv { delimiter: d.to_string(), quote: Some("\"".into()), fields_by_index: BTreeMap::new() };
+            }
+        }
+    }
+    Extract::Regex { pattern: String::new() }
+}
+
+/// The rule library shipped with masstin (rules/), inside the binary: the
+/// studio's presets work wherever masstin is installed.
+pub const LIBRARY: [(&str, &str); 13] = [
+    ("firewall/checkpoint-admin.yaml", include_str!("../rules/firewall/checkpoint-admin.yaml")),
+    ("firewall/cisco-asa.yaml", include_str!("../rules/firewall/cisco-asa.yaml")),
+    ("firewall/fortinet-fortigate.yaml", include_str!("../rules/firewall/fortinet-fortigate.yaml")),
+    ("firewall/palo-alto-traffic.yaml", include_str!("../rules/firewall/palo-alto-traffic.yaml")),
+    ("json/cloudflare-access.yaml", include_str!("../rules/json/cloudflare-access.yaml")),
+    ("json/mordor.yaml", include_str!("../rules/json/mordor.yaml")),
+    ("json/zscaler-zpa.yaml", include_str!("../rules/json/zscaler-zpa.yaml")),
+    ("proxy/squid.yaml", include_str!("../rules/proxy/squid.yaml")),
+    ("vpn/checkpoint-remote-access.yaml", include_str!("../rules/vpn/checkpoint-remote-access.yaml")),
+    ("vpn/cisco-anyconnect.yaml", include_str!("../rules/vpn/cisco-anyconnect.yaml")),
+    ("vpn/fortinet-ssl-vpn.yaml", include_str!("../rules/vpn/fortinet-ssl-vpn.yaml")),
+    ("vpn/openvpn.yaml", include_str!("../rules/vpn/openvpn.yaml")),
+    ("vpn/palo-alto-globalprotect.yaml", include_str!("../rules/vpn/palo-alto-globalprotect.yaml")),
+];
+
+/// Read a rule from its YAML text.
+pub fn rule_from_yaml(text: &str) -> Result<RuleFile, String> {
+    serde_yaml_ng::from_str::<RuleFile>(text).map_err(|e| e.to_string())
+}
+
+/// A rule as YAML text, as the command line reads it.
+pub fn rule_to_yaml(rf: &RuleFile) -> Result<String, String> {
+    serde_yaml_ng::to_string(rf).map_err(|e| e.to_string())
+}
+
+/// The library's rules ranked by how many of these lines they read (rows
+/// written), best first; the ones that read none are left out.
+pub fn rank_library(lines: &[String]) -> Vec<(&'static str, usize)> {
+    let mut out = Vec::new();
+    for (name, text) in LIBRARY {
+        let Ok(rf) = rule_from_yaml(text) else { continue };
+        let Ok(engine) = Engine::from_rule(rf) else { continue };
+        let rows = lines.iter().enumerate().filter(|(i, l)| engine.eval(l, "sample", i + 1, "").verdict == Verdict::Row).count();
+        if rows > 0 {
+            out.push((name, rows));
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
 }
 
 // ─── Matching ───────────────────────────────────────────────────────────────
@@ -626,7 +832,7 @@ fn split_csv(input: &str, delimiter: &str, quote: Option<&str>) -> Vec<String> {
 // ─── Mapping → LogData ──────────────────────────────────────────────────────
 
 fn build_log_data(
-    map: &HashMap<String, String>,
+    map: &BTreeMap<String, String>,
     ctx: &HashMap<String, String>,
     fallback_filename: &str,
 ) -> LogData {
@@ -724,8 +930,78 @@ fn write_csv(path: &str, records: &[LogData]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::substitute;
-    use std::collections::HashMap;
+
+    use super::*;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(|l| l.to_string()).collect()
+    }
+
+    const FORTI: &str = r#"date=2026-11-10 time=00:41:02 devname="FGT-LEO" type="event" subtype="vpn" action="ssl-login-fail" remip=203.0.113.45 user="admin" reason="sslvpn_login_permission_denied" msg="SSL user failed to logged in"
+date=2026-11-10 time=08:02:11 devname="FGT-LEO" type="event" subtype="vpn" action="tunnel-up" remip=198.51.100.7 user="ana.ruiz" tunneltype="ssl-web" group="vpn-users"
+date=2026-11-10 time=09:00:00 devname="FGT-LEO" type="event" subtype="system" action="update" msg="nothing to do with vpn""#;
+
+    #[test]
+    fn every_library_rule_reads_as_yaml_and_compiles() {
+        for (name, text) in LIBRARY {
+            let rf = rule_from_yaml(text).unwrap_or_else(|e| panic!("{}: {}", name, e));
+            Engine::from_rule(rf).unwrap_or_else(|e| panic!("{}: {}", name, e));
+        }
+    }
+
+    #[test]
+    fn the_library_ranks_the_fortigate_rule_first_on_a_fortigate_log() {
+        let ranked = rank_library(&lines(FORTI));
+        assert_eq!(ranked.first().map(|r| r.0), Some("vpn/fortinet-ssl-vpn.yaml"));
+        assert_eq!(ranked[0].1, 2);
+    }
+
+    #[test]
+    fn a_line_through_the_engine_says_which_parser_and_what_row() {
+        let rf = rule_from_yaml(LIBRARY.iter().find(|l| l.0 == "vpn/fortinet-ssl-vpn.yaml").unwrap().1).unwrap();
+        let e = Engine::from_rule(rf).unwrap();
+        let ls = lines(FORTI);
+        let up = e.eval(&ls[1], "FGT.log", 2, "");
+        assert_eq!(up.verdict, Verdict::Row);
+        assert_eq!(up.parser_name.as_deref(), Some("fortinet-sslvpn-tunnel-up"));
+        let rec = up.record.unwrap();
+        assert_eq!(rec.event_type, "SUCCESSFUL_LOGON");
+        assert_eq!(rec.ip_address, "198.51.100.7");
+        assert_eq!(rec.computer, "FGT-LEO");
+        assert_eq!(e.eval(&ls[2], "FGT.log", 3, "").verdict, Verdict::Rejected);
+    }
+
+    #[test]
+    fn the_format_is_guessed_from_the_lines() {
+        assert!(matches!(guess_extract(&lines(FORTI)), Extract::Keyvalue { .. }));
+        let json = lines("{\"user\":\"a\",\"ip\":\"1.2.3.4\"}\n{\"user\":\"b\",\"ip\":\"1.2.3.5\"}");
+        assert!(matches!(guess_extract(&json), Extract::Json { .. }));
+        let csv = lines("2026-11-10,a,b,c,d\n2026-11-11,e,f,g,h");
+        assert!(matches!(guess_extract(&csv), Extract::Csv { ref delimiter, .. } if delimiter == ","));
+        assert!(matches!(guess_extract(&lines("Nov 10 sshd: hello world")), Extract::Regex { .. }));
+    }
+
+    #[test]
+    fn the_fields_of_a_line_in_its_order() {
+        let ls = lines(FORTI);
+        let kv = guess_extract(&ls);
+        let f = fields_of(&kv, &ls[0]).unwrap();
+        assert_eq!(f[0], ("date".to_string(), "2026-11-10".to_string()));
+        assert!(f.contains(&("msg".to_string(), "SSL user failed to logged in".to_string())));
+        let j = fields_of(&Extract::Json { fields: BTreeMap::new() }, r#"{"a":{"b":1},"c":"x"}"#).unwrap();
+        assert_eq!(j, vec![("a.b".to_string(), "1".to_string()), ("c".to_string(), "x".to_string())]);
+        let c = fields_of(&Extract::Csv { delimiter: ",".into(), quote: Some("\"".into()), fields_by_index: BTreeMap::new() }, "a,\"b,c\",d").unwrap();
+        assert_eq!(c[1], ("#1".to_string(), "b,c".to_string()));
+    }
+
+    #[test]
+    fn a_rule_goes_to_yaml_and_back_the_same() {
+        for (_, text) in LIBRARY {
+            let rf = rule_from_yaml(text).unwrap();
+            let again = rule_from_yaml(&rule_to_yaml(&rf).unwrap()).unwrap();
+            assert_eq!(rule_to_yaml(&rf).unwrap(), rule_to_yaml(&again).unwrap());
+        }
+    }
 
     #[test]
     fn substitute_takes_the_first_non_empty_alternative() {
