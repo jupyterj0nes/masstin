@@ -16,6 +16,26 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// No console window for a child (`CREATE_NO_WINDOW`).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The child that validates one carved EVTX: the same binary, silent, and
+/// on Windows with no console of its own. A carve started from the window
+/// (which has no console) would otherwise open a console for every carved
+/// file, hundreds or thousands of them, flashing on the screen and leaving
+/// the desktop unable to draw new OpenGL windows until the next sign-in.
+fn validator_command(exe: &Path, evtx: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.env("MASSTIN_VALIDATE_EVTX", evtx).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 use std::time::{Duration, Instant};
 
 use blockcarve::evtx::{chunk_checksums_ok, orphan_record, ChunkGroups, CHUNK_MAGIC, CHUNK_SIZE};
@@ -183,12 +203,7 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
             continue;
         };
 
-        let mut child = match Command::new(exe)
-            .env("MASSTIN_VALIDATE_EVTX", path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        let mut child = match validator_command(exe, path).spawn() {
             Ok(c) => c,
             Err(e) => {
                 rejected += 1;
@@ -583,5 +598,33 @@ fn provider_to_evtx_filename(provider: &str) -> String {
             let safe = provider.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
             format!("{}.evtx", safe)
         }
+    }
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+
+    #[test]
+    fn the_validator_is_the_same_binary_with_the_file_in_its_environment() {
+        let c = validator_command(Path::new("masstin.exe"), "D:/tmp/carved-1.evtx");
+        assert_eq!(c.get_program(), "masstin.exe");
+        assert_eq!(c.get_args().count(), 0);
+        let envs: Vec<_> = c.get_envs().collect();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].0, "MASSTIN_VALIDATE_EVTX");
+        assert_eq!(envs[0].1, Some(std::ffi::OsStr::new("D:/tmp/carved-1.evtx")));
+    }
+
+    #[test]
+    fn the_carved_files_are_named_by_their_image_not_the_temp_folder() {
+        let p = "C:/Users/someone/AppData/Local/Temp/masstin_carve_extract/0_dev-srv01.vmdk/Security.evtx";
+        assert_eq!(crate::parse::carved_image_name(p).as_deref(), Some("dev-srv01.vmdk"));
+        let label = crate::parse::source_label_for_path(p);
+        assert_eq!(label, "[CARVED]  dev-srv01.vmdk");
+        assert!(!label.contains("Temp") && !label.contains("someone"));
+        let win = r"C:\Users\x\AppData\Local\Temp\masstin_carve_extract\3_HR.e01\a.evtx";
+        assert_eq!(crate::parse::carved_image_name(win).as_deref(), Some("HR.e01"));
+        assert_eq!(crate::parse::carved_image_name("D:/evidence/logs/Security.evtx"), None);
     }
 }

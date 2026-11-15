@@ -666,6 +666,10 @@ pub(crate) fn source_label_for_evtx(
             if let Some(image) = extract_image_name_from_extract_path(path) {
                 return format!("[IMAGE]  {}", image);
             }
+            // carve-image builds its synthetic EVTX in a temp dir of its own
+            if let Some(image) = carved_image_name(path) {
+                return format!("[CARVED]  {}", image);
+            }
             // Loose EVTX: group by full parent-directory path.
             let parent = std::path::Path::new(path)
                 .parent()
@@ -713,12 +717,29 @@ pub(crate) fn source_label_for_path(path: &str) -> String {
     if let Some(image) = extract_image_name_from_extract_path(path) {
         return format!("[IMAGE]  {}", image);
     }
+    if let Some(image) = carved_image_name(path) {
+        return format!("[CARVED]  {}", image);
+    }
     let parent = std::path::Path::new(path)
         .parent()
         .and_then(|p| p.to_str())
         .map(|s| s.replace('\\', "/"))
         .unwrap_or_else(|| path.replace('\\', "/"));
     format!("[FOLDER]  {}", parent)
+}
+
+/// The image a carved synthetic EVTX was built from: carve-image writes
+/// them to `…/masstin_carve_extract/<n>_<image>/…`, a temp folder of the
+/// analyst's machine that the console must not name.
+pub(crate) fn carved_image_name(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let marker = "masstin_carve_extract/";
+    let pos = normalized.find(marker)?;
+    let dir = normalized[pos + marker.len()..].split('/').next().filter(|d| !d.is_empty())?;
+    Some(match dir.split_once('_') {
+        Some((n, image)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => image.to_string(),
+        _ => dir.to_string(),
+    })
 }
 
 pub(crate) fn extract_image_name_from_extract_path(path: &str) -> Option<String> {

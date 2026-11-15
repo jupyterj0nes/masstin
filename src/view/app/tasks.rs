@@ -87,6 +87,10 @@ impl Progress {
             self.notes.push(rest.trim().to_string());
             return false;
         }
+        if is_fact(t) {
+            self.notes.push(t.to_string());
+            return false;
+        }
         for key in ["Artifacts parsed", "Events collected", "Skipped", "Output", "Completed in", "Connections loaded", "Rows written", "Rows"] {
             if let Some(rest) = t.strip_prefix(key) {
                 if let Some(v) = rest.strip_prefix(':') {
@@ -97,6 +101,19 @@ impl Progress {
         }
         false
     }
+}
+
+/// The console's plain lines worth a note in the window: what the image
+/// parser found in the volumes (partitions, shadow copies, what came out of
+/// them, the duplicates between the live volume and the copies) and the
+/// parts of a `parse`.
+fn is_fact(t: &str) -> bool {
+    t.starts_with("Partitions:")
+        || t.starts_with("Extracted:")
+        || t.starts_with("Extracting EVTX from VSS store")
+        || t.contains("duplicate events removed")
+        || (t.starts_with("Part ") && t.contains(" of ") && t.contains(':'))
+        || t.starts_with("Merging the ")
 }
 
 /// Without the terminal's colour codes, should any slip through.
@@ -596,3 +613,51 @@ impl Viewer {
 
 /// Seconds the reveal takes to go through every finding of the view.
 pub(super) const REVEAL_SECS: f32 = 3.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(lines: &[&str]) -> Progress {
+        let mut p = Progress::default();
+        for l in lines {
+            p.absorb(l);
+        }
+        p
+    }
+
+    #[test]
+    fn the_shadow_copies_and_the_carving_are_notes_in_the_window() {
+        let p = read(&[
+            "[1/3] Searching for artifacts...",
+            "          Partitions: 1 NTFS, 1 VSS",
+            "          Extracted: 664 EVTX + 2 UAL",
+            "        Extracting EVTX from VSS store 0...",
+            "        14441 duplicate events removed (live + VSS overlap)",
+            "        => Carving: 13755 event(s), 13753 already in the live logs, 2 recovered",
+        ]);
+        assert_eq!(p.phases.len(), 1);
+        assert_eq!(
+            p.notes,
+            vec![
+                "Partitions: 1 NTFS, 1 VSS",
+                "Extracted: 664 EVTX + 2 UAL",
+                "Extracting EVTX from VSS store 0...",
+                "14441 duplicate events removed (live + VSS overlap)",
+                "Carving: 13755 event(s), 13753 already in the live logs, 2 recovered",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_parts_of_a_parse_are_notes_and_other_plain_lines_are_not() {
+        let p = read(&[
+            "        Part 1 of 2: disk images",
+            "        Part 2 of 2: carving the disk images",
+            "        Merging the 2 part(s) into one timeline",
+            "        Disk images: --carve also carves the EVTX records of deleted or overwritten logs out of them",
+            "        some other line of the parser",
+        ]);
+        assert_eq!(p.notes, vec!["Part 1 of 2: disk images", "Part 2 of 2: carving the disk images", "Merging the 2 part(s) into one timeline"]);
+    }
+}

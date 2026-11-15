@@ -62,11 +62,17 @@ pub(super) struct Ingest {
     pub open_table: bool,
     pub open_external: bool,
     pub log_open: bool,
+    /// `--carve`: the disk images are also carved for the EVTX records of
+    /// deleted or overwritten logs (offered when the evidence holds images)
+    pub carve: bool,
+    /// `--rules`: a YAML rule file or folder for the logs masstin does not
+    /// know (a VPN, a firewall, a proxy)
+    pub rules: String,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new() }
     }
 }
 
@@ -77,12 +83,41 @@ impl Ingest {
         self.verdict.as_ref().map_or(false, |v| v.sure && v.parser.map(pidx) == Some(self.parser))
     }
 
+    /// Whether the evidence holds disk images (what carving reads).
+    pub fn has_images(&self) -> bool {
+        self.scan.as_ref().map_or(false, |s| !s.images.is_empty())
+    }
+
+    /// Carving asked for, on evidence that has images to carve.
+    pub fn carve_on(&self) -> bool {
+        self.carve && self.has_images()
+    }
+
+    /// Rules given for the logs masstin does not know.
+    pub fn rules_on(&self) -> bool {
+        !self.rules.trim().is_empty()
+    }
+
+    /// Whether the command is `masstin -a parse`: the parser masstin picked,
+    /// or an option only `parse` has (carving, rules), which then reads what
+    /// it knows by itself and the rest with the rules.
+    pub fn uses_parse(&self) -> bool {
+        self.is_auto() || self.carve_on() || self.rules_on()
+    }
+
     pub fn command(&self) -> Vec<String> {
-        let action = if self.is_auto() { "parse" } else { PARSERS[self.parser].action };
+        let action = if self.uses_parse() { "parse" } else { PARSERS[self.parser].action };
         let mut args = vec!["-a".to_string(), action.to_string()];
         for s in &self.sources {
             args.push(if Path::new(s).is_dir() { "-d" } else { "-f" }.into());
             args.push(s.clone());
+        }
+        if self.rules_on() {
+            args.push("--rules".into());
+            args.push(self.rules.trim().to_string());
+        }
+        if self.carve_on() {
+            args.push("--carve".into());
         }
         args.push("-o".into());
         args.push(self.output.trim().to_string());
@@ -121,6 +156,8 @@ impl Viewer {
         self.ingest.scan = None;
         self.ingest.verdict = None;
         self.ingest.output.clear();
+        self.ingest.carve = false;
+        self.ingest.rules.clear();
         self.start_scan();
     }
 
@@ -234,7 +271,7 @@ impl Viewer {
     pub(super) fn run_ingest(&mut self) {
         let args = self.ingest.command();
         let out = self.ingest.output.trim().to_string();
-        let title = format!("Parsing with {}", PARSERS[self.ingest.parser].action);
+        let title = if self.ingest.uses_parse() { "Parsing".to_string() } else { format!("Parsing with {}", PARSERS[self.ingest.parser].action) };
         self.start_job(JobKind::Ingest, title, args, vec![out], self.ingest.add);
         self.ingest.step = 3;
         self.ingest.log_open = false;
@@ -377,6 +414,8 @@ impl Viewer {
                 self.ingest.scan = None;
                 self.ingest.verdict = None;
                 self.ingest.output.clear();
+                self.ingest.carve = false;
+                self.ingest.rules.clear();
                 self.ingest.step = 0;
             }
             _ => {}
@@ -481,14 +520,14 @@ impl Viewer {
                             ui.label(theme::semibold(&v.title, 15.0).color(TEXT));
                             ui.label(egui::RichText::new(&v.why).color(theme::MUTED).size(12.5));
                             match (v.parser, v.sure) {
-                                (Some(p), true) => {
-                                    ui.label(egui::RichText::new(format!("{}  {} takes it", ic::CHECK_CIRCLE, p)).color(color).size(12.5));
+                                (Some(_), true) => {
+                                    ui.label(egui::RichText::new(format!("{}  masstin -a parse reads it", ic::CHECK_CIRCLE)).color(color).size(12.5));
                                 }
                                 (Some(p), false) => {
                                     ui.label(egui::RichText::new(format!("{}  not sure: {} is offered, the next step lets you choose", ic::WARNING, p)).color(color).size(12.5));
                                 }
                                 (None, false) => {
-                                    ui.label(egui::RichText::new(format!("{}  the next step asks you which parser", ic::WARNING)).color(color).size(12.5));
+                                    ui.label(egui::RichText::new(format!("{}  the next step asks which parser, or the rules to read it with", ic::WARNING)).color(color).size(12.5));
                                 }
                                 (None, true) => {}
                             }
@@ -535,6 +574,37 @@ impl Viewer {
             if r.clicked() {
                 self.ingest.parser = i;
             }
+        }
+        // what only `masstin -a parse` does: carve the images, read the rest with rules
+        if self.ingest.has_images() {
+            theme::section(ui, "Deleted logs");
+            ui.checkbox(&mut self.ingest.carve, "Carve the disk images for the records of deleted or overwritten logs");
+            ui.label(egui::RichText::new("Every byte of every image is read, unallocated space included, for event log records. What the live logs already hold is dropped; what they lost joins the same timeline (--carve). Slow: minutes per image.").color(theme::MUTED).size(12.0));
+        }
+        theme::section(ui, "Logs masstin does not know");
+        ui.label(egui::RichText::new("A VPN, a firewall, a proxy: YAML rules say how to read them, and their rows join the same timeline (--rules). masstin's rules folder has rules for several products.").color(theme::MUTED).size(12.0));
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.ingest.rules).desired_width(400.0).hint_text("a rule file (.yaml) or a folder of rules"));
+            if ui.button(format!("{}  Rule file…", ic::ARCHIVE)).clicked() {
+                if let Some(p) = rfd::FileDialog::new().set_title("Rule file").add_filter("YAML rules", &["yaml", "yml"]).pick_file() {
+                    self.ingest.rules = p.to_string_lossy().to_string();
+                }
+            }
+            if ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).clicked() {
+                if let Some(p) = rfd::FileDialog::new().set_title("Folder of rules").pick_folder() {
+                    self.ingest.rules = p.to_string_lossy().to_string();
+                }
+            }
+            if self.ingest.rules_on() && ui.add(egui::Button::new(egui::RichText::new(ic::X).color(theme::DIM)).frame(false)).on_hover_text("No rules").clicked() {
+                self.ingest.rules.clear();
+            }
+        });
+        if self.ingest.rules_on() && !Path::new(self.ingest.rules.trim()).exists() {
+            ui.label(egui::RichText::new(format!("{}  no such file or folder; the parser will fail", ic::WARNING)).color(SIGNIFICANT).small());
+        }
+        if self.ingest.uses_parse() && !self.ingest.is_auto() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("{}  With these options masstin -a parse runs: it reads what it knows by itself, whatever is picked above, and the rest with the rules.", ic::INFO)).color(theme::CYAN).size(12.0));
         }
     }
 
@@ -1127,5 +1197,71 @@ mod tests {
         i.parser = P_MASSIVE;
         i.verdict.as_mut().unwrap().sure = false;
         assert_eq!(&i.command()[..2], &["-a", "parse-massive"]);
+    }
+
+    fn with_scan(images: usize, verdict: Option<Verdict>) -> Ingest {
+        let mut i = Ingest::default();
+        i.sources = vec!["D:/case".into()];
+        i.output = "out.csv".into();
+        let mut s = Scan::default();
+        s.images = (0..images).map(|k| format!("D:/case/disk{}.vmdk", k)).collect();
+        i.scan = Some(s);
+        i.verdict = verdict;
+        i
+    }
+
+    #[test]
+    fn carving_is_parse_with_carve_and_only_with_images() {
+        let mut i = with_scan(1, Some(Verdict { parser: Some(detect::PARSE_IMAGE), sure: true, title: String::new(), why: String::new() }));
+        i.parser = P_IMAGE;
+        assert!(!i.command().contains(&"--carve".to_string()));
+        i.carve = true;
+        let c = i.command();
+        assert_eq!(&c[..2], &["-a", "parse"]);
+        assert!(c.contains(&"--carve".to_string()));
+        assert_eq!(&c[c.len() - 3..], &["-o", "out.csv", "--overwrite"]);
+        // no image among the evidence: nothing to carve, no flag
+        let mut j = with_scan(0, Some(Verdict { parser: Some(detect::PARSE_WINDOWS), sure: true, title: String::new(), why: String::new() }));
+        j.parser = P_WINDOWS;
+        j.carve = true;
+        assert!(!j.carve_on());
+        assert!(!j.command().contains(&"--carve".to_string()));
+    }
+
+    #[test]
+    fn carving_turns_a_parser_picked_by_hand_into_parse() {
+        let mut i = with_scan(1, Some(Verdict { parser: Some(detect::PARSE_IMAGE), sure: true, title: String::new(), why: String::new() }));
+        i.parser = P_MASSIVE;
+        assert_eq!(&i.command()[..2], &["-a", "parse-massive"]);
+        i.carve = true;
+        assert!(i.uses_parse() && !i.is_auto());
+        assert_eq!(&i.command()[..2], &["-a", "parse"]);
+    }
+
+    #[test]
+    fn rules_read_what_masstin_does_not_know_with_parse() {
+        // a firewall log: nothing masstin knows, so it is not sure
+        let mut i = with_scan(0, Some(Verdict { parser: None, sure: false, title: String::new(), why: String::new() }));
+        i.sources = vec!["D:/logs/FGT.log".into()];
+        assert_eq!(&i.command()[..2], &["-a", "parse-massive"]);
+        i.rules = "  D:/rules/fortinet-ssl-vpn.yaml ".into();
+        let c = i.command();
+        assert_eq!(&c[..2], &["-a", "parse"]);
+        assert_eq!(&c[2..4], &["-f", "D:/logs/FGT.log"]);
+        assert_eq!(&c[4..6], &["--rules", "D:/rules/fortinet-ssl-vpn.yaml"]);
+        assert_eq!(&c[6..], &["-o", "out.csv", "--overwrite"]);
+        // blank rules are no rules
+        i.rules = "   ".into();
+        assert!(!i.rules_on());
+        assert!(!i.command().contains(&"--rules".to_string()));
+    }
+
+    #[test]
+    fn rules_and_carving_together_on_the_command_line() {
+        let mut i = with_scan(2, Some(Verdict { parser: Some(detect::PARSE_MASSIVE), sure: true, title: String::new(), why: String::new() }));
+        i.parser = P_MASSIVE;
+        i.carve = true;
+        i.rules = "D:/my rules".into();
+        assert_eq!(i.command_line(), "masstin -a parse -f D:/case --rules \"D:/my rules\" --carve -o out.csv --overwrite");
     }
 }
