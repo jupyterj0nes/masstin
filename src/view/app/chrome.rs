@@ -83,6 +83,21 @@ impl Viewer {
                     ui.close();
                     self.show_merge = true;
                 }
+                if icon_button(ui, ic::CLOUD, "Cortex XDR API…").on_hover_text("Lateral movement straight from a Cortex XDR tenant through its XQL API: the endpoints' network connections, or the Windows event logs of the forensics add-on").clicked() {
+                    ui.close();
+                    self.show_cortex = true;
+                }
+                ui.menu_button(format!("{}  Graph databases", ic::DATABASE), |ui| {
+                    ui.set_min_width(300.0);
+                    let items = [(super::remote::DbOp::Load, "Load the timeline into Neo4j / Memgraph…"), (super::remote::DbOp::MergeNodes, "Merge two host nodes there…"), (super::remote::DbOp::Hunt, "Hunt on the graph there…")];
+                    for (op, text) in items {
+                        if ui.button(text).clicked() {
+                            ui.close();
+                            self.db_form.op = op;
+                            self.show_db = true;
+                        }
+                    }
+                });
                 ui.separator();
                 if let Some(c) = &self.case {
                     ui.label(egui::RichText::new("Case").small().color(theme::DIM));

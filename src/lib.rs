@@ -119,7 +119,10 @@ pub struct Cli {
     #[arg(long)]
     silent: bool,
 
-    /// Cortex API base URL (must start with 'https://api-')
+    /// Cortex API base URL (must start with 'https://api-'). The API key
+    /// and its numeric id are asked on the console, or read from
+    /// `$CORTEX_API_KEY` and `$CORTEX_API_KEY_ID` when both are set (so a
+    /// script, or masstin's window, never puts the key on a command line).
     #[arg(long)]
     cortex_url: Option<String>,
 

@@ -17,6 +17,7 @@ mod report;
 mod subnets;
 mod tasks;
 mod hunt;
+mod remote;
 mod ingest;
 mod table;
 mod when;
@@ -41,6 +42,7 @@ use subnets::SubnetGroup;
 use super::views::{LabelPos, NodeStyle};
 use ingest::Ingest;
 use hunt::HuntForm;
+use remote::{CortexForm, DbForm};
 use tasks::{Job, MergeForm};
 use super::store::{Pattern, Store, HUNT_NAMES, RESULT_NAMES, R_CONNECT, R_FAIL, R_LOGOFF, R_OK, VERDICT_NAMES};
 use super::paths::{self, Path, PathQuery};
@@ -335,6 +337,10 @@ pub struct Viewer {
     show_inspector: bool,
     show_hunt: bool,
     show_merge: bool,
+    show_cortex: bool,
+    cortex_form: CortexForm,
+    show_db: bool,
+    db_form: DbForm,
     /// the timeline as a plain table
     show_table: bool,
     table_find: String,
@@ -750,6 +756,10 @@ impl Viewer {
             show_inspector: true,
             show_hunt: false,
             show_merge: false,
+            show_cortex: false,
+            cortex_form: CortexForm::default(),
+            show_db: false,
+            db_form: DbForm::default(),
             show_table: false,
             table_find: String::new(),
             table_rows: Vec::new(),
@@ -4867,6 +4877,8 @@ impl Viewer {
         self.report_window(&ctx);
         self.ingest_window(&ctx);
         self.merge_window(&ctx);
+        self.cortex_window(&ctx);
+        self.db_window(&ctx);
         self.poll_job(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);

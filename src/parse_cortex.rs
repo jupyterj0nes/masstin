@@ -336,12 +336,23 @@ fn get_timestamp(record: &Value) -> Option<i64> {
 
 /// Prompts the user for an API key and returns it as a `String`.
 fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
+    api_key_and_id()
+}
+
+/// The API key and its id: from `$CORTEX_API_KEY_ID` and `$CORTEX_API_KEY`
+/// when both are set (how masstin's window passes them, never on the
+/// command line), else asked on the console.
+pub(crate) fn api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
+    if let Some(pair) = key_from_env(std::env::var("CORTEX_API_KEY_ID").ok(), std::env::var("CORTEX_API_KEY").ok())? {
+        crate::banner::print_phase_detail("Auth:", "API key from $CORTEX_API_KEY (id from $CORTEX_API_KEY_ID)");
+        return Ok(pair);
+    }
     // Prompt for API Key ID
     print!("Enter your Cortex/XDR API Key ID (numeric): ");
     stdout().flush()?;
     let mut api_key_id_input = String::new();
     stdin().read_line(&mut api_key_id_input)?;
-    let api_key_id: u32 = api_key_id_input.trim().parse()?; // 👈 fuerza número
+    let api_key_id: u32 = api_key_id_input.trim().parse()?;
 
     // Prompt for API Key
     print!("Enter your Cortex/XDR API Key: ");
@@ -350,7 +361,32 @@ fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
     stdin().read_line(&mut api_key)?;
     let api_key = api_key.trim().to_string();
 
-    Ok((api_key, api_key_id.to_string())) // 👈 lo devuelves como string
+    Ok((api_key, api_key_id.to_string()))
+}
+
+/// (key, id) from the two variables, both set and not blank; the id is a
+/// number, as the console prompt demands.
+fn key_from_env(id: Option<String>, key: Option<String>) -> Result<Option<(String, String)>, Box<dyn Error>> {
+    match (id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()), key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())) {
+        (Some(id), Some(key)) => {
+            let id: u32 = id.parse().map_err(|_| "$CORTEX_API_KEY_ID is not a number")?;
+            Ok(Some((key, id.to_string())))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::key_from_env;
+
+    #[test]
+    fn the_key_comes_from_the_environment_when_both_are_set() {
+        assert_eq!(key_from_env(Some(" 12 ".into()), Some(" abc ".into())).unwrap(), Some(("abc".to_string(), "12".to_string())));
+        assert_eq!(key_from_env(Some("12".into()), None).unwrap(), None);
+        assert_eq!(key_from_env(Some("12".into()), Some("  ".into())).unwrap(), None);
+        assert!(key_from_env(Some("twelve".into()), Some("abc".into())).is_err());
+    }
 }
 
 /// Builds the necessary headers for the Cortex/XDR API requests.

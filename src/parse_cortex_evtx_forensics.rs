@@ -800,21 +800,7 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
 // ----------------------------------------------
 /// Prompts the user for an API key and returns it as a `String`.
 fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
-    // Prompt for API Key ID
-    print!("Enter your Cortex/XDR API Key ID (numeric): ");
-    stdout().flush()?;
-    let mut api_key_id_input = String::new();
-    stdin().read_line(&mut api_key_id_input)?;
-    let api_key_id: u32 = api_key_id_input.trim().parse()?; // 👈 fuerza número
-
-    // Prompt for API Key
-    print!("Enter your Cortex/XDR API Key: ");
-    stdout().flush()?;
-    let mut api_key = String::new();
-    stdin().read_line(&mut api_key)?;
-    let api_key = api_key.trim().to_string();
-
-    Ok((api_key, api_key_id.to_string())) // 👈 lo devuelves como string
+    crate::parse_cortex::api_key_and_id()
 }
 
 // ----------------------------------------------

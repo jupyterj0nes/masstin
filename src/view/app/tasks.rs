@@ -16,6 +16,8 @@ pub(super) enum JobKind {
     Hunt,
     Ingest,
     Merge,
+    /// the Cortex XDR API and the graph databases: what it wrote, if anything, opens
+    Remote,
 }
 
 pub(super) enum JobMsg {
@@ -238,6 +240,12 @@ impl Viewer {
 
     /// Start a child masstin with these arguments; its lines come through the channel.
     pub(super) fn start_job(&mut self, kind: JobKind, title: String, args: Vec<String>, open: Vec<String>, add: bool) {
+        self.start_job_env(kind, title, args, open, add, Vec::new());
+    }
+
+    /// The same, with environment variables for the child: a secret (an API
+    /// key, a password) goes there, never on the command line or in its log.
+    pub(super) fn start_job_env(&mut self, kind: JobKind, title: String, args: Vec<String>, open: Vec<String>, add: bool, env: Vec<(String, String)>) {
         let exe = Self::masstin_exe();
         let command = format!("masstin {}", args.iter().map(|a| if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }).collect::<Vec<_>>().join(" "));
         let (tx, rx) = channel::<JobMsg>();
@@ -246,7 +254,7 @@ impl Viewer {
         std::thread::spawn(move || {
             use std::io::BufRead;
             let mut cmd = std::process::Command::new(&exe);
-            cmd.args(&args).env("MASSTIN_PROGRESS_PIPE", "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
+            cmd.envs(env).args(&args).env("MASSTIN_PROGRESS_PIPE", "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -369,7 +377,7 @@ impl Viewer {
                         self.finish_ingest(open, add);
                     }
                 }
-                JobKind::Merge => {
+                JobKind::Merge | JobKind::Remote => {
                     if !open.is_empty() {
                         let mut files: Vec<String> = if add { self.files.clone() } else { Vec::new() };
                         for f in open {
