@@ -419,6 +419,35 @@ impl Store {
         Ok(f.layout.to_v19(&fields))
     }
 
+    /// What the rows of a file say of a hunt it carries: rows with a hunt
+    /// state, those significant, the last day with `baseline` rows and the
+    /// first with judged ones (`YYYY-MM-DD`). None when no row has a state.
+    /// Read from the rows already loaded (those with an origin).
+    pub fn hunt_of_file(&self, file: u16) -> Option<(u64, u64, String, String)> {
+        let (a, b) = self.files.get(file as usize)?.edge_range;
+        let (mut n, mut sig) = (0u64, 0u64);
+        let (mut last_base, mut first_judged): (Option<i64>, Option<i64>) = (None, None);
+        for e in &self.edges[a as usize..b as usize] {
+            if e.hunt == H_NONE {
+                continue;
+            }
+            n += 1;
+            if e.hunt == H_BASELINE {
+                last_base = Some(last_base.map_or(e.t, |x: i64| x.max(e.t)));
+            } else {
+                if e.hunt == H_SIGNIFICANT {
+                    sig += 1;
+                }
+                first_judged = Some(first_judged.map_or(e.t, |x: i64| x.min(e.t)));
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        let day = |t: Option<i64>| t.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+        Some((n, sig, day(last_base), day(first_judged)))
+    }
+
     /// The header line of a file, as written (no line end).
     pub fn header_text(&self, file: u16) -> std::io::Result<String> {
         let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;

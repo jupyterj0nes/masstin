@@ -1303,6 +1303,15 @@ pub(super) fn reveal_in_folder(path: &str) -> Result<(), String> {
     }
 }
 
+/// Two spellings of one file (slashes either way; case too on Windows).
+pub(super) fn same_file(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.replace('\\', "/");
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    norm(a) == norm(b)
+}
+
 fn recent_path() -> Option<PathBuf> {
     config_file("recent.json")
 }

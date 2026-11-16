@@ -64,6 +64,9 @@ pub(super) struct HuntForm {
     pub detectors: [bool; 13],
     /// write hunt, hunt_score, hunt_why into the timeline(s)
     pub annotate: bool,
+    /// what to do with a timeline that already carries a hunt (asked when
+    /// Run is pressed on one)
+    pub if_hunted: crate::graph_hunt_common::record::IfHunted,
     /// the findings table, required when the timeline is left untouched
     pub findings: String,
     pub report_on: bool,
@@ -84,6 +87,7 @@ impl Default for HuntForm {
             sigma: String::new(),
             detectors: [true; 13],
             annotate: true,
+            if_hunted: Default::default(),
             findings: String::new(),
             report_on: false,
             report: String::new(),
@@ -182,6 +186,13 @@ impl HuntForm {
             args.push("--no-annotate".into());
             args.push("-o".into());
             args.push(self.findings.trim().to_string());
+        } else {
+            use crate::graph_hunt_common::record::IfHunted;
+            match self.if_hunted {
+                IfHunted::Overwrite => {}
+                IfHunted::Keep => args.extend(["--if-hunted".to_string(), "keep".to_string()]),
+                IfHunted::New => args.extend(["--if-hunted".to_string(), "new".to_string()]),
+            }
         }
         if self.report_wanted() {
             args.push("--report".into());
@@ -256,6 +267,84 @@ fn time_field(ui: &mut egui::Ui, value: &mut String, hint_text: &str) {
 }
 
 impl Viewer {
+    /// The open timelines that already carry a hunt, with what it was run
+    /// with: the record next to the timeline when there is one, else what
+    /// the rows say.
+    pub(super) fn hunted_timelines(&self) -> Vec<(String, crate::graph_hunt_common::record::Previous)> {
+        use crate::graph_hunt_common::record;
+        let mut out = Vec::new();
+        for (i, f) in self.store.files.iter().enumerate() {
+            let rec = record::read(&f.path);
+            let rows = self.store.hunt_of_file(i as u16);
+            if rec.is_none() && rows.is_none() {
+                continue;
+            }
+            let (hunted_rows, significant, last_baseline_day, first_judged_day) = rows.unwrap_or_default();
+            out.push((f.path.clone(), record::Previous { record: rec, hunted_rows, significant, last_baseline_day, first_judged_day }));
+        }
+        out
+    }
+
+    /// "This timeline is already hunted": the earlier hunt, this one, and
+    /// the three things that can be done.
+    fn hunt_ask_window(&mut self, ctx: &egui::Context) {
+        use crate::graph_hunt_common::record::IfHunted;
+        let Some(hunted) = self.hunt_ask.clone() else { return };
+        let mut answer: Option<Option<IfHunted>> = None;
+        let now = format!("investigation from {} UTC; alpha {}", self.hunt_form.from.trim(), self.hunt_form.alpha.trim());
+        egui::Window::new(format!("{}  Already hunted", ic::WARNING)).id(egui::Id::unique("hunt-ask")).collapsible(false).resizable(false).default_width(640.0).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.label(if hunted.len() == 1 { "This timeline already carries a hunt. Running another one writes over its hunt columns unless you say otherwise.".to_string() } else { format!("{} of the open timelines already carry a hunt. Running another one writes over their hunt columns unless you say otherwise.", hunted.len()) });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (f, prev) in &hunted {
+                    let name = std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
+                    ui.label(theme::semibold(&name, 13.0)).on_hover_text(f);
+                    egui::Grid::new(("hunt-ask", f)).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+                        ui.label(egui::RichText::new("the hunt it has").color(theme::MUTED));
+                        ui.add(egui::Label::new(prev.describe()).wrap());
+                        ui.end_row();
+                        ui.label(egui::RichText::new("this hunt").color(theme::MUTED));
+                        ui.add(egui::Label::new(&now).wrap());
+                        ui.end_row();
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+            theme::hairline(ui);
+            ui.add_space(4.0);
+            let big = |text: String| egui::Button::new(text).min_size(Vec2::new(0.0, 30.0));
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(big(format!("{}  Save as a new timeline", ic::FLOPPY_DISK)).fill(theme::ACCENT).stroke(Stroke::NONE)).on_hover_text("The timeline with this hunt is written to a new file next to it (<name>.hunt-<date>.csv) and the window goes on with that one. The file it is now keeps the hunt it has: nothing is lost").clicked() {
+                    answer = Some(Some(IfHunted::New));
+                }
+                if ui.add(big(format!("{}  Overwrite", ic::ARROWS_CLOCKWISE))).on_hover_text("This hunt replaces the one the timeline has, in the same file. The earlier hunt is gone (the verdicts and notes you wrote stay)").clicked() {
+                    answer = Some(Some(IfHunted::Overwrite));
+                }
+                if ui.add(big(format!("{}  Keep the hunt it has", ic::PUSH_PIN))).on_hover_text("The hunt runs and its findings and report are written, but nothing is written into this timeline: it stays as it is").clicked() {
+                    answer = Some(Some(IfHunted::Keep));
+                }
+                if ui.add(big("Cancel".to_string())).clicked() {
+                    answer = Some(None);
+                }
+            });
+        });
+        match answer {
+            Some(Some(x)) => self.answer_hunted(x),
+            Some(None) => self.hunt_ask = None,
+            None => {}
+        }
+    }
+
+    /// The answer to "already hunted": the hunt runs with it.
+    pub(super) fn answer_hunted(&mut self, x: crate::graph_hunt_common::record::IfHunted) {
+        self.hunt_form.if_hunted = x;
+        self.hunt_ask = None;
+        self.hunt_answered = true;
+        self.hunt_autorun = true;
+        self.show_hunt = true;
+    }
+
     pub(super) fn hunt_window(&mut self, ctx: &egui::Context) {
         if !self.show_hunt {
             return;
@@ -310,7 +399,18 @@ impl Viewer {
                 ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, p)).color(CANDIDATE).small());
             }
         });
+        // a timeline that already carries a hunt: said, with what it was
+        // hunted with, and asked about before anything is written
+        if run && self.hunt_form.problem().is_none() && self.hunt_form.annotate && !self.hunt_answered {
+            let hunted = self.hunted_timelines();
+            if !hunted.is_empty() {
+                self.hunt_ask = Some(hunted);
+                run = false;
+            }
+        }
+        self.hunt_ask_window(ctx);
         if run && self.hunt_form.problem().is_none() {
+            self.hunt_answered = false;
             let args = self.hunt_form.command(&self.files);
             // the window reads the findings with the rate the hunt was run with
             if let Ok(a) = self.hunt_form.alpha.trim().parse::<f64>() {
@@ -459,6 +559,28 @@ mod tests {
             f.command(&["D:/c/t.csv".to_string()]),
             vec!["-a", "graph-hunt-csv", "-f", "D:/c/t.csv", "--investigation-from", "2026-11-10 00:00:00", "--alpha", "0.05"]
         );
+    }
+
+    /// The answer to "already hunted" goes on the command line; overwrite
+    /// is what masstin does unasked, and a hunt that leaves the timeline
+    /// untouched has nothing to ask.
+    #[test]
+    fn the_answer_to_already_hunted_is_on_the_command_line() {
+        use crate::graph_hunt_common::record::IfHunted;
+        let files = ["D:/c/t.csv".to_string()];
+        let mut f = usual();
+        f.if_hunted = IfHunted::New;
+        assert_eq!(f.command(&files)[8..], ["--if-hunted".to_string(), "new".to_string()]);
+        f.if_hunted = IfHunted::Keep;
+        assert_eq!(f.command(&files)[8..], ["--if-hunted".to_string(), "keep".to_string()]);
+        f.if_hunted = IfHunted::Overwrite;
+        assert_eq!(f.command(&files).len(), 8);
+        f.if_hunted = IfHunted::New;
+        f.annotate = false;
+        f.findings = "D:/c/f.csv".into();
+        assert!(!f.command(&files).iter().any(|a| a == "--if-hunted"));
+        assert!(super::super::ingest::same_file("D:\\case\\T.csv", "D:/case/T.csv"));
+        assert_eq!(super::super::ingest::same_file("D:/case/T.csv", "d:/CASE/t.csv"), cfg!(windows));
     }
 
     #[test]

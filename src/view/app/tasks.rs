@@ -358,9 +358,23 @@ impl Viewer {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         let finished = job.done.clone();
         let (kind, open, add) = (job.kind, job.open.clone(), job.add);
+        // a hunt that wrote new timelines (`--if-hunted new`) names them:
+        // "New timeline: OLD -> NEW"
+        let renamed: Vec<(String, String)> = job.log.iter().filter_map(|l| l.split_once("New timeline: ").and_then(|(_, r)| r.split_once(" -> ")).map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))).collect();
         if let Some(Ok(())) = finished {
             match kind {
                 JobKind::Hunt => {
+                    // the window goes on with the new timelines; the ones
+                    // it had keep the hunt they had
+                    for (old, new) in &renamed {
+                        if let Some(f) = self.files.iter_mut().find(|f| super::ingest::same_file(f, old)) {
+                            *f = new.clone();
+                        }
+                    }
+                    if !renamed.is_empty() {
+                        super::ingest::remember(&self.files);
+                    }
+                    self.hunt_form.if_hunted = Default::default();
                     match self.reload_store() {
                         Ok(()) => {
                             self.remembered.clear();

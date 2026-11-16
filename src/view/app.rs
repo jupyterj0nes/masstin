@@ -348,6 +348,10 @@ pub struct Viewer {
     show_db: bool,
     studio: Studio,
     db_form: DbForm,
+    /// the open timelines that already carry a hunt, while the analyst is
+    /// asked what to do with them; and that the answer was given
+    hunt_ask: Option<Vec<(String, crate::graph_hunt_common::record::Previous)>>,
+    hunt_answered: bool,
     /// Timeline mode: the centre of the window is the rows of the CSV, in
     /// the file's own 19 columns, instead of the graph
     show_table: bool,
@@ -780,6 +784,8 @@ impl Viewer {
             studio: Studio::default(),
             db_form: DbForm::default(),
             show_table: false,
+            hunt_ask: None,
+            hunt_answered: false,
             table_find: String::new(),
             table_scope: None,
             table_scope_gen: 0,
@@ -4488,6 +4494,12 @@ impl Viewer {
                 self.notes.add(NoteTarget::Free, &other["note=".len()..]);
                 if let Err(e) = self.save_notes() {
                     eprintln!("masstin: cannot write {}: {}", self.notes.path.display(), e);
+                }
+            }
+            // the answer to "already hunted": overwrite, keep or new
+            other if other.starts_with("hunt-answer=") => {
+                if let Some(x) = crate::graph_hunt_common::record::IfHunted::parse(&other["hunt-answer=".len()..]) {
+                    self.answer_hunted(x);
                 }
             }
             // the two modes, and what moves between them
