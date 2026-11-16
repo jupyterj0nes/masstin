@@ -1710,7 +1710,7 @@ impl Viewer {
                 let c = hunt_color(hunt).unwrap_or(MUTED);
                 ui.label(egui::RichText::new(HUNT_NAMES[hunt as usize]).strong().color(c));
                 if !q.is_nan() {
-                    ui.label(egui::RichText::new(format!("score {} · {}", q as u8, crate::csv_out::score_words(q as u8))).color(MUTED)).on_hover_text("hunt_score: how rare the connection is, 0 to 100 (-10 log10 of its q-value)");
+                    ui.label(egui::RichText::new(format!("score {} · {}", q as u8, crate::csv_out::score_words(q as u8))).color(MUTED)).on_hover_text("hunt_score: how rare the connection is among the connections of normal days, 0 to 100 (-10 log10 of the share of baseline connections at least as unusual)");
                 }
             });
             ui.label(why);

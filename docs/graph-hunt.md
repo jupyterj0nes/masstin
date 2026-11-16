@@ -74,15 +74,17 @@ The full design, with the reasons behind each choice, is in [docs/graph-hunt-sta
 |---|---:|
 | rows in the window (connections) | 465,074 |
 | red-team connections among them | 444 |
-| significant at FDR 0.05 | 204: 185 red team (42 % of the 444) and 19 from one unlabelled machine that failed on 47 hosts and then logged in with 7 accounts new to it |
-| precision of the first 100 rows | 99 % |
-| first row that is not red team | rank 84 (that same machine) |
-| red-team connections in the first 500 rows (0.1 % of the rows) | 286 of 444 (64 %) |
-| red-team sources found | the main one (610 of the 640 window events) at rank 1; the second (26 events, each a single login to a new host) first appears at rank 23,301 |
+| significant at FDR 0.05 | 256: 230 red team (52 % of the 444), 25 from one unlabelled machine that failed on 47 hosts and then logged in with 7 accounts new to it, and 1 from another |
+| precision of the first 100 rows | 100 % |
+| first row that is not red team | rank 108 (that same machine) |
+| red-team connections in the first 500 rows (0.1 % of the rows) | 288 of 444 (65 %) |
+| red-team sources found | the main one (610 of the 640 window events) at rank 1; the second (26 events, each a single login to a new host) first appears at rank 20,283 |
 | incident-free period (days 40 to 43, 241,423 connections, 34,587 of them new) | 0 significant |
 
 Before the null skipped the shallow baseline days (October 2026), the same run gave 56 significant connections, all red team, first non-red-team row at rank 168 and 13 % of the red-team connections: the first baseline days, with one or two days of reference behind them, were filling the null with "new" connections that were merely unseen. The owner weight of the credential switch, added at the same time, does not change the count here (203 without it): on this network a person's own account from a never-seen machine is an everyday event, so the weight tells the analyst whose account it is without making the login rarer.
 
-Reading: an analyst who reads the first 83 rows of 465 thousand sees nothing but attack, and the 19 rows that are not labelled red team are one machine spraying 47 hosts and succeeding with seven accounts it had never used, which no analyst would want hidden. What it does not catch is the red-team machine that made one quiet login per host with a different user each time, an action this network's own baseline contains thousands of times a day (people using their own account from a machine never seen before); no login-graph method detects those without an inventory of who owns which machine (Hopper's own 9 misses are of that kind). For comparison, Hopper reports 94.5 % detection at about 9 alerts a day on 15 months of a 2,300-machine enterprise, with an inventory and two months of training; Argus, the best graph-neural-network result on LANL, reports an average precision of 0.32 that falls to 0.09 under fair labelling (Larroche 2026).
+(Figures of November 2026, after the centrality reference and its day-level comparison were corrected; `hunt_score` of the red team's connections: median 51, of the other new connections: median 9.)
+
+Reading: an analyst who reads the first 107 rows of 465 thousand sees nothing but attack, and 25 of the 26 rows that are not labelled red team are one machine spraying 47 hosts and succeeding with seven accounts it had never used, which no analyst would want hidden. What it does not catch is the red-team machine that made one quiet login per host with a different user each time, an action this network's own baseline contains thousands of times a day (people using their own account from a machine never seen before); no login-graph method detects those without an inventory of who owns which machine (Hopper's own 9 misses are of that kind). For comparison, Hopper reports 94.5 % detection at about 9 alerts a day on 15 months of a 2,300-machine enterprise, with an inventory and two months of training; Argus, the best graph-neural-network result on LANL, reports an average precision of 0.32 that falls to 0.09 under fair labelling (Larroche 2026).
 
 The synthetic-corpus figures of the previous, hand-weighted detectors (May 2026) were retired together with that engine; they were never re-run with the statistical one. The current results are described in the [graph-hunt blog post](https://weinvestigateanything.com/en/tools/masstin-graph-hunt/).

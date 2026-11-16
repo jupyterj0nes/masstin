@@ -174,11 +174,21 @@ pub(crate) fn tail(hunt: &str, hunt_score: &str, hunt_why: &str, verdict: &str, 
 /// Top of the `hunt_score` scale.
 pub(crate) const SCORE_MAX: u8 = 100;
 
-/// The `hunt_score` of a q-value: how rare the connection is, 0 to 100,
-/// on the Phred scale (`-10 log10 q`, rounded): 0 is a connection no
-/// rarer than chance (q = 1), 13 is one in twenty, 20 one in a hundred,
-/// 30 one in a thousand, 60 one in a million, 100 one in ten thousand
-/// million or rarer. None for NaN (no test).
+/// The `hunt_score` of a rarity: `-10 log10` of a probability, rounded, 0
+/// to 100. 0 is no rarer than anything else (1), 13 is one in twenty, 20
+/// one in a hundred, 30 one in a thousand, 60 one in a million, 100 one in
+/// ten thousand million or rarer. None for NaN (not judged).
+///
+/// The probability is the share of normal items that look at least as
+/// unusual: for the hunt, of the baseline connections of the same result,
+/// new or habitual, how many score at least as high on the joint test
+/// (with the add-one correction). It is the quantity a rule of caarea,
+/// faramir, allymacb or a Sigma rule in agentc00pr is scored with (the
+/// share of clean reference rows it fires on), so a score means the same
+/// in every tool. It is NOT the q-value: that one is corrected for every
+/// connection put to the test and decides the word in `hunt`. Until v1.4.x
+/// the score was `-10 log10 q`, which the strongest finding of a case
+/// rarely took past 15 while an ordinary rule of the other tools read 30.
 pub(crate) fn score_of(q: f64) -> Option<u8> {
     if q.is_nan() {
         return None;

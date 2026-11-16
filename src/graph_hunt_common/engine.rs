@@ -912,9 +912,23 @@ fn ts_str(t: i64) -> String {
 // (dependence only costs power). The number of null points at least as
 // high in EVERY coordinate is reported alongside as a plain-language check.
 
+/// The coordinates whose value belongs to a (destination, day), not to a
+/// connection: the change of the destination's PageRank and betweenness
+/// that day. Every connection into the destination that day carries the
+/// same number, a thousand of them on a domain controller. Counted over
+/// null connections, one day on which a hub rose was one event read as a
+/// thousand: against a null of five days it gave "one connection in
+/// 28,000" to something that can only be told apart from five days. These
+/// coordinates are compared day against day: on how many null days did any
+/// connection see a destination rise this much.
+const DAY_COORDS: [usize; 2] = [13, 14];
+
 struct JointNull {
     /// per coordinate, null values ascending
     cols: Vec<Vec<f64>>,
+    /// for the coordinates of `DAY_COORDS`: the highest value of each null
+    /// day, by day
+    day_max: HashMap<usize, BTreeMap<i32, f64>>,
     /// null T values ascending
     t_sorted: Vec<f64>,
     n: usize,
@@ -943,13 +957,38 @@ impl JointNull {
                 v
             })
             .collect();
-        let mut t_sorted: Vec<f64> = rows.iter().map(|r| (0..dims).map(|k| surprise(&cols[k], r[k], n, true)).sum()).collect();
+        let mut day_max: HashMap<usize, BTreeMap<i32, f64>> = HashMap::new();
+        for k in DAY_COORDS.iter().copied().filter(|k| *k < dims) {
+            let m = day_max.entry(k).or_default();
+            for (r, d) in rows.iter().zip(&days) {
+                let x = m.entry(*d).or_insert(0.0);
+                *x = x.max(r[k]);
+            }
+        }
+        let mut jn = JointNull { cols, day_max, t_sorted: Vec::new(), n, rows, days };
+        let mut t_sorted: Vec<f64> = jn.rows.iter().zip(&jn.days).map(|(r, d)| (0..dims).map(|k| jn.surprise_of(k, r[k], Some(*d))).sum()).collect();
         t_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        JointNull { cols, t_sorted, n, rows, days }
+        jn.t_sorted = t_sorted;
+        jn
+    }
+    /// -ln of the share of the null at least as high in coordinate `k`.
+    /// `own_day`: the value is a null row's own, of that day (left out).
+    fn surprise_of(&self, k: usize, v: f64, own_day: Option<i32>) -> f64 {
+        match self.day_max.get(&k) {
+            None => surprise(&self.cols[k], v, self.n, own_day.is_some()),
+            Some(m) => {
+                if v <= 0.0 || m.is_empty() {
+                    return 0.0;
+                }
+                let others = m.iter().filter(|(d, _)| Some(**d) != own_day);
+                let (ge, n) = others.fold((0usize, 0usize), |(ge, n), (_, x)| (ge + usize::from(*x >= v), n + 1));
+                -stats::empirical_p(ge, n).ln()
+            }
+        }
     }
     /// (p, T): conformal p of the joint statistic
     fn test_fast(&self, x: &[f64]) -> (f64, f64) {
-        let t: f64 = x.iter().enumerate().map(|(k, v)| surprise(&self.cols[k], *v, self.n, false)).sum();
+        let t: f64 = x.iter().enumerate().map(|(k, v)| self.surprise_of(k, *v, None)).sum();
         let ge = self.t_sorted.len() - self.t_sorted.partition_point(|v| *v < t - 1e-12);
         (stats::empirical_p(ge, self.n), t)
     }
@@ -969,6 +1008,11 @@ impl JointNull {
 struct Conn {
     p: f64,
     q: f64,
+    /// How rare the connection is among ALL the connections of normal
+    /// days, habitual ones included: (1 + baseline connections at least as
+    /// unusual) / (1 + baseline connections). The `hunt_score` is this, on
+    /// the scale of the four tools; the decision stays with `q`.
+    rarity: f64,
     tstat: f64,
     day: i32,
     first: i64,
@@ -1144,7 +1188,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
 // day); a timeline row belongs to exactly one, found again with the key
 // the corpus rows were built with. The row's `hunt` column says what the
 // hunt made of that connection, `hunt_score` how rare it is (0 to 100,
-// `-10 log10 q`, see `csv_out::score_of`) and `hunt_why` its
+// `-10 log10` of its rarity, see `csv_out::score_of`) and `hunt_why` its
 // explanation. A session end (LOGOFF) is not a connection: it takes the
 // state of the login it closes, found by logon ID on the same
 // destination. The 14 event columns are copied byte for byte; `verdict`
@@ -1404,7 +1448,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
                 }
                 let (hq, why): (String, &str) = if idx != u32::MAX {
                     let r = &rows[idx as usize];
-                    let hq = if st == ST_HABITUAL { "0".to_string() } else { crate::csv_out::score_of(r.q).map(|s| s.to_string()).unwrap_or_default() };
+                    let hq = if st == ST_HABITUAL { "0".to_string() } else { crate::csv_out::score_of(r.rarity).map(|s| s.to_string()).unwrap_or_default() };
                     (hq, r.why.as_str())
                 } else {
                     (String::new(), "")
@@ -1890,8 +1934,8 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         }
     }
 
-    // ── reference graphs (baseline pairs; on a baseline day without the
-    //    pairs unique to it) for Louvain and centrality ──
+    // ── reference graphs (the pairs of the earlier days) for Louvain and
+    //    centrality ──
     let want_comm = enabled[3];
     let want_central = cfg.enabled("pagerank-spike") || cfg.enabled("betweenness-spike");
     // the origins that ever used each account, for the home share
@@ -1907,64 +1951,82 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     }
     let no_origins: Vec<u32> = Vec::new();
     let mut home_cache: HashMap<(i32, u32), f64> = HashMap::new();
-    // The reference graph holds the pairs seen BEFORE the cutoff only. The
-    // index also holds the window days (they are reference for novelty);
-    // with them in this graph a window day's logins were already part of
-    // the reference, its centrality change was always zero and its own
-    // edges shaped the communities it was judged against.
-    let mut base_pairs: Vec<(usize, usize)> = Vec::new();
-    let mut unique_by_day: BTreeMap<i32, HashSet<(usize, usize)>> = BTreeMap::new();
-    for k in ix_pair.m.keys() {
+    // The reference of a day is the graph of the pairs seen on EARLIER
+    // days, and what the day adds is the pairs first seen on it: the same
+    // rule for baseline and window days, the one novelty follows. (It was
+    // two rules: a baseline day added the pairs seen on that one day and
+    // no other, a window day every pair the baseline did not hold. A pair
+    // that appears and stays, a new service or a new workstation, counted
+    // on every window day it was seen and on no baseline day; the window's
+    // centrality changes had nothing to be compared with, and an
+    // incident-free period of the LANL set gave 1,928 significant
+    // connections.)
+    let mut first_seen: BTreeMap<i32, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut node_first: Vec<i32> = vec![i32::MAX; ne];
+    for (k, c0) in &ix_pair.m {
         let (o, d) = *k;
         if o == d {
             continue;
         }
-        // a pair seen on one baseline day only is what that day adds
-        match ix_pair.baseline(k, cutoff_day) {
-            (0, _, _) => continue,
-            (1, Some(first), _) => {
-                unique_by_day.entry(first).or_default().insert((o as usize, d as usize));
-            }
-            _ => {}
+        first_seen.entry(c0.first).or_default().push((o as usize, d as usize));
+        for n in [o as usize, d as usize] {
+            node_first[n] = node_first[n].min(c0.first);
         }
-        base_pairs.push((o as usize, d as usize));
     }
     // the map's order must not reach the graph algorithms
-    base_pairs.sort_unstable();
-    let nodes_of = |edges: &[(usize, usize)]| -> HashSet<usize> { edges.iter().flat_map(|(a, b)| [*a, *b]).collect() };
-    let g_base = DiGraph::from_edges(ne, &base_pairs);
-    let base_nodes = nodes_of(&base_pairs);
-    let comm_base = if want_comm { algos::louvain(&g_base) } else { Vec::new() };
-    let m_base = if want_central { Some((algos::pagerank(&g_base), algos::betweenness(&g_base))) } else { None };
+    for v in first_seen.values_mut() {
+        v.sort_unstable();
+    }
     // PageRank is iterative: two starting points give values that differ
     // by the convergence noise. A change smaller than twice that noise (or
     // than rounding) is no change.
-    let pr_noise = if want_central { algos::pagerank_noise(&g_base) } else { 0.0 };
-    let pr_clean = |a: f64, b: f64| -> f64 {
+    let pr_clean = |a: f64, b: f64, noise: f64| -> f64 {
         let d = a - b;
-        if d.abs() <= (2.0 * pr_noise).max((ne.max(1) as f64) * f64::EPSILON * a.abs().max(b.abs())) {
+        if d.abs() <= (2.0 * noise).max((ne.max(1) as f64) * f64::EPSILON * a.abs().max(b.abs())) {
             0.0
         } else {
             d
         }
     };
-    let mut comm_day: HashMap<i32, (Vec<usize>, HashSet<usize>)> = HashMap::new();
+    let event_days: BTreeSet<i32> = evs.iter().map(|e| e.day).collect();
+    // communities of the graph before each day
+    let mut comm_day: HashMap<i32, std::rc::Rc<Vec<usize>>> = HashMap::new();
+    // change of PageRank and betweenness the day's new pairs make
     let mut delta_day: HashMap<i32, (Vec<f64>, Vec<f64>)> = HashMap::new();
-    for (day, uniq) in &unique_by_day {
-        let need_c = want_comm;
-        let need_m = want_central && *day >= s_day;
-        if !need_c && !need_m {
-            continue;
-        }
-        let r: Vec<(usize, usize)> = base_pairs.iter().copied().filter(|p| !uniq.contains(p)).collect();
-        let g = DiGraph::from_edges(ne, &r);
-        if need_c {
-            comm_day.insert(*day, (algos::louvain(&g), nodes_of(&r)));
-        }
-        if need_m {
-            let (pb, bb) = m_base.as_ref().unwrap();
-            let (pr, bc) = (algos::pagerank(&g), algos::betweenness(&g));
-            delta_day.insert(*day, (pb.iter().zip(&pr).map(|(a, b)| pr_clean(*a, *b)).collect(), bb.iter().zip(&bc).map(|(a, b)| clean_delta(*a, *b, ne * ne)).collect()));
+    {
+        let mut prefix: Vec<(usize, usize)> = Vec::new();
+        let mut comm_at: Option<(usize, std::rc::Rc<Vec<usize>>)> = None;
+        let mut metrics_at: Option<(usize, Vec<f64>, Vec<f64>)> = None;
+        for day in &event_days {
+            if want_comm {
+                let cm = match &comm_at {
+                    Some((n, cm)) if *n == prefix.len() => cm.clone(),
+                    _ => std::rc::Rc::new(algos::louvain(&DiGraph::from_edges(ne, &prefix))),
+                };
+                comm_at = Some((prefix.len(), cm.clone()));
+                comm_day.insert(*day, cm);
+            }
+            let added: &[(usize, usize)] = first_seen.get(day).map(|v| v.as_slice()).unwrap_or(&[]);
+            // the days that are compared: the window's and the baseline's
+            // from the start of the panel on
+            let need_m = want_central && !added.is_empty() && (!is_base(*day) || *day >= s_day);
+            if need_m {
+                let (pb, bb) = match metrics_at.take() {
+                    Some((n, pr, bc)) if n == prefix.len() => (pr, bc),
+                    _ => {
+                        let g = DiGraph::from_edges(ne, &prefix);
+                        (algos::pagerank(&g), algos::betweenness(&g))
+                    }
+                };
+                prefix.extend_from_slice(added);
+                let g = DiGraph::from_edges(ne, &prefix);
+                let (pr, bc) = (algos::pagerank(&g), algos::betweenness(&g));
+                let noise = algos::pagerank_noise(&g);
+                delta_day.insert(*day, (pr.iter().zip(&pb).map(|(a, b)| pr_clean(*a, *b, noise)).collect(), bc.iter().zip(&bb).map(|(a, b)| clean_delta(*a, *b, ne * ne)).collect()));
+                metrics_at = Some((prefix.len(), pr, bc));
+            } else {
+                prefix.extend_from_slice(added);
+            }
         }
     }
 
@@ -1995,7 +2057,6 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     let mut triples: Vec<TripleDay> = Vec::new();
     let mut origin_days: BTreeMap<(i32, u32), OriginDay> = BTreeMap::new();
     let mut ok_events: Vec<OkEvent> = Vec::new();
-    let mut pairs_by_day: BTreeMap<i32, BTreeSet<(u32, u32)>> = BTreeMap::new();
     let mut i = 0usize;
     while i < evs.len() {
         let day = evs[i].day;
@@ -2005,10 +2066,11 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         }
         let b = is_base(day);
         let today = &evs[i..j];
-        let (cm, cnodes): (&Vec<usize>, &HashSet<usize>) = match (b, comm_day.get(&day)) {
-            (true, Some(x)) => (&x.0, &x.1),
-            _ => (&comm_base, &base_nodes),
-        };
+        // the communities of the graph of the earlier days, and whether a
+        // machine was in that graph
+        let no_comm: Vec<usize> = Vec::new();
+        let cm: &Vec<usize> = comm_day.get(&day).map(|x| x.as_ref()).unwrap_or(&no_comm);
+        let in_graph = |n: u32| node_first[n as usize] < day;
         let mut tri: HashMap<(u32, u32, u32, u8), (u64, i64, i64, u64)> = HashMap::new();
         let mut ltc: HashMap<(u32, u32, u32), u64> = HashMap::new();
         // last LOGOFF of the day per (origin, destination, account)
@@ -2077,11 +2139,10 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
                     let pnew = ix_pair.is_new(&(e.o, e.d), day);
                     if pnew && e.o != e.d {
                         od.new_dsts.insert(e.d);
-                        if want_comm && cnodes.contains(&(e.o as usize)) && cnodes.contains(&(e.d as usize)) && cm[e.o as usize] != cm[e.d as usize] {
+                        if want_comm && in_graph(e.o) && in_graph(e.d) && cm[e.o as usize] != cm[e.d as usize] {
                             od.cross_dsts.insert(e.d);
                         }
                     }
-                    pairs_by_day.entry(day).or_default().insert((e.o, e.d));
                     let an = c.accts.name(e.a);
                     if !is_uid_account(an) {
                         let oa_new = ix_oa.is_new(&(e.o, e.a), day);
@@ -2246,30 +2307,10 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     // same result (login OK / failed / unauthenticated) on the baseline
     // days, on the destinations both days could show.
 
-    // window-day centrality deltas (baseline graph + the day's logins)
-    let mut win_delta: HashMap<i32, (Vec<f64>, Vec<f64>)> = HashMap::new();
-    if let Some((pb, bb)) = m_base.as_ref() {
-        for wday in &win_days {
-            let mut e: Vec<(usize, usize)> = base_pairs.clone();
-            if let Some(ps) = pairs_by_day.get(wday) {
-                e.extend(ps.iter().filter(|(o, d)| o != d).map(|(o, d)| (*o as usize, *d as usize)));
-            }
-            let g = DiGraph::from_edges(ne, &e);
-            let (pr, bc) = (algos::pagerank(&g), algos::betweenness(&g));
-            win_delta.insert(
-                *wday,
-                (
-                    pr.iter().zip(pb).map(|(a, b)| pr_clean(*a, *b)).collect(),
-                    bc.iter().zip(bb).map(|(a, b)| clean_delta(*a, *b, ne * ne)).collect(),
-                ),
-            );
-        }
-    }
     let use_pr = cfg.enabled("pagerank-spike");
     let use_bc = cfg.enabled("betweenness-spike");
     let cen = |day: i32, d: u32| -> (f64, f64) {
-        let src = if is_base(day) { delta_day.get(&day) } else { win_delta.get(&day) };
-        match src {
+        match delta_day.get(&day) {
             Some((p, b)) => (if use_pr { p[d as usize].max(0.0) } else { 0.0 }, if use_bc { b[d as usize].max(0.0) } else { 0.0 }),
             None => (0.0, 0.0),
         }
@@ -2345,6 +2386,9 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         p: f64,
         tstat: f64,
         n_null: usize,
+        /// every baseline connection of this result the null was drawn
+        /// from, new or habitual
+        n_all: usize,
         marg: Vec<(usize, f64, usize)>,
         /// destination without comparable coverage; evaluated only because
         /// the origin has no baseline at all
@@ -2378,6 +2422,11 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
                 .filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && deep(t.day) && t.flags & F_TRIPLE != 0 && on_panel(t) && had_history(t))
                 .map(|t| (features(t, &okp, &failp, &mut cache, false).to_vec(), t.day))
                 .unzip();
+            // the same baseline connections with the habitual ones: what
+            // "one in N normal connections" is counted over (a habitual
+            // connection is never unusual, so it is never at least as
+            // unusual as a new one: it only counts in the N)
+            let n_all = triples.iter().filter(|t| t.cls == cls && is_base(t.day) && t.day >= s_day && deep(t.day) && on_panel(t) && had_history(t)).count();
             let jn = JointNull::new(null_rows, null_row_days, 17);
             for t in triples.iter().filter(|t| t.cls == cls && t.day == *wday) {
                 let off = !on_panel(t);
@@ -2392,7 +2441,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
                 let x = features(t, &okp, &failp, &mut cache, off);
                 let (p, tstat) = jn.test_fast(&x);
                 let marg: Vec<(usize, f64, usize)> = (0..17).map(|k| if x[k] > 0.0 { jn.marginal(k, x[k]) } else { (jn.n, 1.0, null_days.len()) }).collect();
-                tested.push(Tested { t, x, p, tstat, n_null: jn.n, marg, off_panel: off });
+                tested.push(Tested { t, x, p, tstat, n_null: jn.n, n_all, marg, off_panel: off });
             }
         }
     }
@@ -2421,6 +2470,21 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         .iter()
         .filter_map(|cls| tested.iter().find(|x| x.t.cls == *cls).map(|x| format!("{} 1/{}", match *cls { OK => "logins", FAIL => "failed logins", _ => "unauthenticated connections" }, x.n_null + 1)))
         .collect();
+    // what the score is counted over: every baseline connection of the
+    // result, new or habitual (the largest null of the window days)
+    let rarest: Vec<String> = [OK, FAIL, PRE]
+        .iter()
+        .filter_map(|cls| {
+            tested.iter().filter(|x| x.t.cls == *cls).map(|x| x.n_all).max().map(|n| {
+                format!(
+                    "{} one in {} (score {})",
+                    match *cls { OK => "logins", FAIL => "failed logins", _ => "unauthenticated connections" },
+                    n + 1,
+                    crate::csv_out::score_of(1.0 / (n as f64 + 1.0)).unwrap_or(0)
+                )
+            })
+        })
+        .collect();
     lines.push(format!(
         "Connections: {} new connections tested (origin, destination, account, result, day) against {} baseline day(s), {} habitual (p = 1, not tested); {} significant at FDR {} (Benjamini-Hochberg over the new ones); {} on destinations without comparable coverage; smallest reachable p: {}",
         family.len(),
@@ -2431,6 +2495,12 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         not_eval.len(),
         floor.join(", ")
     ));
+    if !rarest.is_empty() {
+        lines.push(format!(
+            "Score: how rare each connection is among all the baseline connections of its result, habitual ones included (hunt_score = -10 log10 of that share); the rarest a connection can read: {}",
+            rarest.join(", ")
+        ));
+    }
 
     // ── campaigns (origins with no history sharing a new account) ──
     let mut campaign_of: HashMap<u32, String> = HashMap::new();
@@ -2676,9 +2746,13 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         let why_text = why.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>().join("; ");
         let evidence = why.iter().filter(|(_, e)| !e.is_empty()).map(|(w, e)| format!("{}: {}", w, e)).collect::<Vec<_>>().join("; ");
         let acct = c.accts.name(t.a);
+        // (1 + null connections at least as unusual) is p x (N + 1); a
+        // habitual connection is like every other: rarity 1
+        let rarity = if t.flags & F_TRIPLE == 0 || !(tt.p < 1.0) { 1.0 } else { (tt.p * (tt.n_null as f64 + 1.0) / (tt.n_all as f64 + 1.0)).min(1.0) };
         out.push(Conn {
             p: tt.p,
             q: qs[i],
+            rarity,
             tstat: tt.tstat,
             day: t.day,
             first: t.t0,
@@ -2709,6 +2783,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         out.push(Conn {
             p: f64::NAN,
             q: f64::NAN,
+            rarity: f64::NAN,
             tstat: f64::NAN,
             day: t.day,
             first: t.t0,
@@ -3320,7 +3395,7 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>, ents: &Entities, d
         )
     };
     let mut buf = String::from(
-        "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,signature,why_unusual,evidence,chain,campaign,cypher_snippet
+        "rank,significant,p_value,q_value,day,first_seen_utc,last_seen_utc,origin,destination,account,result,events,logs,signature,why_unusual,evidence,chain,campaign,cypher_snippet,rarity,hunt_score
 ",
     );
     for (k, r) in rows.iter().enumerate() {
@@ -3332,7 +3407,7 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>, ents: &Entities, d
             "no"
         };
         buf.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
 ",
             k + 1,
             sig,
@@ -3353,6 +3428,8 @@ fn write_csv(rows: &[Conn], alpha: f64, output: Option<&str>, ents: &Entities, d
             csv_escape(&r.chain),
             csv_escape(&r.campaign),
             csv_escape(&snippet(r)),
+            fmt_p(r.rarity),
+            crate::csv_out::score_of(r.rarity).map(|s| s.to_string()).unwrap_or_default(),
         ));
     }
     match output {
@@ -3781,6 +3858,119 @@ mod tests {
         assert_eq!((state(2).as_str(), state(3).as_str()), ("habitual", "habitual"));
         assert_eq!((state(4).as_str(), state(5).as_str()), ("", ""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A value that belongs to a (destination, day) is compared day against
+    /// day: a thousand null connections of one day that share it are one
+    /// event.
+    #[test]
+    fn a_day_level_coordinate_is_counted_over_days() {
+        // five null days of 100 connections each; on day 3 every
+        // connection carries 9.0 in coordinate 13 (one hub rose that day),
+        // on the others 1.0. Coordinate 0 varies by connection.
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        let mut days: Vec<i32> = Vec::new();
+        for d in 1..=5 {
+            for i in 0..100 {
+                let mut r = vec![0.0; 17];
+                r[0] = (i % 10) as f64;
+                r[13] = if d == 3 { 9.0 } else { 1.0 };
+                rows.push(r);
+                days.push(d);
+            }
+        }
+        let jn = JointNull::new(rows, days, 17);
+        // higher than every null day: one day in six, not one connection in 501
+        let s = jn.surprise_of(13, 50.0, None);
+        assert!((s - 6f64.ln()).abs() < 1e-9, "{s}");
+        // reached on one null day of five: two in six
+        let s = jn.surprise_of(13, 9.0, None);
+        assert!((s - 3f64.ln()).abs() < 1e-9, "{s}");
+        // a null row of day 3 leaves its own day out: no other day of four
+        let s = jn.surprise_of(13, 9.0, Some(3));
+        assert!((s - 5f64.ln()).abs() < 1e-9, "{s}");
+        // a connection-level coordinate is counted over connections as before
+        let s = jn.surprise_of(0, 9.0, None);
+        assert!((s - (501.0f64 / 51.0).ln()).abs() < 1e-9, "{s}");
+        // the hundred connections of the day the hub rose are not, for that
+        // alone, the rarest of the null
+        let mut x = vec![0.0; 17];
+        x[13] = 50.0;
+        let (p, _) = jn.test_fast(&x);
+        assert!(p > 0.05, "{p}");
+    }
+
+    /// `hunt_score` is the connection's rarity among ALL the baseline
+    /// connections, habitual ones included, and never its q-value: the
+    /// same count as the p-value over a larger total.
+    #[test]
+    fn the_score_is_rarity_among_every_baseline_connection() {
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        // twelve baseline days: four habitual connections every day, and on
+        // each of the last eight days one connection never seen before
+        for d in 1..=12u32 {
+            for (k, (src, dst, user)) in [("10.0.0.5", "SRV01", "alice"), ("10.0.0.6", "SRV01", "bob"), ("10.0.0.5", "SRV02", "alice"), ("10.0.0.7", "SRV02", "carol")].iter().enumerate() {
+                lines.push(format!("{}{}", login(d, 8 + k as u32, src, dst, user, "SUCCESSFUL_LOGON", &format!("0x{}{}", d, k)), crate::csv_out::EMPTY_TAIL));
+            }
+            if d >= 5 {
+                lines.push(format!("{}{}", login(d, 14, &format!("10.0.1.{}", d), "SRV01", "alice", "SUCCESSFUL_LOGON", &format!("0xn{}", d)), crate::csv_out::EMPTY_TAIL));
+            }
+        }
+        // the window day: the four habitual ones, a newcomer with a new
+        // account on two servers, and one more ordinary new connection
+        for (k, (src, dst, user)) in [("10.0.0.5", "SRV01", "alice"), ("10.0.0.6", "SRV01", "bob"), ("10.0.0.5", "SRV02", "alice"), ("10.0.0.7", "SRV02", "carol")].iter().enumerate() {
+            lines.push(format!("{}{}", login(13, 8 + k as u32, src, dst, user, "SUCCESSFUL_LOGON", &format!("0xw{}", k)), crate::csv_out::EMPTY_TAIL));
+        }
+        lines.push(format!("{}{}", login(13, 12, "10.0.0.99", "SRV01", "mallory", "SUCCESSFUL_LOGON", "0x99"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(13, 13, "10.0.0.99", "SRV02", "mallory", "SUCCESSFUL_LOGON", "0x9a"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(13, 15, "10.0.1.13", "SRV01", "alice", "SUCCESSFUL_LOGON", "0xn13"), crate::csv_out::EMPTY_TAIL));
+        let path = tmp_path("rarity.csv");
+        let out = tmp_path("rarity.findings.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let files = vec![path.clone()];
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-13T00:00:00Z"), Some(&out), None, Some(Annotate { files: &files, carry_marks: None }));
+        let findings: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&out).unwrap().records().map(|r| r.unwrap()).collect();
+        let head = csv::ReaderBuilder::new().from_path(&out).unwrap().headers().unwrap().clone();
+        let col = |name: &str| head.iter().position(|h| h == name).unwrap_or_else(|| panic!("no column {}", name));
+        let (cp, cq, cr, cs, csig) = (col("p_value"), col("q_value"), col("rarity"), col("hunt_score"), col("signature"));
+        assert_eq!(findings.len(), 7);
+        let mut ratios: Vec<f64> = Vec::new();
+        for f in &findings {
+            let (p, q, rarity): (f64, f64, f64) = (f[cp].parse().unwrap(), f[cq].parse().unwrap(), f[cr].parse().unwrap());
+            let score: u8 = f[cs].parse().unwrap();
+            assert_eq!(Some(score), crate::csv_out::score_of(rarity), "{:?}", f);
+            if &f[csig] == "habitual connection" {
+                assert_eq!((rarity, score), (1.0, 0), "a habitual connection is like any other: {:?}", f);
+                continue;
+            }
+            // the same count over a larger total: rarer than p, which is no larger than q
+            assert!(rarity < p && p <= q, "{:?}", f);
+            assert!(score > crate::csv_out::score_of(q).unwrap(), "a rarity, not the q-value: {:?}", f);
+            ratios.push(rarity / p);
+        }
+        assert_eq!(ratios.len(), 3);
+        // (new baseline connections + 1) / (baseline connections + 1) is one
+        // number for every login of the day. The null days are the last six
+        // (those with half the baseline before them): 6 new connections and
+        // 6 x 4 habitual ones on destinations covered before, so 7 / 31
+        for r in &ratios {
+            assert!((r - 7.0 / 31.0).abs() < 1e-3, "{:?}", ratios);
+        }
+        // the timeline carries the same score on the rows of each connection
+        let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&path).unwrap().records().map(|r| r.unwrap()).collect();
+        let window: Vec<&csv::StringRecord> = rows.iter().filter(|r| r[0].starts_with("2026-01-13")).collect();
+        assert_eq!(window.len(), 7);
+        let mut from_timeline: Vec<String> = window.iter().map(|r| r[15].to_string()).collect();
+        let mut from_findings: Vec<String> = findings.iter().map(|f| f[cs].to_string()).collect();
+        from_timeline.sort();
+        from_findings.sort();
+        assert_eq!(from_timeline, from_findings);
+        // the newcomer's two logins are the rarest of the day
+        let score_of_row = |user: &str, src: &str| -> u8 { window.iter().find(|r| &r[5] == user && &r[8] == src).map(|r| r[15].parse().unwrap()).unwrap() };
+        assert!(score_of_row("mallory", "10.0.0.99") >= score_of_row("alice", "10.0.1.13"));
+        assert_eq!(score_of_row("alice", "10.0.0.5"), 0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&out);
     }
 
     /// The hunt of the same events is the same whatever order they are

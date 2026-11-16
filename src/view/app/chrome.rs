@@ -587,7 +587,7 @@ impl Viewer {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("score ≥").color(theme::MUTED));
                 ui.spacing_mut().slider_width = (ui.available_width() - 48.0).max(80.0);
-                changed |= ui.add(egui::Slider::new(&mut self.draft.min_score, 0..=100).show_value(true)).on_hover_text("hunt_score: how rare a connection is, 0 to 100; 13 is one in twenty, 30 one in a thousand, 60 one in a million").changed();
+                changed |= ui.add(egui::Slider::new(&mut self.draft.min_score, 0..=100).show_value(true)).on_hover_text("hunt_score: how rare a connection is among the connections of normal days, 0 to 100; 13 is one in twenty, 20 one in a hundred, 30 one in a thousand, 40 one in ten thousand").changed();
             });
             ui.label(egui::RichText::new(if self.draft.min_score == 0 { "any score".to_string() } else { crate::csv_out::score_words(self.draft.min_score).to_string() }).small().color(theme::DIM));
             ui.add_space(2.0);
