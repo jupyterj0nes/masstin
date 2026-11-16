@@ -4418,6 +4418,28 @@ impl Viewer {
                 self.open_files(vec![other["open=".len()..].to_string()]);
             }
             "persist" => self.persist(),
+            other if other.starts_with("open-case=") => {
+                self.open_case(std::path::PathBuf::from(&other["open-case=".len()..]));
+            }
+            // the rows of a connection (the n-th edge of the view), a text
+            // typed into its notes box, and "Save on all rows" with a verdict
+            other if other.starts_with("rows=") => {
+                let i: usize = other["rows=".len()..].parse().unwrap_or(0);
+                if i < self.graph.edges.len() {
+                    self.load_rows(i);
+                }
+            }
+            other if other.starts_with("note=") => self.notes_draft = other["note=".len()..].to_string(),
+            other if other.starts_with("mark-all=") => {
+                if let Some(i) = self.rows.as_ref().map(|(e, _, _)| *e) {
+                    let v = super::store::verdict_code(&other["mark-all=".len()..]);
+                    let all: Vec<(u16, u32)> = self.graph.edges[i].rows.iter().map(|&ei| (self.store.edges[ei as usize].file, self.store.edges[ei as usize].line)).collect();
+                    self.mark_rows(i, &all, v);
+                    if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
+                        eprintln!("[view] mark: {}", self.mark_msg);
+                    }
+                }
+            }
             other if other.starts_with("save-view=") => {
                 let name = other["save-view=".len()..].to_string();
                 self.saved.retain(|v| v.name != name);

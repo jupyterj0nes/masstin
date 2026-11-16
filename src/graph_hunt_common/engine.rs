@@ -174,7 +174,51 @@ struct Corpus {
     ambiguous: HashSet<String>,
 }
 
+impl Interner {
+    /// The names in their own order, and for each old id its new one.
+    fn sorted(&mut self) -> Vec<u32> {
+        let mut order: Vec<u32> = (0..self.names.len() as u32).collect();
+        order.sort_by(|a, b| self.names[*a as usize].cmp(&self.names[*b as usize]));
+        let mut new_of = vec![0u32; order.len()];
+        let mut names = Vec::with_capacity(order.len());
+        for (new, old) in order.iter().enumerate() {
+            new_of[*old as usize] = new as u32;
+            names.push(std::mem::take(&mut self.names[*old as usize]));
+        }
+        self.map = names.iter().enumerate().map(|(i, n)| (n.clone(), i as u32)).collect();
+        self.names = names;
+        new_of
+    }
+}
+
 impl Corpus {
+    /// The same corpus whatever order its rows arrived in. Machines,
+    /// accounts and the rest are numbered as they are first met, and where
+    /// two things tie (two origins an account used equally often, two
+    /// hosts of one score) the lower number wins: a timeline read from a
+    /// file, from Neo4j and from Memgraph met them in three orders, and
+    /// the same hunt gave p-values that differed in the third decimal.
+    /// Numbered by name and with the rows in one order, it gives one answer.
+    fn canonical(&mut self) {
+        let nodes = self.nodes.sorted();
+        let accts = self.accts.sorted();
+        let fams = self.fams.sorted();
+        let lts = self.lts.sorted();
+        let ets = self.ets.sorted();
+        // (the empty session id sorts first and stays 0, "none")
+        let lids = self.lids.sorted();
+        for r in self.rows.iter_mut() {
+            r.o = nodes[r.o as usize];
+            r.d = nodes[r.d as usize];
+            r.a = accts[r.a as usize];
+            r.fam = fams[r.fam as usize];
+            r.lt = lts[r.lt as usize];
+            r.et = ets[r.et as usize];
+            r.lid = lids[r.lid as usize];
+        }
+        self.rows.sort_by(|x, y| (x.t, x.o, x.d, x.a, x.cls, x.et, x.lt, x.lid, x.fam, x.n, x.logoff).cmp(&(y.t, y.o, y.d, y.a, y.cls, y.et, y.lt, y.lid, y.fam, y.n, y.logoff)));
+    }
+
     fn empty() -> Corpus {
         Corpus { cov: HashMap::new(), aliases: HashMap::new(), fams: Interner::default(), nodes: Interner::default(), accts: Interner::default(), lts: Interner::default(), ets: Interner::default(), lids: Interner::default(), rows: Vec::new(), bad_ts: 0, ambiguous: HashSet::new() }
     }
@@ -1022,6 +1066,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
     }
     crate::banner::print_phase("4", "4", "Computing statistics...");
     let mut corpus = corpus;
+    corpus.canonical();
     if let Some(end) = cfg.end {
         let e = end.timestamp();
         corpus.rows.retain(|r| r.t <= e);
@@ -1482,6 +1527,20 @@ fn build_entities_from(c: &Corpus, res: HashMap<String, resolve::Resolution>) ->
             }
         }
     }
+    // Machines numbered by their name. Numbered as their nodes came, a
+    // timeline whose addresses are folded here (a CSV: the address nodes
+    // sort before the names) and the same timeline already folded by a
+    // loader numbered the same machines differently, and ties went to
+    // another machine.
+    let new_of = names.sorted();
+    let mut by_name: Vec<BTreeSet<String>> = vec![BTreeSet::new(); aliases.len()];
+    for (old, set) in aliases.into_iter().enumerate() {
+        by_name[new_of[old] as usize] = set;
+    }
+    let aliases = by_name;
+    for id in of_node.iter_mut() {
+        *id = new_of[*id as usize];
+    }
     (Entities { names, aliases, of_node, not_run: None }, res)
 }
 
@@ -1648,7 +1707,8 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     // the same rows when they fold an IP, so a hunt on a loaded graph and
     // on the CSV see the same rows
     evs.retain(|e| e.o != e.d);
-    evs.sort_by_key(|e| e.t);
+    // (one order for the events of a same second, whatever the source)
+    evs.sort_by(|x, y| (x.t, x.o, x.d, x.a, x.cls, x.et, x.lt, x.lid, x.fam, x.n, x.logoff).cmp(&(y.t, y.o, y.d, y.a, y.cls, y.et, y.lt, y.lid, y.fam, y.n, y.logoff)));
     let fam_cov: Vec<(bool, bool)> = c.fams.names.iter().map(|f| super::coverage_kinds(f)).collect();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
     let win_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| !is_base(*d)).collect();
@@ -3721,6 +3781,40 @@ mod tests {
         assert_eq!((state(2).as_str(), state(3).as_str()), ("habitual", "habitual"));
         assert_eq!((state(4).as_str(), state(5).as_str()), ("", ""));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The hunt of the same events is the same whatever order they are
+    /// read in (a file, or a graph database that returns them as it likes).
+    #[test]
+    fn the_order_the_rows_arrive_in_does_not_change_the_hunt() {
+        let mut lines: Vec<String> = Vec::new();
+        for d in 1..=12 {
+            for (k, (src, dst, user)) in [("10.0.0.5", "SRV01", "alice"), ("10.0.0.6", "SRV01", "bob"), ("10.0.0.5", "SRV02", "alice"), ("10.0.0.7", "SRV02", "carol"), ("10.0.0.6", "SRV02", "alice"), ("10.0.0.7", "SRV01", "alice")].iter().enumerate() {
+                lines.push(format!("{}{}", login(d, 8 + k as u32, src, dst, user, "SUCCESSFUL_LOGON", &format!("0x{}{}", d, k)), crate::csv_out::EMPTY_TAIL));
+            }
+        }
+        for (k, (src, dst, user)) in [("10.0.0.99", "SRV01", "mallory"), ("10.0.0.5", "SRV02", "bob"), ("10.0.0.98", "SRV02", "carol"), ("10.0.0.7", "SRV01", "bob")].iter().enumerate() {
+            lines.push(format!("{}{}", login(13, 9 + k as u32, src, dst, user, "SUCCESSFUL_LOGON", &format!("0xf{}", k)), crate::csv_out::EMPTY_TAIL));
+        }
+        let hunt = |order: &[String], name: &str| -> String {
+            let path = tmp_path(name);
+            let out = tmp_path(&format!("{}.findings.csv", name));
+            std::fs::write(&path, format!("{}\n{}\n", crate::csv_out::HEADER, order.join("\n"))).unwrap();
+            run_csv(&[path.clone()], &super::super::NEO4J, &hunt_settings("2026-01-13T00:00:00Z"), Some(&out), None, None);
+            let text = std::fs::read_to_string(&out).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&out);
+            text
+        };
+        let as_written = hunt(&lines, "order-a.csv");
+        assert!(as_written.lines().count() > 4, "{}", as_written);
+        let mut reversed = lines.clone();
+        reversed.reverse();
+        assert_eq!(hunt(&reversed, "order-b.csv"), as_written);
+        // every third row first, then the rest: another order again
+        let mut shuffled: Vec<String> = lines.iter().step_by(3).cloned().collect();
+        shuffled.extend(lines.iter().enumerate().filter(|(i, _)| i % 3 != 0).map(|(_, l)| l.clone()));
+        assert_eq!(hunt(&shuffled, "order-c.csv"), as_written);
     }
 
     /// A note of several lines survives the hunt, run after run: the

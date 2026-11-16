@@ -459,9 +459,24 @@ fn resolve_to_edge(
         dst_raw.to_string()
     };
 
-    if origin_name.eq_ignore_ascii_case(&destination_name) {
-        return None;
-    }
+    // The name of the origin is the destination itself: an RDP logon is
+    // logged with the server's own name as the workstation and the
+    // client's address beside it. The address is the origin then, as in
+    // graph-hunt-csv; only when it names no other machine is the row a
+    // machine talking to itself.
+    let origin_name = if origin_name.eq_ignore_ascii_case(&destination_name) {
+        let by_address = if src_ip_raw.is_empty() || local_values.contains(src_ip_raw) {
+            None
+        } else {
+            Some(ip_to_host.get(src_ip_raw).cloned().unwrap_or_else(|| src_ip_raw.to_string()))
+        };
+        match by_address {
+            Some(a) if !a.eq_ignore_ascii_case(&destination_name) => a,
+            _ => return None,
+        }
+    } else {
+        origin_name
+    };
 
     let target_user_raw = &parts[idx.target_user];
     let relation_type = if target_user_raw.trim().is_empty() || target_user_raw == "\"\"" {

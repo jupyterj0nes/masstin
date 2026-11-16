@@ -253,6 +253,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The hive of a lab user after a share was mapped by address as a drive
+    /// and opened in Explorer (DEV-DC01, 2026-11-16): `MASSTIN_MP2_LAB=<dir
+    /// with ryan.devlead_NTUSER.DAT and its logs>`. The share is a
+    /// connection from the machine of the hive to the server; the server's
+    /// address is the destination and never the source.
+    #[test]
+    fn lab_hive_share_mapped_by_address() {
+        let Ok(dir) = std::env::var("MASSTIN_MP2_LAB") else { return };
+        let events = parse_mountpoints(Path::new(&dir), "DEV-DC01");
+        for e in &events {
+            println!("{} | dst {} | src {} / [{}] | {} | {}", e.time_created, e.computer, e.workstation_name, e.ip_address, e.target_user_name, e.detail);
+        }
+        let by_ip: Vec<_> = events.iter().filter(|e| e.computer == "10.10.0.37").collect();
+        assert!(!by_ip.is_empty(), "the share mapped by address");
+        assert!(events.iter().all(|e| e.ip_address.is_empty() && e.workstation_name == "DEV-DC01"));
+    }
+
     /// Real hive from the lab: `MASSTIN_MP2_FIXTURE=<dir with user_NTUSER.DAT and its logs>`.
     /// Expects live and deleted share keys and prints what was found.
     #[test]

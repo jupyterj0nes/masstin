@@ -320,7 +320,10 @@ pub async fn load_memgraph(
 
             if local_values.contains(&row[idx_src_computer]) && local_values.contains(&row[idx_src_ip]) {
                 None
-            } else if row[idx_dst] == row[idx_src_computer] {
+            } else if row[idx_dst] == row[idx_src_computer] && (local_values.contains(&row[idx_src_ip]) || row[idx_src_ip] == row[idx_dst]) {
+                // (the destination named as its own origin AND no address
+                // of another machine: with one, the address is the origin,
+                // decided where the edge is resolved)
                 None
             } else if row[idx_dst] == row[idx_src_ip] {
                 None
@@ -510,9 +513,23 @@ pub async fn load_memgraph(
             // at the same host post-resolution. Self-loops are pure noise in
             // a lateral-movement graph. Checked here because resolution itself
             // creates new matches (e.g. 192.168.10.11 → WINTERFELL).
-            if origin_name.eq_ignore_ascii_case(&destination_name) {
-                continue;
-            }
+            // (unless the address names another machine: an RDP logon is
+            // logged with the server's own name as the workstation and the
+            // client's address beside it; the address is the origin then,
+            // as in graph-hunt-csv and load-neo4j)
+            let origin_name = if origin_name.eq_ignore_ascii_case(&destination_name) {
+                let by_address = if src_ip_raw.is_empty() || local_values.contains(src_ip_raw) {
+                    None
+                } else {
+                    Some(ip_to_host.get(src_ip_raw).cloned().unwrap_or_else(|| src_ip_raw.to_string()))
+                };
+                match by_address {
+                    Some(a) if !a.eq_ignore_ascii_case(&destination_name) => a,
+                    _ => continue,
+                }
+            } else {
+                origin_name
+            };
 
             // Relationship type must be a valid Cypher identifier:
             // [A-Za-z_][A-Za-z0-9_]*. Anything else (`$`, `!`, dots, hyphens,
