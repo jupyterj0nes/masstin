@@ -51,11 +51,9 @@ pub async fn parse_cortex_data(
     crate::banner::print_phase("1", "3", "Authenticating with Cortex XDR API...");
     let (token, x_xdr_auth_id) = prompt_for_api_key_and_id()?;
 
-    let default_start = String::new();
-    let cortex_start_str = start_time.unwrap_or(&default_start);
-
-    let default_end: String = String::new();
-    let cortex_end_str = end_time.unwrap_or(&default_end);
+    // a time written without a zone is UTC, here as in the forensics sources
+    let cortex_start_str = utc_bound(start_time.map(|s| s.as_str()).unwrap_or(""));
+    let cortex_end_str = utc_bound(end_time.map(|s| s.as_str()).unwrap_or(""));
 
     
 
@@ -953,6 +951,21 @@ pub fn sources_from(spec: Option<&str>) -> Result<Vec<Source>, String> {
     Ok(out)
 }
 
+/// A bound of the time range as Cortex is sent it: always with an explicit
+/// UTC offset. "YYYY-MM-DD HH:MM:SS" with no zone is UTC (what the forensics
+/// sources already assumed; sent bare, the tenant decided), and a bound
+/// with another offset is converted. Anything else goes as written.
+pub(crate) fn utc_bound(s: &str) -> String {
+    let t = s.trim();
+    if let Ok(dt) = DateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S %z") {
+        return dt.with_timezone(&Utc).format("%Y-%m-%d %H:%M:%S -0000").to_string();
+    }
+    if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S") {
+        return nd.format("%Y-%m-%d %H:%M:%S -0000").to_string();
+    }
+    t.to_string()
+}
+
 /// The window when none is given: the last seven days (the forensics event
 /// logs, which come from triages of any date, keep their own year).
 fn default_window() -> (String, String) {
@@ -983,7 +996,7 @@ pub async fn parse_cortex_sources(
 ) -> Result<(), Box<dyn Error>> {
     let given = start_time.map_or(false, |s| !s.is_empty()) && end_time.map_or(false, |s| !s.is_empty());
     let (def_start, def_end) = default_window();
-    let (net_start, net_end) = if given { (start_time.unwrap().clone(), end_time.unwrap().clone()) } else { (def_start, def_end) };
+    let (net_start, net_end) = if given { (utc_bound(start_time.unwrap()), utc_bound(end_time.unwrap())) } else { (def_start, def_end) };
     if !given {
         crate::banner::print_info(&format!("No time window given: the last 7 days ({} to {}); the forensics event logs, the last year", net_start, net_end));
     }
@@ -1069,6 +1082,20 @@ pub async fn parse_cortex_sources(
         crate::banner::print_load_hint(out);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod utc_bound_tests {
+    use super::utc_bound;
+
+    #[test]
+    fn a_bound_without_a_zone_is_sent_as_utc() {
+        assert_eq!(utc_bound("2026-10-01 00:00:00"), "2026-10-01 00:00:00 -0000");
+        assert_eq!(utc_bound(" 2026-10-01 00:00:00 -0000 "), "2026-10-01 00:00:00 -0000");
+        assert_eq!(utc_bound("2026-10-01 01:30:00 +0200"), "2026-09-30 23:30:00 -0000");
+        assert_eq!(utc_bound(""), "");
+        assert_eq!(utc_bound("yesterday"), "yesterday");
+    }
 }
 
 #[cfg(test)]
