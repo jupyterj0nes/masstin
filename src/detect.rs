@@ -297,7 +297,9 @@ fn look_at(p: &Path, s: &mut Scan) {
     } else if crate::parse_image_windows::is_first_image_segment(p) {
         s.images.push(p.to_string_lossy().to_string());
     } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
-        let head = head_of(p, 4096);
+        // (64 KiB: one Winlogbeat document with a long `message` before its
+        // `winlog` is more than the 4 KiB looked at before)
+        let head = head_of(p, 65536);
         if crate::parse_elastic::head_holds_windows_events(&head) {
             s.elastic_json += 1;
             s.elastic_paths.push(p.to_string_lossy().to_string());
@@ -349,6 +351,10 @@ fn head_of(p: &Path, n: usize) -> String {
     let mut buf = vec![0u8; n];
     let Ok(mut f) = std::fs::File::open(p) else { return String::new() };
     let got = f.read(&mut buf).unwrap_or(0);
+    // UTF-16 with its mark (PowerShell's `>`): looked at as the text it is
+    if let Some(t) = crate::textlines::utf16_text(&buf[..got - got % 2]) {
+        return t;
+    }
     String::from_utf8_lossy(&buf[..got]).to_string()
 }
 

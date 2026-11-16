@@ -319,8 +319,10 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     }
 
     // Phase 2: Extract logs from each image
-    let base_temp = std::env::temp_dir().join("masstin_linux_image_extract");
+    let run_temp = std::env::temp_dir().join(format!("masstin_run_{}", std::process::id()));
+    let base_temp = run_temp.join("masstin_linux_image_extract");
     let _ = fs::remove_dir_all(&base_temp);
+    let _ = fs::remove_dir(&run_temp);
     let _ = fs::create_dir_all(&base_temp);
 
     let mut extracted_dirs: Vec<String> = Vec::new();
@@ -394,6 +396,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
 
     // Cleanup
     let _ = fs::remove_dir_all(&base_temp);
+    let _ = fs::remove_dir(&run_temp);
 }
 
 // -----------------------------------------------------------------------------
@@ -560,7 +563,19 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
         crate::banner::print_info(&format!("    {} confirmed — extracting logs...", kind.label()));
 
         // Dump LV to temp file so we can pass it to the volume reader
-        let tmp_path = std::env::temp_dir().join(format!("masstin_lvm_{}_{}.raw", lvm_index, lv_name));
+        // A name of its own: the process, the image's folder and a count.
+        // Two images read at once (or two runs) used to dump their volumes
+        // to the same file whenever index and name matched (`lv_root` of
+        // partition 2 is on almost every disk).
+        static DUMPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let tmp_path = std::env::temp_dir().join(format!(
+            "masstin_lvm_{}_{}_{}_{}.raw",
+            std::process::id(),
+            DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            lvm_index,
+            crate::parse_image_windows::one_component(lv_name)
+        ));
+        let mut cut: Option<std::io::Error> = None;
         {
             if olv.seek(SeekFrom::Start(0)).is_err() { continue; }
             let mut tmp_file = match File::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
@@ -569,10 +584,25 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
             loop {
                 match olv.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => { if tmp_file.write_all(&buf[..n]).is_err() { break; } }
+                    Ok(n) => {
+                        if let Err(e) = tmp_file.write_all(&buf[..n]) {
+                            cut = Some(e);
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
+        }
+        if let Some(e) = cut {
+            // a volume cut short is not read as if it were whole
+            crate::banner::print_warning(&format!(
+                "    LV '{}': its copy could not be written ({}): is the temporary disk full? The volume is skipped and its logs are missing from the timeline.",
+                lv_name, e
+            ));
+            crate::mark_failed();
+            let _ = fs::remove_file(&tmp_path);
+            continue;
         }
 
         // Now process the temp file as a regular ext4 partition
@@ -705,7 +735,10 @@ fn find_linux_partitions<R: Read + Seek>(
                         entry_count, entry_size, entry_start_lba);
                 }
 
-                let entries_offset = entry_start_lba * 512;
+                if !(128..=4096).contains(&entry_size) {
+                    return Err(format!("GPT header damaged: partition entries of {} bytes", entry_size));
+                }
+                let entries_offset = entry_start_lba.saturating_mul(512);
                 for i in 0..entry_count.min(128) {
                     let entry_offset = entries_offset + (i as u64 * entry_size as u64);
                     reader.seek(SeekFrom::Start(entry_offset)).map_err(|e| e.to_string())?;
@@ -884,9 +917,17 @@ fn extract_logs_from_ext4_partition<R: Read + Seek + 'static>(
 /// Map a Linux absolute path like /var/log/auth.log to a local directory
 /// structure under output_dir: output_dir/var/log/auth.log
 fn map_linux_path_to_local(linux_path: &str, output_dir: &Path) -> PathBuf {
-    // Strip leading / and convert to local path
-    let relative = linux_path.trim_start_matches('/');
-    output_dir.join(relative)
+    // each part of the path is one folder or file here: a name from the
+    // image holding `\` or `:` (legal on ext4, separators on Windows), or
+    // `..`, would be written outside `output_dir`
+    let mut out = output_dir.to_path_buf();
+    for part in linux_path.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            continue;
+        }
+        out.push(crate::parse_image_windows::one_component(part));
+    }
+    out
 }
 
 // -----------------------------------------------------------------------------

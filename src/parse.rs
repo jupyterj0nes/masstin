@@ -809,7 +809,8 @@ pub(crate) fn display_source(path: &str) -> String {
         }
     }
     // Windows: <image>/evtx_extracted/partition_N[_vss_M]/[Sum/]<name>
-    if let Some(rest) = rest.strip_prefix("evtx_extracted/") {
+    // (a mounted volume's shadow copies are extracted under vss_extracted/)
+    if let Some(rest) = rest.strip_prefix("evtx_extracted/").or_else(|| rest.strip_prefix("vss_extracted/")) {
         let Some((place, inside)) = rest.split_once('/') else { return format!("{}:{}", image, rest) };
         let name = inside.rsplit('/').next().unwrap_or(inside);
         if inside.starts_with("Sum/") || name.to_ascii_lowercase().ends_with(".mdb") {
@@ -873,7 +874,8 @@ mod source_tests {
         assert_eq!(display_source(&format!(r"{}\tasks_extracted\partition_0\Microsoft\Windows\Evil\Task", t)), "HRServer.e01:tasks:Microsoft/Windows/Evil/Task");
         assert_eq!(display_source(&format!(r"{}\linux_logs_extracted\partition_2\var\log\auth.log", t)), "HRServer.e01:partition_2:/var/log/auth.log");
         assert_eq!(display_source("/tmp/masstin_linux_image_extract/srv.img/logs_extracted/partition_0/var/log/secure"), "srv.img:partition_0:/var/log/secure");
-        assert_eq!(display_source(r"C:\Temp\masstin_image_extract\vol_C:\evtx_extracted\partition_0_vss_0\Security.evtx"), "vol_C::vss_0:Security.evtx");
+        // as the run on a lab server wrote it (DEV-SRV01, -d C:, 2026-11-16)
+        assert_eq!(display_source(r"C:\Temp\masstin_run_4242\masstin_image_extract\vol_C\vss_extracted\partition_0_vss_0\Security.evtx"), "vol_C:vss_0:Security.evtx");
         // carved: the image and the log the chunks belong to
         assert_eq!(display_source(r"C:\Users\someone\AppData\Local\Temp\masstin_carve_extract\0_dev-srv01.vmdk\Microsoft-Windows-Eventlog.evtx"), "dev-srv01.vmdk:carved:Microsoft-Windows-Eventlog.evtx");
         // the evidence where it sits, as it always was

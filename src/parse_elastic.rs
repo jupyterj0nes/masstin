@@ -294,18 +294,37 @@ pub(crate) fn json_documents(file_path: &str, mut each: impl FnMut(Value) -> boo
         Ok(f) => f,
         Err(e) => return Some(format!("cannot open {}: {}", file_path, e)),
     };
-    let mut lines = crate::textlines::EvidenceLines::new(BufReader::new(file));
+    // UTF-16 with its byte-order mark (what PowerShell's `>` and `Out-File`
+    // write) is read as the text it is; anything else as UTF-8
+    let mut rd = BufReader::new(file);
+    let utf16 = {
+        use std::io::BufRead;
+        rd.fill_buf().map(|b| crate::textlines::utf16_bom(b).is_some()).unwrap_or(false)
+    };
+    let source: Box<dyn std::io::BufRead> = if utf16 {
+        let mut bytes = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut rd, &mut bytes) {
+            return Some(format!("cannot read {}: {}", file_path, e));
+        }
+        Box::new(std::io::Cursor::new(crate::textlines::utf16_text(&bytes).unwrap_or_default().into_bytes()))
+    } else {
+        Box::new(rd)
+    };
+    let mut lines = crate::textlines::EvidenceLines::new(source);
     let mut doc = String::new();
     let mut whole = false;
     let mut first = true;
     for line in &mut lines {
+        // a byte-order mark is not part of the document it stands before
+        let line: &str = line.trim_start_matches('\u{feff}');
         if whole {
             doc.push_str(&line);
             doc.push('\n');
             continue;
         }
         if doc.is_empty() {
-            let t = line.trim();
+            // (a byte-order mark before the first document is not part of it)
+            let t = line.trim().trim_start_matches('\u{feff}').trim_start();
             if t.is_empty() || (t.starts_with("Record ") && !t.contains('{')) {
                 continue;
             }
@@ -407,6 +426,46 @@ fn parse_winlogbeat_json(file_path: &str) -> Vec<LogData> {
     log_data
 }
 
+#[cfg(test)]
+mod review_2026_11_tests {
+    use super::*;
+
+    fn docs(name: &str, bytes: &[u8]) -> Vec<Value> {
+        let p = std::env::temp_dir().join(format!("masstin_json_rev_{}_{}.json", name, std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        let mut got = Vec::new();
+        let problem = json_documents(p.to_str().unwrap(), |v| {
+            got.push(v);
+            true
+        });
+        let _ = std::fs::remove_file(&p);
+        assert!(problem.is_none(), "{:?}", problem);
+        got
+    }
+
+    const TWO: &str = "{\"n\": 1, \"winlog\": {}}\n{\"n\": 2, \"winlog\": {}}\n";
+
+    #[test]
+    fn a_byte_order_mark_does_not_cost_the_first_event() {
+        let plain = docs("plain", TWO.as_bytes());
+        assert_eq!(plain.len(), 2);
+        let bom: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(TWO.bytes()).collect();
+        assert_eq!(docs("bom", &bom), plain);
+        // an array with a mark before it
+        let arr: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(b"[{\"n\": 1},\n {\"n\": 2}]".iter().copied()).collect();
+        assert_eq!(docs("bomarr", &arr).len(), 2);
+    }
+
+    #[test]
+    fn utf16_as_powershell_writes_it_is_read() {
+        let plain = docs("plain16", TWO.as_bytes());
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(TWO.replace('\n', "\r\n").encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        assert_eq!(docs("utf16le", &le), plain);
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(TWO.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(docs("utf16be", &be), plain);
+    }
+}
+
 /// **Filters, sorts and writes the extracted events as CSV**
 fn write_rows(log_data: Vec<LogData>, output: Option<&String>) {
     // logoffs take the origin of their logon, as parse-windows does
@@ -419,12 +478,54 @@ fn write_rows(log_data: Vec<LogData>, output: Option<&String>) {
         .collect();
     if log_data.is_empty() {
         println!("[WARNING] No relevant events found.");
+        // the timeline asked for is still written, with its header and no
+        // rows: whatever runs after (the window, a script) finds the file
+        // the summary names
+        if output.is_some() {
+            if let Err(e) = crate::csv_out::write_timeline(&log_data, output) {
+                eprintln!("[ERROR] Failed to write CSV: {}", e);
+                crate::mark_failed();
+            }
+        }
         return;
     }
 
-    // Same order polars gave: ascending on the time_created text.
+    // By the instant, not by its text: `10:00:00.5Z` and `10:00:00.123456Z`
+    // compare the wrong way round as text, and so do two zones. The same
+    // event read from two files (two exports of one log in the folder) is
+    // written once; inside one file every event is kept, since an export
+    // with times to the second can hold two real events that read alike.
     let mut log_data = log_data;
-    log_data.sort_by(|a, b| a.time_created.cmp(&b.time_created));
+    let instant = |r: &LogData| crate::graph_hunt_common::parse_ts(&r.time_created);
+    log_data.sort_by(|a, b| instant(a).cmp(&instant(b)).then_with(|| a.time_created.cmp(&b.time_created)));
+    let same = |a: &LogData, b: &LogData| {
+        a.time_created == b.time_created
+            && a.computer == b.computer
+            && a.event_type == b.event_type
+            && a.event_id == b.event_id
+            && a.logon_type == b.logon_type
+            && a.target_user_name == b.target_user_name
+            && a.target_domain_name == b.target_domain_name
+            && a.workstation_name == b.workstation_name
+            && a.ip_address == b.ip_address
+            && a.subject_user_name == b.subject_user_name
+            && a.subject_domain_name == b.subject_domain_name
+            && a.logon_id == b.logon_id
+            && a.detail == b.detail
+    };
+    let before = log_data.len();
+    let mut kept: Vec<LogData> = Vec::with_capacity(before);
+    for r in log_data {
+        // events of one instant are few: looked at one by one
+        let dup = kept.iter().rev().take_while(|k| k.time_created == r.time_created).any(|k| k.filename != r.filename && same(k, &r));
+        if !dup {
+            kept.push(r);
+        }
+    }
+    let log_data = kept;
+    if log_data.len() < before {
+        println!("[INFO] {} event(s) held by more than one file written once", before - log_data.len());
+    }
     match crate::csv_out::write_timeline(&log_data, output) {
         Ok(()) => {
             if let Some(output_path) = output {

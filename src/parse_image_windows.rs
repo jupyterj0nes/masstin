@@ -32,6 +32,43 @@ struct ExtractedArtifacts {
 /// Main entry point: parse forensic disk images (Windows + Linux).
 /// Auto-detects OS per partition: NTFS→EVTX+UAL+VSS, ext4 / XFS→Linux logs.
 /// All sources are extracted to temp directories first, then parsed together into a single CSV.
+/// `name-s001` (a split extent) or `name-000001` (a snapshot): the disk
+/// they are a part of, `name`. None for any other name. Bytes, not
+/// characters, are looked at: a name with letters outside ASCII is a name
+/// like any other (it used to end in a panic).
+pub(crate) fn vmdk_part_of(stem: &str) -> Option<&str> {
+    let dash = stem.rfind('-')?;
+    let (base, tail) = (&stem[..dash], &stem[dash + 1..]);
+    if base.is_empty() {
+        return None;
+    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let extent = tail.strip_prefix('s').or_else(|| tail.strip_prefix('S')).map_or(false, |n| n.len() == 3 && digits(n));
+    let snapshot = tail.len() == 6 && digits(tail);
+    if extent || snapshot { Some(base) } else { None }
+}
+
+/// A name read from inside an image, as one path component here: the
+/// image is evidence, and a name holding `\`, `/`, `:` or `..` would be
+/// written outside the folder it is extracted to.
+pub(crate) fn one_component(name: &str) -> String {
+    let s: String = name.chars().map(|c| if matches!(c, '\\' | '/' | ':' | '\0') { '_' } else { c }).collect();
+    if s.is_empty() || s == "." || s == ".." { "_".to_string() } else { s }
+}
+
+/// An extracted file that could not be written whole (the disk filled
+/// up): said once, since every file after it fails the same way.
+pub(crate) fn extraction_write_failed(path: &Path, e: &std::io::Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::banner::print_warning(&format!(
+            "Could not write {} ({}): is the temporary disk full? The files extracted from here on are incomplete and events will be missing from the timeline.",
+            path.display(), e
+        ));
+        crate::mark_failed();
+    }
+}
+
 /// One image's extraction: what it was and how it went.
 struct ImageOutcome {
     result: Result<ExtractedArtifacts, String>,
@@ -63,6 +100,21 @@ fn skip_category(msg: &str) -> &'static str {
 /// Extract one image into its temp dir, printing its block of the banner
 /// (the header, the partitions, what came out, or why it was skipped).
 fn extract_one_image(img_idx: usize, total_images: usize, image_path: &str, base_temp: &Path) -> ImageOutcome {
+    // An image is evidence, and evidence can be damaged in ways no check
+    // foresaw: whatever goes wrong inside one image ends that image, not
+    // the run with the other images in it.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract_one_image_inner(img_idx, total_images, image_path, base_temp))) {
+        Ok(o) => o,
+        Err(p) => {
+            let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown".to_string());
+            let msg = format!("the image's structures are damaged and it could not be read ({})", why);
+            crate::banner::print_warning(&format!("  {}: {}; skipped", image_path, msg));
+            ImageOutcome { result: Err(msg) }
+        }
+    }
+}
+
+fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str, base_temp: &Path) -> ImageOutcome {
     let ext = Path::new(image_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -256,7 +308,10 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
             all_image_files.push(f.clone());
         }
     }
-    let base_temp = std::env::temp_dir().join("masstin_image_extract");
+    // of this run: two masstin at a time used to share the folder, and
+    // each emptied it under the other when it started
+    let run_temp = std::env::temp_dir().join(format!("masstin_run_{}", std::process::id()));
+    let base_temp = run_temp.join("masstin_image_extract");
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
     // Temp dirs where parse-massive extracts forensic images found INSIDE zip
@@ -278,7 +333,10 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
         // 2. Open raw volume for VSS extraction only
         crate::banner::print_info("  VSS: opening raw volume for shadow copy recovery...");
-        let temp_dir = base_temp.join(format!("vol_{}", volume_label));
+        // `vol_C`, not `vol_C:`: Windows refuses a folder name with a
+        // colon, the folder was never created and the shadow copies of a
+        // mounted volume were never extracted
+        let temp_dir = base_temp.join(format!("vol_{}", volume_label.replace([':', '\\', '/', '.'], "")));
         let _ = fs::create_dir_all(&temp_dir);
 
         match extract_vss_only_from_volume(&volume_label, &temp_dir) {
@@ -324,17 +382,13 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     if stem_lower.ends_with("-flat") { return false; }
                     // Skip change tracking block files: name-ctk.vmdk
                     if stem_lower.ends_with("-ctk") { return false; }
-                    // Skip split extents: name-sNNN.vmdk
-                    if let Some(pos) = stem.rfind("-s") {
-                        let after = &stem[pos + 2..];
-                        if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
-                            return false;
-                        }
-                    }
-                    // Skip VMware snapshots: name-NNNNNN.vmdk
-                    if let Some(pos) = stem.rfind("-0") {
-                        let after = &stem[pos + 1..];
-                        if after.len() >= 6 && after[..6].chars().all(|c| c.is_ascii_digit()) {
+                    // Split extents (name-sNNN.vmdk) and VMware snapshots
+                    // (name-NNNNNN.vmdk) are parts of the disk `name.vmdk`
+                    // and are read through it: skipped when that disk is
+                    // there. A disk that only looks like one (`web-s1.vmdk`,
+                    // `host-0123456.vmdk`, no `web.vmdk` beside it) is read.
+                    if let Some(base) = vmdk_part_of(stem) {
+                        if Path::new(p).with_file_name(format!("{}.vmdk", base)).exists() {
                             return false;
                         }
                     }
@@ -627,6 +681,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Cleanup temp directories
     let _ = fs::remove_dir_all(&base_temp);
+    let _ = fs::remove_dir(&run_temp);
     // Cleanup any temp dirs where images were extracted out of zips (massive mode)
     zip_img_temps.sort();
     zip_img_temps.dedup();
@@ -1726,7 +1781,13 @@ fn find_ntfs_partitions<R: Read + Seek>(
                             entry_count, entry_size, entry_start_lba);
                     }
 
-                    let entries_offset = entry_start_lba * 512;
+                    // a partition entry is 128 bytes or more (UEFI); a
+                    // header saying less is damaged, and reading its
+                    // "entries" would read fields that are not there
+                    if !(128..=4096).contains(&entry_size) {
+                        return Err(format!("GPT header damaged: partition entries of {} bytes", entry_size));
+                    }
+                    let entries_offset = entry_start_lba.saturating_mul(512);
                     for i in 0..entry_count.min(128) {
                         let entry_offset = entries_offset + (i as u64 * entry_size as u64);
                         reader.seek(SeekFrom::Start(entry_offset)).map_err(|e| e.to_string())?;
@@ -1921,7 +1982,7 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
             let mut attached = data_value.attach(&mut partition_reader);
 
             // Write to output directory
-            let output_path = partition_dir.join(&name);
+            let output_path = partition_dir.join(one_component(&name));
             let mut output_file = match File::create(&output_path) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -1934,7 +1995,8 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
                     Ok(n) => n,
                     Err(_) => break,
                 };
-                if output_file.write_all(&buf[..bytes_read]).is_err() {
+                if let Err(e) = output_file.write_all(&buf[..bytes_read]) {
+                    extraction_write_failed(&output_path, &e);
                     break;
                 }
             }
@@ -2013,14 +2075,19 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
             let data_value = match data_attr.value(store_reader) { Ok(v) => v, Err(_) => continue };
             let mut attached = data_value.attach(store_reader);
 
-            let output_path = vss_dir.join(&name);
+            let output_path = vss_dir.join(one_component(&name));
             let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];
             loop {
                 match attached.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                    Ok(n) => {
+                        if let Err(e) = output_file.write_all(&buf[..n]) {
+                            extraction_write_failed(&output_path, &e);
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -2097,14 +2164,19 @@ fn extract_files_from_ntfs_path<R: Read + Seek>(
             let data_value = match data_attr.value(&mut partition_reader) { Ok(v) => v, Err(_) => continue };
             let mut attached = data_value.attach(&mut partition_reader);
 
-            let output_path = output_dir.join(&name);
+            let output_path = output_dir.join(one_component(&name));
             let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];
             loop {
                 match attached.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                    Ok(n) => {
+                        if let Err(e) = output_file.write_all(&buf[..n]) {
+                            extraction_write_failed(&output_path, &e);
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -2200,14 +2272,19 @@ fn extract_files_recursive<R: Read + Seek>(
                 let data_value = match data_attr.value(reader) { Ok(v) => v, Err(_) => continue };
                 let mut attached = data_value.attach(reader);
 
-                let output_path = output_dir.join(&name);
+                let output_path = output_dir.join(one_component(&name));
                 let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
                 let mut buf = [0u8; 65536];
                 loop {
                     match attached.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                        Ok(n) => {
+                            if let Err(e) = output_file.write_all(&buf[..n]) {
+                                extraction_write_failed(&output_path, &e);
+                                break;
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -2221,7 +2298,7 @@ fn extract_files_recursive<R: Read + Seek>(
         let subdir = match file_ref.to_file(ntfs, reader) {
             Ok(f) => f, Err(_) => continue
         };
-        let subdir_path = output_dir.join(&name);
+        let subdir_path = output_dir.join(one_component(&name));
         match extract_files_recursive(ntfs, &subdir, reader, &subdir_path) {
             Ok(c) => count += c,
             Err(_) => {}
@@ -2376,14 +2453,19 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
                     let mut attached = data_value.attach(&mut partition_reader);
 
                     // Save as username_NTUSER.DAT
-                    let output_path = output_dir.join(format!("{}_NTUSER.DAT", username));
+                    let output_path = output_dir.join(format!("{}_NTUSER.DAT", one_component(&username)));
                     let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
                     let mut buf = [0u8; 65536];
                     loop {
                         match attached.read(&mut buf) {
                             Ok(0) => break,
-                            Ok(n) => { let _ = output_file.write_all(&buf[..n]); }
+                            Ok(n) => {
+                                if let Err(e) = output_file.write_all(&buf[..n]) {
+                                    extraction_write_failed(&output_path, &e);
+                                    break;
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -2400,4 +2482,56 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod review_2026_11_tests {
+    use super::*;
+
+    #[test]
+    fn a_vmdk_part_is_told_by_its_whole_tail() {
+        assert_eq!(vmdk_part_of("srv-s001"), Some("srv"));
+        assert_eq!(vmdk_part_of("srv-000002"), Some("srv"));
+        assert_eq!(vmdk_part_of("my-disk-s012"), Some("my-disk"));
+        // disks that only look like one
+        for whole in ["web-s1", "host-0123456", "srv-snapshot", "srv", "srv-s00a", "-s001", "srv-00001", "srv-0ééé", "ñandú-0éé", "srv-séé"] {
+            assert_eq!(vmdk_part_of(whole), None, "{}", whole);
+        }
+    }
+
+    #[test]
+    fn a_name_from_an_image_stays_one_component() {
+        assert_eq!(one_component("Security.evtx"), "Security.evtx");
+        assert_eq!(one_component(r"..\..\Windows\evil.evtx"), ".._.._Windows_evil.evtx");
+        assert_eq!(one_component("../../etc/x"), ".._.._etc_x");
+        assert_eq!(one_component("C:evil"), "C_evil");
+        assert_eq!(one_component(".."), "_");
+        assert_eq!(one_component(""), "_");
+        let base = Path::new("base");
+        for n in [r"..\x", "../x", r"C:\x", "..", r"a\..\..\b"] {
+            let p = base.join(one_component(n));
+            assert_eq!(p.parent(), Some(base), "{}", n);
+        }
+    }
+
+    /// A GPT header whose entries have no size (a damaged image): refused,
+    /// not read past the end of a buffer.
+    #[test]
+    fn a_damaged_gpt_is_refused_without_a_panic() {
+        for entry_size in [0u32, 16, 64, 100_000] {
+            let mut disk = vec![0u8; 64 * 512];
+            disk[446 + 4] = 0xEE;
+            disk[510] = 0x55;
+            disk[511] = 0xAA;
+            disk[512..520].copy_from_slice(b"EFI PART");
+            disk[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+            disk[512 + 80..512 + 84].copy_from_slice(&128u32.to_le_bytes());
+            disk[512 + 84..512 + 88].copy_from_slice(&entry_size.to_le_bytes());
+            // an entry that looks used, so the loop would read its fields
+            disk[2 * 512] = 0xAB;
+            let mut rd = std::io::Cursor::new(disk);
+            let r = find_ntfs_partitions(&mut rd, 64 * 512);
+            assert!(r.is_err(), "entry size {}: {:?}", entry_size, r.map(|v| v.len()));
+        }
+    }
 }

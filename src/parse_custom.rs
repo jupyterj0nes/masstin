@@ -393,7 +393,8 @@ pub fn parse_custom(
             crate::banner::print_info("");
             crate::banner::print_info("  [dry-run] First rejected lines (no rule matched):");
             for (f, ln, text) in rejected_samples.iter().take(5) {
-                let preview = if text.len() > 120 { &text[..120] } else { text.as_str() };
+                // by characters: a cut at byte 120 inside a letter was a panic
+                let preview: String = text.chars().take(120).collect();
                 eprintln!("    {}:{}  {}", f, ln, preview);
             }
         }

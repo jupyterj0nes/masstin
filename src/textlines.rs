@@ -135,3 +135,38 @@ mod tests {
         assert!(it.problem(Path::new("auth.log.1.gz")).unwrap().contains("read stopped"));
     }
 }
+
+/// The byte order of a UTF-16 text that starts with its byte-order mark
+/// (`true` = little endian, what Windows writes); None for any other file.
+pub fn utf16_bom(head: &[u8]) -> Option<bool> {
+    match head {
+        [0xFF, 0xFE, ..] => Some(true),
+        [0xFE, 0xFF, ..] => Some(false),
+        _ => None,
+    }
+}
+
+/// A UTF-16 text with its byte-order mark, as UTF-8 (unpaired surrogates
+/// shown as U+FFFD); None when the bytes do not start with the mark.
+pub fn utf16_text(bytes: &[u8]) -> Option<String> {
+    let le = utf16_bom(bytes)?;
+    let units = bytes[2..].chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) });
+    Some(char::decode_utf16(units).map(|r| r.unwrap_or('\u{fffd}')).collect())
+}
+
+#[cfg(test)]
+mod utf16_tests {
+    use super::*;
+
+    #[test]
+    fn utf16_with_its_mark_is_read_and_nothing_else_is() {
+        let text = "{\"a\": \"\u{f1}\u{20ac}\"}\r\n";
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        assert_eq!(utf16_text(&le).as_deref(), Some(text));
+        assert_eq!(utf16_text(&be).as_deref(), Some(text));
+        assert_eq!(utf16_text(text.as_bytes()), None);
+        assert_eq!(utf16_text(&[0xEF, 0xBB, 0xBF, b'{']), None);
+        assert_eq!(utf16_text(&[]), None);
+    }
+}
