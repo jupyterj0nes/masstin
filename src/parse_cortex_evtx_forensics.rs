@@ -79,6 +79,7 @@ pub async fn parse_cortex_evtx_forensics_data(
     // again, with or without --start-time / --end-time. (Without both, a
     // cut result used to be taken as complete, and one bound alone was
     // ignored.)
+    let asked = (epoch_start, epoch_end);
     let now = Utc::now().timestamp();
     let epoch_end = Some(epoch_end.unwrap_or(now + 86_400));
     let epoch_start = Some(epoch_start.unwrap_or(now - 366 * 86_400));
@@ -386,6 +387,18 @@ pub async fn parse_cortex_evtx_forensics_data(
         }
     }
 
+    // The query compares in whole seconds with both ends included, so that
+    // no event is lost where two windows meet; it can then return an event
+    // of the second before the start asked for (seen on a tenant: 24 events
+    // at 07:59:59.x for a start of 08:00:00). What was asked for is kept,
+    // to the millisecond: from the start, through the last millisecond of
+    // the second of the end.
+    let before_trim = all_data.len();
+    all_data.retain(|r| inside_asked(get_timestamp(r), asked.0, asked.1));
+    if all_data.len() < before_trim {
+        crate::banner::print_phase_detail("Window:", &format!("{} event(s) of the second before the start (or after the end) left out", before_trim - all_data.len()));
+    }
+
     // Count unique destination hosts and unique event sources for the summary.
     // The query returns `dst_host` (renamed from host_name) so we count that.
     let mut machines: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -601,6 +614,14 @@ fn parse_ndjson(data: &str, debug: bool) -> Result<Vec<Value>, Box<dyn Error>> {
 // ----------------------------------------------
 // Time extraction
 // ----------------------------------------------
+/// Whether an event's time (milliseconds) is in the range the user asked
+/// for (seconds; either end may be absent). An event without a readable
+/// time is kept: it is not this function's to drop.
+fn inside_asked(ts_ms: Option<i64>, start: Option<i64>, end: Option<i64>) -> bool {
+    let Some(t) = ts_ms else { return true };
+    start.map_or(true, |s| t >= s * 1000) && end.map_or(true, |e| t <= e * 1000 + 999)
+}
+
 fn get_timestamp(record: &Value) -> Option<i64> {
     if let Some(ts) = record.get("Timestamp").and_then(|v| v.as_i64()) {
         Some(ts)
@@ -1006,6 +1027,21 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.len() == 19));
         assert_eq!((&rows[0][3], &rows[1][3], &rows[1][7]), ("4624", "5858", "WS07"));
+    }
+
+    #[test]
+    fn the_window_asked_for_is_kept_to_the_millisecond() {
+        let s = 1_778_572_800; // 2026-05-12 08:00:00
+        let e = s + 3600;
+        // the second before the start, which the query's whole-second comparison lets in
+        assert!(!inside_asked(Some(s * 1000 - 1), Some(s), Some(e)));
+        assert!(!inside_asked(Some(s * 1000 - 400), Some(s), Some(e)));
+        assert!(inside_asked(Some(s * 1000), Some(s), Some(e)));
+        assert!(inside_asked(Some(e * 1000 + 999), Some(s), Some(e)));
+        assert!(!inside_asked(Some(e * 1000 + 1000), Some(s), Some(e)));
+        // one end alone, none, and an event without a time
+        assert!(inside_asked(Some(0), None, Some(e)) && !inside_asked(Some(0), Some(s), None));
+        assert!(inside_asked(Some(0), None, None) && inside_asked(None, Some(s), Some(e)));
     }
 
     #[test]
