@@ -25,6 +25,16 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// on Windows with no console of its own. A carve started from the window
 /// (which has no console) would otherwise open a console for every carved
 /// file, hundreds or thousands of them, flashing on the screen.
+/// The chunks of a synthetic EVTX: a 4096-byte file header, then chunks of
+/// 64 KiB.
+fn synthetic_chunks(path: &Path) -> Vec<Vec<u8>> {
+    let Ok(bytes) = fs::read(path) else { return Vec::new() };
+    if bytes.len() < 4096 {
+        return Vec::new();
+    }
+    bytes[4096..].chunks_exact(CHUNK_SIZE).map(|c| c.to_vec()).collect()
+}
+
 fn validator_command(exe: &Path, evtx: &str) -> Command {
     let mut cmd = Command::new(exe);
     cmd.env("MASSTIN_VALIDATE_EVTX", evtx).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -51,6 +61,19 @@ use crate::parse::is_debug_mode;
 /// non-zero exit code and rejects the file. `catch_unwind` still covers
 /// ordinary panics inside the child.
 pub fn validate_evtx_file(path: &str) -> bool {
+    // For tests of the carving itself: a file holding this text is refused,
+    // as a chunk the parser cannot survive would be.
+    if let Ok(mark) = std::env::var("MASSTIN_TEST_REJECT_EVTX_WITH") {
+        if !mark.is_empty() {
+            if let Ok(bytes) = std::fs::read(path) {
+                let utf16: Vec<u8> = mark.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+                let holds = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+                if holds(mark.as_bytes()) || holds(&utf16) {
+                    return false;
+                }
+            }
+        }
+    }
     let result = std::panic::catch_unwind(|| {
         let parser = match evtx::EvtxParser::from_path(path) {
             Ok(p) => p,
@@ -192,60 +215,94 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
     // single bad chunk can try to allocate ~16 GiB and crash the whole
     // process). catch_unwind + thread isolation cannot catch that.
     let exe = std::env::current_exe().ok();
-    for path in &all_carved_evtx {
-        let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?");
-
-        let Some(exe) = exe.as_ref() else {
-            rejected += 1;
-            crate::banner::print_warning(&format!(
-                "  [reject] {} — cannot locate current executable to spawn validator", fname
-            ));
-            continue;
-        };
-
+    // What the child said of one file.
+    enum Verdict {
+        Good,
+        Exit(String),
+        Hung,
+        WaitFailed,
+        NoSpawn(String),
+    }
+    let check = |path: &str| -> Verdict {
+        let Some(exe) = exe.as_ref() else { return Verdict::NoSpawn("cannot locate current executable to spawn validator".to_string()) };
         let mut child = match validator_command(exe, path).spawn() {
             Ok(c) => c,
-            Err(e) => {
-                rejected += 1;
-                crate::banner::print_warning(&format!(
-                    "  [reject] {} — could not spawn validator: {}", fname, e
-                ));
-                continue;
-            }
+            Err(e) => return Verdict::NoSpawn(format!("could not spawn validator: {}", e)),
         };
-
         // Poll every 50 ms up to a 60 s deadline.
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut timed_out = false;
-        let status = loop {
+        loop {
             match child.try_wait() {
-                Ok(Some(s)) => break Some(s),
+                Ok(Some(s)) if s.success() => return Verdict::Good,
+                Ok(Some(s)) => return Verdict::Exit(s.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated by signal".to_string())),
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        timed_out = true;
-                        break None;
+                        return Verdict::Hung;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(_) => break None,
+                Err(_) => return Verdict::WaitFailed,
             }
-        };
-
-        match (status, timed_out) {
-            (Some(s), _) if s.success() => {
-                validated.push(path.clone());
+        }
+    };
+    // A synthetic EVTX is every chunk carved for one provider. One chunk
+    // that cannot be parsed used to cost the whole file: thousands of good
+    // Security chunks dropped for one corrupt one. A file that fails is
+    // split in two and each half tried again, down to the chunk at fault,
+    // which is the only one left out. The halves keep the file's name (the
+    // parsers go by it), each in a folder of its own.
+    let mut work: Vec<String> = all_carved_evtx.iter().rev().cloned().collect();
+    let mut splits = 0usize;
+    let mut split_files = 0usize;
+    let mut chunks_dropped = 0usize;
+    while let Some(path) = work.pop() {
+        let path = &path;
+        let fname = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let fname = fname.as_str();
+        let verdict = check(path);
+        if matches!(verdict, Verdict::Good) {
+            validated.push(path.clone());
+            continue;
+        }
+        if !matches!(verdict, Verdict::NoSpawn(_)) {
+            let chunks = synthetic_chunks(Path::new(path));
+            if chunks.len() > 1 {
+                let (first, second) = chunks.split_at(chunks.len() / 2);
+                let parent = Path::new(path).parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                let mut made = Vec::new();
+                for half in [second, first] {
+                    splits += 1;
+                    let part = parent.join(format!("split-{}", splits)).join(fname);
+                    if blockcarve::evtx::write_synthetic_evtx(&part, half).is_ok() {
+                        made.push(part.to_string_lossy().to_string());
+                    }
+                }
+                if made.len() == 2 {
+                    if all_carved_evtx.contains(path) {
+                        split_files += 1;
+                    }
+                    if is_debug_mode() {
+                        eprintln!("[DEBUG] {}: {} chunks failed together, tried again as {} + {}", fname, chunks.len(), first.len(), second.len());
+                    }
+                    let _ = fs::remove_file(path);
+                    work.extend(made);
+                    continue;
+                }
             }
-            (Some(s), _) => {
-                rejected += 1;
-                let code_str = s
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "terminated by signal".to_string());
+            chunks_dropped += chunks.len().max(1);
+        }
+        rejected += 1;
+        match verdict {
+            Verdict::Good => {}
+            Verdict::NoSpawn(why) => {
+                crate::banner::print_warning(&format!("  [reject] {} — {}", fname, why));
+            }
+            Verdict::Exit(code_str) => {
                 if save_rejected {
                     if !rejected_dir_created { let _ = fs::create_dir_all(&rejected_dir); rejected_dir_created = true; }
-                    let dest = rejected_dir.join(format!("panic_oom__{}", fname));
+                    let dest = rejected_dir.join(format!("panic_oom__{}__{}", rejected, fname));
                     let _ = fs::copy(path, &dest);
                     crate::banner::print_warning(&format!(
                         "  [reject] {} — validator exit={} (OOM/panic, saved to {})",
@@ -257,11 +314,10 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
                     ));
                 }
             }
-            (None, true) => {
-                rejected += 1;
+            Verdict::Hung => {
                 if save_rejected {
                     if !rejected_dir_created { let _ = fs::create_dir_all(&rejected_dir); rejected_dir_created = true; }
-                    let dest = rejected_dir.join(format!("hang__{}", fname));
+                    let dest = rejected_dir.join(format!("hang__{}__{}", rejected, fname));
                     let _ = fs::copy(path, &dest);
                     crate::banner::print_warning(&format!(
                         "  [reject] {} — hung >60s (killed, saved to {})", fname, dest.display()
@@ -272,13 +328,18 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
                     ));
                 }
             }
-            (None, false) => {
-                rejected += 1;
+            Verdict::WaitFailed => {
                 crate::banner::print_warning(&format!(
                     "  [reject] {} — validator wait failed", fname
                 ));
             }
         }
+    }
+    if splits > 0 {
+        crate::banner::print_info(&format!(
+            "  {} file(s) could not be parsed whole and were tried again in halves: {} chunk(s) left out, the rest kept",
+            split_files, chunks_dropped
+        ));
     }
     crate::banner::print_info(&format!(
         "  Validation: {} accepted, {} rejected (corrupt BinXML)",
@@ -614,6 +675,26 @@ mod validator_tests {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].0, "MASSTIN_VALIDATE_EVTX");
         assert_eq!(envs[0].1, Some(std::ffi::OsStr::new("D:/tmp/carved-1.evtx")));
+    }
+
+    #[test]
+    fn a_synthetic_file_gives_its_chunks_back() {
+        let dir = std::env::temp_dir().join(format!("masstin_carve_chunks_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let chunks: Vec<Vec<u8>> = (0..5u8).map(|k| vec![k; CHUNK_SIZE]).collect();
+        let p = dir.join("split-1").join("Security.evtx");
+        blockcarve::evtx::write_synthetic_evtx(&p, &chunks).unwrap();
+        assert_eq!(synthetic_chunks(&p), chunks);
+        assert_eq!(fs::metadata(&p).unwrap().len(), 4096 + 5 * CHUNK_SIZE as u64);
+        // the halves a failed file is tried again as: all of it, nothing twice
+        let (a, b) = chunks.split_at(chunks.len() / 2);
+        assert_eq!((a.len(), b.len()), (2, 3));
+        assert!(synthetic_chunks(&dir.join("none.evtx")).is_empty());
+        fs::write(dir.join("short.evtx"), b"ElfFile").unwrap();
+        assert!(synthetic_chunks(&dir.join("short.evtx")).is_empty());
+        // a part keeps the name of its log, whatever folder it is in
+        assert_eq!(crate::parse::display_source(&format!("C:/T/masstin_run_1/masstin_carve_extract/0_srv.vmdk/split-3/{}", "Security.evtx")), "srv.vmdk:carved:Security.evtx");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

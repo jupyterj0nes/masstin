@@ -740,11 +740,36 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
             crate::banner::print_warning(&format!("  {}: read stopped: {}", file, e));
         }
         let text = String::from_utf8_lossy(&bytes);
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(&text) {
-            for v in &items {
-                if let Some(r) = classify_json_value(v, &dst, &file, &mut ss) {
-                    out.push(r);
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(items)) => {
+                for v in &items {
+                    if let Some(r) = classify_json_value(v, &dst, &file, &mut ss) {
+                        out.push(r);
+                    }
                 }
+            }
+            _ => {
+                // Not one whole array: an export cut short (the disk filled
+                // up, the copy stopped) has no closing bracket and its last
+                // event is half written. Its events are read one by one up
+                // to there, and it is said. (It used to give no row and no
+                // word.)
+                let (objects, whole) = top_level_objects(&text);
+                let mut read = 0usize;
+                for o in &objects {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(o) {
+                        read += 1;
+                        if let Some(r) = classify_json_value(&v, &dst, &file, &mut ss) {
+                            out.push(r);
+                        }
+                    }
+                }
+                crate::banner::print_warning(&format!(
+                    "  {}: not a complete JSON array ({}): {} event(s) read up to where it breaks; what follows, if anything, is missing from the timeline",
+                    file,
+                    if whole { "it does not parse as one" } else { "it ends in the middle of an event: the export is cut short" },
+                    read
+                ));
             }
         }
         out.extend(pair_screenshare(ss, &dst, &file).0);
@@ -767,6 +792,60 @@ fn parse_json_export(path: &Path, out: &mut Vec<LogData>) {
         crate::banner::print_warning(&format!("  {}", p));
     }
     out.extend(pair_screenshare(ss, &dst, &file).0);
+}
+
+/// The objects of a JSON array, each as its own text, found by their braces
+/// (strings and escapes honoured). The second value is false when the text
+/// ends inside an object.
+fn top_level_objects(text: &str) -> (Vec<&str>, bool) {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    let (mut in_str, mut esc) = (false, false);
+    for (i, &c) in b.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    (out, depth == 0 && !in_str)
+}
+
+#[cfg(test)]
+mod cut_export_tests {
+    use super::top_level_objects;
+
+    #[test]
+    fn the_events_of_a_cut_array_are_found_up_to_the_cut() {
+        let whole = "[{\"a\": \"x}y\", \"n\": {\"k\": 1}},\n {\"a\": \"q\\\"{\"}]";
+        assert_eq!(top_level_objects(whole), (vec!["{\"a\": \"x}y\", \"n\": {\"k\": 1}}", "{\"a\": \"q\\\"{\"}"], true));
+        let cut = "[{\"a\": 1},{\"a\": 2},{\"a\": \"hal";
+        assert_eq!(top_level_objects(cut), (vec!["{\"a\": 1}", "{\"a\": 2}"], false));
+        assert_eq!(top_level_objects("["), (vec![], true));
+        assert_eq!(top_level_objects(""), (vec![], true));
+    }
 }
 
 /// True when a file looks like a `log show` JSON / NDJSON export: a JSON

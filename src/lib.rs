@@ -36,6 +36,7 @@ pub use crate::parse_linux::*;
 pub use crate::parse_mac::parse_mac;
 mod parse_journal;
 pub(crate) mod linux_tz;
+mod partitions;
 mod parse_image_windows;
 pub use crate::parse_image_windows::*;
 mod parse_image_linux;
@@ -1173,7 +1174,10 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
         return Err("No events from any part: nothing to write.".into());
     }
     crate::banner::print_info(&format!("Merging the {} part(s) into one timeline", parts.len()));
+    // the parts were filtered as they were parsed
+    crate::filter::pause_filter(true);
     let r = merge_files(&parts, config.output.as_ref(), None, None, None);
+    crate::filter::pause_filter(false);
     let _ = fs::remove_dir_all(&tmp);
     if r.is_ok() {
         if let Some(out) = config.output.as_ref() {

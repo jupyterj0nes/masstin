@@ -61,7 +61,7 @@ parsers:
       ip_address:         "${remip}"
       logon_type:         "VPN"
       filename:           "${__source_file}"
-      detail:             "FortiGate SSL VPN tunnel UP | user=${user} from=${remip} tunneltype=${tunneltype} group=${group} assignip=${assignip}"
+      detail:             "FortiGate SSL VPN tunnel UP | user=${user} from=${remip} tunneltype=${tunneltype} group=${group} assignip=${tunnelip|assignip}"
 
   # ─────────────────────────────────────────────────────────────────────────
   # 2. SSL login failed

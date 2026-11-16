@@ -37,6 +37,201 @@ pub(crate) struct TzifTable {
     idx: Vec<u8>,            // ttinfo index per transition
     utoff: Vec<i32>,         // per ttinfo
     isdst: Vec<bool>,
+    /// The rule for every instant after the last transition (the TZ string
+    /// that ends a version 2+ file). A "slim" file, what `zic` writes by
+    /// default since 2020, lists the transitions only up to the last
+    /// change of rules (1996 for most of Europe) and leaves every year
+    /// since to this rule: without it the zone stayed for ever in the
+    /// offset of its last listed transition, and half of every year was
+    /// read an hour off.
+    footer: Option<PosixTz>,
+}
+
+/// One end of the daylight period of a POSIX TZ rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RuleDay {
+    /// `Mm.w.d`: month, week (5 = the last), day of the week (0 = Sunday)
+    Month(u32, u32, u32),
+    /// `Jn`: day 1..=365, February 29 never counted
+    Julian1(u32),
+    /// `n`: day 0..=365, February 29 counted
+    Julian0(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Change {
+    day: RuleDay,
+    /// local time of the change, seconds from midnight (02:00 when not
+    /// written; may be negative or beyond a day)
+    secs: i64,
+}
+
+/// A POSIX TZ string: `CET-1CEST,M3.5.0,M10.5.0/3`, `JST-9`,
+/// `<-04>4<-03>,M9.1.6/24,M4.1.6/24`. Offsets are kept in seconds EAST of
+/// UTC (the string writes them west).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PosixTz {
+    std: i32,
+    /// (offset, the change into it, the change out of it)
+    dst: Option<(i32, Change, Change)>,
+}
+
+impl PosixTz {
+    pub(crate) fn parse(s: &str) -> Option<PosixTz> {
+        let b = s.trim().as_bytes();
+        let mut p = 0usize;
+        let name = |p: &mut usize| -> Option<()> {
+            if *p < b.len() && b[*p] == b'<' {
+                while *p < b.len() && b[*p] != b'>' {
+                    *p += 1;
+                }
+                if *p >= b.len() {
+                    return None;
+                }
+                *p += 1;
+                Some(())
+            } else {
+                let start = *p;
+                while *p < b.len() && b[*p].is_ascii_alphabetic() {
+                    *p += 1;
+                }
+                if *p - start >= 3 { Some(()) } else { None }
+            }
+        };
+        // [+-]hh[:mm[:ss]] as seconds, sign as written
+        let hms = |p: &mut usize| -> Option<i64> {
+            let mut sign = 1i64;
+            if *p < b.len() && (b[*p] == b'+' || b[*p] == b'-') {
+                if b[*p] == b'-' {
+                    sign = -1;
+                }
+                *p += 1;
+            }
+            let mut total = 0i64;
+            for (k, unit) in [3600i64, 60, 1].iter().enumerate() {
+                if k > 0 {
+                    if *p < b.len() && b[*p] == b':' {
+                        *p += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let start = *p;
+                let mut n = 0i64;
+                while *p < b.len() && b[*p].is_ascii_digit() && *p - start < 3 {
+                    n = n * 10 + (b[*p] - b'0') as i64;
+                    *p += 1;
+                }
+                if *p == start {
+                    return None;
+                }
+                total += n * unit;
+            }
+            Some(sign * total)
+        };
+        let change = |p: &mut usize| -> Option<Change> {
+            if *p >= b.len() || b[*p] != b',' {
+                return None;
+            }
+            *p += 1;
+            let num = |p: &mut usize| -> Option<u32> {
+                let start = *p;
+                let mut n = 0u32;
+                while *p < b.len() && b[*p].is_ascii_digit() && *p - start < 4 {
+                    n = n * 10 + (b[*p] - b'0') as u32;
+                    *p += 1;
+                }
+                if *p == start { None } else { Some(n) }
+            };
+            let day = if *p < b.len() && b[*p] == b'M' {
+                *p += 1;
+                let m = num(p)?;
+                if *p >= b.len() || b[*p] != b'.' { return None; }
+                *p += 1;
+                let w = num(p)?;
+                if *p >= b.len() || b[*p] != b'.' { return None; }
+                *p += 1;
+                let d = num(p)?;
+                if !(1..=12).contains(&m) || !(1..=5).contains(&w) || d > 6 { return None; }
+                RuleDay::Month(m, w, d)
+            } else if *p < b.len() && b[*p] == b'J' {
+                *p += 1;
+                let n = num(p)?;
+                if !(1..=365).contains(&n) { return None; }
+                RuleDay::Julian1(n)
+            } else {
+                let n = num(p)?;
+                if n > 365 { return None; }
+                RuleDay::Julian0(n)
+            };
+            let secs = if *p < b.len() && b[*p] == b'/' {
+                *p += 1;
+                hms(p)?
+            } else {
+                7200
+            };
+            Some(Change { day, secs })
+        };
+        name(&mut p)?;
+        let std = -hms(&mut p)? as i32;
+        if p >= b.len() {
+            return Some(PosixTz { std, dst: None });
+        }
+        name(&mut p)?;
+        let dst_off = if p < b.len() && b[p] != b',' { -hms(&mut p)? as i32 } else { std + 3600 };
+        let start = change(&mut p)?;
+        let end = change(&mut p)?;
+        if p != b.len() {
+            return None;
+        }
+        Some(PosixTz { std, dst: Some((dst_off, start, end)) })
+    }
+
+    /// Days from 1970-01-01 to the day a change falls on in `year`.
+    fn day_of(day: RuleDay, year: i32) -> Option<i64> {
+        use chrono::{Datelike, NaiveDate};
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+        let jan1 = NaiveDate::from_ymd_opt(year, 1, 1)?;
+        let leap = NaiveDate::from_ymd_opt(year, 2, 29).is_some();
+        let date = match day {
+            RuleDay::Julian0(n) => jan1 + chrono::Duration::days(n as i64),
+            RuleDay::Julian1(n) => jan1 + chrono::Duration::days(n as i64 - 1 + if leap && n >= 60 { 1 } else { 0 }),
+            RuleDay::Month(m, w, d) => {
+                let first = NaiveDate::from_ymd_opt(year, m, 1)?;
+                let next = if m == 12 { NaiveDate::from_ymd_opt(year + 1, 1, 1)? } else { NaiveDate::from_ymd_opt(year, m + 1, 1)? };
+                let days_in_month = (next - first).num_days() as u32;
+                let first_wd = first.weekday().num_days_from_sunday();
+                let mut dom = 1 + (d + 7 - first_wd) % 7 + 7 * (w - 1);
+                while dom > days_in_month {
+                    dom -= 7;
+                }
+                NaiveDate::from_ymd_opt(year, m, dom)?
+            }
+        };
+        Some((date - epoch).num_days())
+    }
+
+    /// UTC offset (seconds east) in force at `utc_secs`.
+    pub(crate) fn offset_at(&self, utc_secs: i64) -> i32 {
+        let Some((dst, start, end)) = self.dst else { return self.std };
+        use chrono::Datelike;
+        let year = match chrono::DateTime::from_timestamp(utc_secs + self.std as i64, 0) {
+            Some(d) => d.year(),
+            None => return self.std,
+        };
+        // the change into daylight time is written in standard time, the
+        // change out of it in daylight time; a period that began last year
+        // or ends next year is looked at too (changes near the new year)
+        for y in [year - 1, year, year + 1] {
+            let (Some(s), Some(e)) = (Self::day_of(start.day, y), Self::day_of(end.day, if Self::day_of(end.day, y) > Self::day_of(start.day, y) { y } else { y + 1 })) else { continue };
+            let s_utc = s * 86_400 + start.secs - self.std as i64;
+            let e_utc = e * 86_400 + end.secs - dst as i64;
+            if utc_secs >= s_utc && utc_secs < e_utc {
+                return dst;
+            }
+        }
+        self.std
+    }
 }
 
 impl TzifTable {
@@ -78,7 +273,20 @@ impl TzifTable {
         }
         if utoff.is_empty() { return None; }
         if idx.iter().any(|&i| (i as usize) >= utoff.len()) { return None; }
-        Some(TzifTable { transitions, idx, utoff, isdst })
+        // the footer of a version 2+ file: after the abbreviations, the
+        // leap seconds and the two indicator arrays, a TZ string between
+        // two line feeds
+        let footer = if times_are_64 {
+            let at = p + c.charcnt + c.leapcnt * 12 + c.isstdcnt + c.isutcnt;
+            bytes.get(at..).filter(|rest| rest.first() == Some(&b'\n')).and_then(|rest| {
+                let line = &rest[1..];
+                let end = line.iter().position(|&x| x == b'\n').unwrap_or(line.len());
+                std::str::from_utf8(&line[..end]).ok().and_then(PosixTz::parse)
+            })
+        } else {
+            None
+        };
+        Some(TzifTable { transitions, idx, utoff, isdst, footer })
     }
 
     fn counts(h: &[u8]) -> Option<Counts> {
@@ -93,6 +301,12 @@ impl TzifTable {
 
     /// UTC offset (seconds east of UTC) in force at `utc_secs`.
     pub(crate) fn offset_at(&self, utc_secs: i64) -> i32 {
+        // after the last transition listed, the footer's rule
+        if let Some(rule) = &self.footer {
+            if self.transitions.last().map_or(true, |last| utc_secs >= *last) {
+                return rule.offset_at(utc_secs);
+            }
+        }
         if self.transitions.is_empty() || utc_secs < self.transitions[0] {
             // Before the first transition: the first standard-time ttinfo,
             // as RFC 8536 prescribes.
@@ -112,6 +326,12 @@ impl TzifTable {
     fn local_to_utc(&self, local: &NaiveDateTime) -> NaiveDateTime {
         let l = local.and_utc().timestamp();
         let mut offs: Vec<i32> = self.utoff.clone();
+        if let Some(rule) = &self.footer {
+            offs.push(rule.std);
+            if let Some((dst, _, _)) = rule.dst {
+                offs.push(dst);
+            }
+        }
         offs.sort_unstable();
         offs.dedup();
         let mut best: Option<i64> = None;
@@ -251,4 +471,78 @@ pub(crate) fn discover_timezone(root: &Path) -> (LocalTz, String) {
         }
     }
     (LocalTz::Utc, "not found — syslog timestamps assumed UTC".to_string())
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+    use chrono::Offset;
+
+    #[test]
+    fn posix_tz_strings_are_read() {
+        let p = |s: &str| PosixTz::parse(s);
+        assert_eq!(p("JST-9"), Some(PosixTz { std: 32400, dst: None }));
+        assert_eq!(p("<+00>0"), Some(PosixTz { std: 0, dst: None }));
+        let madrid = p("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        assert_eq!(madrid.std, 3600);
+        assert_eq!(madrid.dst, Some((7200, Change { day: RuleDay::Month(3, 5, 0), secs: 7200 }, Change { day: RuleDay::Month(10, 5, 0), secs: 10800 })));
+        let ny = p("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        assert_eq!((ny.std, ny.dst.unwrap().0), (-18000, -14400));
+        let chatham = p("<+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45").unwrap();
+        assert_eq!((chatham.std, chatham.dst.unwrap().0, chatham.dst.unwrap().1.secs), (45900, 49500, 9900));
+        let santiago = p("<-04>4<-03>,M9.1.6/24,M4.1.6/24").unwrap();
+        assert_eq!(santiago.dst.unwrap().1.secs, 86400);
+        assert_eq!(p("EST5EDT,J60,300/-1").unwrap().dst.unwrap().2, Change { day: RuleDay::Julian0(300), secs: -3600 });
+        for bad in ["", "X", "CET", "CET-1CEST", "CET-1CEST,M13.1.0,M10.5.0", "CET-1CEST,M3.5.0", "CET-1CEST,M3.5.0,M10.5.0/3x", "<+00"] {
+            assert_eq!(p(bad), None, "{:?}", bad);
+        }
+    }
+
+    /// Real "slim" zoneinfo files (tzdata 2026.6, as RHEL, Fedora and
+    /// Python's tzdata ship them): every hour from 2015 to 2037, the
+    /// offset masstin reads from the file is the zone's.
+    #[test]
+    fn a_slim_file_gives_the_zones_offset_every_hour() {
+        let zones: [(&str, &[u8], chrono_tz::Tz); 7] = [
+            ("Europe/Madrid", include_bytes!("testdata/tzif/Europe_Madrid.tzif"), chrono_tz::Europe::Madrid),
+            ("Europe/Dublin", include_bytes!("testdata/tzif/Europe_Dublin.tzif"), chrono_tz::Europe::Dublin),
+            ("America/Santiago", include_bytes!("testdata/tzif/America_Santiago.tzif"), chrono_tz::America::Santiago),
+            ("Australia/Sydney", include_bytes!("testdata/tzif/Australia_Sydney.tzif"), chrono_tz::Australia::Sydney),
+            ("Asia/Tokyo", include_bytes!("testdata/tzif/Asia_Tokyo.tzif"), chrono_tz::Asia::Tokyo),
+            ("America/New_York", include_bytes!("testdata/tzif/America_New_York.tzif"), chrono_tz::America::New_York),
+            ("Pacific/Chatham", include_bytes!("testdata/tzif/Pacific_Chatham.tzif"), chrono_tz::Pacific::Chatham),
+        ];
+        let from = chrono::NaiveDate::from_ymd_opt(2015, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let to = chrono::NaiveDate::from_ymd_opt(2037, 12, 31).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        for (name, bytes, tz) in zones {
+            let table = TzifTable::parse(bytes).unwrap_or_else(|| panic!("{}", name));
+            let mut t = from;
+            let mut wrong = 0usize;
+            let mut first = None;
+            while t < to {
+                let want = tz.offset_from_utc_datetime(&chrono::DateTime::from_timestamp(t, 0).unwrap().naive_utc()).fix().local_minus_utc();
+                let got = table.offset_at(t);
+                if got != want {
+                    wrong += 1;
+                    first.get_or_insert((t, got, want));
+                }
+                t += 3600;
+            }
+            assert_eq!(wrong, 0, "{}: {} hour(s) with another offset, the first {:?}", name, wrong, first);
+        }
+    }
+
+    /// A syslog time of a July afternoon and of a January one in Madrid,
+    /// from the slim file: two hours and one hour ahead of UTC.
+    #[test]
+    fn local_times_are_converted_with_the_footers_rule() {
+        let table = TzifTable::parse(include_bytes!("testdata/tzif/Europe_Madrid.tzif")).unwrap();
+        let tz = LocalTz::Table(table);
+        let at = |s: &str| tz.to_utc(&NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()).format("%Y-%m-%d %H:%M:%S").to_string();
+        assert_eq!(at("2026-07-15 16:00:00"), "2026-07-15 14:00:00");
+        assert_eq!(at("2026-01-15 16:00:00"), "2026-01-15 15:00:00");
+        // the night the clocks go back: 02:30 happens twice, the earlier one is taken
+        assert_eq!(at("2026-10-25 02:30:00"), "2026-10-25 00:30:00");
+        assert_eq!(at("2026-10-25 03:30:00"), "2026-10-25 02:30:00");
+    }
 }

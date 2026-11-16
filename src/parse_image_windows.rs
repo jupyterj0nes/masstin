@@ -1766,8 +1766,10 @@ fn find_ntfs_partitions<R: Read + Seek>(
                 eprintln!("[DEBUG] GPT protective MBR detected");
             }
 
-            // GPT header at LBA 1 (offset 512)
-            reader.seek(SeekFrom::Start(512)).map_err(|e| e.to_string())?;
+            // GPT header at LBA 1: byte 512, or 4096 on a disk with 4096-byte
+            // sectors (4Kn), where every LBA of the table counts 4096 bytes
+            let sector = crate::partitions::gpt_sector_size(reader).unwrap_or(512);
+            reader.seek(SeekFrom::Start(sector)).map_err(|e| e.to_string())?;
             let mut gpt_header = [0u8; 92];
             if reader.read_exact(&mut gpt_header).is_ok() {
                 // Verify "EFI PART" signature
@@ -1787,7 +1789,7 @@ fn find_ntfs_partitions<R: Read + Seek>(
                     if !(128..=4096).contains(&entry_size) {
                         return Err(format!("GPT header damaged: partition entries of {} bytes", entry_size));
                     }
-                    let entries_offset = entry_start_lba.saturating_mul(512);
+                    let entries_offset = entry_start_lba.saturating_mul(sector);
                     for i in 0..entry_count.min(128) {
                         let entry_offset = entries_offset + (i as u64 * entry_size as u64);
                         reader.seek(SeekFrom::Start(entry_offset)).map_err(|e| e.to_string())?;
@@ -1803,7 +1805,7 @@ fn find_ntfs_partitions<R: Read + Seek>(
                         }
 
                         let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
-                        let partition_byte_offset = first_lba * 512;
+                        let partition_byte_offset = first_lba.saturating_mul(sector);
 
                         // For Basic Data GUID, try NTFS even if signature check fails
                         // (some partition tools don't write the NTFS boot sector signature at offset 3)
@@ -1839,11 +1841,26 @@ fn find_ntfs_partitions<R: Read + Seek>(
                 ]);
 
                 if part_type == 0x07 && lba_start > 0 {
-                    let offset = lba_start as u64 * 512;
-                    // Add if NTFS or BitLocker (BitLocker replaces NTFS signature but keeps partition type 0x07)
-                    if verify_ntfs_signature(reader, offset) || verify_bitlocker_signature(reader, offset) {
-                        partitions.push(offset);
+                    // (an MBR does not say its sector size: the one that
+                    // puts a volume at the LBA is the disk's)
+                    for sector in crate::partitions::SECTOR_SIZES {
+                        let offset = lba_start as u64 * sector;
+                        // Add if NTFS or BitLocker (BitLocker replaces NTFS signature but keeps partition type 0x07)
+                        if verify_ntfs_signature(reader, offset) || verify_bitlocker_signature(reader, offset) {
+                            partitions.push(offset);
+                            break;
+                        }
                     }
+                }
+            }
+            // the logical partitions inside an extended one
+            for (part_type, lba) in crate::partitions::mbr_logical_partitions(reader, &mbr_buf, 512) {
+                let offset = lba * 512;
+                if part_type == 0x07 && (verify_ntfs_signature(reader, offset) || verify_bitlocker_signature(reader, offset)) {
+                    if is_debug_mode() {
+                        eprintln!("[DEBUG] logical partition at LBA {} (offset {:#x}) -- NTFS", lba, offset);
+                    }
+                    partitions.push(offset);
                 }
             }
         }
@@ -1950,6 +1967,7 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
                 Ok(f) => f,
                 Err(_) => continue,
             };
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
 
             let name = file_name.name().to_string_lossy().to_string();
             if !name.to_lowercase().ends_with(".evtx") {
@@ -2065,6 +2083,7 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if let Some(key) = entry.key() {
             let file_name = match key { Ok(f) => f, Err(_) => continue };
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
             let name = file_name.name().to_string_lossy().to_string();
             if !name.to_lowercase().ends_with(".evtx") { continue; }
 
@@ -2151,6 +2170,7 @@ fn extract_files_from_ntfs_path<R: Read + Seek>(
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if let Some(key) = entry.key() {
             let file_name = match key { Ok(f) => f, Err(_) => continue };
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
             let name = file_name.name().to_string_lossy().to_string();
             if !name.to_lowercase().ends_with(&format!(".{}", extension)) { continue; }
 
@@ -2252,6 +2272,7 @@ fn extract_files_recursive<R: Read + Seek>(
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if let Some(key) = entry.key() {
             let file_name = match key { Ok(f) => f, Err(_) => continue };
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
             let name = file_name.name().to_string_lossy().to_string();
 
             // Skip . and .. and system files
@@ -2382,6 +2403,7 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
             let entry = match entry { Ok(e) => e, Err(_) => continue };
             if let Some(key) = entry.key() {
                 let file_name = match key { Ok(f) => f, Err(_) => continue };
+                if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
                 let name = file_name.name().to_string_lossy();
                 if name.eq_ignore_ascii_case("Users") {
                     found_dir = Some(
@@ -2413,6 +2435,7 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         if let Some(key) = entry.key() {
             let file_name = match key { Ok(f) => f, Err(_) => continue };
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
             let username = file_name.name().to_string_lossy().to_string();
 
             // Skip system profiles and special entries

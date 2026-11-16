@@ -166,8 +166,40 @@ fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
             }
         }
     }
-    for log_dir in LOG_DIRS {
-        for (name, _, is_file) in tree.list_dir(log_dir) {
+    // Where /var/log is on THIS volume. On the root volume, `/var/log`. But
+    // `/var` or `/var/log` is often a volume of its own (the hardening
+    // guides ask for it): there the logs are under `/log`, or at the root
+    // of the volume, and looked for under `/var/log` they were never
+    // found. Whichever holds them, they are saved as `/var/log/...`.
+    let mut found_in = None;
+    for on_volume in ["/var/log", "/log", ""] {
+        let n = extract_log_dir(tree, on_volume, output_dir);
+        if n > 0 {
+            found_in = Some(on_volume);
+            count += n;
+            break;
+        }
+    }
+    if let Some(dir) = found_in.filter(|d| *d != "/var/log") {
+        crate::banner::print_info(&format!(
+            "    The volume is {} on its own: its logs are read from {}",
+            if dir.is_empty() { "/var/log" } else { "/var" },
+            if dir.is_empty() { "its root" } else { dir }
+        ));
+    }
+    count
+}
+
+/// The logs of one `/var/log`, which on this volume is the folder
+/// `on_volume` (`/var/log`, `/log` when the volume is `/var`, the root when
+/// it is `/var/log`): the known names in it and in its `audit`, and the
+/// journals under its `journal`. Saved under `/var/log`.
+fn extract_log_dir(tree: &dyn LogTree, on_volume: &str, output_dir: &Path) -> usize {
+    let mut count = 0;
+    let list = |dir: &str| tree.list_dir(if dir.is_empty() { "/" } else { dir });
+    for (sub, as_sub) in [("", ""), ("/audit", "/audit")] {
+        let dir = format!("{}{}", on_volume, sub);
+        for (name, _, is_file) in list(&dir) {
             if !is_file {
                 continue;
             }
@@ -176,10 +208,10 @@ fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
             if !wanted {
                 continue;
             }
-            let full = format!("{}/{}", log_dir, name);
+            let full = format!("{}/{}", dir, name);
             match tree.read_file(&full) {
                 Some(data) => {
-                    if save_extracted(&full, &data, output_dir) {
+                    if save_extracted(&format!("/var/log{}/{}", as_sub, name), &data, output_dir) {
                         count += 1;
                     }
                 }
@@ -191,11 +223,12 @@ fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
             }
         }
     }
-    for (machine, is_dir, _) in tree.list_dir("/var/log/journal") {
+    let journal = format!("{}/journal", on_volume);
+    for (machine, is_dir, _) in list(&journal) {
         if !is_dir {
             continue;
         }
-        let machine_dir = format!("/var/log/journal/{}", machine);
+        let machine_dir = format!("{}/{}", journal, machine);
         for (jname, _, is_file) in tree.list_dir(&machine_dir) {
             let jlow = jname.to_lowercase();
             if !is_file || !(jlow.ends_with(".journal") || jlow.ends_with(".journal~")) {
@@ -203,7 +236,7 @@ fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
             }
             let full = format!("{}/{}", machine_dir, jname);
             if let Some(data) = tree.read_file(&full) {
-                if save_extracted(&full, &data, output_dir) {
+                if save_extracted(&format!("/var/log/journal/{}/{}", machine, jname), &data, output_dir) {
                     count += 1;
                 }
             }
@@ -723,7 +756,9 @@ fn find_linux_partitions<R: Read + Seek>(
                 eprintln!("[DEBUG] GPT protective MBR detected");
             }
 
-            reader.seek(SeekFrom::Start(512)).map_err(|e| e.to_string())?;
+            // (LBA 1 is byte 512, or 4096 on a 4Kn disk)
+            let sector = crate::partitions::gpt_sector_size(reader).unwrap_or(512);
+            reader.seek(SeekFrom::Start(sector)).map_err(|e| e.to_string())?;
             let mut gpt_header = [0u8; 92];
             if reader.read_exact(&mut gpt_header).is_ok() && &gpt_header[0..8] == b"EFI PART" {
                 let entry_start_lba = u64::from_le_bytes(gpt_header[72..80].try_into().unwrap());
@@ -731,14 +766,14 @@ fn find_linux_partitions<R: Read + Seek>(
                 let entry_size = u32::from_le_bytes(gpt_header[84..88].try_into().unwrap());
 
                 if is_debug_mode() {
-                    eprintln!("[DEBUG] GPT: {} entries, {} bytes each, starting at LBA {}",
-                        entry_count, entry_size, entry_start_lba);
+                    eprintln!("[DEBUG] GPT: {} entries, {} bytes each, starting at LBA {} ({}-byte sectors)",
+                        entry_count, entry_size, entry_start_lba, sector);
                 }
 
                 if !(128..=4096).contains(&entry_size) {
                     return Err(format!("GPT header damaged: partition entries of {} bytes", entry_size));
                 }
-                let entries_offset = entry_start_lba.saturating_mul(512);
+                let entries_offset = entry_start_lba.saturating_mul(sector);
                 for i in 0..entry_count.min(128) {
                     let entry_offset = entries_offset + (i as u64 * entry_size as u64);
                     reader.seek(SeekFrom::Start(entry_offset)).map_err(|e| e.to_string())?;
@@ -753,7 +788,7 @@ fn find_linux_partitions<R: Read + Seek>(
                     }
 
                     let first_lba = u64::from_le_bytes(entry[32..40].try_into().unwrap());
-                    let partition_byte_offset = first_lba * 512;
+                    let partition_byte_offset = first_lba.saturating_mul(sector);
 
                     // whatever the type GUID says, the superblock decides (ext4 or XFS)
                     if let Some(kind) = sniff_linux_fs(reader, partition_byte_offset) {
@@ -779,11 +814,29 @@ fn find_linux_partitions<R: Read + Seek>(
 
                 // 0x83 = Linux native partition
                 if part_type == 0x83 && lba_start > 0 {
-                    let offset = lba_start as u64 * 512;
+                    // (an MBR does not say its sector size: the one that
+                    // puts a file system at the LBA is the disk's)
+                    for sector in crate::partitions::SECTOR_SIZES {
+                        let offset = lba_start as u64 * sector;
+                        if let Some(kind) = sniff_linux_fs(reader, offset) {
+                            if is_debug_mode() {
+                                eprintln!("[DEBUG] MBR partition {} at LBA {} (offset {:#x}) -- {} confirmed",
+                                    i, lba_start, offset, kind.label());
+                            }
+                            partitions.push((offset, kind));
+                            break;
+                        }
+                    }
+                }
+            }
+            // the logical partitions inside an extended one (`/var`, `/home`
+            // on installs that ran out of primary entries)
+            for (part_type, lba) in crate::partitions::mbr_logical_partitions(reader, &mbr_buf, 512) {
+                let offset = lba * 512;
+                if part_type == 0x83 {
                     if let Some(kind) = sniff_linux_fs(reader, offset) {
                         if is_debug_mode() {
-                            eprintln!("[DEBUG] MBR partition {} at LBA {} (offset {:#x}) -- {} confirmed",
-                                i, lba_start, offset, kind.label());
+                            eprintln!("[DEBUG] logical partition at LBA {} (offset {:#x}) -- {} confirmed", lba, offset, kind.label());
                         }
                         partitions.push((offset, kind));
                     }

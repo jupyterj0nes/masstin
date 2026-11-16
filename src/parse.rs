@@ -2041,8 +2041,18 @@ pub(crate) fn map_sysmon(rec: &WinRec, file: &str) -> Option<LogData> {
     let initiated = v("Initiated").eq_ignore_ascii_case("true");
 
     // (origin hostname, origin ip, dest hostname, dest ip, service port)
+    // Initiated=false, as Sysmon writes it (seen in real logs, OTRF
+    // Security-Datasets): a TCP connection this machine ACCEPTED has the
+    // client in Source* and this machine in Destination*, the service port
+    // being DestinationPort. (Read as "Source* is always this machine",
+    // the port looked at was the client's ephemeral one, and every
+    // inbound SMB / RDP / WinRM connection was dropped.) The other form
+    // exists too, with this machine in Source* and the service port in
+    // SourcePort: the service port says which one a record is.
     let (origin_host, origin_ip, dest_host, dest_ip, port) = if initiated {
         (computer.clone(), v("SourceIp"), v("DestinationHostname"), v("DestinationIp"), v("DestinationPort"))
+    } else if SYSMON_LM_PORTS.contains(&v("DestinationPort").as_str()) {
+        (v("SourceHostname"), v("SourceIp"), computer.clone(), v("DestinationIp"), v("DestinationPort"))
     } else {
         (v("DestinationHostname"), v("DestinationIp"), computer.clone(), v("SourceIp"), v("SourcePort"))
     };
@@ -2433,7 +2443,9 @@ pub(crate) fn report_logoff_pairing(filled: usize, dropped: usize) {
     }
 }
 
-fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
+/// Returns (rows written, events left out because the same event had
+/// already been taken).
+fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> (usize, usize) {
     // a file taken out of an image names the image, not the temp folder it
     // sat in; live before shadow copies still holds (`live` is shorter)
     for r in log_data.iter_mut() {
@@ -2448,6 +2460,7 @@ fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
     // Deduplicate events (e.g., same event from live volume and VSS snapshot)
     // Key: (time_created, dst_computer, event_id, event_type, target_user_name, src_ip)
     // Prefer live volume events over VSS (shorter filename = no "vss_" in path)
+    let mut duplicates = 0usize;
     let log_data = {
         let mut seen = std::collections::HashSet::new();
         let mut deduped: Vec<LogData> = Vec::with_capacity(log_data.len());
@@ -2469,6 +2482,8 @@ fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
                 item.workstation_name, item.logon_id, item.detail);
             if seen.insert(key) {
                 deduped.push(item);
+            } else {
+                duplicates += 1;
             }
         }
         deduped
@@ -2494,10 +2509,11 @@ fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> usize {
             Some(p) => eprintln!("[ERROR] Cannot write output file {}: {}", p, e),
             None => eprintln!("[ERROR] Cannot write output: {}", e),
         }
-        return 0;
+        crate::mark_failed();
+        return (0, duplicates);
     }
 
-    deduped_count
+    (deduped_count, duplicates)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3349,9 +3365,10 @@ pub fn parse_events_ex(
 
     // Phase 3: Generate output
     crate::banner::print_output_start();
-    let total_before_dedup = log_data.len();
-    let total_after_dedup = write_rows(log_data, output);
-    let deduped = total_before_dedup - total_after_dedup;
+    // (counted where they are dropped: the difference between what went in
+    // and what was written also holds the rows --ignore-local and the
+    // --exclude lists left out, and those were reported as duplicates)
+    let (total_after_dedup, deduped) = write_rows(log_data, output);
     if deduped > 0 {
         crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
     }

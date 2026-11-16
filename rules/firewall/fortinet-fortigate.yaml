@@ -54,6 +54,13 @@ parsers:
       pair_separator: " "
       kv_separator: "="
       trim: true
+    # `ui` is how the administrator came in and from where: `https(10.20.30.40)`,
+    # `ssh(185.220.101.45)`, or `console` with no address. The address alone
+    # is the origin.
+    sub_extract:
+      field: ui
+      type: regex
+      pattern: '\((?P<ui_ip>[^)]+)\)'
     map:
       time_created:       "${date} ${time}"
       computer:           "${devname}"
@@ -61,8 +68,7 @@ parsers:
       event_id:           "FORTI-ADMIN-LOGIN"
       subject_user_name:  "${user}"
       target_user_name:   "${user}"
-      workstation_name:   "${ui}"
-      ip_address:         "${ui}"
+      ip_address:         "${ui_ip}"
       logon_type:         "FW"
       filename:           "${__source_file}"
       detail:             "FortiGate admin login | user=${user} via=${ui} method=${method}"
@@ -80,6 +86,13 @@ parsers:
       pair_separator: " "
       kv_separator: "="
       trim: true
+    # `ui` is how the administrator came in and from where: `https(10.20.30.40)`,
+    # `ssh(185.220.101.45)`, or `console` with no address. The address alone
+    # is the origin.
+    sub_extract:
+      field: ui
+      type: regex
+      pattern: '\((?P<ui_ip>[^)]+)\)'
     map:
       time_created:       "${date} ${time}"
       computer:           "${devname}"
@@ -87,8 +100,7 @@ parsers:
       event_id:           "FORTI-ADMIN-LOGIN-FAIL"
       subject_user_name:  "${user}"
       target_user_name:   "${user}"
-      workstation_name:   "${ui}"
-      ip_address:         "${ui}"
+      ip_address:         "${ui_ip}"
       logon_type:         "FW"
       filename:           "${__source_file}"
       detail:             "FortiGate admin login FAIL | user=${user} via=${ui} reason=${reason} msg=${msg}"
@@ -106,6 +118,13 @@ parsers:
       pair_separator: " "
       kv_separator: "="
       trim: true
+    # `ui` is how the administrator came in and from where: `https(10.20.30.40)`,
+    # `ssh(185.220.101.45)`, or `console` with no address. The address alone
+    # is the origin.
+    sub_extract:
+      field: ui
+      type: regex
+      pattern: '\((?P<ui_ip>[^)]+)\)'
     map:
       time_created:       "${date} ${time}"
       computer:           "${devname}"
@@ -113,8 +132,7 @@ parsers:
       event_id:           "FORTI-ADMIN-LOGOUT"
       subject_user_name:  "${user}"
       target_user_name:   "${user}"
-      workstation_name:   "${ui}"
-      ip_address:         "${ui}"
+      ip_address:         "${ui_ip}"
       logon_type:         "FW"
       filename:           "${__source_file}"
       detail:             "FortiGate admin logout | user=${user} via=${ui} duration=${duration}"

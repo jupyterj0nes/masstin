@@ -162,7 +162,20 @@ pub fn is_filter_dry_run() -> bool {
 /// In dry-run mode with any active filter, always returns false — the
 /// parsers still run but produce empty output (header only), and the
 /// caller is expected to inspect print_filter_summary() at the end.
+static FILTER_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// While paused, every record is kept and none is counted. A `parse` of
+/// several parts filters each part as it is parsed and then merges them:
+/// the merge read the same rows through the filter again and the summary
+/// counted every row twice.
+pub fn pause_filter(paused: bool) {
+    FILTER_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn should_keep_record(r: &LogData) -> bool {
+    if FILTER_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let cfg = match FILTER_CONFIG.get() {
         Some(c) => c,
         None => return true,

@@ -456,6 +456,31 @@ mod review_2026_11_tests {
         assert_eq!(docs("bomarr", &arr).len(), 2);
     }
 
+    /// Sysmon 3 as the OTRF Security-Datasets hold it (covenant_copy_smb,
+    /// WORKSTATION6): a connection the machine accepted has the client in
+    /// Source* and the machine itself in Destination*.
+    #[test]
+    fn an_inbound_sysmon_connection_comes_from_its_client() {
+        let doc = |initiated: &str, sip: &str, sport: &str, dip: &str, dport: &str| {
+            serde_json::json!({
+                "@timestamp": "2020-09-22T18:53:03.000Z", "EventID": 3, "Channel": "Microsoft-Windows-Sysmon/Operational",
+                "Hostname": "WORKSTATION6.theshire.local", "Initiated": initiated, "Protocol": "tcp", "Image": "System", "User": "NT AUTHORITY\\SYSTEM",
+                "SourceIp": sip, "SourceHostname": "-", "SourcePort": sport, "DestinationIp": dip, "DestinationHostname": "-", "DestinationPort": dport
+            })
+        };
+        // accepted on 445: from the client, to this machine
+        let r = winlogbeat_row(&doc("false", "172.18.39.5", "62782", "172.18.39.6", "445"), "f.json").expect("an inbound SMB connection is a row");
+        assert_eq!((r.computer.as_str(), r.workstation_name.as_str(), r.ip_address.as_str()), ("WORKSTATION6.theshire.local", "", "172.18.39.5"));
+        // the other form of the same thing: this machine in Source*, its service port in SourcePort
+        let r = winlogbeat_row(&doc("false", "172.18.39.6", "445", "172.18.39.5", "62782"), "f.json").expect("the server-first form is a row too");
+        assert_eq!((r.computer.as_str(), r.ip_address.as_str()), ("WORKSTATION6.theshire.local", "172.18.39.5"));
+        // made by this machine: from it, to the server
+        let r = winlogbeat_row(&doc("true", "172.18.39.6", "51000", "172.18.39.5", "445"), "f.json").expect("an outbound connection is a row");
+        assert_eq!((r.computer.as_str(), r.workstation_name.as_str()), ("172.18.39.5", "WORKSTATION6.theshire.local"));
+        // no service port on either side (a DNS answer): nothing
+        assert!(winlogbeat_row(&doc("false", "172.18.38.5", "53", "172.18.39.5", "64354"), "f.json").is_none());
+    }
+
     #[test]
     fn utf16_as_powershell_writes_it_is_read() {
         let plain = docs("plain16", TWO.as_bytes());

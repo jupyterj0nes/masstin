@@ -157,9 +157,13 @@ parsers:
         subj: "SubjectUserName"
         sdom: "SubjectDomainName"
         ip: "IpAddress"
+        host: "Hostname"
     map:
       time_created:        "${ts}"
       computer:            "${tsn}"
+      # written on the machine that used the credentials: it is the origin,
+      # with or without an address in the event
+      workstation_name:    "${host}"
       event_type:          "CONNECT"
       event_id:            "4648"
       logon_type:          "3"
