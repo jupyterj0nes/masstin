@@ -3537,12 +3537,10 @@ impl Viewer {
             return;
         };
         let q = self.path_query(h, h);
-        let reach = if forward {
-            paths::forward_cone(&self.store, h, q.from.unwrap_or(self.store.t_min), &q)
-        } else {
-            paths::backward_cone(&self.store, h, q.to.unwrap_or(self.store.t_max), &q)
-        };
-        let edges: Vec<u32> = reach.values().filter_map(|r| r.via).collect();
+        let t0 = if forward { q.from.unwrap_or(self.store.t_min) } else { q.to.unwrap_or(self.store.t_max) };
+        let (reach, support) = paths::cone(&self.store, h, t0, &q, forward);
+        let mut edges: Vec<u32> = reach.values().filter_map(|r| r.via).collect();
+        edges.extend(support);
         let labels: HashMap<u32, String> = reach.iter().map(|(host, r)| (*host, if r.hop == 0 { (if forward { "origin" } else { "destination" }).to_string() } else { format!("hop {} · {}", r.hop, &fmt_time(r.t)[5..16]) })).collect();
         let hops: HashMap<u32, usize> = reach.iter().map(|(host, r)| (*host, r.hop)).collect();
         self.path_found.clear();

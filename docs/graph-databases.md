@@ -38,8 +38,9 @@ The loader supports two modes depending on what you are investigating:
 | Flag | Effect |
 |------|--------|
 | `--ungrouped` | One edge per CSV row (`CREATE`) instead of grouping. Preserves real timestamps for temporal path queries. Pair with `--start-time` / `--end-time`. |
-| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this. |
-| `--end-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is later than this. |
+| `--start-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is earlier than this (UTC; a date alone, or a zone at the end, are read too). |
+| `--end-time "YYYY-MM-DD HH:MM:SS"` | Drop rows whose `time_created` is later than this (a date alone is its last second). |
+| `--database` | `localhost:7687`, `127.0.0.1:7687` or a full `bolt://...` / `neo4j+s://...` address: `bolt://` is added when there is no scheme. |
 
 ```bash
 # Global overview — who talks to whom (default, grouped)
@@ -97,7 +98,7 @@ When the variable is unset or empty the loader falls back to the interactive pro
 
 ## Merge graph nodes after loading
 
-If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
+If you discover post-hoc that two `:host` nodes are the same physical machine (for example because the loader had no 4778/4779 evidence to unify them), use the `merge-*-nodes` actions to fuse them. Both nodes must exist (a name that is not in the graph is an error, and nothing is changed); the old node's aliases, its name and its log coverage go to the new one, and the edges between the two are deleted. They transfer every relationship from `--old-node` to `--new-node`, preserving relationship type and properties, and then delete the orphan node. **No APOC or MAGE plugin required** — masstin introspects the relationship types client-side and emits one transfer query per type.
 
 ```bash
 # Neo4j

@@ -132,80 +132,151 @@ pub struct Reach {
     pub via: Option<u32>,
 }
 
-/// Earliest-arrival traversal from `origin` starting at `from`: every host
-/// a chain of logins could have reached, each hop no later than `max_gap`
-/// after the previous one.
+/// Every host a chain of logins could have reached from `origin`, starting
+/// at `from`, each hop no later than `max_gap` after the one before it.
 pub fn forward_cone(s: &Store, origin: u32, from: i64, q: &PathQuery) -> HashMap<u32, Reach> {
-    let mut best: HashMap<u32, Reach> = HashMap::new();
-    best.insert(origin, Reach { hop: 0, t: from, via: None });
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    queue.push_back(origin);
-    while let Some(h) = queue.pop_front() {
-        let r = best[&h];
-        if r.hop >= q.max_hops {
-            continue;
-        }
-        let edges = s.out_adj.of(h);
-        let not_before = if r.hop == 0 { r.t } else { r.t + 1 };
-        let not_after = if r.hop == 0 { q.to.unwrap_or(i64::MAX) } else { (r.t + q.max_gap).min(q.to.unwrap_or(i64::MAX)) };
-        let start = edges.partition_point(|&ei| s.edges[ei as usize].t < not_before);
-        for &ei in &edges[start..] {
-            let e = &s.edges[ei as usize];
-            if e.t > not_after {
-                break;
-            }
-            if !hop_ok(s, e, q) {
-                continue;
-            }
-            let better = match best.get(&e.dst) {
-                None => true,
-                Some(b) => e.t < b.t,
-            };
-            if better {
-                best.insert(e.dst, Reach { hop: r.hop + 1, t: e.t, via: Some(ei) });
-                queue.push_back(e.dst);
-            }
-        }
-    }
-    best
+    cone(s, origin, from, q, true).0
 }
 
 /// The same towards `dest`, back in time from `to`: every host from which
 /// a chain of logins could have reached it.
 pub fn backward_cone(s: &Store, dest: u32, to: i64, q: &PathQuery) -> HashMap<u32, Reach> {
-    let mut best: HashMap<u32, Reach> = HashMap::new();
-    best.insert(dest, Reach { hop: 0, t: to, via: None });
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    queue.push_back(dest);
-    while let Some(h) = queue.pop_front() {
-        let r = best[&h];
-        if r.hop >= q.max_hops {
-            continue;
+    cone(s, dest, to, q, false).0
+}
+
+/// The cone of `seed`, forward in time or back, and the logins that
+/// support it besides each host's own (see below).
+///
+/// The logins are walked in the order of time, and a host keeps EVERY
+/// arrival that can still be continued, not its first one only: a login
+/// out of a host is a hop when some arrival came before it and no more
+/// than `max_gap` earlier. (Keeping the first arrival alone, a host
+/// entered at 09:00 and again at 17:00 could not be left at 17:30 with a
+/// gap of an hour, and everything reached from there was missing from the
+/// cone.) A host's `Reach` is its first arrival, as before; when the hop
+/// into it left a host through a LATER arrival than that host's first, the
+/// login of that arrival is given too, so what is drawn holds together.
+pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (HashMap<u32, Reach>, Vec<u32>) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    // time as the walk runs it: as it is forward, negated backward
+    let tau = |t: i64| if forward { t } else { t.saturating_neg() };
+    let limit: i64 = if forward { q.to.unwrap_or(i64::MAX) } else { q.from.map(|f| f.saturating_neg()).unwrap_or(i64::MAX) };
+    let adj = |h: u32| -> &[u32] {
+        if forward { s.out_adj.of(h) } else { s.in_adj.of(h) }
+    };
+    // the k-th login of a host in walk order (the lists are in time order)
+    let nth = |h: u32, k: usize| -> Option<u32> {
+        let l = adj(h);
+        if k >= l.len() {
+            None
+        } else if forward {
+            Some(l[k])
+        } else {
+            Some(l[l.len() - 1 - k])
         }
-        let edges = s.in_adj.of(h);
-        let not_after = if r.hop == 0 { r.t } else { r.t - 1 };
-        let not_before = if r.hop == 0 { q.from.unwrap_or(i64::MIN) } else { (r.t - q.max_gap).max(q.from.unwrap_or(i64::MIN)) };
-        // walk the latest first
-        let end = edges.partition_point(|&ei| s.edges[ei as usize].t <= not_after);
-        for &ei in edges[..end].iter().rev() {
-            let e = &s.edges[ei as usize];
-            if e.t < not_before {
-                break;
-            }
-            if !hop_ok(s, e, q) {
+    };
+    let etau = |ei: u32| tau(s.edges[ei as usize].t);
+    // the first login of a host, in walk order, at or after `x`
+    let first_at = |h: u32, x: i64| -> usize {
+        let l = adj(h);
+        if forward {
+            l.partition_point(|&ei| s.edges[ei as usize].t < x)
+        } else {
+            l.len() - l.partition_point(|&ei| s.edges[ei as usize].t <= x.saturating_neg())
+        }
+    };
+    struct Host {
+        /// the next login to look at, in walk order
+        next: usize,
+        /// no login after this can be a hop (the last arrival plus the gap)
+        until: i64,
+        /// arrivals that can still be continued: (time, hops, login), in
+        /// time order and with more hops the later they are (one that is
+        /// later and no shorter than another is never the better choice)
+        arrivals: VecDeque<(i64, usize, u32)>,
+        queued: bool,
+    }
+    let mut best: HashMap<u32, Reach> = HashMap::new();
+    best.insert(seed, Reach { hop: 0, t: t0, via: None });
+    let mut support: HashSet<u32> = HashSet::new();
+    let mut hosts: HashMap<u32, Host> = HashMap::new();
+    let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
+    let start = first_at(seed, tau(t0));
+    hosts.insert(seed, Host { next: start, until: limit, arrivals: VecDeque::new(), queued: false });
+    if let Some(ei) = nth(seed, start) {
+        heap.push(Reverse((etau(ei), seed)));
+        hosts.get_mut(&seed).unwrap().queued = true;
+    }
+    while let Some(Reverse((_, h))) = heap.pop() {
+        // this host's next login, and what it can continue
+        let (ei, hops, enabling) = {
+            let host = hosts.get_mut(&h).unwrap();
+            host.queued = false;
+            let Some(ei) = nth(h, host.next) else { continue };
+            let te = etau(ei);
+            if te > limit || (h != seed && te > host.until) {
+                // nothing more from here until another arrival
                 continue;
             }
-            let better = match best.get(&e.src) {
-                None => true,
-                Some(b) => e.t > b.t,
-            };
-            if better {
-                best.insert(e.src, Reach { hop: r.hop + 1, t: e.t, via: Some(ei) });
-                queue.push_back(e.src);
+            host.next += 1;
+            if h == seed {
+                (ei, 0usize, None)
+            } else {
+                while host.arrivals.front().map_or(false, |a| a.0 < te.saturating_sub(q.max_gap)) {
+                    host.arrivals.pop_front();
+                }
+                // the oldest arrival before this login is the one with the fewest hops
+                match host.arrivals.iter().find(|a| a.0 < te) {
+                    Some(a) => (ei, a.1, Some(a.2)),
+                    None => {
+                        if let Some(n) = nth(h, host.next) {
+                            heap.push(Reverse((etau(n), h)));
+                            host.queued = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        let e = &s.edges[ei as usize];
+        let te = etau(ei);
+        let v = if forward { e.dst } else { e.src };
+        if v != seed && v != h && hops < q.max_hops && hop_ok(s, e, q) {
+            if !best.contains_key(&v) {
+                best.insert(v, Reach { hop: hops + 1, t: e.t, via: Some(ei) });
+                if let Some(en) = enabling {
+                    if best.get(&h).and_then(|r| r.via) != Some(en) {
+                        support.insert(en);
+                    }
+                }
+            }
+            let first_next = first_at(v, te.saturating_add(1));
+            let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
+            while hv.arrivals.back().map_or(false, |a| a.1 >= hops + 1) {
+                hv.arrivals.pop_back();
+            }
+            hv.arrivals.push_back((te, hops + 1, ei));
+            hv.until = hv.until.max(te.saturating_add(q.max_gap));
+            if !hv.queued {
+                hv.next = hv.next.max(first_next);
+                if let Some(n) = nth(v, hv.next) {
+                    heap.push(Reverse((etau(n), v)));
+                    hv.queued = true;
+                }
+            }
+        }
+        let host = hosts.get_mut(&h).unwrap();
+        if !host.queued {
+            if let Some(n) = nth(h, host.next) {
+                heap.push(Reverse((etau(n), h)));
+                host.queued = true;
             }
         }
     }
-    best
+    let mut support: Vec<u32> = support.into_iter().collect();
+    support.sort_unstable();
+    (best, support)
 }
 
 /// The canned questions: short tables over a set of edges (the view's).
@@ -340,6 +411,89 @@ mod tests {
         (Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap(), path)
     }
 
+    /// A host entered twice: what it reaches after its SECOND arrival is in
+    /// the cone, forward and back, and the cone is every host a path
+    /// search finds and no other.
+    #[test]
+    fn a_cone_follows_every_arrival_not_the_first_one() {
+        let path = std::env::temp_dir().join(format!("masstin-cone-{}.csv", std::process::id()));
+        let row = |day: u32, hour: u32, src: &str, dst: &str| format!("2026-01-{:02}T{:02}:00:00Z,{},SUCCESSFUL_LOGON,4624,3,ana,CORP,,{},,,0x{}{},,Security.evtx,,,,,", day, hour, dst, src, day, hour);
+        let body = [
+            crate::csv_out::HEADER.to_string(),
+            row(5, 9, "10.0.0.1", "B"),
+            // eight hours later A enters B again, and B goes on within the hour
+            row(5, 17, "10.0.0.1", "B"),
+            row(5, 18, "B", "C"),
+            row(5, 19, "C", "D"),
+            // too late after anything: never part of the cone
+            row(9, 9, "D", "E"),
+            // another way into C, a day before, that leads nowhere in time
+            row(4, 9, "X", "C"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        let name = |id: &u32| s.hosts.name(*id).to_string();
+        let q = PathQuery { origin: h("10.0.0.1"), dest: h("D"), max_gap: 2 * 3600, ..Default::default() };
+        let (f, support) = cone(&s, h("10.0.0.1"), 0, &q, true);
+        let mut reached: Vec<String> = f.keys().map(name).collect();
+        reached.sort();
+        assert_eq!(reached, ["10.0.0.1", "B", "C", "D"]);
+        assert_eq!((f[&h("B")].hop, f[&h("C")].hop, f[&h("D")].hop), (1, 2, 3));
+        // B is shown by its first arrival; the one that let it go on is given too
+        assert_eq!(s.edges[f[&h("B")].via.unwrap() as usize].t % 86_400, 9 * 3600);
+        assert_eq!(support.len(), 1);
+        assert_eq!(s.edges[support[0] as usize].t % 86_400, 17 * 3600);
+        // what the path search finds is in the cone
+        assert_eq!(find_paths(&s, &q).len(), 1);
+        // back from D: the same chain, and X (a day early) is not on it
+        let (b, _) = cone(&s, h("D"), i64::MAX, &q, false);
+        let mut from: Vec<String> = b.keys().map(name).collect();
+        from.sort();
+        assert_eq!(from, ["10.0.0.1", "B", "C", "D"]);
+        assert_eq!((b[&h("C")].hop, b[&h("B")].hop, b[&h("10.0.0.1")].hop), (1, 2, 3));
+        // one hop at most: only what the seed touches itself
+        let one = PathQuery { max_hops: 1, ..PathQuery { origin: h("10.0.0.1"), dest: h("D"), max_gap: 2 * 3600, ..Default::default() } };
+        assert_eq!(cone(&s, h("10.0.0.1"), 0, &one, true).0.len(), 2);
+        // a window that ends before the second arrival: B alone
+        let early = PathQuery { to: Some(s.edges[f[&h("B")].via.unwrap() as usize].t + 3600), ..PathQuery { origin: h("10.0.0.1"), dest: h("D"), max_gap: 2 * 3600, ..Default::default() } };
+        assert_eq!(cone(&s, h("10.0.0.1"), 0, &early, true).0.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// On a real timeline (`MASSTIN_CONE_FIXTURE=<timeline.csv>`, and
+    /// `MASSTIN_CONE_ORIGINS=a,b`): every host the path search reaches from
+    /// an origin is in that origin's cone, and the other way round.
+    #[test]
+    fn the_cone_is_what_the_path_search_reaches() {
+        let Ok(file) = std::env::var("MASSTIN_CONE_FIXTURE") else { return };
+        let s = Store::load(&[file], 0.05).unwrap();
+        let origins = std::env::var("MASSTIN_CONE_ORIGINS").unwrap_or_default();
+        for o in origins.split(',').filter(|o| !o.is_empty()) {
+            let origin = s.hosts.get(o).unwrap_or_else(|| panic!("no host {}", o));
+            for (hops, gap) in [(2usize, 3600i64), (3, 6 * 3600), (4, 24 * 3600)] {
+                let q = PathQuery { origin, dest: origin, max_hops: hops, max_gap: gap, ..Default::default() };
+                let (reach, _) = cone(&s, origin, s.t_min, &q, true);
+                let (mut both, mut only_paths, mut only_cone) = (0usize, 0usize, 0usize);
+                for d in 0..s.hosts.len() as u32 {
+                    if d == origin {
+                        continue;
+                    }
+                    let found = !find_paths(&s, &PathQuery { dest: d, max_paths: 1, ..q.clone() }).is_empty();
+                    match (found, reach.contains_key(&d)) {
+                        (true, true) => both += 1,
+                        (true, false) => only_paths += 1,
+                        (false, true) => only_cone += 1,
+                        _ => {}
+                    }
+                }
+                println!("{} hops<={} gap={}h: cone {} hosts; with a path {}; a path but not in the cone {}; in the cone without a path found {}", o, hops, gap / 3600, reach.len() - 1, both, only_paths, only_cone);
+                assert_eq!(only_paths, 0, "{}: hosts with a path that the cone misses", o);
+            }
+        }
+    }
+
     #[test]
     fn paths_respect_time_gap_and_filters() {
         let (s, path) = store();
@@ -371,6 +525,8 @@ mod tests {
         let b = backward_cone(&s, h("DC01"), i64::MAX, &strict);
         assert!(b.contains_key(&h("10.0.0.5")));
         assert_eq!(b[&h("WS01")].hop, 2);
+        // the same hosts whichever way the cone is asked for
+        assert_eq!(cone(&s, h("10.0.0.5"), 0, &q2, true).0.len(), f.len());
         let qs = questions(&s, &(0..s.edges.len() as u32).collect::<Vec<_>>(), 5);
         assert_eq!(qs[0].rows[0].0, "WS01");
         assert!(qs[3].rows.iter().any(|r| r.0 == "WS01 -> DC01"));

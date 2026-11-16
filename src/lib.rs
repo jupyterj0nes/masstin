@@ -106,7 +106,10 @@ pub struct Cli {
     #[arg(long)]
     db: Option<String>,
 
-    /// If specified, overwrite the output file if it exists
+    /// Overwrite the output file (-o) if it exists. Every action that
+    /// writes a timeline asks for it: without it an existing -o is an error,
+    /// said before anything is read. -o is never one of the files being
+    /// read, unless that file is a masstin timeline being merged into.
     #[arg(long)]
     overwrite: bool,
 
@@ -294,7 +297,9 @@ pub struct Cli {
     /// For `graph-hunt`: cutoff datetime separating baseline from investigation
     /// window. Events strictly before this timestamp form the baseline; events
     /// at or after it are the window scanned for anomalies. Format:
-    /// "YYYY-MM-DD HH:MM:SS" (UTC assumed).
+    /// "YYYY-MM-DD HH:MM:SS" (UTC); a date alone is read too. A hunt that
+    /// cannot be computed (no connection on or after the cutoff, fewer
+    /// than two days before it) writes nothing and ends with an error.
     #[arg(long)]
     investigation_from: Option<String>,
 
