@@ -346,7 +346,11 @@ pub(crate) fn split_csv(line: &str) -> Vec<String> {
 
 fn account_type(user: &str) -> String {
     let stripped = user.split('@').next().unwrap_or(user);
-    let mut s: String = stripped.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    // Letters and digits of any alphabet are kept: with ASCII only, two
+    // accounts written in another script and of the same length became
+    // the same run of `_` and the hunt took them for one account.
+    // Punctuation is `_`, as in the relationship types of a loaded graph.
+    let mut s: String = stripped.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
     if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
         s = format!("u{}", s);
     }
@@ -354,6 +358,46 @@ fn account_type(user: &str) -> String {
         s = "NO_USER".to_string();
     }
     s.to_uppercase()
+}
+
+/// A host cell as the one name of its machine: an address without its
+/// port, brackets or zone (`10.9.9.9:50211`, `[fe80::1%eth0]:22`), an IPv4
+/// address written as IPv6 (`::ffff:10.8.8.8`) as that IPv4 address, a
+/// name without the dot that ends a fully qualified one. Before, each of
+/// those was another machine, and `10.9.9.9:50211` the machine `10`.
+pub(crate) fn clean_host(v: &str) -> String {
+    let t = v.trim().trim_end_matches('.');
+    let inner = t.strip_prefix('[').and_then(|s| s.split_once(']')).map(|(a, _)| a).unwrap_or(t);
+    let no_zone = inner.split('%').next().unwrap_or(inner);
+    let plain = |ip: std::net::IpAddr| -> String {
+        match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| v6.to_string()),
+            v4 => v4.to_string(),
+        }
+    };
+    if let Ok(ip) = no_zone.parse::<std::net::IpAddr>() {
+        return plain(ip);
+    }
+    if let Some((addr, port)) = no_zone.rsplit_once(':') {
+        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(v4) = addr.parse::<std::net::Ipv4Addr>() {
+                return v4.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// A cleaned host cell that names no machine: empty, a placeholder, the
+/// machine itself by any of its loopback names.
+fn names_no_machine(v: &str) -> bool {
+    if LOCAL_SOURCES.iter().any(|l| l.eq_ignore_ascii_case(v)) || v.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match v.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
 }
 
 /// Values of `src_computer` / `src_ip` that name no machine.
@@ -377,20 +421,26 @@ pub(crate) fn short_name(v: &str, ambiguous: &HashSet<String>) -> String {
 /// origin is its destination. The same function keys the corpus rows and
 /// finds a row's connection again when the timeline is annotated.
 pub(crate) fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) -> Option<(String, String, String, u8)> {
-    let is_local = |v: &str| LOCAL_SOURCES.contains(&v);
-    let sc = p[7].trim();
-    let si = p[8].trim();
-    let origin = if !is_local(sc) && !(looks_like_ip(sc) && sc == si) {
-        short_name(sc, ambiguous)
-    } else if !is_local(si) {
-        short_name(si, ambiguous)
+    let sc = clean_host(&p[7]);
+    let si = clean_host(&p[8]);
+    let dest = short_name(&clean_host(&p[1]), ambiguous);
+    if dest.is_empty() {
+        return None;
+    }
+    // The origin is the name when there is one, else the address. A name
+    // that is the destination itself says nothing (a logoff written with
+    // the machine's own name): the address, when it names another
+    // machine, is the origin then.
+    let by_name = if !names_no_machine(&sc) && !(looks_like_ip(&sc) && sc == si) { Some(short_name(&sc, ambiguous)) } else { None };
+    let by_addr = if !names_no_machine(&si) { Some(short_name(&si, ambiguous)) } else { None };
+    let other = |o: &Option<String>| o.as_ref().map_or(false, |x| !x.eq_ignore_ascii_case(&dest));
+    let origin = if other(&by_name) {
+        by_name.unwrap()
+    } else if other(&by_addr) {
+        by_addr.unwrap()
     } else {
         return None;
     };
-    let dest = short_name(p[1].trim(), ambiguous);
-    if dest.is_empty() || origin.eq_ignore_ascii_case(&dest) {
-        return None;
-    }
     let acct = account_type(p[5].trim());
     let cls = class_of(p[2].trim(), p[3].trim(), &acct);
     Some((origin, dest, acct, cls))
@@ -425,7 +475,7 @@ pub(crate) fn ambiguous_short_names(files: &[String]) -> std::io::Result<HashSet
             split_csv_into(&line, &mut p);
             for &col in &cols {
                 if let Some(v) = p.get(col) {
-                    let v = v.to_uppercase();
+                    let v = clean_host(v).to_uppercase();
                     if v.contains('.') && !looks_like_ip(&v) {
                         if let Some(short) = v.split('.').next() {
                             fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
@@ -468,7 +518,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
             }
             n_lines += 1;
             for col in [1usize, 7, 8] {
-                let v = p[col].to_uppercase();
+                let v = clean_host(&p[col]).to_uppercase();
                 if v.contains('.') && !looks_like_ip(&v) {
                     if let Some(short) = v.split('.').next() {
                         fqdn_by_short.entry(short.to_string()).or_default().insert(v.clone());
@@ -1164,8 +1214,13 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
         // pass A: the state of every line; logins by (destination, logon
         // ID) for the session ends
         let mut states: Vec<(u8, u32)> = Vec::new();
-        let mut logins: HashMap<(u32, String), (u8, u32)> = HashMap::new();
-        let mut pending: Vec<(usize, u32, String)> = Vec::new();
+        // Every login of a destination by its logon ID, with its time. An
+        // ID comes back (RDP session ids are 1, 2, 3...; a logon ID after a
+        // reboot), so a session end is the end of the LAST login with its
+        // ID before it, tracked by the hunt or not: with one entry per ID
+        // every end took the state of whichever login was read last.
+        let mut logins: HashMap<(u32, String), Vec<(i64, (u8, u32))>> = HashMap::new();
+        let mut pending: Vec<(usize, u32, String, i64)> = Vec::new();
         {
             let rd = std::io::BufReader::new(std::fs::File::open(f)?);
             for line in crate::csv_out::records(rd).skip(1) {
@@ -1181,13 +1236,31 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
                     Some(x) => x.and_utc().timestamp(),
                     None => continue,
                 };
+                // a login the hunt does not follow (no origin, the machine
+                // itself, a baseline day) still opens the session its
+                // logoff ends: it is noted with no state
+                let untracked = |logins: &mut HashMap<(u32, String), Vec<(i64, (u8, u32))>>| {
+                    let et = p[2].trim();
+                    let lid = p[11].trim();
+                    if et == "LOGOFF" || et == "FAILED_LOGON" || lid.is_empty() {
+                        return;
+                    }
+                    let dest = short_name(&clean_host(&p[1]), &c.ambiguous);
+                    if let Some(&d) = c.nodes.map.get(&dest) {
+                        logins.entry((ents.of_node[d as usize], lid.to_string())).or_default().push((t, (ST_NONE, u32::MAX)));
+                    }
+                };
                 let (origin, dest, acct, cls) = match row_key(&p, &c.ambiguous) {
                     Some(k) => k,
-                    None => continue,
+                    None => {
+                        untracked(&mut logins);
+                        continue;
+                    }
                 };
                 let day = day_of(t);
                 if day < cutoff_day {
                     states[n] = (ST_BASELINE, u32::MAX);
+                    untracked(&mut logins);
                     continue;
                 }
                 if let Some(e) = end_ts {
@@ -1202,7 +1275,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
                 let lid = p[11].trim();
                 if cls == OTHER {
                     if p[2].trim() == "LOGOFF" && !lid.is_empty() {
-                        pending.push((n, de, lid.to_string()));
+                        pending.push((n, de, lid.to_string(), t));
                     }
                     continue;
                 }
@@ -1214,20 +1287,30 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
                     Some(&a) => a,
                     None => continue,
                 };
-                if let Some(&i) = by_key.get(&(oe, de, a, cls, day)) {
-                    let st = (state_of(i), i as u32);
-                    states[n] = st;
-                    if cls == OK && !lid.is_empty() {
-                        logins.insert((de, lid.to_string()), st);
-                    }
+                let st = match by_key.get(&(oe, de, a, cls, day)) {
+                    Some(&i) => (state_of(i), i as u32),
+                    None => (ST_NONE, u32::MAX),
+                };
+                states[n] = st;
+                if cls == OK && !lid.is_empty() {
+                    logins.entry((de, lid.to_string())).or_default().push((t, st));
                 }
             }
         }
         let mut inherited = 0usize;
-        for (n, de, lid) in pending {
-            if let Some(&st) = logins.get(&(de, lid)) {
-                states[n] = st;
-                inherited += 1;
+        for v in logins.values_mut() {
+            v.sort_by_key(|(t, _)| *t);
+        }
+        for (n, de, lid, t) in pending {
+            if let Some(v) = logins.get(&(de, lid)) {
+                let k = v.partition_point(|(lt, _)| *lt <= t);
+                if k > 0 {
+                    let st = v[k - 1].1;
+                    if st.0 != ST_NONE {
+                        states[n] = st;
+                        inherited += 1;
+                    }
+                }
             }
         }
         // pass B: the file again, with its tail
@@ -1747,6 +1830,12 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     for (o, a) in ix_oa.m.keys() {
         acct_origins.entry(*a).or_default().push(*o);
     }
+    // in a fixed order: the keys come out of a hash map in another order
+    // on every run, and an account used as often from two machines had one
+    // "home" or the other depending on it
+    for v in acct_origins.values_mut() {
+        v.sort_unstable();
+    }
     let no_origins: Vec<u32> = Vec::new();
     let mut home_cache: HashMap<(i32, u32), f64> = HashMap::new();
     // The reference graph holds the pairs seen BEFORE the cutoff only. The
@@ -2000,27 +2089,69 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         for v in inbound.values_mut() {
             v.sort();
         }
-        for e2 in ok_events.iter().filter(|e| e.o != e.d) {
-            let v = match inbound.get(&e2.o) {
-                Some(v) => v,
-                None => continue,
-            };
-            let k = v.partition_point(|(t, _, _, _)| *t <= e2.t);
-            let mut cands: BTreeMap<(u32, u32), i64> = BTreeMap::new();
-            for (t1, a_node, a1, end1) in &v[..k] {
-                if *end1 >= e2.t && *a_node != e2.o && *a_node != e2.d {
-                    // latest entry of each candidate cause
-                    cands.insert((*a_node, *a1), *t1);
+        // The logins out of each pivot, in time order, against the
+        // sessions open on it at that moment. The open sessions are kept as
+        // the pivot's logins go by (entered: added; ended: removed), by
+        // (machine, account) with the entry times still open: what is
+        // looked at for each login is the distinct candidates, not every
+        // session that ever entered. (Walking all the earlier sessions for
+        // every login took 30 s on 250,000 rows through one host; the
+        // result is the same.)
+        let mut outbound: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, e2) in ok_events.iter().enumerate().filter(|(_, e)| e.o != e.d) {
+            if inbound.contains_key(&e2.o) {
+                outbound.entry(e2.o).or_default().push(i);
+            }
+        }
+        let mut pivots: Vec<u32> = outbound.keys().copied().collect();
+        pivots.sort_unstable();
+        for pivot in pivots {
+            let v = &inbound[&pivot];
+            let mut outs = outbound.remove(&pivot).unwrap_or_default();
+            outs.sort_by_key(|&i| (ok_events[i].t, i));
+            let mut open: BTreeMap<(u32, u32), BTreeMap<i64, u32>> = BTreeMap::new();
+            let mut ends: std::collections::BinaryHeap<std::cmp::Reverse<(i64, u32, u32, i64)>> = std::collections::BinaryHeap::new();
+            let mut next = 0usize;
+            for i in outs {
+                let e2 = &ok_events[i];
+                while next < v.len() && v[next].0 <= e2.t {
+                    let (t1, a_node, a1, end1) = v[next];
+                    *open.entry((a_node, a1)).or_default().entry(t1).or_insert(0) += 1;
+                    ends.push(std::cmp::Reverse((end1, a_node, a1, t1)));
+                    next += 1;
                 }
-            }
-            if cands.is_empty() {
-                continue;
-            }
-            let cert = 1.0 / cands.len() as f64;
-            for ((a_node, a1), t1) in &cands {
-                if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), day_of(e2.t)) {
-                    if let Some(od) = origin_days.get_mut(&(day_of(e2.t), e2.o)) {
-                        od.paths.push(PathFact { cert, a_node: *a_node, a1: *a1, t1: *t1, c_node: e2.d, a2: e2.a, t2: e2.t, n_cand: cands.len() });
+                while let Some(std::cmp::Reverse((end1, a_node, a1, t1))) = ends.peek().copied() {
+                    if end1 >= e2.t {
+                        break;
+                    }
+                    ends.pop();
+                    if let Some(times) = open.get_mut(&(a_node, a1)) {
+                        if let Some(n) = times.get_mut(&t1) {
+                            *n -= 1;
+                            if *n == 0 {
+                                times.remove(&t1);
+                            }
+                        }
+                        if times.is_empty() {
+                            open.remove(&(a_node, a1));
+                        }
+                    }
+                }
+                // latest entry of each candidate cause still open
+                let cands: Vec<((u32, u32), i64)> = open
+                    .iter()
+                    .filter(|((a_node, _), _)| *a_node != e2.o && *a_node != e2.d)
+                    .filter_map(|(k, times)| times.keys().next_back().map(|t1| (*k, *t1)))
+                    .collect();
+                if cands.is_empty() {
+                    continue;
+                }
+                let cert = 1.0 / cands.len() as f64;
+                for ((a_node, a1), t1) in &cands {
+                    if *a1 != e2.a && ix_ad.is_new(&(*a1, e2.d), day_of(e2.t)) {
+                        if let Some(od) = origin_days.get_mut(&(day_of(e2.t), e2.o)) {
+                            od.paths.push(PathFact { cert, a_node: *a_node, a1: *a1, t1: *t1, c_node: e2.d, a2: e2.a, t2: e2.t, n_cand: cands.len() });
+                        }
                     }
                 }
             }
@@ -2722,17 +2853,41 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
             accounts: HashSet<u32>,
             has_history: bool,
         }
+        // A seed is matched as it is written in the logs and as the hunt
+        // names it: `svc-backup` is the account the hunt calls SVC_BACKUP,
+        // `CORP\svc-backup` and `svc-backup@corp.local` too; a host by its
+        // short name or its FQDN, an address with or without its port.
         let find_m = |s: &str| -> HashSet<u32> {
-            (0..ents.names.names.len() as u32)
-                .filter(|&e| ents.names.name(e).to_lowercase() == s || ents.aliases[e as usize].iter().any(|a| a.to_lowercase() == s))
+            let cleaned = clean_host(s);
+            let short = short_name(&cleaned, &c.ambiguous).to_lowercase();
+            let cleaned = cleaned.to_lowercase();
+            let is = |n: &str| {
+                let n = n.to_lowercase();
+                n == s || n == cleaned || n == short
+            };
+            (0..ents.names.names.len() as u32).filter(|&e| is(ents.names.name(e)) || ents.aliases[e as usize].iter().any(|a| is(a))).collect()
+        };
+        let find_a = |s: &str| -> HashSet<u32> {
+            let bare = s.rsplit('\\').next().unwrap_or(s);
+            let key = account_type(bare).to_lowercase();
+            (0..c.accts.names.len() as u32)
+                .filter(|&a| {
+                    let n = c.accts.name(a).to_lowercase();
+                    n == s || n == key
+                })
                 .collect()
         };
-        let find_a = |s: &str| -> HashSet<u32> { (0..c.accts.names.len() as u32).filter(|&a| c.accts.name(a).to_lowercase() == s).collect() };
         let mut specs: Vec<Spec> = Vec::new();
         let mut matched: Vec<String> = Vec::new();
         let mut unmatched: Vec<String> = Vec::new();
         for raw in &cfg.seeds {
             let s = raw.to_lowercase();
+            // an address with its port (or brackets, or written as IPv6) is
+            // the machine at that address, not `machine:account`
+            let s = match clean_host(&s) {
+                c if c.parse::<std::net::IpAddr>().is_ok() => c,
+                _ => s,
+            };
             let (machines, accounts) = match s.rfind(':') {
                 Some(k) if !looks_like_ip(&s) => (find_m(&s[..k]), find_a(&s[k + 1..])),
                 _ => {
@@ -2754,7 +2909,8 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
             matched.push(raw.clone());
             specs.push(Spec { text: raw.clone(), machines, accounts, has_history });
         }
-        let seed_m: HashSet<u32> = specs.iter().flat_map(|sp| sp.machines.iter().copied()).collect();
+        // (ordered: the report lists them, and the hops back from them, in this order)
+        let seed_m: BTreeSet<u32> = specs.iter().flat_map(|sp| sp.machines.iter().copied()).collect();
         let seed_a: HashSet<u32> = specs.iter().filter(|sp| sp.machines.is_empty()).flat_map(|sp| sp.accounts.iter().copied()).collect();
         let t_lo = cfg.seed_from.map(|t| t.timestamp()).unwrap_or(i64::MIN);
         let t_hi = cfg.seed_to.map(|t| t.timestamp()).unwrap_or(i64::MAX);
@@ -2798,7 +2954,10 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
             v.sort_by_key(|i| sess[*i].t);
         }
         // is a session a new connection in the hunt? (origin, dest, account, day)
-        let conn_of: HashMap<(u32, u32, u32, i32), usize> = out.iter().enumerate().map(|(i, cn)| ((cn.oid, cn.did, cn.aid, cn.day), i)).collect();
+        // (the successful connection: a failure of the same origin,
+        // destination and account that day is another row of the hunt, and
+        // read in its place it made a new login look habitual)
+        let conn_of: HashMap<(u32, u32, u32, i32), usize> = out.iter().enumerate().filter(|(_, cn)| cn.cls == OK).map(|(i, cn)| ((cn.oid, cn.did, cn.aid, cn.day), i)).collect();
         let is_new_conn = |s: &Sess| conn_of.get(&(s.o, s.d, s.a, s.day)).map(|&i| out[i].flags & F_TRIPLE != 0).unwrap_or(false);
         struct HopRec {
             s: usize,
@@ -3464,6 +3623,95 @@ mod tests {
 
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir().join(format!("masstin-annot-{}-{}", std::process::id(), name)).to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn a_host_cell_is_the_one_name_of_its_machine() {
+        for (cell, name) in [
+            ("10.9.9.9:50211", "10.9.9.9"),
+            ("10.9.9.9", "10.9.9.9"),
+            ("::ffff:10.8.8.8", "10.8.8.8"),
+            ("[fe80::1%eth0]:22", "fe80::1"),
+            ("fe80::1%eth0", "fe80::1"),
+            ("[2001:db8::5]", "2001:db8::5"),
+            ("SRV01.corp.local.", "SRV01.corp.local"),
+            (" SRV01 ", "SRV01"),
+            ("WS-7:backup", "WS-7:backup"),
+            ("", ""),
+        ] {
+            assert_eq!(clean_host(cell), name, "{:?}", cell);
+        }
+        for none in ["", "-", "LOCAL", "local", "localhost", "LOCALHOST", "127.0.0.1", "127.0.0.53", "::1", "0.0.0.0", "::"] {
+            assert!(names_no_machine(&clean_host(none)), "{:?}", none);
+        }
+        for some in ["10.0.0.5", "SRV01", "fe80::1", "LOCALHOST01"] {
+            assert!(!names_no_machine(&clean_host(some)), "{:?}", some);
+        }
+    }
+
+    /// What a row is to the hunt, for the cells the parsers really write.
+    #[test]
+    fn the_origin_of_a_row() {
+        let none: HashSet<String> = HashSet::new();
+        let key = |dst: &str, sc: &str, si: &str, user: &str| -> Option<(String, String, String)> {
+            let line = format!("2026-01-05T10:00:00Z,{},SUCCESSFUL_LOGON,4624,3,{},CORP,{},{},,,0x1,,Security.evtx", dst, user, sc, si);
+            let mut p: Vec<std::borrow::Cow<str>> = Vec::new();
+            split_csv_into(&line, &mut p);
+            row_key(&p, &none).map(|(o, d, a, _)| (o, d, a))
+        };
+        let k = |o: &str, d: &str, a: &str| Some((o.to_string(), d.to_string(), a.to_string()));
+        assert_eq!(key("SRV01.corp.local", "WS07", "10.0.0.7", "ana"), k("WS07", "SRV01", "ANA"));
+        assert_eq!(key("SRV01.corp.local", "", "10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA"));
+        // a port, an IPv4 address written as IPv6, a dot ending the name
+        assert_eq!(key("SRV01", "", "10.0.0.7:50211", "ana"), k("10.0.0.7", "SRV01", "ANA"));
+        assert_eq!(key("SRV01", "", "::ffff:10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA"));
+        assert_eq!(key("SRV01.corp.local.", "WS07.corp.local.", "", "ana"), k("WS07", "SRV01", "ANA"));
+        // the machine itself, by any name: no origin
+        for (sc, si) in [("", ""), ("-", "-"), ("localhost", ""), ("", "127.0.0.1"), ("LOCAL", "::1"), ("SRV01", ""), ("srv01.corp.local", "-"), ("", "::ffff:127.0.0.1")] {
+            assert_eq!(key("SRV01.corp.local", sc, si, "ana"), None, "{:?} {:?}", sc, si);
+        }
+        // RDP as Windows logs it (lab, DEV-SRV01): the workstation is the
+        // server itself and the address is the client's
+        assert_eq!(key("DEV-SRV01.dev.leoncorp.test", "DEV-SRV01", "10.10.0.37", "ryan.devlead"), k("10.10.0.37", "DEV-SRV01", "RYAN_DEVLEAD"));
+        // accounts of another alphabet stay themselves
+        let a = key("SRV01", "WS07", "", "\u{43c}\u{430}\u{440}\u{438}\u{44f}").unwrap().2;
+        let b = key("SRV01", "WS07", "", "\u{438}\u{432}\u{430}\u{43d}\u{430}").unwrap().2;
+        assert!(a != b && !a.contains('_'), "{} {}", a, b);
+        assert_eq!(key("SRV01", "WS07", "", "jos\u{e9}").unwrap().2, "JOS\u{c9}");
+    }
+
+    /// A logon ID that comes back on a destination (RDP session ids, a
+    /// logon ID after a reboot): each session end takes the state of the
+    /// login it ends, the last one with its ID before it.
+    #[test]
+    fn a_session_end_takes_the_state_of_its_own_login() {
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        for d in 1..=10 {
+            lines.push(format!("{}{}", login(d, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "2"), crate::csv_out::EMPTY_TAIL));
+            lines.push(format!("{}{}", login(d, 10, "10.0.0.5", "SRV01", "alice", "LOGOFF", "2"), crate::csv_out::EMPTY_TAIL));
+        }
+        // the window day, session id 2 three times: a never-seen origin,
+        // the habitual one, a login from the machine itself
+        lines.push(format!("{}{}", login(11, 8, "10.0.0.99", "SRV01", "mallory", "SUCCESSFUL_LOGON", "2"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 9, "10.0.0.99", "SRV01", "mallory", "LOGOFF", "2"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 10, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "2"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 11, "10.0.0.5", "SRV01", "alice", "LOGOFF", "2"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 12, "127.0.0.1", "SRV01", "bob", "SUCCESSFUL_LOGON", "2"), crate::csv_out::EMPTY_TAIL));
+        lines.push(format!("{}{}", login(11, 13, "127.0.0.1", "SRV01", "bob", "LOGOFF", "2"), crate::csv_out::EMPTY_TAIL));
+        let path = tmp_path("sessid.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let files = vec![path.clone()];
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None }));
+        let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&path).unwrap().records().map(|r| r.unwrap()).collect();
+        let w = &rows[20..];
+        assert_eq!(w.len(), 6);
+        let state = |i: usize| w[i][14].to_string();
+        // each end as its login, the local one outside the hunt
+        assert!(state(0) == "significant" || state(0) == "candidate", "{}", state(0));
+        assert_eq!(state(1), state(0));
+        assert_eq!((state(2).as_str(), state(3).as_str()), ("habitual", "habitual"));
+        assert_eq!((state(4).as_str(), state(5).as_str()), ("", ""));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A note of several lines survives the hunt, run after run: the

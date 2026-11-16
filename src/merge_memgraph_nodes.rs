@@ -20,7 +20,7 @@ pub async fn merge_memgraph_nodes(
     crate::banner::print_phase_detail("New node:", new_name);
 
     let config = ConfigBuilder::default()
-        .uri(database)
+        .uri(crate::graph_hunt_common::bolt_uri(database))
         .user(user)
         .password("")
         .db(db)
@@ -28,6 +28,18 @@ pub async fn merge_memgraph_nodes(
         .unwrap();
     let graph = Graph::connect(config).await.unwrap();
     crate::banner::print_phase_result("Connected");
+
+    // Both nodes must be there, and be two. Merging into a name that does
+    // not exist used to "transfer N edges" (the count of the old node's)
+    // while moving none.
+    if let Err(e) = crate::merge_neo4j_nodes::both_nodes_exist(&graph, old_name, new_name).await {
+        eprintln!("MASSTIN - Error: {} Nothing was changed.", e);
+        crate::mark_failed();
+        return;
+    }
+    // an edge between the two would become an edge of the new node to
+    // itself, which no loader writes: those go first
+    crate::merge_neo4j_nodes::drop_edges_between(&graph, old_name, new_name).await;
 
     crate::banner::print_phase("2", "4", "Discovering relationship types...");
     let out_types = discover_types(&graph, old_name, true).await;
@@ -55,10 +67,17 @@ pub async fn merge_memgraph_nodes(
         crate::banner::print_phase_detail(&format!("  in  :{}", t), &format!("{} edges", n));
     }
 
+
+    // what the old node knew goes to the new one: the addresses folded
+    // into it, its own name, and the time spans its logs cover (the hunt
+    // reads them from the node)
+    crate::merge_neo4j_nodes::carry_node_properties(&graph, old_name, new_name).await;
+
     crate::banner::print_phase("4", "4", "Deleting old node...");
     let q = query("MATCH (n:host {name:$name}) DELETE n").param("name", old_name.as_str());
     if let Err(e) = graph.run(q).await {
         eprintln!("[ERROR] Failed to delete old node: {:?}", e);
+        crate::mark_failed();
     } else {
         crate::banner::print_phase_result("Old node deleted");
     }

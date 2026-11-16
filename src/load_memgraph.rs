@@ -139,7 +139,7 @@ pub async fn load_memgraph(
         crate::banner::print_phase_detail("End time:", e);
     }
     let config = ConfigBuilder::default()
-        .uri(database)
+        .uri(crate::graph_hunt_common::bolt_uri(database))
         .user(user)
         .password("")
         .db(db)
@@ -535,7 +535,14 @@ pub async fn load_memgraph(
                 origin: origin_name,
                 destination: destination_name,
                 rel_type: rel_type_normalized,
-                time: strip_timezone(&row[0].replace(" utc", "").replace(" ", "T")),
+                // Memgraph stores the time without a zone: a time written
+                // with an offset is converted to UTC first (cutting the
+                // offset off left `22:00:00-05:00` as 22:00 UTC, five
+                // hours early), and one ending in ` UTC` loses the word
+                time: match crate::graph_hunt_common::utc_if_rewritten(&row[0]) {
+                    Some(utc) => utc,
+                    None => strip_timezone(&row[0].replace(" ", "T")),
+                },
                 logon_type: row[7].to_string(),
                 src_computer: src_computer_raw.to_string(),
                 src_ip: src_ip_raw.to_string(),

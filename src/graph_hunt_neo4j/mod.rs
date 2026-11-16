@@ -44,7 +44,7 @@ pub async fn graph_hunt_neo4j(
         }
         _ => rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap_or_default(),
     };
-    let config = match ConfigBuilder::default().uri(database).user(user).password(&pass).db(db).build() {
+    let config = match ConfigBuilder::default().uri(crate::graph_hunt_common::bolt_uri(database)).user(user).password(&pass).db(db).build() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Masstin - Error: failed to build Neo4j config: {}", e);

@@ -31,7 +31,7 @@ pub async fn merge_neo4j_nodes(
         Ok(p) if !p.is_empty() => p,
         _ => rpassword::prompt_password("MASSTIN - Enter Neo4j database password: ").unwrap_or_default(),
     };
-    let config = match ConfigBuilder::default().uri(database).user(user).password(&pass).db(db).build() {
+    let config = match ConfigBuilder::default().uri(crate::graph_hunt_common::bolt_uri(database)).user(user).password(&pass).db(db).build() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("MASSTIN - Error: failed to build Neo4j config: {}", e);
@@ -46,6 +46,18 @@ pub async fn merge_neo4j_nodes(
         }
     };
     crate::banner::print_phase_result("Connected");
+
+    // Both nodes must be there, and be two. Merging into a name that does
+    // not exist used to "transfer N edges" (the count of the old node's)
+    // while moving none.
+    if let Err(e) = crate::merge_neo4j_nodes::both_nodes_exist(&graph, old_name, new_name).await {
+        eprintln!("MASSTIN - Error: {} Nothing was changed.", e);
+        crate::mark_failed();
+        return;
+    }
+    // an edge between the two would become an edge of the new node to
+    // itself, which no loader writes: those go first
+    crate::merge_neo4j_nodes::drop_edges_between(&graph, old_name, new_name).await;
 
     // Phase 2: discover rel types touching the old node
     crate::banner::print_phase("2", "4", "Discovering relationship types...");
@@ -76,11 +88,18 @@ pub async fn merge_neo4j_nodes(
         crate::banner::print_phase_detail(&format!("  in  :{}", t), &format!("{} edges", n));
     }
 
+
+    // what the old node knew goes to the new one: the addresses folded
+    // into it, its own name, and the time spans its logs cover (the hunt
+    // reads them from the node)
+    crate::merge_neo4j_nodes::carry_node_properties(&graph, old_name, new_name).await;
+
     // Phase 4: delete the orphan old node
     crate::banner::print_phase("4", "4", "Deleting old node...");
     let q = query("MATCH (n:host {name:$name}) DELETE n").param("name", old_name.as_str());
     if let Err(e) = graph.run(q).await {
         eprintln!("[ERROR] Failed to delete old node: {:?}", e);
+        crate::mark_failed();
     } else {
         crate::banner::print_phase_result("Old node deleted");
     }
@@ -193,5 +212,54 @@ async fn run_count(graph: &Graph, cypher: &str, old: &String) -> usize {
             0
         }
         Err(_) => 0,
+    }
+}
+
+/// Whether `old` and `new` are two `:host` nodes of the graph; the error
+/// says which one is missing. Shared with the Memgraph action.
+pub(crate) async fn both_nodes_exist(graph: &Graph, old: &str, new: &str) -> std::result::Result<(), String> {
+    if old == new {
+        return Err(format!("--old-node and --new-node are the same node ({}).", old));
+    }
+    for (flag, name) in [("--old-node", old), ("--new-node", new)] {
+        let q = query("MATCH (n:host {name:$name}) RETURN count(n) AS c").param("name", name);
+        let n = match graph.execute(q).await {
+            Ok(mut r) => match r.next().await {
+                Ok(Some(row)) => row.get::<i64>("c").unwrap_or(0),
+                _ => 0,
+            },
+            Err(e) => return Err(format!("cannot look for the node {}: {:?}.", name, e)),
+        };
+        if n == 0 {
+            return Err(format!("{} {}: there is no host node with that name in the graph (names are written as the graph has them: upper case, short name).", flag, name));
+        }
+    }
+    Ok(())
+}
+
+/// Before the old node goes: its aliases and its own name are added to
+/// the new node's `aliases`, its coverage spans to the new node's
+/// (`cov_ok` / `cov_fail` are lists of [start, end, start, end...]; the
+/// hunt reads them pair by pair, in any order).
+pub(crate) async fn carry_node_properties(graph: &Graph, old: &str, new: &str) {
+    let steps = [
+        ("aliases", "MATCH (o:host {name:$old}), (n:host {name:$new}) SET n.aliases = coalesce(n.aliases, []) + coalesce(o.aliases, []) + [$old]"),
+        ("cov_ok", "MATCH (o:host {name:$old}), (n:host {name:$new}) WHERE o.cov_ok IS NOT NULL SET n.cov_ok = coalesce(n.cov_ok, []) + o.cov_ok"),
+        ("cov_fail", "MATCH (o:host {name:$old}), (n:host {name:$new}) WHERE o.cov_fail IS NOT NULL SET n.cov_fail = coalesce(n.cov_fail, []) + o.cov_fail"),
+    ];
+    for (what, cypher) in steps {
+        if let Err(e) = graph.run(query(cypher).param("old", old).param("new", new)).await {
+            eprintln!("[ERROR] carrying {} to the new node failed: {:?}", what, e);
+            crate::mark_failed();
+        }
+    }
+}
+
+/// The edges between the two nodes, in either direction, deleted.
+pub(crate) async fn drop_edges_between(graph: &Graph, old: &str, new: &str) {
+    let q = query("MATCH (o:host {name:$old})-[r]-(n:host {name:$new}) DELETE r").param("old", old).param("new", new);
+    if let Err(e) = graph.run(q).await {
+        eprintln!("[ERROR] deleting the edges between the two nodes failed: {:?}", e);
+        crate::mark_failed();
     }
 }

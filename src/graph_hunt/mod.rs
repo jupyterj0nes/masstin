@@ -149,7 +149,7 @@ pub async fn graph_hunt(
     crate::banner::print_phase_detail("Database:", database);
     crate::banner::print_phase_detail("Cutoff:", &settings.cutoff.to_rfc3339());
     crate::banner::print_phase_detail("Alpha (FDR):", &format!("{}", alpha));
-    let config = match ConfigBuilder::default().uri(database).user(user).password("").db(db).build() {
+    let config = match ConfigBuilder::default().uri(crate::graph_hunt_common::bolt_uri(database)).user(user).password("").db(db).build() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Masstin - Error: failed to build Memgraph config: {}", e);

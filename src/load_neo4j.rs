@@ -477,7 +477,13 @@ fn resolve_to_edge(
         origin: origin_name,
         destination: destination_name,
         rel_type: rel_type_normalized,
-        time: parts[0].replace(" utc", "").replace(" ", "T"),
+        // (`.replace(" utc", "")` ran on text already in upper case and
+        // removed nothing: a time ending in ` UTC` reached the database as
+        // `...TUTC` and its whole batch of edges failed)
+        time: match crate::graph_hunt_common::utc_if_rewritten(&parts[0]) {
+            Some(utc) => format!("{}Z", utc),
+            None => parts[0].replace(" ", "T"),
+        },
         event_type: if idx.event_type == NONE_COL { String::new() } else { parts[idx.event_type].clone() },
         event_id: if idx.event_id == NONE_COL { String::new() } else { parts[idx.event_id].clone() },
         log_source: if idx.log_source == NONE_COL || idx.log_source >= parts.len() { String::new() } else { parts[idx.log_source].clone() },
@@ -623,7 +629,7 @@ pub async fn load_neo4j(
     // / 2026.x deployments commonly have multiple DBs (one per case, one
     // per environment); `--db` lets the user pick. Defaults to `neo4j`.
     let config = match ConfigBuilder::default()
-        .uri(database)
+        .uri(crate::graph_hunt_common::bolt_uri(database))
         .user(user)
         .password(&pass)
         .db(db)
@@ -800,18 +806,30 @@ pub async fn load_neo4j(
             pb.inc(1);
 
             if ungrouped {
+                // What a log file covers is every row it gave for its
+                // machine, with an origin or without: a machine whose rows
+                // in the window are all its own (local logons) is still a
+                // machine whose log was there. Taken only from the rows
+                // that became edges, such a destination had no coverage in
+                // Neo4j while graph-hunt-csv and the Memgraph loader gave
+                // it, and the same timeline hunted three ways had three
+                // panels.
+                if let Some(t) = crate::graph_hunt_common::parse_ts(&parts[0]) {
+                    let t = t.and_utc().timestamp();
+                    let dst_raw = parts[idx.dst].as_str();
+                    let dst = if looks_like_ip(dst_raw) { ip_to_host.get(dst_raw).cloned().unwrap_or_else(|| dst_raw.to_string()) } else { dst_raw.to_string() };
+                    // the log file by its column: the analysis tail follows it since v1.4.0
+                    let raw_file = crate::graph_hunt_common::engine::csv_fields(&line).get(idx.log_source).cloned().unwrap_or_default();
+                    if !dst.is_empty() {
+                        let e = file_spans.entry((dst, raw_file)).or_insert((t, t));
+                        if t < e.0 { e.0 = t; }
+                        if t > e.1 { e.1 = t; }
+                    }
+                }
                 let edge = match resolve_to_edge(&parts, &idx, &ip_to_host, &local_values, &mut resolved_count) {
                     Some(e) => e,
                     None => continue,
                 };
-                if let Some(t) = crate::graph_hunt_common::parse_ts(&edge.time) {
-                    let t = t.and_utc().timestamp();
-                    // the log file by its column: the analysis tail follows it since v1.4.0
-                    let raw_file = crate::graph_hunt_common::engine::csv_fields(&line).get(idx.log_source).cloned().unwrap_or_default();
-                    let e = file_spans.entry((edge.destination.clone(), raw_file)).or_insert((t, t));
-                    if t < e.0 { e.0 = t; }
-                    if t > e.1 { e.1 = t; }
-                }
                 // Lazy-merge any new nodes
                 ensure_node(&edge.origin, &mut new_nodes, &mut nodes_known);
                 ensure_node(&edge.destination, &mut new_nodes, &mut nodes_known);

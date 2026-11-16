@@ -103,6 +103,22 @@ pub fn is_no_account(t: &str) -> bool {
 pub fn parse_ts(s: &str) -> Option<NaiveDateTime> {
     let mut t = s.trim().to_string();
     if let Some(i) = t.find('[') { t.truncate(i); }
+    // `2026-09-23 15:35:09` (a space where ISO has a T: masstin's older
+    // parsers and many custom rules write it) and `... UTC` after the time
+    // are the same instants; refused here, those rows were out of the hunt
+    // and of the viewer while `merge` and the loaders read them
+    let upper = t.to_ascii_uppercase();
+    if let Some(cut) = upper.strip_suffix(" UTC").or_else(|| upper.strip_suffix(" GMT")) {
+        t.truncate(cut.len());
+        t = t.trim_end().to_string();
+    }
+    if t.len() >= 19 && t.as_bytes()[10] == b' ' && t.as_bytes()[4] == b'-' && t.as_bytes()[13] == b':' {
+        t.replace_range(10..11, "T");
+        // `15:35:09 +0200` -> `15:35:09+0200`
+        if let Some(i) = t[11..].find(' ') {
+            t.remove(11 + i);
+        }
+    }
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&t) {
         return Some(dt.naive_utc());
     }
@@ -121,12 +137,86 @@ pub fn parse_ts(s: &str) -> Option<NaiveDateTime> {
     crate::timefmt::parse_fallback(s)
 }
 
+/// The UTC instant of a `time_created` cell that the loaders cannot store
+/// as it is written: one with an offset other than zero (`22:00:00-05:00`)
+/// or with its zone in words (`15:35:09.123 UTC`, as Cortex gives it).
+/// `Some("2026-10-20T03:00:00")` (with the fraction, to the microsecond,
+/// when there is one), or None when the cell is fine as it is (UTC, with
+/// `Z`, `+00:00` or no zone) or is not a time.
+pub fn utc_if_rewritten(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let upper = t.to_ascii_uppercase();
+    let in_words = upper.ends_with(" UTC") || upper.ends_with(" GMT");
+    let iso = t.replacen(' ', "T", 1);
+    let offset = chrono::DateTime::parse_from_rfc3339(&iso)
+        .or_else(|_| chrono::DateTime::parse_from_str(&iso, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .map(|d| d.offset().local_minus_utc() != 0)
+        .unwrap_or(false);
+    if !in_words && !offset {
+        return None;
+    }
+    let dt = parse_ts(t)?;
+    use chrono::Timelike;
+    Some(if dt.nanosecond() == 0 { dt.format("%Y-%m-%dT%H:%M:%S").to_string() } else { dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string() })
+}
+
+/// `--database` as the driver takes it. `localhost:7687` works bare, but
+/// an address (`127.0.0.1:7687`, `10.0.0.5:7687`) was refused as a
+/// "relative URL without a base": a value without a scheme gets `bolt://`.
+pub fn bolt_uri(database: &str) -> String {
+    let d = database.trim();
+    if d.contains("://") { d.to_string() } else { format!("bolt://{}", d) }
+}
+
+#[cfg(test)]
+mod bolt_uri_tests {
+    #[test]
+    fn a_value_without_a_scheme_gets_bolt() {
+        assert_eq!(super::bolt_uri("127.0.0.1:7687"), "bolt://127.0.0.1:7687");
+        assert_eq!(super::bolt_uri(" localhost:7687 "), "bolt://localhost:7687");
+        assert_eq!(super::bolt_uri("bolt://db:7687"), "bolt://db:7687");
+        assert_eq!(super::bolt_uri("neo4j+s://x.databases.neo4j.io"), "neo4j+s://x.databases.neo4j.io");
+    }
+}
+
+#[cfg(test)]
+mod utc_if_rewritten_tests {
+    use super::utc_if_rewritten;
+
+    #[test]
+    fn only_the_cells_that_need_it_are_rewritten() {
+        for fine in ["2026-10-19T22:00:00Z", "2026-10-19T22:00:00.123456Z", "2026-10-19T22:00:00+00:00", "2026-10-19 22:00:00", "2026-10-19T22:00:00.1234567", "not a time", ""] {
+            assert_eq!(utc_if_rewritten(fine), None, "{}", fine);
+        }
+        assert_eq!(utc_if_rewritten("2026-10-19T22:00:00-05:00").as_deref(), Some("2026-10-20T03:00:00"));
+        assert_eq!(utc_if_rewritten("2026-10-19T22:00:00.5+02:00").as_deref(), Some("2026-10-19T20:00:00.500000"));
+        assert_eq!(utc_if_rewritten("2026-10-19 22:00:00 +0200").as_deref(), Some("2026-10-19T20:00:00"));
+        assert_eq!(utc_if_rewritten("2026-10-19 22:00:00.123 UTC").as_deref(), Some("2026-10-19T22:00:00.123000"));
+        assert_eq!(utc_if_rewritten("2026-10-19 22:00:00 utc").as_deref(), Some("2026-10-19T22:00:00"));
+    }
+}
+
 #[cfg(test)]
 mod parse_ts_tests {
     use super::parse_ts;
 
     fn at(s: &str) -> String {
         parse_ts(s).map(|d| d.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_space_for_the_t_and_a_zone_in_words() {
+        assert_eq!(at("2026-09-23 15:35:09"), "2026-09-23T15:35:09.000");
+        assert_eq!(at("2026-09-23 15:35:09.250"), "2026-09-23T15:35:09.250");
+        assert_eq!(at("2026-09-23 15:35:09 UTC"), "2026-09-23T15:35:09.000");
+        assert_eq!(at("2026-09-23 15:35:09.250 utc"), "2026-09-23T15:35:09.250");
+        assert_eq!(at("2026-09-23T15:35:09 UTC"), "2026-09-23T15:35:09.000");
+        assert_eq!(at("2026-09-23 15:35:09 +0200"), "2026-09-23T13:35:09.000");
+        assert_eq!(at("2026-09-23 15:35:09+02:00"), "2026-09-23T13:35:09.000");
+        assert_eq!(at("2026-09-23 15:35:09Z"), "2026-09-23T15:35:09.000");
+        // what is not a time stays refused
+        assert_eq!(at("2026-09-23 "), "");
+        assert_eq!(at("ñññññññññññññññññññññ"), "");
     }
 
     #[test]
