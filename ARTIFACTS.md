@@ -14,7 +14,7 @@ Masstin parses the following forensic artifacts to extract lateral movement data
 | 4625 | Failed logon | as logged |
 | 4634 | Logoff (origin and logon type taken from the 4624 with the same logon ID on that machine) | as its logon |
 | 4647 | User-initiated logoff | — |
-| 4648 | Logon with explicit credentials (RunAs) | — |
+| 4648 | Explicit credentials used toward another machine, written on the source. A `CONNECT`: the attempt, not the access (a wrong password over NTLM writes it too); the destination's 4624 / 4625 says which it was | — |
 | 4768 | Kerberos TGT request | — |
 | 4769 | Kerberos service ticket request | — |
 | 4770 | Kerberos service ticket renewed | — |

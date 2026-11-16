@@ -589,6 +589,9 @@ mod tests {
         assert_eq!(r.computer, "SRV02.corp");
         assert_eq!(r.workstation_name, "WS01.corp");
         assert_eq!(r.ip_address, "");
+        // the attempt, not the access: a wrong password writes a 4648 too
+        assert_eq!(r.event_type, "CONNECT");
+        assert_eq!(r.detail, r"explicit credentials (outcome not recorded here): C:\Windows\System32\runas.exe");
     }
 
     #[test]

@@ -747,7 +747,8 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
         "4624" => "SUCCESSFUL_LOGON".to_string(),
         "4625" => "FAILED_LOGON".to_string(),
         "4634" | "4647" | "4779" => "LOGOFF".to_string(),
-        "4648" => "SUCCESSFUL_LOGON".to_string(),
+        // the attempt, not the access: as parse-windows
+        "4648" => "CONNECT".to_string(),
         // Status as parse-windows reads it; when the message gave none,
         // success (the query's earlier behaviour)
         "4768" | "4769" | "4776" => {
@@ -775,7 +776,8 @@ fn process_record(record: &Value, debug: bool) -> Vec<String> {
     // (ProcessName for 4624/4648, SubStatus for 4625, ShareName for 5140,
     // Operation for 5858, connection for 6). Final wrapping happens here.
     let detail = match event_id.as_str() {
-        "4624" | "4648" => process.clone(),
+        "4624" => process.clone(),
+        "4648" => crate::parse::explicit_credentials_detail(&process),
         // the service the ticket was issued for: the real destination of
         // the move (the row's destination is the KDC), as parse-windows
         "4769" | "4770" => process.clone(),

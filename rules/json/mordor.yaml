@@ -16,7 +16,7 @@
 #                   ports and only outbound (Initiated=true)
 #   4624 / 4625     logon success / failure
 #   4634 / 4647     logoff
-#   4648            logon with explicit credentials (RunAs)
+#   4648            explicit credentials used (the attempt: CONNECT)
 #   5140            network share access
 #
 #   Mordor/OTRF collections are Sysmon- and WFP-centric, so SMB-server/-client
@@ -141,7 +141,9 @@ parsers:
       filename:           "${__source_file}"
 
   # ---------------------------------------------------------------------------
-  # 4648 — logon with explicit credentials (RunAs); destination = TargetServerName
+  # 4648 — explicit credentials used toward TargetServerName. Written on the
+  # source before the answer is known (a wrong password over NTLM writes it
+  # too), so it is a CONNECT: the attempt, not the access.
   # ---------------------------------------------------------------------------
   - name: "mordor-4648-explicit-creds"
     match:
@@ -158,7 +160,7 @@ parsers:
     map:
       time_created:        "${ts}"
       computer:            "${tsn}"
-      event_type:          "SUCCESSFUL_LOGON"
+      event_type:          "CONNECT"
       event_id:            "4648"
       logon_type:          "3"
       target_user_name:    "${user}"

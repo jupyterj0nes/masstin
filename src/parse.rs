@@ -1276,6 +1276,17 @@ pub(crate) fn mapper_for_channel(channel: &str, event_id: &str) -> Option<MapFn>
 /// For records that do not say their channel (old exports): the event ids
 /// that belong to one family only. 1102, 6 and 3 are left out: without the
 /// channel they are as likely to be something else.
+/// The detail of a 4648: what the event is, and the process that used the
+/// credentials when it names one.
+pub(crate) fn explicit_credentials_detail(process: &str) -> String {
+    let p = process.trim();
+    if p.is_empty() || p == "-" {
+        "explicit credentials (outcome not recorded here)".to_string()
+    } else {
+        format!("explicit credentials (outcome not recorded here): {}", p)
+    }
+}
+
 pub(crate) fn mapper_for_id(event_id: &str) -> Option<MapFn> {
     let table: [(&[&str], MapFn); 8] = [
         (SECURITY_EVENT_IDS, map_security),
@@ -1343,7 +1354,12 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
         "4625" => "FAILED_LOGON".to_string(),
         "4634" => "LOGOFF".to_string(),
         "4647" => "LOGOFF".to_string(),
-        "4648" => "SUCCESSFUL_LOGON".to_string(),
+        // 4648 is written on the SOURCE when a process uses explicit
+        // credentials, before the answer is known: over NTLM a wrong
+        // password writes it too (measured: the destination answers 4625
+        // and the source still has its 4648). It proves the attempt, not
+        // the access; the destination's own 4624 / 4625 says which it was.
+        "4648" => "CONNECT".to_string(),
         "4768" | "4769" | "4776" => {
             if status == "0x0" { "SUCCESSFUL_LOGON".to_string() } else { "FAILED_LOGON".to_string() }
         },
@@ -1355,7 +1371,8 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
         _ => "CONNECT".to_string(),
     };
     let detail = match event_id.as_str() {
-        "4624" | "4648" => v("ProcessName"),
+        "4624" => v("ProcessName"),
+        "4648" => explicit_credentials_detail(&v("ProcessName")),
         "4625" => translate_substatus(&v("SubStatus")),
         "5140" => v("ShareName"),
         // the object as a path on the share: `\\*\ADMIN$\System32\cmd.exe`
