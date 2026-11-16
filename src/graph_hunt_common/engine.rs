@@ -1581,16 +1581,25 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     let ne = ents.names.names.len();
     // Sigma hits matched to machines by short upper-case name (or IP)
     let (hits_of, n_hits_matched): (HashMap<u32, Vec<usize>>, usize) = {
-        let mut by_name: HashMap<String, u32> = HashMap::new();
+        // A hit names its host as the rule's log did: fully qualified or
+        // short. It goes to the machine with that full name; by the short
+        // name only when one machine alone answers to it. (With one entry
+        // per short name, the hits of `SRV.dev.corp` and of `SRV.prod.corp`
+        // all went to whichever machine came first.)
+        let full = |s: &str| s.trim().trim_end_matches('.').to_uppercase();
+        let mut by_full: HashMap<String, u32> = HashMap::new();
+        let mut by_short: HashMap<String, Option<u32>> = HashMap::new();
         for e in 0..ne as u32 {
             for a in &ents.aliases[e as usize] {
-                by_name.entry(sigma::norm_host(a)).or_insert(e);
+                by_full.entry(full(a)).or_insert(e);
+                by_short.entry(sigma::norm_host(a)).and_modify(|x| if *x != Some(e) { *x = None }).or_insert(Some(e));
             }
         }
         let mut m: HashMap<u32, Vec<usize>> = HashMap::new();
         let mut n = 0usize;
         for (i, h) in hits.iter().enumerate() {
-            if let Some(&e) = by_name.get(&sigma::norm_host(&h.host)) {
+            let found = by_full.get(&full(&h.host)).copied().or_else(|| by_short.get(&sigma::norm_host(&h.host)).copied().flatten());
+            if let Some(e) = found {
                 m.entry(e).or_default().push(i);
                 n += 1;
             }

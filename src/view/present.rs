@@ -257,11 +257,11 @@ impl Story {
         p.with_file_name(format!("{}.story.json", stem))
     }
     pub fn load(path: &Path) -> Story {
-        std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        super::views::read_side_file(path).and_then(|s| super::views::parsed_or_set_aside(path, &s)).unwrap_or_default()
     }
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, text)
+        super::views::write_whole(path, &text)
     }
 }
 
@@ -314,7 +314,8 @@ pub fn build_steps(events: &[(i64, String, bool)], story: &Story) -> Vec<Step> {
         let base = match timing {
             Timing::Fixed => step_secs,
             Timing::Compressed => match prev_t {
-                Some(p) => (((t0 - p) as f32) / compress.max(1.0)).clamp(story.min_gap, story.max_gap),
+                // (the two bounds in their order: "Gap min" set above "Gap max" was a panic)
+                Some(p) => (((t0 - p) as f32) / compress.max(1.0)).clamp(story.min_gap.min(story.max_gap), story.max_gap.max(story.min_gap)),
                 None => step_secs,
             },
         };

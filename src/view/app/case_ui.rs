@@ -33,6 +33,7 @@ impl Viewer {
             Ok(s) => {
                 self.store = s;
                 self.files = found;
+                self.case_missing = missing.clone();
                 self.merges = c.views.merges.clone();
                 self.subnet_defs = c.views.subnets.clone();
                 self.saved = c.views.views.clone();

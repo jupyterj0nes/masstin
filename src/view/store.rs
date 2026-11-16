@@ -579,22 +579,39 @@ impl Pattern {
     }
 
     fn matches(&self, s: &str) -> bool {
+        // The literal that must start the name and the one that must end
+        // it are taken from the two ends first; the ones between are then
+        // looked for, in order, in what is left. (Looked for from the left
+        // all the way, the last literal was found at its FIRST place:
+        // `*1` did not match `WS11`, nor `10.*.5` the address `10.5.5.5`,
+        // and written with `!` those hosts were not left out.)
         let u = s.to_uppercase();
-        let mut at = 0usize;
-        for (i, part) in self.parts.iter().enumerate() {
-            match u[at..].find(part.as_str()) {
-                Some(k) => {
-                    if i == 0 && self.anchored_start && k != 0 {
-                        return false;
-                    }
-                    at += k + part.len();
-                }
-                None => return false,
+        let (mut lo, mut hi) = (0usize, u.len());
+        let (mut first, mut last) = (0usize, self.parts.len());
+        if self.anchored_start && first < last {
+            let p = self.parts[first].as_str();
+            if !u.starts_with(p) {
+                return false;
             }
+            lo = p.len();
+            first += 1;
         }
         if self.anchored_end {
-            if let Some(last) = self.parts.last() {
-                return u.ends_with(last.as_str()) && at == u.len();
+            if first == last {
+                // one literal, anchored at both ends: the whole name
+                return lo == hi;
+            }
+            let p = self.parts[last - 1].as_str();
+            if hi - lo < p.len() || !u[lo..].ends_with(p) {
+                return false;
+            }
+            hi -= p.len();
+            last -= 1;
+        }
+        for p in &self.parts[first..last] {
+            match u[lo..hi].find(p.as_str()) {
+                Some(k) => lo += k + p.len(),
+                None => return false,
             }
         }
         true
@@ -739,6 +756,23 @@ mod tests {
         assert!(lines[1].ends_with(",habitual,0,nothing new,,"), "{}", lines[1]);
         assert!(lines[2].ends_with(",significant,30,origin never seen before,suspicious,"), "{}", lines[2]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_wildcard_is_matched_from_both_ends() {
+        let m = |pat: &str, s: &str| Pattern::any(&Pattern::parse_list(pat), s);
+        assert!(m("*1", "WS11") && m("*1", "WS1") && !m("*1", "WS12"));
+        assert!(m("10.*.5", "10.5.5.5") && m("10.*.5", "10.0.0.5") && !m("10.*.5", "10.0.0.50") && !m("10.*.5", "110.0.0.5"));
+        assert!(m("ws*", "WS07") && !m("ws*", "DEVWS07"));
+        assert!(m("*srv*", "DEV-SRV01") && m("srv", "DEV-SRV01"));
+        assert!(m("=SRV01", "srv01") && !m("=SRV01", "SRV011") && !m("=SRV01", "XSRV01"));
+        assert!(m("a*b*c", "aXbXc") && m("a*b*c", "abc") && !m("a*b*c", "acb") && !m("ab*b", "ab"));
+        assert!(m("*a*a", "aa") && !m("*a*a", "a"));
+        // left out with `!`: the hosts that end in 1, whatever else they hold
+        assert!(!m("!*1", "WS11") && m("!*1", "WS12"));
+        assert!(!m("!10.*.5", "10.5.5.5") && m("!10.*.5", "10.5.5.6"));
+        // letters outside ASCII are compared, not cut
+        assert!(m("*ñ", "CAÑAÑ") && m("ñ*ñ", "ñandúñ") && !m("ñ*ñ", "ñ"));
     }
 
     /// A note of several lines is one row: the file keeps its row count,

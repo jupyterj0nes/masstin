@@ -385,12 +385,85 @@ impl ViewsFile {
     }
 
     pub fn load(path: &Path) -> ViewsFile {
-        std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        read_side_file(path).and_then(|s| parsed_or_set_aside(path, &s)).unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, text)
+        write_whole(path, &text)
+    }
+}
+
+/// The text of a side file (views, story, notes), when it is there.
+pub(crate) fn read_side_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// A side file read as what it should be. One that is there and cannot be
+/// read as that (cut by a crash, edited by hand into something else) is
+/// set aside as `<name>.unreadable` before anything is written in its
+/// place: it used to be taken for empty and then overwritten, and the
+/// analyst's saved views, story or notes were gone.
+pub(crate) fn parsed_or_set_aside<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Option<T> {
+    match serde_json::from_str::<T>(text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if !text.trim().is_empty() {
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(".unreadable");
+                let _ = std::fs::copy(path, std::path::PathBuf::from(&aside));
+                eprintln!("masstin: {} could not be read ({}); kept as {} and a new one started", path.display(), e, std::path::Path::new(&aside).display());
+            }
+            None
+        }
+    }
+}
+
+/// Write a side file whole or not at all: beside it first, then in its
+/// place. Written straight over the file, a crash or a full disk in the
+/// middle left half a file where the views, the story or the notes were.
+pub(crate) fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".masstin-tmp-{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, text)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod side_file_tests {
+    use super::*;
+
+    #[test]
+    fn a_side_file_that_cannot_be_read_is_kept_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("masstin_side_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("case.views.json");
+        // a views file cut in the middle
+        std::fs::write(&p, "{\"views\": [{\"name\": \"my filter\", ").unwrap();
+        let v = ViewsFile::load(&p);
+        assert!(v.views.is_empty());
+        let aside = dir.join("case.views.json.unreadable");
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{\"views\": [{\"name\": \"my filter\", ");
+        // saving the (empty) views does not touch the copy, and leaves no temp file
+        v.save(&p).unwrap();
+        assert!(aside.is_file());
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert!(left.iter().all(|n| !n.contains("masstin-tmp")), "{:?}", left);
+        assert!(serde_json::from_str::<ViewsFile>(&std::fs::read_to_string(&p).unwrap()).is_ok());
+        // a file that is not there, or empty, is just empty
+        assert!(ViewsFile::load(&dir.join("none.views.json")).views.is_empty());
+        std::fs::write(dir.join("empty.views.json"), "").unwrap();
+        assert!(ViewsFile::load(&dir.join("empty.views.json")).views.is_empty());
+        assert!(!dir.join("empty.views.json.unreadable").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

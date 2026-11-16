@@ -215,6 +215,9 @@ pub struct Viewer {
     drag_grab: V2,
     rows: Option<(usize, Vec<RowDetail>, usize)>,
     notes_draft: String,
+    /// the notes the box was opened with: left as they are, each row of a
+    /// block keeps its own
+    notes_shown: String,
     pending_verdict: Option<u8>,
     mark_msg: String,
     status: String,
@@ -416,6 +419,9 @@ pub struct Viewer {
     edge_edit: Option<EdgeEdit>,
     /// the analyst's merges, `(from, into)`, kept in the views file
     merges: Vec<(String, String)>,
+    /// timelines the open case names that were not there when it was
+    /// opened (a share that is down): kept in the case when it is saved
+    pub(super) case_missing: Vec<String>,
     subnet_defs: Vec<(String, String)>,
     subnets: Vec<SubnetGroup>,
     subnet_of: Vec<Option<u16>>,
@@ -664,6 +670,7 @@ impl Viewer {
             drag_grab: V2::default(),
             rows: None,
             notes_draft: String::new(),
+            notes_shown: String::new(),
             pending_verdict: None,
             mark_msg: String::new(),
             status: String::new(),
@@ -815,6 +822,7 @@ impl Viewer {
             host_edit: None,
             edge_edit: None,
             merges: vf.merges.clone(),
+            case_missing: Vec::new(),
             subnet_defs: vf.subnets.clone(),
             subnets: Vec::new(),
             subnet_of: Vec::new(),
@@ -1253,6 +1261,7 @@ impl Viewer {
             out.push(RowDetail { file: e.file, line: e.line, t: fmt_time(e.t), fields, hunt: e.hunt, verdict: e.verdict, notes: self.store.notes.get(&(e.file, e.line)).cloned().unwrap_or_default() });
         }
         self.notes_draft = out.iter().find(|r| !r.notes.is_empty()).map(|r| r.notes.clone()).unwrap_or_default();
+        self.notes_shown = self.notes_draft.clone();
         self.pending_verdict = None;
         self.mark_msg.clear();
         self.row_pick = vec![false; out.len()];
@@ -1374,7 +1383,43 @@ impl Viewer {
 
     /// Write a verdict and the notes draft on these rows of a connection.
     fn mark_rows(&mut self, edge: usize, rows: &[(u16, u32)], verdict: u8) {
-        match self.store.mark(rows, verdict, self.notes_draft.trim()) {
+        // a hunt under way is rewriting these same files: a mark written now
+        // would be lost when the hunt replaces them, or the other way round
+        if self.job.as_ref().map_or(false, |j| j.kind == tasks::JobKind::Hunt && j.done.is_none()) {
+            self.mark_msg = "A hunt is writing this timeline: mark it when the hunt ends".to_string();
+            self.status = self.mark_msg.clone();
+            return;
+        }
+        // The notes box shows one note for the whole connection. Left as
+        // it was opened, every row keeps the note it has (the box showed
+        // one of them, or none; the verdict alone is written). Edited, its
+        // text goes on every row given. Before, an untouched box was
+        // written on all the rows, and an empty one erased their notes.
+        let draft = self.notes_draft.trim().to_string();
+        let untouched = draft == self.notes_shown.trim();
+        let mut groups: Vec<(String, Vec<(u16, u32)>)> = Vec::new();
+        if untouched && rows.len() > 1 {
+            for &r in rows {
+                let own = self.store.notes.get(&r).cloned().unwrap_or_default();
+                match groups.iter_mut().find(|(n, _)| *n == own) {
+                    Some((_, v)) => v.push(r),
+                    None => groups.push((own, vec![r])),
+                }
+            }
+        } else {
+            groups.push((draft, rows.to_vec()));
+        }
+        let mut result: std::io::Result<usize> = Ok(0);
+        for (note, group) in &groups {
+            match self.store.mark(group, verdict, note) {
+                Ok(n) => result = result.map(|k| k + n),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        match result {
             Ok(n) => {
                 self.mark_msg = format!("{} row(s) written to the timeline", n);
                 self.status = self.mark_msg.clone();
@@ -1567,7 +1612,7 @@ impl Viewer {
         if !host_notes.is_empty() {
             theme::section(ui, "Notes");
             for (when, text) in host_notes {
-                ui.label(egui::RichText::new(format!("{}  {}", &when[..16], text)).color(theme::MUTED).size(12.5));
+                ui.label(egui::RichText::new(format!("{}  {}", when.get(..16).unwrap_or(&when), text)).color(theme::MUTED).size(12.5));
             }
         }
         ui.horizontal(|ui| {
@@ -1782,7 +1827,15 @@ impl Viewer {
 
     /// Everything the case keeps, written to `path`.
     pub(super) fn write_case(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let c = CaseFile { masstin_case: 1, timelines: self.files.iter().map(|f| case::absolute(f)).collect(), views: self.views_now(), story: self.story.clone(), notes: self.notes.notes.clone() };
+        // (with the timelines that could not be found when the case was
+        // opened: a share that is down today is still part of the case)
+        let mut timelines: Vec<String> = self.files.iter().map(|f| case::absolute(f)).collect();
+        for m in &self.case_missing {
+            if !timelines.contains(m) {
+                timelines.push(m.clone());
+            }
+        }
+        let c = CaseFile { masstin_case: 1, timelines, views: self.views_now(), story: self.story.clone(), notes: self.notes.notes.clone() };
         c.save(path)
     }
 
@@ -2403,7 +2456,7 @@ impl Viewer {
             }
         }
         if resp.drag_started() {
-            if let Some(Sel::Node(i)) = self.press_hit {
+            if let Some(Sel::Node(i)) = self.press_hit.filter(|h| matches!(h, Sel::Node(i) if *i < self.layout.pos.len() && *i < self.layout.fixed.len())) {
                 self.dragging = Some(i);
                 self.layout.fixed[i] = true;
             } else {
@@ -2411,6 +2464,11 @@ impl Viewer {
             }
         }
         if resp.dragged() {
+            // (a job that ends while a host is held redraws the graph with
+            // other hosts: the one held may be gone)
+            if self.dragging.map_or(false, |i| i >= self.layout.pos.len()) {
+                self.dragging = None;
+            }
             match self.dragging {
                 Some(i) => {
                     if let Some(p) = resp.interact_pointer_pos() {
@@ -4356,6 +4414,18 @@ impl Viewer {
                 }
             }
             "cut" => self.stop_film(false),
+            // for tests: another timeline opened the way every opener
+            // does, and the side files written as a change of style does
+            other if other.starts_with("open=") => {
+                self.open_files(vec![other["open=".len()..].to_string()]);
+            }
+            "persist" => self.persist(),
+            other if other.starts_with("save-view=") => {
+                let name = other["save-view=".len()..].to_string();
+                self.saved.retain(|v| v.name != name);
+                self.saved.push(SavedView { name, filter: self.draft.clone(), style: self.style.clone(), places: Vec::new() });
+                self.persist();
+            }
             "close" => {
                 self.ingest.open = false;
                 self.show_hunt = false;
@@ -4792,6 +4862,11 @@ impl Viewer {
         self.film_step(&ctx);
         self.autopilot(&ctx);
         if self.export.is_some() {
+            // Esc stops a recording and keeps what was recorded, as the
+            // window says: the key was only read when nothing was recording
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.cancel_export();
+            }
             self.export_step(&ctx);
         } else if self.presenting {
             if self.present_playing {
@@ -4940,5 +5015,17 @@ impl Viewer {
             avg(&|s| s.6),
             avg(&|s| s.7)
         );
+    }
+}
+
+impl Drop for Viewer {
+    /// The window is closing: a parse or a hunt started from it does not
+    /// go on alone, with nobody to see it end.
+    fn drop(&mut self) {
+        if let Some(j) = self.job.as_mut() {
+            if j.done.is_none() {
+                j.cancel();
+            }
+        }
     }
 }

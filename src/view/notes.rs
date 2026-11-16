@@ -54,14 +54,14 @@ impl Notes {
     }
 
     pub fn load(path: &Path) -> Notes {
-        let mut n: Notes = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let mut n: Notes = super::views::read_side_file(path).and_then(|s| super::views::parsed_or_set_aside(path, &s)).unwrap_or_default();
         n.path = path.to_path_buf();
         n
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         let s = serde_json::to_string_pretty(self).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(&self.path, s)
+        super::views::write_whole(&self.path, &s)
     }
 
     pub fn add(&mut self, target: NoteTarget, text: &str) {

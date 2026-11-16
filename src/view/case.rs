@@ -51,7 +51,7 @@ impl CaseFile {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, text)
+        super::views::write_whole(path, &text)
     }
 
     /// A new case on these timelines, starting from what is already kept next

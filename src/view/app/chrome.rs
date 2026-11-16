@@ -820,7 +820,7 @@ impl Viewer {
                         if ui.add(egui::Button::new(egui::RichText::new(ic::TRASH).color(theme::DIM)).frame(false)).on_hover_text("Delete this note").clicked() {
                             delete = Some(i);
                         }
-                        ui.label(egui::RichText::new(&n.when[..16]).color(theme::DIM).small());
+                        ui.label(egui::RichText::new(n.when.get(..16).unwrap_or(&n.when)).color(theme::DIM).small());
                     });
                 });
                 ui.label(egui::RichText::new(&n.text).size(12.5));

@@ -212,7 +212,14 @@ impl Ingest {
         let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".into());
         let dir = if p.is_dir() { p.parent().unwrap_or(p) } else { p.parent().unwrap_or(p) };
         let name = if self.sources.len() > 1 { format!("{}-and-{}-more.csv", stem, self.sources.len() - 1) } else { format!("{}.csv", stem) };
-        dir.join(name).to_string_lossy().to_string()
+        // never the evidence itself: a log called `fw.csv` gave `fw.csv`,
+        // and the run wrote the timeline over it
+        let same = |a: &Path, b: &str| a.to_string_lossy().replace('\\', "/").eq_ignore_ascii_case(&b.trim_end_matches(['\\', '/']).replace('\\', "/"));
+        let mut out = dir.join(&name);
+        if self.sources.iter().any(|s| same(&out, s)) {
+            out = dir.join(format!("{}-timeline.csv", stem));
+        }
+        out.to_string_lossy().to_string()
     }
 }
 
@@ -314,12 +321,33 @@ impl Viewer {
         }
         // timelines added to the open case stay in it; others leave it
         let in_case = self.case.is_some() && self.files.iter().all(|f| files.contains(f));
-        let merges = if in_case { self.merges.clone() } else { ViewsFile::load(&ViewsFile::path_for(&files[0])).merges };
+        // Another timeline is another set of side files: its saved views,
+        // its subnets and its merges are read from ITS views file. Only the
+        // merges were, so the next change of style wrote the views of the
+        // timeline open before (or none) over the ones this timeline had.
+        let own = if in_case { None } else { Some(ViewsFile::load(&ViewsFile::path_for(&files[0]))) };
+        let merges = match &own {
+            Some(vf) => vf.merges.clone(),
+            None => self.merges.clone(),
+        };
         match Store::load_with(&files, self.alpha, &merges) {
             Ok(s) => {
                 self.store = s;
                 self.files = files;
                 self.merges = merges;
+                if let Some(vf) = own {
+                    self.saved = vf.views;
+                    self.subnet_defs = vf.subnets;
+                    if let Some(st) = vf.last_style {
+                        self.style = st;
+                    }
+                    self.case_missing.clear();
+                }
+                // what was typed for the timeline open before is not this
+                // one's: the hunt's dates, seeds and files, the merge's list
+                self.hunt_form = super::hunt::HuntForm::default();
+                self.merge_form = super::tasks::MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() };
+                self.builtin = super::super::views::builtin_views(self.store.t_max);
                 self.views_path = ViewsFile::path_for(&self.files[0]);
                 self.story_path = Story::path_for(&self.files[0]);
                 if !in_case {
@@ -479,7 +507,8 @@ impl Viewer {
                 }
             }
             Some("stop") => {
-                if let Some(j) = self.job.as_mut() {
+                // (the parse of this wizard: a hunt under way is not its to stop)
+                if let Some(j) = self.job.as_mut().filter(|j| j.kind == JobKind::Ingest) {
                     j.cancel();
                 }
             }
@@ -500,7 +529,18 @@ impl Viewer {
                 self.ingest.verdict = None;
                 self.ingest.output.clear();
                 self.ingest.carve = false;
+                self.ingest.carve_only = false;
                 self.ingest.rules.clear();
+                // the next evidence starts clean: the rows left out, the
+                // threads and the debug of this run were its own
+                self.ingest.ignore_local = false;
+                self.ingest.exclude_users.clear();
+                self.ingest.exclude_hosts.clear();
+                self.ingest.exclude_ips.clear();
+                self.ingest.threads.clear();
+                self.ingest.parallel_images.clear();
+                self.ingest.skip_offsets.clear();
+                self.ingest.debug = false;
                 self.ingest.step = 0;
             }
             _ => {}
@@ -1225,8 +1265,10 @@ pub(super) fn open_external(path: &str) -> Result<(), String> {
     let mut cmd;
     #[cfg(windows)]
     {
-        cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", "", path]);
+        // not through `cmd /C start`: the shell read the path again, and a
+        // name with `&` in it (`a&calc.csv`) ran its second half as a command
+        cmd = std::process::Command::new("rundll32.exe");
+        cmd.args(["url.dll,FileProtocolHandler", path]);
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
@@ -1434,6 +1476,23 @@ mod tests {
         i.sources = vec![std::env::temp_dir().to_string_lossy().to_string()];
         assert!(!i.carve_only_possible());
         assert_eq!(&i.command()[..2], &["-a", "parse"]);
+    }
+
+    /// The timeline proposed is never the evidence: a log that is itself a
+    /// `.csv` gets another name.
+    #[test]
+    fn the_output_proposed_is_not_the_evidence() {
+        let mut i = Ingest::default();
+        i.sources = vec!["D:/case/fw.csv".to_string()];
+        assert_eq!(i.default_output().replace(char::from(92u8), "/"), "D:/case/fw-timeline.csv");
+        i.sources = vec!["D:/case/FW.CSV".to_string()];
+        assert_eq!(i.default_output().replace(char::from(92u8), "/"), "D:/case/FW-timeline.csv");
+        i.sources = vec!["D:/case/auth.log".to_string()];
+        assert_eq!(i.default_output().replace(char::from(92u8), "/"), "D:/case/auth.csv");
+        i.sources = vec!["D:/case/auth.log".to_string(), "D:/case/auth.csv".to_string()];
+        assert_eq!(i.default_output().replace(char::from(92u8), "/"), "D:/case/auth-and-1-more.csv");
+        i.sources = vec!["D:/case/a.csv".to_string(), "D:/case/a-and-1-more.csv".to_string()];
+        assert_eq!(i.default_output().replace(char::from(92u8), "/"), "D:/case/a-timeline.csv");
     }
 
     #[test]
