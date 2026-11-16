@@ -458,3 +458,82 @@ mod tests {
         assert_eq!(tail("significant", "0.001", "a; b", "", "x, y"), ",significant,0.001,a; b,,\"x, y\"");
     }
 }
+
+/// One CSV record into `buf`, line break included: a quoted field may hold
+/// line breaks (a note of two lines, a `detail` a rule copied whole), so a
+/// record is as many lines as it takes to close its quotes. Returns the
+/// bytes read, 0 at the end of the file. Every reader of a timeline that
+/// does not go through the `csv` crate reads its records with this: a
+/// reader that took each line for a row cut such a record in two and wrote
+/// both halves back as rows.
+pub(crate) fn read_record<R: io::BufRead>(rd: &mut R, buf: &mut String) -> io::Result<usize> {
+    buf.clear();
+    let mut total = 0usize;
+    let mut quotes = 0usize;
+    loop {
+        let from = buf.len();
+        let n = rd.read_line(buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total += n;
+        quotes += buf.as_bytes()[from..].iter().filter(|b| **b == b'"').count();
+        if quotes % 2 == 0 {
+            return Ok(total);
+        }
+    }
+}
+
+/// The records of a timeline, one text each, without the line break that
+/// ends them (the ones inside a quoted field are kept).
+pub(crate) struct Records<R> {
+    rd: R,
+}
+
+pub(crate) fn records<R: io::BufRead>(rd: R) -> Records<R> {
+    Records { rd }
+}
+
+impl<R: io::BufRead> Iterator for Records<R> {
+    type Item = io::Result<String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = String::new();
+        match read_record(&mut self.rd, &mut buf) {
+            Ok(0) => None,
+            Ok(_) => {
+                let keep = buf.trim_end_matches(['\r', '\n']).len();
+                buf.truncate(keep);
+                Some(Ok(buf))
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_ends_where_its_quotes_close() {
+        let text = "a,b\r\n1,\"two\nlines, and \"\"quotes\"\"\"\n\n2,plain\n3,\"open";
+        let got: Vec<String> = records(io::Cursor::new(text)).map(|r| r.unwrap()).collect();
+        assert_eq!(got, ["a,b", "1,\"two\nlines, and \"\"quotes\"\"\"", "", "2,plain", "3,\"open"]);
+    }
+
+    #[test]
+    fn the_bytes_read_add_up_to_the_file() {
+        let text = "h\n\"x\ny\",1\r\nz\n";
+        let mut rd = io::Cursor::new(text);
+        let mut buf = String::new();
+        let mut sizes = Vec::new();
+        loop {
+            let n = read_record(&mut rd, &mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            sizes.push(n);
+        }
+        assert_eq!(sizes, [2, 9, 2]);
+    }
+}

@@ -28,7 +28,10 @@ pub async fn graph_hunt_neo4j(
 ) {
     let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
-        None => return,
+        None => {
+            crate::mark_failed();
+            return;
+        }
     };
     crate::banner::print_phase("1", "4", "Connecting to Neo4j...");
     crate::banner::print_phase_detail("Database:", database);

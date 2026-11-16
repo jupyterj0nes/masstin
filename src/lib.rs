@@ -129,14 +129,18 @@ pub struct Cli {
     #[arg(long)]
     cortex_url: Option<String>,
 
-    /// Optional start time in format "YYYY-MM-DD HH:MM:SS -0000"
-    /// If the timezone offset is omitted, "-0000" is automatically added.
-    #[arg(long, value_parser = parse_cortex_time)]
+    /// Optional start time, "YYYY-MM-DD HH:MM:SS", in UTC. Also read: a
+    /// date alone ("2026-01-05", its first second), "T" between date and
+    /// time, no seconds, and a zone at the end ("+0200", "-05:00", "Z"),
+    /// which is converted to UTC. For the Cortex actions the range is sent
+    /// to Cortex in UTC.
+    #[arg(long, value_parser = parse_start_time)]
     start_time: Option<String>,
 
-    /// Optional end time in format "YYYY-MM-DD HH:MM:SS -0000"
-    /// If the timezone offset is omitted, "-0000" is automatically added.
-    #[arg(long, value_parser = parse_cortex_time)]
+    /// Optional end time, "YYYY-MM-DD HH:MM:SS", in UTC. Same shapes as
+    /// --start-time; a date alone ("2026-10-20") is its last second, so
+    /// the whole day is inside.
+    #[arg(long, value_parser = parse_end_time)]
     end_time: Option<String>,
 
 
@@ -504,6 +508,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     }
 
     validate_folders(&config)?;
+    check_output(&config)?;
 
     // Build the global noise filter from CLI flags and install it before any
     // parser action runs. If all four filter flags are off, the filter is a
@@ -515,10 +520,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         config.exclude_ips.as_deref(),
     ) {
         Ok(cfg) => crate::filter::init_filter(cfg, config.dry_run),
-        Err(e) => {
-            eprintln!("Error: invalid filter argument: {}", e);
-            return Ok(());
-        }
+        Err(e) => return Err(format!("invalid filter argument: {}", e).into()),
     }
 
     // Print banner
@@ -668,14 +670,10 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         ActionType::ParseCustom => {
             let rules_path = match config.rules.as_ref() {
                 Some(r) => r.clone(),
-                None => {
-                    eprintln!("Error: parse-custom requires --rules <path> (file or directory of YAML rule files)");
-                    return Ok(());
-                }
+                None => return Err("parse-custom requires --rules <path> (file or directory of YAML rule files)".into()),
             };
             if config.file.is_empty() {
-                eprintln!("Error: parse-custom requires at least one -f <logfile>");
-                return Ok(());
+                return Err("parse-custom requires at least one -f <logfile>".into());
             }
             crate::parse_custom::parse_custom(
                 &config.file,
@@ -791,6 +789,72 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     // Print noise filter summary (no-op if no filter flags were set)
     crate::filter::print_filter_summary();
 
+    if failed() {
+        return Err("the run did not complete: see the error above.".into());
+    }
+    Ok(())
+}
+
+static RUN_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An action that reports its own error on the console and returns calls
+/// this, so the process still ends with a non-zero code: masstin's window
+/// and every script decide by the exit code whether the run worked.
+pub(crate) fn mark_failed() {
+    RUN_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn failed() -> bool {
+    RUN_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `-o` of an action that writes a timeline, checked before anything is
+/// read: it is a file, in a folder that exists; an existing file is
+/// replaced only with --overwrite; and it is never one of the files the
+/// run reads (the timeline would replace the evidence), unless that file
+/// is itself a masstin timeline being merged into.
+fn check_output(config: &Cli) -> Result<(), String> {
+    let writes = matches!(
+        config.action,
+        ActionType::Parse
+            | ActionType::ParseWindows
+            | ActionType::ParserElastic
+            | ActionType::ParseLinux
+            | ActionType::ParseMac
+            | ActionType::ParseImage
+            | ActionType::ParseMassive
+            | ActionType::CarveImage
+            | ActionType::ParseCustom
+            | ActionType::Merge
+            | ActionType::ParseCortex
+            | ActionType::ParseCortexEvtxForensics
+    );
+    let Some(output) = config.output.as_ref().filter(|_| writes) else { return Ok(()) };
+    let op = std::path::Path::new(output);
+    if op.is_dir() {
+        return Err(format!("-o {} is a folder: give the name of the timeline file to write (for example {}).", op.display(), op.join("timeline.csv").display()));
+    }
+    if let Some(parent) = op.parent() {
+        if parent != std::path::Path::new("") && !parent.exists() {
+            return Err(format!("Parent folder of output file {} does not exist.", op.display()));
+        }
+    }
+    if !op.exists() {
+        return Ok(());
+    }
+    let same = |a: &std::path::Path, b: &std::path::Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    };
+    for f in &config.file {
+        let fp = std::path::Path::new(f);
+        if same(op, fp) && !crate::detect::is_timeline(fp) {
+            return Err(format!("-o {} is one of the files to read: the timeline would replace the evidence. Give the timeline another name.", op.display()));
+        }
+    }
+    if !config.overwrite {
+        return Err(format!("Output file {} already exists. Use --overwrite to overwrite it.", op.display()));
+    }
     Ok(())
 }
 
@@ -1187,28 +1251,9 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                     }
                 }
 
-                if output_path.exists() && !config.overwrite {
-                    return Err(format!(
-                        "Output file {} already exists. Use --overwrite to overwrite it.",
-                        output_path.display()
-                    ));
-                }
-
-                // Check write permissions
-                let temp_file = output_path.join("temp_file.txt");
-                match fs::File::create(&temp_file) {
-                    Ok(_) => {
-                        fs::remove_file(&temp_file).unwrap();
-                    }
-                    Err(e) => {
-                        if e.kind() == ErrorKind::PermissionDenied {
-                            return Err(format!(
-                                "Cannot write to output folder {}.",
-                                output_path.display()
-                            ));
-                        }
-                    }
-                }
+                // the rest (a folder, an existing file, the evidence itself)
+                // is check_output's, for every action that writes a timeline
+                let _ = output_path;
             }
         }
         ActionType::ParseImage | ActionType::ParseMassive => {
@@ -1403,7 +1448,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
 // -----------------------------------------------------------------------------
 fn is_evtx_file(file_path: &str) -> bool {
     let path = std::path::Path::new(file_path);
-    if path.extension().map_or(false, |ext| ext == "evtx") {
+    if path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("evtx")) {
         return true;
     }
 
@@ -1436,13 +1481,16 @@ fn clean_path(path: &str) -> Result<String, String> {
     // Detect shell quoting corruption: path contains what looks like CLI flags
     // This happens in PowerShell when a path ends with \ inside single quotes:
     //   -d 'C:\path\' -o output.csv  →  -d receives 'C:\path" -o output.csv'
-    if p.contains("\" -") || p.contains("\" --") || p.contains(" -o ") || p.contains(" --overwrite") {
+    // (a path that exists is what it says, whatever it contains: a folder
+    // can be called `logs -o old`)
+    let swallowed_flags = p.contains("\" -") || p.contains("\" --") || ((p.contains(" -o ") || p.contains(" --overwrite")) && !std::path::Path::new(&p).exists());
+    if swallowed_flags {
         return Err(format!(
             "Path corrupted by shell quoting: '{}...'\n\
              This happens when a path ends with \\ inside single quotes in PowerShell.\n\
              Fix: remove the trailing \\ or use double quotes.\n\
              Example: -d \"C:\\evidence\\image.vmdk\"",
-            &p[..p.len().min(80)]
+            p.chars().take(80).collect::<String>()
         ));
     }
 
@@ -1482,20 +1530,50 @@ fn normalize_path(path: &str) -> String {
 // -----------------------------------------------------------------------------
 //   Tries to parse the provided string as a UTC date/time
 // -----------------------------------------------------------------------------
-fn parse_cortex_time(raw: &str) -> Result<String, String> {
-    // Si ya contiene offset, lo aceptamos tal cual (pero validamos el formato base).
-    let has_offset = raw.trim().ends_with("-0000") || raw.trim().ends_with("-1000") || raw.trim().ends_with("-0100");
+/// `--start-time` / `--end-time` as every action receives them: UTC,
+/// written "YYYY-MM-DD HH:MM:SS -0000" (see `timefmt::time_bound` for
+/// what is read).
+fn parse_time_option(raw: &str, end_of_day: bool) -> Result<String, String> {
+    match crate::timefmt::time_bound(raw, end_of_day) {
+        Some(t) => Ok(format!("{} -0000", t.format("%Y-%m-%d %H:%M:%S"))),
+        None => Err("write the time as \"YYYY-MM-DD HH:MM:SS\" (UTC); a date alone, and a zone at the end (+0200, -05:00, Z), are read too".to_string()),
+    }
+}
 
-    let base_part = if has_offset {
-        raw.trim().to_string()
-    } else {
-        format!("{} -0000", raw.trim())
-    };
+fn parse_start_time(raw: &str) -> Result<String, String> {
+    parse_time_option(raw, false)
+}
 
-    // Validar que esté en formato "YYYY-MM-DD HH:MM:SS -0000"
-    match chrono::NaiveDateTime::parse_from_str(&base_part[..19], "%Y-%m-%d %H:%M:%S") {
-        Ok(_) => Ok(base_part),
-        Err(_) => Err("Date must be in format 'YYYY-MM-DD HH:MM:SS [-0000]'".to_string()),
+fn parse_end_time(raw: &str) -> Result<String, String> {
+    parse_time_option(raw, true)
+}
+
+#[cfg(test)]
+mod time_option_tests {
+    use super::*;
+
+    #[test]
+    fn short_values_and_zones_are_read_not_a_panic() {
+        assert_eq!(parse_start_time("2026-01-05").unwrap(), "2026-01-05 00:00:00 -0000");
+        assert_eq!(parse_end_time("2026-10-20").unwrap(), "2026-10-20 23:59:59 -0000");
+        assert_eq!(parse_start_time("2026-01-05 10:00:00").unwrap(), "2026-01-05 10:00:00 -0000");
+        assert_eq!(parse_start_time("2026-01-05 10:00:00 -0000").unwrap(), "2026-01-05 10:00:00 -0000");
+        assert_eq!(parse_start_time("2026-01-05 10:00:00 +0200").unwrap(), "2026-01-05 08:00:00 -0000");
+        assert!(parse_start_time("x").is_err());
+        assert!(parse_end_time("2026").is_err());
+    }
+
+    #[test]
+    fn a_path_is_cleaned_without_cutting_a_character() {
+        let long = format!("{}é\" -o out.csv", "a".repeat(79));
+        assert!(clean_path(&long).unwrap_err().contains("corrupted"));
+        // flags inside a path that does not exist: the shell swallowed them
+        assert!(clean_path("Z:\\no\\such -o out.csv").is_err());
+        // the same text in a path that exists is the path
+        let d = std::env::temp_dir().join(format!("masstin logs -o old {}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(clean_path(&d.to_string_lossy()).unwrap(), d.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 #[cfg(test)]

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 pub use schema::GraphMode;
 
 fn parse_cutoff(raw: &str) -> Option<DateTime<Utc>> {
-    NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S").ok().map(|n| Utc.from_utc_datetime(&n))
+    crate::timefmt::time_bound(raw, false).map(|n| Utc.from_utc_datetime(&n))
 }
 
 fn parse_detector_list(raw: &str) -> HashSet<String> {
@@ -35,7 +35,7 @@ pub(crate) fn settings(
     let cutoff = match parse_cutoff(investigation_from) {
         Some(c) => c,
         None => {
-            eprintln!("Masstin - Error: --investigation-from must be \"YYYY-MM-DD HH:MM:SS\" (got: {})", investigation_from);
+            eprintln!("Masstin - Error: --investigation-from must be \"YYYY-MM-DD HH:MM:SS\" or a date alone, in UTC (got: {})", investigation_from);
             return None;
         }
     };
@@ -106,7 +106,10 @@ pub fn graph_hunt_csv(
 ) {
     let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
-        None => return,
+        None => {
+            crate::mark_failed();
+            return;
+        }
     };
     crate::banner::print_phase("1", "4", "Timeline CSV input");
     for f in files {
@@ -137,7 +140,10 @@ pub async fn graph_hunt(
 ) {
     let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
-        None => return,
+        None => {
+            crate::mark_failed();
+            return;
+        }
     };
     crate::banner::print_phase("1", "4", "Connecting to Memgraph...");
     crate::banner::print_phase_detail("Database:", database);

@@ -313,6 +313,11 @@ fn classify(process: &str, message: &str) -> Option<Classified> {
         // form, and both before the pre-auth touches.
         if let Some(c) = SSH_FAIL_RE.captures(message) {
             let method = &c[1];
+            // the client asking which methods are allowed, not an attempt
+            // (parse-linux skips it for the same reason)
+            if method == "none" {
+                return None;
+            }
             let user = c.get(3).map_or("", |m| m.as_str());
             let invalid = c.get(2).is_some();
             return Some(Classified {

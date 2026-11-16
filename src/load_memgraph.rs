@@ -165,8 +165,14 @@ pub async fn load_memgraph(
     let end_dt = end_time.and_then(|s| parse_time_window(s));
 
     for file in files {
-        let file_contents: String = std::fs::read_to_string(file).unwrap();
-        let mut lines: Vec<&str> = file_contents.lines().collect();
+        let file_contents: Vec<String> = match std::fs::File::open(file) {
+            Ok(f) => crate::csv_out::records(std::io::BufReader::new(f)).map_while(|r: std::io::Result<String>| r.ok()).collect(),
+            Err(e) => {
+                eprintln!("MASSTIN - cannot read {}: {}", file, e);
+                continue;
+            }
+        };
+        let mut lines: Vec<&str> = file_contents.iter().map(|s| s.as_str()).collect();
 
         // Verify the file header: the 12-, 14- or 19-column layout (see
         // csv_out::Layout); the 14 event columns sit at the same positions

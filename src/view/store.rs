@@ -234,8 +234,7 @@ impl Store {
             let mut line = String::new();
             let mut rows = 0usize;
             loop {
-                line.clear();
-                let n = rd.read_line(&mut line)?;
+                let n = csv_out::read_record(&mut rd, &mut line)?;
                 if n == 0 {
                     break;
                 }
@@ -412,7 +411,7 @@ impl Store {
         fh.seek(SeekFrom::Start(at))?;
         let mut rd = std::io::BufReader::new(fh);
         let mut text = String::new();
-        rd.read_line(&mut text)?;
+        csv_out::read_record(&mut rd, &mut text)?;
         let trimmed = text.trim_end_matches(['\r', '\n']);
         let mut p: Vec<Cow<str>> = Vec::with_capacity(20);
         split_csv_into(trimmed, &mut p);
@@ -428,7 +427,7 @@ impl Store {
         let rd = std::io::BufReader::new(std::fs::File::open(&f.path)?);
         let mut out = Vec::new();
         // line 0 of the file is the header: data row k is file line k + 1
-        for (k, line) in rd.lines().enumerate().skip(1) {
+        for (k, line) in csv_out::records(rd).enumerate().skip(1) {
             if line?.to_lowercase().contains(&needle) {
                 out.push((k - 1) as u32);
             }
@@ -444,7 +443,7 @@ impl Store {
         fh.seek(SeekFrom::Start(at))?;
         let mut rd = std::io::BufReader::new(fh);
         let mut line = String::new();
-        rd.read_line(&mut line)?;
+        csv_out::read_record(&mut rd, &mut line)?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let mut p: Vec<Cow<str>> = Vec::with_capacity(20);
         split_csv_into(trimmed, &mut p);
@@ -455,15 +454,14 @@ impl Store {
     /// Write a verdict and notes on these rows: the edges here and the
     /// files' tails. Returns how many rows were written.
     pub fn mark(&mut self, rows: &[(u16, u32)], verdict: u8, notes: &str) -> std::io::Result<usize> {
+        // The files first, the store after: a file that cannot be written
+        // (open in Excel, a share that went away) leaves the store as it
+        // was, so the window never shows a mark the timeline does not hold.
         let mut per_file: HashMap<u16, HashSet<u32>> = HashMap::new();
+        let mut marked: Vec<(usize, u16, u32)> = Vec::new();
         for &(f, l) in rows {
             if let Some(ei) = self.edge_at(f, l) {
-                self.edges[ei].verdict = verdict;
-                if notes.is_empty() {
-                    self.notes.remove(&(f, l));
-                } else {
-                    self.notes.insert((f, l), notes.to_string());
-                }
+                marked.push((ei, f, l));
                 per_file.entry(f).or_default().insert(l);
             }
         }
@@ -471,7 +469,9 @@ impl Store {
         let verdict_name = VERDICT_NAMES[verdict as usize];
         for (fi, lines) in per_file {
             let path = self.files[fi as usize].path.clone();
-            let tmp = Path::new(&path).with_extension("csv.masstin-tmp");
+            // a name of this process: a hunt writing the same timeline at
+            // the same moment has its own
+            let tmp = Path::new(&path).with_extension(format!("csv.masstin-tmp-{}", std::process::id()));
             let mut new_offsets: Vec<u64> = Vec::with_capacity(self.files[fi as usize].offsets.len());
             {
                 let mut rd = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(&path)?);
@@ -486,8 +486,7 @@ impl Store {
                 let mut buf = String::new();
                 let mut line_no: u32 = 0;
                 loop {
-                    buf.clear();
-                    if rd.read_line(&mut buf)? == 0 {
+                    if csv_out::read_record(&mut rd, &mut buf)? == 0 {
                         break;
                     }
                     let line = buf.trim_end_matches(['\r', '\n']);
@@ -533,6 +532,14 @@ impl Store {
             f.layout = Layout::V19;
             f.offsets = new_offsets;
             written += lines.len();
+        }
+        for (ei, f, l) in marked {
+            self.edges[ei].verdict = verdict;
+            if notes.is_empty() {
+                self.notes.remove(&(f, l));
+            } else {
+                self.notes.insert((f, l), notes.to_string());
+            }
         }
         Ok(written)
     }
@@ -732,6 +739,58 @@ mod tests {
         assert!(lines[1].ends_with(",habitual,0,nothing new,,"), "{}", lines[1]);
         assert!(lines[2].ends_with(",significant,30,origin never seen before,suspicious,"), "{}", lines[2]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A note of several lines is one row: the file keeps its row count,
+    /// the note reads back whole, and a mark made after it lands on the
+    /// row chosen (it used to land one row early for every line break).
+    #[test]
+    fn a_note_of_several_lines_is_still_one_row() {
+        let path = std::env::temp_dir().join(format!("masstin-store-ml-{}.csv", std::process::id()));
+        let body = [
+            csv_out::HEADER.to_string(),
+            row(5, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(5, 10, "10.0.0.9", "SRV01", "mallory", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(5, 11, "10.0.0.7", "SRV01", "carol", "SUCCESSFUL_LOGON", ",,,,,"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let p = path.to_string_lossy().to_string();
+        let mut s = Store::load(&[p.clone()], 0.05).unwrap();
+        let note = "first line\nsecond, with a comma\r\nthird \"quoted\"";
+        assert_eq!(s.mark(&[(0, 0)], verdict_code("suspicious"), note).unwrap(), 1);
+        // a mark on a later row, after the multi-line one
+        assert_eq!(s.mark(&[(0, 2)], verdict_code("benign"), "carol is fine").unwrap(), 1);
+        assert_eq!(s.row_fields(0, 2).unwrap()[5], "carol");
+        assert_eq!(s.raw_row(0, 0).unwrap()[18], note);
+
+        let again = Store::load(&[p.clone()], 0.05).unwrap();
+        assert_eq!(again.rows_total, 3);
+        assert_eq!(again.edges.len(), 3);
+        assert_eq!(again.notes.get(&(0, 0)).map(|x| x.as_str()), Some(note));
+        assert_eq!(again.notes.get(&(0, 2)).map(|x| x.as_str()), Some("carol is fine"));
+        assert_eq!(again.notes.get(&(0, 1)), None);
+        assert_eq!(again.edges[2].verdict, verdict_code("benign"));
+        assert_eq!(again.row_fields(0, 1).unwrap()[5], "mallory");
+        // what the csv crate reads is the same three rows
+        let n = csv::ReaderBuilder::new().flexible(true).from_path(&path).unwrap().records().filter(|r| r.as_ref().map(|r| r.len() == 19).unwrap_or(false)).count();
+        assert_eq!(n, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A timeline that cannot be replaced leaves the store unmarked.
+    #[test]
+    fn a_mark_that_cannot_be_written_is_not_shown() {
+        let path = std::env::temp_dir().join(format!("masstin-store-ro-{}.csv", std::process::id()));
+        let body = [csv_out::HEADER.to_string(), row(5, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", ",,,,,")].join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let p = path.to_string_lossy().to_string();
+        let mut s = Store::load(&[p.clone()], 0.05).unwrap();
+        // the file is gone when the mark is written
+        std::fs::remove_file(&path).unwrap();
+        assert!(s.mark(&[(0, 0)], verdict_code("suspicious"), "x").is_err());
+        assert_eq!(s.edges[0].verdict, V_NONE);
+        assert!(s.notes.is_empty());
     }
 
     #[test]

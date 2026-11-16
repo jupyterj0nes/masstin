@@ -468,6 +468,7 @@ pub(crate) async fn run_xql(
 
     // Poll up to 10 minutes (120 * 5s) — large saturated windows can take a while.
     let max_retries = 120;
+    let mut finished = false;
     for attempt in 0..max_retries {
         if debug {
             eprintln!("[DEBUG] Poll attempt {}", attempt + 1);
@@ -501,6 +502,7 @@ pub(crate) async fn run_xql(
                     out.extend(more);
                 }
             }
+            finished = true;
             break;
         } else if status == "PENDING" || status == "RUNNING" {
             sleep(Duration::from_secs(5)).await;
@@ -510,6 +512,10 @@ pub(crate) async fn run_xql(
         }
     }
     spinner.finish_and_clear();
+    if !finished {
+        // not "no events": the answer never came
+        return Err(format!("Cortex was still running the query after {} minutes and masstin stopped waiting: no result was received (this is not an empty result). Narrow the time range (--start-time / --end-time) and run it again.", max_retries * 5 / 60).into());
+    }
     Ok(out)
 }
 

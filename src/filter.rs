@@ -227,7 +227,7 @@ pub fn should_keep_record(r: &LogData) -> bool {
 
     // Layer 4 — --exclude-ips
     if !cfg.exclude_ips.is_empty() {
-        if let Ok(ip) = r.ip_address.parse::<IpAddr>() {
+        if let Ok(ip) = r.ip_address.trim().parse::<IpAddr>().map(plain_ip) {
             if cfg.exclude_ips.iter().any(|m| m.matches(&ip)) {
                 stats.exclude_ips += 1;
                 return false;
@@ -299,13 +299,45 @@ pub fn classify_local(r: &LogData) -> Option<LocalReason> {
 
     // 5. Self-reference (workstation == dst_computer) with no IP
     if !r.workstation_name.is_empty()
-        && r.workstation_name.eq_ignore_ascii_case(&r.computer)
+        && same_host(&r.workstation_name, &r.computer)
     {
         return Some(LocalReason::SelfReference);
     }
 
     // 6. Catch-all: both fields are empty / dash / MSTSC / default_value
     Some(LocalReason::BothNoise)
+}
+
+/// Two names of one machine: the same text in any case, or a short name
+/// and the fully qualified one of the same host (`SRV01` and
+/// `SRV01.corp.local`). A domain member logs itself by its FQDN in
+/// `Computer` and by its NetBIOS name in `WorkstationName`: compared
+/// letter by letter they never matched, and --ignore-local kept every
+/// local logon of every domain machine. Two different FQDNs are two hosts.
+fn same_host(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim().trim_end_matches('.'), b.trim().trim_end_matches('.'));
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let is_ip = |s: &str| s.parse::<IpAddr>().is_ok();
+    if a.is_empty() || b.is_empty() || is_ip(a) || is_ip(b) {
+        return false;
+    }
+    let short = |s: &str| s.split('.').next().unwrap_or("").to_string();
+    match (a.contains('.'), b.contains('.')) {
+        (true, false) => short(a).eq_ignore_ascii_case(b),
+        (false, true) => short(b).eq_ignore_ascii_case(a),
+        _ => false,
+    }
+}
+
+/// An IPv4 address written as IPv6 (`::ffff:10.0.0.5`, as a dual-stack
+/// listener logs it) is that IPv4 address, for a range given as IPv4.
+fn plain_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
 }
 
 fn is_src_ip_noise(ip: &str) -> bool {
@@ -316,7 +348,7 @@ fn is_src_ip_noise(ip: &str) -> bool {
     if lower == "local" || lower == "localhost" {
         return true;
     }
-    match ip.parse::<IpAddr>() {
+    match ip.parse::<IpAddr>().map(plain_ip) {
         Ok(addr) => addr.is_loopback() || addr.is_unspecified() || is_link_local(&addr),
         Err(_) => true, // not a valid IP → treat as noise
     }
@@ -336,7 +368,7 @@ fn is_src_computer_noise(hostname: &str, dst_computer: &str) -> bool {
     }
     // Self-reference: src_computer == dst_computer is noise when combined with
     // an absent src_ip (handled by the outer classify_local).
-    if !dst_computer.is_empty() && hostname.eq_ignore_ascii_case(dst_computer) {
+    if !dst_computer.is_empty() && same_host(hostname, dst_computer) {
         return true;
     }
     false
@@ -585,5 +617,63 @@ mod tests {
         assert!(matches!(classify_local(&row("DC01", "", "", "2")), Some(LocalReason::InteractiveLogon)));
         assert!(matches!(classify_local(&row("DC01", "dc01", "", "3")), Some(LocalReason::SelfReference)));
         assert!(matches!(classify_local(&row("DC01", "MSTSC", "", "3")), Some(LocalReason::BothNoise)));
+    }
+}
+
+#[cfg(test)]
+mod host_and_address_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_name_and_its_fqdn_are_one_machine() {
+        assert!(same_host("SRV01", "srv01"));
+        assert!(same_host("SRV01.corp.local", "SRV01"));
+        assert!(same_host("dev-dc01", "DEV-DC01.dev.leoncorp.test"));
+        assert!(same_host("SRV01.corp.local.", "srv01.CORP.local"));
+        // two domains, two hosts; a prefix is not a name; an address is not a name
+        assert!(!same_host("SRV01.corp.local", "SRV01.other.local"));
+        assert!(!same_host("SRV01", "SRV011.corp.local"));
+        assert!(!same_host("SRV", "SRV01.corp.local"));
+        assert!(!same_host("10.0.0.5", "10"));
+        assert!(!same_host("10", "10.0.0.5"));
+        assert!(!same_host("", "SRV01.corp.local"));
+    }
+
+    /// As a domain member logs itself (lab, DEV-DC01): `Computer` fully
+    /// qualified, `WorkstationName` short, no address.
+    #[test]
+    fn a_domain_member_logging_on_to_itself_is_local() {
+        let ld = |computer: &str, ws: &str, ip: &str, lt: &str| LogData {
+            time_created: "2026-11-10T08:00:00Z".into(),
+            computer: computer.into(),
+            event_type: "SUCCESSFUL_LOGON".into(),
+            event_id: "4624".into(),
+            subject_user_name: String::new(),
+            subject_domain_name: String::new(),
+            target_user_name: "DEV-DC01$".into(),
+            target_domain_name: "DEV".into(),
+            logon_type: lt.into(),
+            workstation_name: ws.into(),
+            ip_address: ip.into(),
+            logon_id: "0x1".into(),
+            filename: "Security.evtx".into(),
+            detail: String::new(),
+        };
+        assert!(classify_local(&ld("DEV-DC01.dev.leoncorp.test", "DEV-DC01", "-", "3")).is_some());
+        assert!(classify_local(&ld("DEV-DC01.dev.leoncorp.test", "DEV-DC01", "::ffff:127.0.0.1", "3")).is_some());
+        // from another machine, or from an address: kept
+        assert!(classify_local(&ld("DEV-DC01.dev.leoncorp.test", "DEV-SRV01", "-", "3")).is_none());
+        assert!(classify_local(&ld("DEV-DC01.dev.leoncorp.test", "DEV-DC01", "10.10.0.38", "3")).is_none());
+    }
+
+    #[test]
+    fn an_ipv4_address_written_as_ipv6_is_in_its_ipv4_range() {
+        let net = IpMatcher::parse("10.0.0.0/8").unwrap();
+        let mapped: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+        assert!(!net.matches(&mapped));
+        assert!(net.matches(&plain_ip(mapped)));
+        assert_eq!(plain_ip("2001:db8::1".parse().unwrap()), "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert!(is_src_ip_noise("::ffff:127.0.0.1"));
+        assert!(!is_src_ip_noise("::ffff:10.0.0.5"));
     }
 }

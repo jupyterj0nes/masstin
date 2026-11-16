@@ -338,7 +338,7 @@ fn streaming_pass1(
 
     let file = File::open(path)?;
     let reader = BufReader::new(file);
-    for (i, line_result) in reader.lines().enumerate() {
+    for (i, line_result) in crate::csv_out::records(reader).enumerate() {
         let line = line_result?;
         if i == 0 { continue; }  // header already validated upstream
         match clean_row(&line, idx, local_values, start_dt, end_dt) {
@@ -785,7 +785,7 @@ pub async fn load_neo4j(
             }
         };
         let reader = BufReader::new(f);
-        for (line_i, line_result) in reader.lines().enumerate() {
+        for (line_i, line_result) in crate::csv_out::records(reader).enumerate() {
             if line_i == 0 { continue; }  // header
             let line = match line_result {
                 Ok(l) => l,

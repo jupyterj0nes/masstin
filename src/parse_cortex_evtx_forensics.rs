@@ -73,6 +73,15 @@ pub async fn parse_cortex_evtx_forensics_data(
         Some(s) if !s.is_empty() => Some(to_epoch_secs(s)?),
         _ => None,
     };
+    // The query reads the last 365 days (`timeframe=365d`). A bound not
+    // given is that year's: the window is then always known, so a result
+    // cut at Cortex's limit of a million records is split in two and asked
+    // again, with or without --start-time / --end-time. (Without both, a
+    // cut result used to be taken as complete, and one bound alone was
+    // ignored.)
+    let now = Utc::now().timestamp();
+    let epoch_end = Some(epoch_end.unwrap_or(now + 86_400));
+    let epoch_start = Some(epoch_start.unwrap_or(now - 366 * 86_400));
 
     // Build the time_filter XQL clause as a function of window bounds. When
     // auto-pagination bisects, each pass uses its own (start, end) to rebuild
@@ -81,8 +90,12 @@ pub async fn parse_cortex_evtx_forensics_data(
     let build_time_filter = |start: Option<i64>, end: Option<i64>| -> String {
         match (start, end) {
             (Some(s), Some(e)) => format!(
-                r#"| filter (timestamp_diff(to_timestamp({e}), Timestamp, "SECOND") > 0) and
-                     (timestamp_diff(Timestamp,      to_timestamp({s}), "SECOND") > 0 )"#
+                // both ends included: the second where two windows meet is
+                // asked for by both, and its events are written once (the
+                // writer drops identical rows). With both ends excluded the
+                // events of that second were in neither.
+                r#"| filter (timestamp_diff(to_timestamp({e}), Timestamp, "SECOND") >= 0) and
+                     (timestamp_diff(Timestamp,      to_timestamp({s}), "SECOND") >= 0 )"#
             ),
             _ => String::new(),
         }
@@ -461,6 +474,7 @@ async fn run_forensics_query(
 
     // Poll up to 10 minutes (120 * 5s) — large saturated windows can take a while.
     let max_retries = 120;
+    let mut finished = false;
     for attempt in 0..max_retries {
         if debug {
             eprintln!("[DEBUG] Poll attempt {}", attempt + 1);
@@ -486,6 +500,7 @@ async fn run_forensics_query(
                 let more = fetch_stream_data(client, get_stream_url, headers, stream_id, debug).await?;
                 out.extend(more);
             }
+            finished = true;
             break;
         } else if status == "PENDING" || status == "RUNNING" {
             sleep(Duration::from_secs(5)).await;
@@ -495,6 +510,10 @@ async fn run_forensics_query(
         }
     }
     spinner.finish_and_clear();
+    if !finished {
+        // not "no events": the answer never came
+        return Err(format!("Cortex was still running the query after {} minutes and masstin stopped waiting: no result was received (this is not an empty result). Narrow the time range (--start-time / --end-time) and run it again.", max_retries * 5 / 60).into());
+    }
     Ok(out)
 }
 
@@ -619,6 +638,13 @@ fn write_processed_csv(records: &[Value], filename: &str, debug: bool) -> Result
     let sessions: std::collections::HashSet<(String, String)> = rows.iter().filter(|r| r.len() >= 14 && r[2] != "LOGOFF" && !r[11].is_empty()).map(|r| (r[1].to_ascii_lowercase(), r[11].to_ascii_lowercase())).collect();
     let mut orphans = 0usize;
     for row in rows {
+        // an event process_record leaves out (a WMI 5858 from the machine
+        // itself or of a service account) comes back empty: it is not a
+        // row. Written, it was a line of 5 columns among lines of 19, the
+        // writer refused it and the whole forensics source was lost.
+        if row.len() < 14 {
+            continue;
+        }
         if row.len() >= 14 && (row[3] == "4634" || row[3] == "4647") && !sessions.contains(&(row[1].to_ascii_lowercase(), row[11].to_ascii_lowercase())) {
             orphans += 1;
             continue;
@@ -961,6 +987,25 @@ mod tests {
     fn a_kerberos_ticket_names_its_service() {
         let r = rec(serde_json::json!({"event_id": "4769", "dst_host": "DC01", "srcip": "10.0.0.5", "target_user": "ana@CORP.LOCAL", "status": "0x0", "process": "cifs/FS01"}));
         assert_eq!(r[12], "cifs/FS01");
+    }
+
+    /// A WMI 5858 of the machine itself or of a service account is left
+    /// out; the events around it are written. (Its empty row reached the
+    /// writer, which refused it, and the whole source was lost.)
+    #[test]
+    fn an_event_left_out_does_not_break_the_file() {
+        let logon = serde_json::json!({"Timestamp": 1700000000000i64, "event_id": "4624", "dst_host": "SRV1", "srcip": "10.0.0.5", "target_user": "ana", "lt": "3"});
+        let own_wmi = serde_json::json!({"Timestamp": 1700000001000i64, "event_id": "5858", "dst_host": "SRV1.corp.local", "srcip": "SRV1", "target_user": "ana"});
+        let service_wmi = serde_json::json!({"Timestamp": 1700000002000i64, "event_id": "5858", "dst_host": "SRV1", "srcip": "WS07", "target_user": "SYSTEM"});
+        let remote_wmi = serde_json::json!({"Timestamp": 1700000003000i64, "event_id": "5858", "dst_host": "SRV1", "srcip": "WS07", "target_user": "ana"});
+        assert!(rec(own_wmi.clone()).is_empty() && rec(service_wmi.clone()).is_empty());
+        let p = std::env::temp_dir().join(format!("masstin_cortex_for_5858_{}.csv", std::process::id()));
+        write_processed_csv(&[logon, own_wmi, service_wmi, remote_wmi], p.to_str().unwrap(), false).unwrap();
+        let rows: Vec<csv::StringRecord> = csv::Reader::from_path(&p).unwrap().records().map(|r| r.unwrap()).collect();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.len() == 19));
+        assert_eq!((&rows[0][3], &rows[1][3], &rows[1][7]), ("4624", "5858", "WS07"));
     }
 
     #[test]

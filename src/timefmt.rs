@@ -8,7 +8,7 @@
 //! loaders, the hunt, `merge`, the parsers' own sort) tries its usual
 //! formats first and then this one.
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
 /// asctime ("Fri May 31 17:35:42 2019", also "Fri May  1 ..." and without
 /// the weekday), the same with the year after the day ("Apr 13 2026
@@ -171,5 +171,90 @@ mod tests {
         assert_eq!(normalise_for_csv("Apr 13 09:14:22"), "Apr 13 09:14:22");
         // ISO is never touched
         assert_eq!(super::normalise_for_csv_bounded("2026-04-13T09:14:22Z", b), "2026-04-13T09:14:22Z");
+    }
+}
+
+/// A time bound typed by a person (`--start-time`, `--end-time`,
+/// `--investigation-from`, `--seed-from`, `--seed-to`), as naive UTC.
+///
+/// Read: `YYYY-MM-DD HH:MM:SS`, with `T` between date and time, without
+/// the seconds, with a fraction (dropped), and a date alone, which is its
+/// first second, or its last when `end_of_day` (an end bound of
+/// `2026-10-20` takes the whole day in). A zone at the end is applied:
+/// `Z`, `+0200`, ` -0500`, `+02:00`; without one the time is UTC.
+pub fn time_bound(raw: &str, end_of_day: bool) -> Option<NaiveDateTime> {
+    let s = raw.trim().trim_matches('"').trim();
+    // the zone, if any, after the date (whose own dashes end at byte 10)
+    let (body, offset_secs): (&str, i64) = if let Some(b) = s.strip_suffix(['Z', 'z']) {
+        (b, 0)
+    } else {
+        match s.char_indices().rev().find(|(_, c)| *c == '+' || *c == '-') {
+            Some((i, sign)) if i >= 10 => {
+                let digits: String = s[i + 1..].chars().filter(|c| *c != ':').collect();
+                if digits.len() == 4 && digits.bytes().all(|c| c.is_ascii_digit()) {
+                    let h: i64 = digits[..2].parse().ok()?;
+                    let m: i64 = digits[2..].parse().ok()?;
+                    if h > 14 || m > 59 {
+                        return None;
+                    }
+                    let secs = h * 3600 + m * 60;
+                    (&s[..i], if sign == '-' { -secs } else { secs })
+                } else {
+                    return None;
+                }
+            }
+            _ => (s, 0),
+        }
+    };
+    let body = body.trim();
+    let naive = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(body, f).ok())
+        .or_else(|| {
+            let d = NaiveDate::parse_from_str(body, "%Y-%m-%d").ok()?;
+            if end_of_day { d.and_hms_opt(23, 59, 59) } else { d.and_hms_opt(0, 0, 0) }
+        })?;
+    let naive = naive.with_nanosecond(0).unwrap_or(naive);
+    naive.checked_sub_signed(chrono::Duration::seconds(offset_secs))
+}
+
+#[cfg(test)]
+mod time_bound_tests {
+    use super::time_bound;
+
+    fn at(s: &str, end: bool) -> String {
+        time_bound(s, end).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "-".into())
+    }
+
+    #[test]
+    fn the_shapes_a_person_types() {
+        assert_eq!(at("2026-01-05 10:20:30", false), "2026-01-05 10:20:30");
+        assert_eq!(at("2026-01-05T10:20:30", false), "2026-01-05 10:20:30");
+        assert_eq!(at("2026-01-05 10:20", false), "2026-01-05 10:20:00");
+        assert_eq!(at("2026-01-05 10:20:30.750", false), "2026-01-05 10:20:30");
+        assert_eq!(at(" \"2026-01-05 10:20:30\" ", false), "2026-01-05 10:20:30");
+    }
+
+    #[test]
+    fn a_date_alone_is_its_first_second_or_its_last() {
+        assert_eq!(at("2026-01-05", false), "2026-01-05 00:00:00");
+        assert_eq!(at("2026-10-20", true), "2026-10-20 23:59:59");
+    }
+
+    #[test]
+    fn a_zone_is_applied_not_dropped() {
+        assert_eq!(at("2026-01-05 10:20:30 -0000", false), "2026-01-05 10:20:30");
+        assert_eq!(at("2026-01-05 10:20:30 +0200", false), "2026-01-05 08:20:30");
+        assert_eq!(at("2026-01-05T10:20:30+02:00", false), "2026-01-05 08:20:30");
+        assert_eq!(at("2026-01-05 22:00:00 -0500", false), "2026-01-06 03:00:00");
+        assert_eq!(at("2026-01-05T10:20:30Z", false), "2026-01-05 10:20:30");
+        assert_eq!(at("2026-01-05 +0200", false), "2026-01-04 22:00:00");
+    }
+
+    #[test]
+    fn what_is_not_a_time_is_refused_without_a_panic() {
+        for bad in ["", "2026", "2026-13-05", "yesterday", "2026-01-05 25:00:00", "2026-01-05 10:20:30 +2", "20261-01-05", "2026-01-05 10:20:30 +9900", "ñññññññññññññññññññññ"] {
+            assert_eq!(at(bad, false), "-", "{}", bad);
+        }
     }
 }

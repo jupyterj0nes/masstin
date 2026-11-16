@@ -38,12 +38,16 @@ const ACCOUNTING: i16 = 9;
 //   * 384 bytes where __WORDSIZE_TIME64_COMPAT32 is set (x86_64): a 32-bit
 //     ut_session at 336, a 32-bit tv_sec at 340 and tv_usec at 344;
 //   * 400 bytes on the other 64-bit ports (aarch64, riscv64, ppc64le,
-//     s390x): padding at 336, a long ut_session at 340, a 16-byte timeval
-//     with tv_sec at 348.
+//     s390x): a long ut_session at 336, a 16-byte timeval with tv_sec
+//     at 344.
 // Reading a Graviton or Raspberry Pi wtmp with the x86_64 size gave
 // garbage from the second record on.
 const UTMP_SIZE_COMPAT32: usize = 384;
 const UTMP_SIZE_TIME64: usize = 400;
+fn utmp_host_is_local(host: &str) -> bool {
+    host.starts_with(':') || host.starts_with("tmux(") || host == "login screen"
+}
+
 /// One record: (ut_type, ut_pid, ut_line, ut_user, ut_host, tv_sec).
 fn utmp_record(rec: &[u8], time64: bool) -> (i16, u32, String, String, String, i64) {
     let ut_type = i16::from_le_bytes([rec[0], rec[1]]);
@@ -52,7 +56,9 @@ fn utmp_record(rec: &[u8], time64: bool) -> (i16, u32, String, String, String, i
     let user = c_chars(&rec[44..76]);
     let host = c_chars(&rec[76..332]);
     let secs = if time64 {
-        i64::from_le_bytes(rec[348..356].try_into().unwrap())
+        // (ut_session is a long at 336: the padding the x86_64 layout has
+        // there is not needed, so the timeval starts at 344, not 348)
+        i64::from_le_bytes(rec[344..352].try_into().unwrap())
     } else {
         u32::from_le_bytes(rec[340..344].try_into().unwrap()) as i64
     };
@@ -100,18 +106,30 @@ static IPV6_COLON: Lazy<Regex> = Lazy::new(|| Regex::new(r":").unwrap());
 // gssapi-with-mic, hostbased): the old `password|publickey` list silently
 // dropped Kerberos and PAM-challenge logins.
 pub(crate) static SSH_OK_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"Accepted (\S+) for (\S+) from (\S+)"#).unwrap()
+    Regex::new(&format!(r#"{}Accepted (\S+) for (\S+) from (\S+)"#, SSHD_LEAD)).unwrap()
 });
+/// What may stand in a line before sshd's own words: the rest of an
+/// RFC5424 header, the host, the process tag (`sshd[1234]:`), Solaris'
+/// `[ID ...]`, a level (`error:`). Every sshd pattern starts here, at the
+/// start of the line, and nowhere else: the account name a client
+/// announces is written into the log as it comes, so a client that calls
+/// itself `Accepted password for root from 8.8.8.8 port 1 ssh2` produced a
+/// line (`Invalid user Accepted password for root from 8.8.8.8 ... from
+/// <its real address>`) that an unanchored pattern read as a successful
+/// logon of root from 8.8.8.8. For the same reason the patterns that end
+/// in the source take the LAST `from <source>` of the line: the one sshd
+/// wrote, after anything the client chose.
+pub(crate) const SSHD_LEAD: &str = r"^\s*(?:-\s+-\s+)?(?:\S+\s+)?(?:\S+?(?:\[\d+\])?:\s+)?(?:\[ID [^\]]+\]\s+)?(?:(?:error|fatal|warning|info|debug\d?): )?";
 // Captures: 1 = method, 2 = "invalid user" marker (optional), 3 = user,
 // 4 = source. The marker matters: "Failed password for invalid user bob
 // from ..." did not match the previous `for (\S+) from` form at all, so
 // every guess against a non-existent account was lost.
 pub(crate) static SSH_FAIL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"Failed (\S+) for (?:(invalid user) )?(\S+) from (\S+)"#).unwrap());
+    Lazy::new(|| Regex::new(&format!(r#"{}Failed (\S+) for (?:(invalid user) )?(.*) from (\S+)(?: port \d+)?(?: ssh\d*)?(?:: \S+ \S+)?\s*$"#, SSHD_LEAD)).unwrap());
 // Policy denial after successful authentication — still a failed logon
 // from the network's point of view, and the source is usually a hostname.
 pub(crate) static SSH_NOTALLOWED_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"User (\S+) from (\S+) not allowed because"#).unwrap());
+    Lazy::new(|| Regex::new(&format!(r#"{}User (\S+) from (\S+) not allowed because"#, SSHD_LEAD)).unwrap());
 // SSH connections that ended before any authentication attempt. They are
 // not logons, but they are contact: a scanner, a banner grab, a client
 // that probes the port before the real login. Only lines that are
@@ -125,19 +143,25 @@ pub(crate) static SSH_NOTALLOWED_RE: Lazy<Regex> =
 // Captures: source (1). For the closed/disconnect form, 1 = user
 // (optional), 2 = source.
 pub(crate) static PREAUTH_NOIDENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"Did not receive identification string from (\S+)"#).unwrap());
+    Lazy::new(|| Regex::new(&format!(r#"{}Did not receive identification string from (\S+)"#, SSHD_LEAD)).unwrap());
 pub(crate) static PREAUTH_BADPROTO_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"Bad protocol version identification .* from (\S+)"#).unwrap());
+    Lazy::new(|| Regex::new(&format!(r#"{}Bad protocol version identification .* from (\S+)"#, SSHD_LEAD)).unwrap());
 // The source is whatever sshd wrote: an address, or a name when the host
 // resolves clients (`UseDNS yes`), as in the Accepted / Failed lines.
 pub(crate) static PREAUTH_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(invalid|authenticating) user (\S+)\s+)?(\S+).*\[preauth\]"#).unwrap()
+    Regex::new(&format!(r#"{}(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(?:(invalid|authenticating) user (.*)\s+)?(\S+) port \d+(?::\d+:.*)?\s*\[preauth\]\s*$"#, SSHD_LEAD)).unwrap()
+});
+/// The same lines as OpenSSH wrote them before 7.x: no port and no user
+/// ("Connection closed by 203.0.113.9 [preauth]", "Received disconnect
+/// from 203.0.113.9: 11: Bye Bye [preauth]"). Captures: 1 source.
+pub(crate) static PREAUTH_CLOSED_OLD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(&format!(r#"{}(?:Connection closed by|Connection reset by|Received disconnect from|Disconnected from)\s+(\S+).*\[preauth\]"#, SSHD_LEAD)).unwrap()
 });
 pub(crate) static PREAUTH_PORT_CLOSED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Connection closed by|Connection reset by)\s+(\S+)\s+port\s+\d+"#).unwrap()
+    Regex::new(&format!(r#"{}(?:Connection closed by|Connection reset by)\s+(\S+)\s+port\s+\d+"#, SSHD_LEAD)).unwrap()
 });
 pub(crate) static PREAUTH_TIMEOUT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?:Timeout before authentication for connection from\s+|drop connection .*? from \[)([^\]\s,:]+)"#).unwrap()
+    Regex::new(&format!(r#"{}(?:Timeout before authentication for connection from\s+|drop connection .*? from \[)([^\]\s,:]+)"#, SSHD_LEAD)).unwrap()
 });
 
 /// "Invalid user admin from 203.0.113.9 [port 4242]": sshd names an
@@ -162,23 +186,44 @@ pub(crate) const INVALID_USER_EVT: &str = "SSH_INVALID_USER";
 /// a pid are taken one by one.
 pub(crate) fn invalid_users_as_failures(out: &mut Vec<RawEvt>, prefix: &str) {
     use std::collections::{HashMap, HashSet};
-    let mut has_outcome: HashSet<u32> = HashSet::new();
-    for e in out.iter() {
-        if e.pid != 0 && (e.evt == "SSH_FAILED" || e.evt == "SSH_SUCCESS") {
-            has_outcome.insert(e.pid);
+    // One connection = one sshd pid, for as long as it lives. The system
+    // hands the same pid out again (after 32768 processes on a default
+    // kernel: days on a busy host, and a file holds weeks), so a pid is
+    // the same connection only while its lines are close in time: sshd
+    // gives an unauthenticated connection two minutes (LoginGraceTime).
+    // With the pid alone, a failed password of one day cancelled the
+    // "Invalid user" of another connection weeks later.
+    const SAME_CONNECTION_SECS: i64 = 600;
+    let mut conn_of: Vec<(u32, u32)> = Vec::with_capacity(out.len());
+    {
+        let mut last: HashMap<u32, (i64, u32)> = HashMap::new();
+        for e in out.iter() {
+            let t = DateTime::parse_from_rfc3339(&e.ts_rfc3339).map(|d| d.timestamp()).unwrap_or(0);
+            let entry = last.entry(e.pid).or_insert((t, 0));
+            if (t - entry.0).abs() > SAME_CONNECTION_SECS {
+                entry.1 += 1;
+            }
+            entry.0 = t;
+            conn_of.push((e.pid, entry.1));
         }
     }
-    // first announcement per pid: an "Invalid user" line, else a pre-auth
-    // close that names an invalid user
-    let mut first: HashMap<u32, usize> = HashMap::new();
+    let mut has_outcome: HashSet<(u32, u32)> = HashSet::new();
+    for (i, e) in out.iter().enumerate() {
+        if e.pid != 0 && (e.evt == "SSH_FAILED" || e.evt == "SSH_SUCCESS") {
+            has_outcome.insert(conn_of[i]);
+        }
+    }
+    // first announcement per connection: an "Invalid user" line, else a
+    // pre-auth close that names an invalid user
+    let mut first: HashMap<(u32, u32), usize> = HashMap::new();
     for (i, e) in out.iter().enumerate() {
         let announced = e.evt == INVALID_USER_EVT
             || (e.evt == "SSH_PREAUTH" && e.tty_or_proc.contains("invalid-user="));
-        if announced && e.pid != 0 && !has_outcome.contains(&e.pid) {
-            first.entry(e.pid).or_insert(i);
+        if announced && e.pid != 0 && !has_outcome.contains(&conn_of[i]) {
+            first.entry(conn_of[i]).or_insert(i);
         }
     }
-    let converted: HashSet<u32> = first.keys().copied().collect();
+    let converted: HashSet<(u32, u32)> = first.keys().copied().collect();
     let keep_idx: HashSet<usize> = first.values().copied().collect();
     let old = std::mem::take(out);
     for (i, mut e) in old.into_iter().enumerate() {
@@ -195,7 +240,7 @@ pub(crate) fn invalid_users_as_failures(out: &mut Vec<RawEvt>, prefix: &str) {
         } else if e.evt == INVALID_USER_EVT {
             // the connection logged its own Failed line, or this is a later
             // repeat of the announcement
-        } else if e.evt == "SSH_PREAUTH" && converted.contains(&e.pid) {
+        } else if e.evt == "SSH_PREAUTH" && converted.contains(&conn_of[i]) {
             // the same connection, now a failed logon
         } else {
             out.push(e);
@@ -233,6 +278,14 @@ pub(crate) fn preauth_touch(msg: &str) -> Option<(String, String)> {
             _ => "preauth-closed".into(),
         };
         return Some((src, d));
+    }
+    if let Some(c) = PREAUTH_CLOSED_OLD_RE.captures(msg) {
+        let src = clean(&c[1]);
+        // a line with an account is the newer form, read above or not at all
+        if src.is_empty() || src.eq_ignore_ascii_case("peer") || src == "invalid" || src == "authenticating" {
+            return None;
+        }
+        return Some((src, "preauth-closed".into()));
     }
     None
 }
@@ -809,6 +862,13 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
     let mut open: HashMap<String, (String, String, u32)> = HashMap::new();
     for rec in data.chunks_exact(rec_size) {
         let (ut_type, pid, line, user, host, secs) = utmp_record(rec, time64);
+        // A boot ends every session of the file so far: none of them wrote
+        // its logout, and the terminal names start again from pts/0, so
+        // the first logout after the boot would close a session of before.
+        if ut_type == BOOT_TIME {
+            open.clear();
+            continue;
+        }
         // Only session records matter: USER_PROCESS (login), DEAD_PROCESS
         // (logout) and, in btmp, LOGIN_PROCESS (failed attempt). Boot,
         // runlevel and init records name the kernel or "~" in ut_host and
@@ -850,6 +910,13 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
         // on such estates an IP-only filter throws away >99% of wtmp. Only
         // console / tty sessions (empty ut_host) are dropped.
         if filter_ip && host.is_empty() && !evt.eq("FAILED_LOGIN") {
+            continue;
+        }
+        // ut_host of a session that came from the machine itself: an X
+        // display (":0", ":1.0"), a screen window (":pts/0:S.0"), a tmux
+        // pane ("tmux(1234).%0"), the display manager ("login screen").
+        // They are not logons from the network.
+        if utmp_host_is_local(&host) {
             continue;
         }
         if evt == "LOGIN" {
@@ -1066,6 +1133,7 @@ fn parse_secure_or_messages(
     let years = Rfc3164Years::for_file(path, &fname, year_hint);
     let mut years_seen = 0i32;
     let mut prev_month: Option<u32> = None;
+    let mut undated = 0usize;
 
     if is_debug_mode() {
         println!("    reading {} (last line in {}, the year turns {} time(s) inside; {}) ...", path.display(), years.last_year, years.turns, years.source);
@@ -1100,6 +1168,9 @@ fn parse_secure_or_messages(
             if let Some(ts) = parse_rfc3164_timestamp(month, day, time, line_year, None, tz) {
                 (ts, msg.to_string())
             } else {
+                // a day that does not exist in the year given to the line
+                // (Feb 29): the year inferred for the file is wrong there
+                undated += 1;
                 continue;
             }
         }
@@ -1349,6 +1420,12 @@ fn parse_secure_or_messages(
                      fname, disconnect_fallback.len());
         }
         out.extend(disconnect_fallback);
+    }
+    if undated > 0 {
+        crate::banner::print_warning(&format!(
+            "  {}: {} line(s) carry a day that does not exist in the year masstin gave them (a Feb 29 outside a leap year: the file's year, taken as {}, is not the real one); those lines are not in the timeline",
+            path.display(), undated, years.last_year
+        ));
     }
     if sshd_outcomes == 0 && !pam_fallback.is_empty() {
         if is_debug_mode() {
@@ -2048,8 +2125,7 @@ fn extract_tar_recursive(tar_path: &Path, dest_base: &Path, display_path: &str, 
     let mut archive = tar::Archive::new(reader);
 
     let stem = crate::parse::archive_stem(&archive_name).unwrap_or_else(|| "extracted".to_string());
-    let extract_dir = dest_base.join(stem);
-    let _ = fs::create_dir_all(&extract_dir);
+    let extract_dir = fresh_extract_dir(dest_base, &stem);
 
     let mut entries: Vec<String> = Vec::new();
     let mut matched: usize = 0;
@@ -2187,6 +2263,22 @@ fn extract_tar_recursive(tar_path: &Path, dest_base: &Path, display_path: &str, 
     }
 }
 
+/// A folder of its own for an archive's contents: `<base>/<stem>`, or
+/// `<stem>-2`, `-3`... when an archive of the same name was already
+/// extracted there. Two collections called `collection.tar.gz`, one per
+/// host folder, used to be unpacked into the same folder: the files of the
+/// second replaced the first's and one host's events were lost.
+fn fresh_extract_dir(base: &Path, stem: &str) -> PathBuf {
+    let mut dir = base.join(stem);
+    let mut n = 2;
+    while dir.exists() {
+        dir = base.join(format!("{}-{}", stem, n));
+        n += 1;
+    }
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
 /// Recursively extract ZIPs (including password-protected with common forensic passwords)
 /// and return paths to extracted directories
 fn extract_zips_recursive(zip_path: &Path, dest_base: &Path, tar_out: &mut Vec<TarExtract>) -> Vec<PathBuf> {
@@ -2212,8 +2304,7 @@ fn extract_zips_recursive(zip_path: &Path, dest_base: &Path, tar_out: &mut Vec<T
     };
 
     let zip_name = zip_path.file_stem().and_then(|s| s.to_str()).unwrap_or("extracted");
-    let extract_dir = dest_base.join(zip_name);
-    let _ = fs::create_dir_all(&extract_dir);
+    let extract_dir = fresh_extract_dir(dest_base, zip_name);
 
     // Try each password — test with the first actual file (not directory)
     let entry_count = archive.len();
@@ -2265,13 +2356,26 @@ fn extract_zips_recursive(zip_path: &Path, dest_base: &Path, tar_out: &mut Vec<T
         };
 
         let entry_name = zip_entry.name().to_string();
+        // The name comes from the archive, and the archive from the
+        // evidence: `..\..\x` or `C:\x` would be written outside the
+        // extraction folder. Only a path that stays inside is taken.
+        let inside = match zip_entry.enclosed_name() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                crate::banner::print_warning(&format!(
+                    "{}: entry '{}' points outside the archive (.. or an absolute path); not extracted",
+                    zip_path.display(), entry_name
+                ));
+                continue;
+            }
+        };
         if zip_entry.is_dir() {
-            let dir_path = extract_dir.join(&entry_name);
+            let dir_path = extract_dir.join(&inside);
             let _ = fs::create_dir_all(&dir_path);
             continue;
         }
 
-        let out_path = extract_dir.join(&entry_name);
+        let out_path = extract_dir.join(&inside);
         if let Some(parent) = out_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -2408,7 +2512,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     let mut archives_scanned: usize = 0;
 
     // Create temp dir for ZIP extraction
-    let temp_dir = std::env::temp_dir().join("masstin_linux_extract");
+    // one per run: two masstin at a time shared the folder and each
+    // deleted the other's files
+    let temp_dir = std::env::temp_dir().join(format!("masstin_linux_extract_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
 
     // Collect additional dirs from ZIP extraction
@@ -2986,7 +3092,8 @@ mod repeated_tests {
         r[76..84].copy_from_slice(b"10.0.0.5");
         let secs: i64 = 1_767_254_400;
         if size == 400 {
-            r[348..356].copy_from_slice(&secs.to_le_bytes());
+            // offsetof(struct utmp, ut_tv) on aarch64, from its compiler
+            r[344..352].copy_from_slice(&secs.to_le_bytes());
         } else {
             r[340..344].copy_from_slice(&(secs as u32).to_le_bytes());
         }
@@ -3097,5 +3204,233 @@ mod loose_evidence_tests {
         assert!(row.to_lowercase().contains("web01"), "the host comes from the tarball's /etc/hostname: {row}");
         let _ = std::io::stdout().flush();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod review_2026_11_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("masstin_rev_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// sshd's own lines, from the lab (LEO-LNX01, OpenSSH 8.9, 2026-11-16):
+    /// a client announced itself with account names written to look like
+    /// log lines. Every one is a failed logon from the client's address
+    /// and none is a logon of root from the address in the name.
+    #[test]
+    fn an_account_name_that_looks_like_a_log_line_forges_nothing() {
+        let log = "\
+Nov 16 07:33:44 LEO-LNX01 sshd[32166]: Invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 from 10.10.0.49 port 59318
+Nov 16 07:33:45 LEO-LNX01 sshd[32166]: Connection closed by invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 10.10.0.49 port 59318 [preauth]
+Nov 16 07:33:45 LEO-LNX01 sshd[32168]: Invalid user x] from 10.10.0.49 port 59322
+Nov 16 07:33:45 LEO-LNX01 sshd[32168]: Connection closed by invalid user x] 10.10.0.49 port 59322 [preauth]
+Nov 16 07:33:45 LEO-LNX01 sshd[32170]: Invalid user User root from 8.8.8.7 not allowed because from 10.10.0.49 port 59334
+Nov 16 07:33:45 LEO-LNX01 sshd[32170]: Connection closed by invalid user User root from 8.8.8.7 not allowed because 10.10.0.49 port 59334 [preauth]
+Nov 16 07:33:45 LEO-LNX01 sshd[32172]: Invalid user masstin b2 plain from 10.10.0.49 port 59346
+Nov 16 07:33:45 LEO-LNX01 sshd[32172]: Connection closed by invalid user masstin b2 plain 10.10.0.49 port 59346 [preauth]
+";
+        let d = tmp("forged");
+        let p = d.join("auth.log");
+        fs::write(&p, log).unwrap();
+        let evs = parse_secure_or_messages(&p, "LEO-LNX01", true, Some(2026), &crate::linux_tz::LocalTz::Utc);
+        let got: Vec<(String, String, String)> = evs.iter().map(|e| (e.evt.clone(), e.user.clone(), e.remote.clone())).collect();
+        assert_eq!(
+            got,
+            [
+                ("SSH_FAILED".to_string(), "Accepted password for root from 8.8.8.8 port 1 ssh2".to_string(), "10.10.0.49".to_string()),
+                ("SSH_FAILED".to_string(), "x]".to_string(), "10.10.0.49".to_string()),
+                ("SSH_FAILED".to_string(), "User root from 8.8.8.7 not allowed because".to_string(), "10.10.0.49".to_string()),
+                ("SSH_FAILED".to_string(), "masstin b2 plain".to_string(), "10.10.0.49".to_string()),
+            ]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sshd_lines_are_read_from_their_start_and_their_last_source() {
+        // as they come in every source: with the syslog tag, bare (journal,
+        // macOS), after an RFC5424 header, with a level
+        for l in [
+            " web01 sshd[4242]: Accepted publickey for alice from 10.0.0.5 port 50022 ssh2: ED25519 SHA256:abc",
+            "Accepted publickey for alice from 10.0.0.5 port 50022 ssh2: ED25519 SHA256:abc",
+            " - - Accepted publickey for alice from 10.0.0.5 port 50022 ssh2",
+            "web01 sshd-session[4242]: Accepted publickey for alice from 10.0.0.5 port 50022 ssh2",
+            "web01 sshd[4242]: [ID 800047 auth.info] Accepted publickey for alice from 10.0.0.5 port 50022 ssh2",
+        ] {
+            let c = SSH_OK_RE.captures(l).unwrap_or_else(|| panic!("{}", l));
+            assert_eq!((&c[1], &c[2], &c[3]), ("publickey", "alice", "10.0.0.5"), "{}", l);
+        }
+        // the same words inside a line of another kind are not a logon
+        for l in [
+            "web01 sshd[1]: Invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 from 10.10.0.49 port 59318",
+            "web01 sshd[1]: Failed password for invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 from 10.10.0.49 port 5 ssh2",
+            "web01 sshd[1]: Connection closed by invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 10.10.0.49 port 59318 [preauth]",
+            "web01 sshd[1]: x]: Accepted password for root from 8.8.8.9 port 2 ssh2",
+        ] {
+            assert!(SSH_OK_RE.captures(l).is_none(), "{}", l);
+        }
+        let f = |l: &str| SSH_FAIL_RE.captures(l).map(|c| (c[1].to_string(), c.get(2).is_some(), c[3].to_string(), c[4].to_string()));
+        assert_eq!(f("web01 sshd[9]: Failed password for root from 203.0.113.9 port 22 ssh2"), Some(("password".into(), false, "root".into(), "203.0.113.9".into())));
+        assert_eq!(f("web01 sshd[9]: Failed password for invalid user bob from 203.0.113.9 port 22 ssh2"), Some(("password".into(), true, "bob".into(), "203.0.113.9".into())));
+        assert_eq!(f("Failed publickey for git from 203.0.113.9 port 22 ssh2: RSA SHA256:abcdef"), Some(("publickey".into(), false, "git".into(), "203.0.113.9".into())));
+        assert_eq!(f("Failed none for invalid user  0101 from 5.188.10.180 port 9 ssh2"), Some(("none".into(), true, " 0101".into(), "5.188.10.180".into())));
+        // the source is the one sshd wrote last, not one inside the name
+        assert_eq!(
+            f("web01 sshd[9]: Failed password for invalid user a from 8.8.8.8 port 1 ssh2 from 203.0.113.9 port 5 ssh2"),
+            Some(("password".into(), true, "a from 8.8.8.8 port 1 ssh2".into(), "203.0.113.9".into()))
+        );
+        assert_eq!(
+            f("web01 sshd[9]: Failed password for invalid user a from 8.8.8.8 port 1 ssh2: x y from 203.0.113.9 port 5 ssh2"),
+            Some(("password".into(), true, "a from 8.8.8.8 port 1 ssh2: x y".into(), "203.0.113.9".into()))
+        );
+        assert!(SSH_NOTALLOWED_RE.is_match("web01 sshd[9]: User bob from host.example not allowed because not listed in AllowUsers"));
+        assert!(!SSH_NOTALLOWED_RE.is_match("web01 sshd[9]: Invalid user User root from 8.8.8.7 not allowed because from 10.10.0.49 port 59334"));
+    }
+
+    #[test]
+    fn a_pre_auth_touch_names_the_address_sshd_wrote() {
+        let t = |l: &str| preauth_touch(l);
+        assert_eq!(t("web01 sshd[1]: Connection closed by 203.0.113.9 port 4242 [preauth]"), Some(("203.0.113.9".into(), "preauth-closed".into())));
+        assert_eq!(t("web01 sshd[1]: Connection closed by authenticating user root 203.0.113.9 port 4242 [preauth]"), Some(("203.0.113.9".into(), "preauth-closed user=root".into())));
+        assert_eq!(t("web01 sshd[1]: Disconnected from invalid user admin 203.0.113.9 port 4242 [preauth]"), Some(("203.0.113.9".into(), "preauth-closed invalid-user=admin".into())));
+        assert_eq!(t("web01 sshd[1]: Received disconnect from 203.0.113.9 port 4242:11: Bye Bye [preauth]"), Some(("203.0.113.9".into(), "preauth-closed".into())));
+        assert_eq!(t("web01 sshd[1]: error: Received disconnect from 203.0.113.9 port 4242:3: com.jcraft.jsch.JSchException: Auth fail [preauth]"), Some(("203.0.113.9".into(), "preauth-closed".into())));
+        // OpenSSH before 7: no port
+        assert_eq!(t("web01 sshd[1]: Connection closed by 203.0.113.9 [preauth]"), Some(("203.0.113.9".into(), "preauth-closed".into())));
+        assert_eq!(t("web01 sshd[1]: Received disconnect from 203.0.113.9: 11: Bye Bye [preauth]"), Some(("203.0.113.9".into(), "preauth-closed".into())));
+        assert_eq!(t("web01 sshd[1]: Did not receive identification string from 203.0.113.9 port 4242"), Some(("203.0.113.9".into(), "preauth-no-ident".into())));
+        assert_eq!(t("web01 sshd[1]: Bad protocol version identification 'GET / from 8.8.8.8' from 203.0.113.9 port 4242"), Some(("203.0.113.9".into(), "preauth-bad-proto".into())));
+        // the lab's line: the address is the client's, whatever the name says
+        let (src, detail) = t("LEO-LNX01 sshd[32166]: Connection closed by invalid user Accepted password for root from 8.8.8.8 port 1 ssh2 10.10.0.49 port 59318 [preauth]").unwrap();
+        assert_eq!(src, "10.10.0.49");
+        assert!(detail.starts_with("preauth-closed invalid-user=Accepted password"));
+        assert_eq!(t("web01 sshd[1]: Read from socket failed: Connection reset by peer [preauth]"), None);
+        // inside another line they are nothing
+        assert_eq!(t("web01 sshd[1]: Invalid user Connection closed by 8.8.8.8 port 1 from 203.0.113.9 port 5"), None);
+    }
+
+    /// The same pid weeks apart is another connection: the failed password
+    /// of January does not cancel the unknown account of February.
+    #[test]
+    fn a_pid_used_again_is_another_connection() {
+        let ev = |t: &str, evt: &str, user: &str, detail: &str, pid: u32| RawEvt {
+            ts_rfc3339: t.into(), user: user.into(), remote: "203.0.113.9".into(),
+            tty_or_proc: detail.into(), evt: evt.into(), filename: "auth.log".into(),
+            dst_host: "web01".into(), pid, conn: 0,
+        };
+        let mut out = vec![
+            ev("2026-01-05T10:00:00+00:00", INVALID_USER_EVT, "guest", "ssh/invalid-user", 4242),
+            ev("2026-01-05T10:00:02+00:00", "SSH_FAILED", "guest", "ssh/password invalid-user", 4242),
+            ev("2026-02-09T03:00:00+00:00", INVALID_USER_EVT, "oracle", "ssh/invalid-user", 4242),
+            ev("2026-02-09T03:00:01+00:00", "SSH_PREAUTH", "", "ssh/preauth-closed invalid-user=oracle", 4242),
+        ];
+        invalid_users_as_failures(&mut out, "ssh");
+        let got: Vec<(&str, &str, &str)> = out.iter().map(|e| (e.ts_rfc3339.as_str(), e.evt.as_str(), e.user.as_str())).collect();
+        assert_eq!(got, [("2026-01-05T10:00:02+00:00", "SSH_FAILED", "guest"), ("2026-02-09T03:00:00+00:00", "SSH_FAILED", "oracle")]);
+    }
+
+    /// An archive entry whose name leaves the extraction folder is not
+    /// written; the entries inside it are.
+    #[test]
+    fn a_zip_entry_cannot_leave_the_extraction_folder() {
+        use std::io::Write;
+        let d = tmp("zipslip");
+        let dest = d.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let z = d.join("evidence.zip");
+        {
+            let mut w = zip::ZipWriter::new(File::create(&z).unwrap());
+            for (name, body) in [
+                ("../escaped.txt", "out"),
+                ("../../escaped2.txt", "out"),
+                ("a/../../escaped3.txt", "out"),
+                ("/escaped-abs.txt", "out"),
+                ("var/log/auth.log", "inside"),
+            ] {
+                w.start_file(name, zip::write::FileOptions::default()).unwrap();
+                w.write_all(body.as_bytes()).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let mut tars = Vec::new();
+        let dirs = extract_zips_recursive(&z, &dest, &mut tars);
+        let root = dirs.last().unwrap().clone();
+        assert!(root.starts_with(&dest));
+        assert_eq!(fs::read_to_string(root.join("var/log/auth.log")).unwrap(), "inside");
+        for outside in [dest.join("escaped.txt"), d.join("escaped.txt"), d.join("escaped2.txt"), dest.join("escaped3.txt"), d.join("escaped3.txt"), root.join("../escaped.txt")] {
+            assert!(!outside.exists(), "{}", outside.display());
+        }
+        // nothing but the one file under the extraction folder, and nothing new beside it
+        let written: Vec<String> = WalkDir::new(&d).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(written.iter().all(|n| !n.starts_with("escaped") || n == "escaped-abs.txt"), "{:?}", written);
+        // (an absolute name is taken as a path inside the folder, or left out: never at the root of the disk)
+        assert!(!Path::new("/escaped-abs.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_archives_of_one_name_get_a_folder_each() {
+        let d = tmp("samename");
+        let a = fresh_extract_dir(&d, "collection");
+        let b = fresh_extract_dir(&d, "collection");
+        let c = fresh_extract_dir(&d, "collection");
+        assert!(a != b && b != c && a != c);
+        assert!(a.is_dir() && b.is_dir() && c.is_dir());
+        assert_eq!(a, d.join("collection"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_session_of_the_machine_itself_is_not_a_logon_from_the_network() {
+        for local in [":0", ":0.0", ":1", ":pts/0:S.0", "tmux(1234).%0", "login screen"] {
+            assert!(utmp_host_is_local(local), "{}", local);
+        }
+        for remote in ["10.0.0.5", "host.example.org", "fe80::1", "203.0.113.9 via mosh [1234]", ""] {
+            assert!(!utmp_host_is_local(remote), "{}", remote);
+        }
+    }
+
+    /// wtmp: a session of an X display is left out, a remote one kept; a
+    /// boot ends the sessions before it, so the first logout after the
+    /// boot does not close a session of before on the same terminal.
+    #[test]
+    fn wtmp_local_sessions_and_boots() {
+        let rec = |ut_type: i16, pid: i32, line: &str, user: &str, host: &str, secs: u32| {
+            let mut r = vec![0u8; 384];
+            r[0..2].copy_from_slice(&ut_type.to_le_bytes());
+            r[4..8].copy_from_slice(&pid.to_le_bytes());
+            r[8..8 + line.len()].copy_from_slice(line.as_bytes());
+            r[44..44 + user.len()].copy_from_slice(user.as_bytes());
+            r[76..76 + host.len()].copy_from_slice(host.as_bytes());
+            r[340..344].copy_from_slice(&secs.to_le_bytes());
+            r
+        };
+        let t0 = 1_767_254_400u32;
+        let mut data = Vec::new();
+        data.extend(rec(USER_PROCESS, 10, "pts/0", "alice", "10.0.0.5", t0));
+        data.extend(rec(USER_PROCESS, 11, ":0", "bob", ":0", t0 + 60));
+        data.extend(rec(USER_PROCESS, 12, "pts/3", "carol", "tmux(900).%1", t0 + 90));
+        data.extend(rec(BOOT_TIME, 0, "~", "reboot", "5.15.0", t0 + 120));
+        data.extend(rec(USER_PROCESS, 20, "pts/0", "dave", "10.0.0.9", t0 + 300));
+        data.extend(rec(DEAD_PROCESS, 20, "pts/0", "", "", t0 + 400));
+        data.extend(rec(DEAD_PROCESS, 21, "pts/0", "", "", t0 + 500));
+        let d = tmp("wtmp");
+        let p = d.join("wtmp");
+        fs::write(&p, &data).unwrap();
+        let got: Vec<(String, String, String)> = parse_utmp_file(&p, "srv01", true).into_iter().map(|e| (e.evt, e.user, e.remote)).collect();
+        assert_eq!(
+            got,
+            [
+                ("LOGIN".to_string(), "alice".to_string(), "10.0.0.5".to_string()),
+                ("LOGIN".to_string(), "dave".to_string(), "10.0.0.9".to_string()),
+                ("LOGOUT".to_string(), "dave".to_string(), "10.0.0.9".to_string()),
+            ]
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 }

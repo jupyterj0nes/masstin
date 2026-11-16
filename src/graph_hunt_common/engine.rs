@@ -411,7 +411,7 @@ pub(crate) fn ambiguous_short_names(files: &[String]) -> std::io::Result<HashSet
     let mut fqdn_by_short: HashMap<String, HashSet<String>> = HashMap::new();
     for f in files {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
-        let mut lines = rd.lines();
+        let mut lines = crate::csv_out::records(rd);
         let header = lines.next().transpose()?.unwrap_or_default();
         let layout = match crate::csv_out::Layout::of(&header) {
             Some(l) => l,
@@ -453,7 +453,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
     let mut n_lines = 0usize;
     for f in files {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
-        let mut lines = rd.lines();
+        let mut lines = crate::csv_out::records(rd);
         let header = lines.next().transpose()?.unwrap_or_default();
         if !timeline_header_ok(&header) {
             bad_header.push(f.clone());
@@ -500,7 +500,7 @@ fn corpus_from_csv(files: &[String]) -> std::io::Result<(Corpus, Vec<String>)> {
     let mut total = 0usize;
     for f in files {
         let rd = std::io::BufReader::new(std::fs::File::open(f)?);
-        for line in rd.lines().skip(1) {
+        for line in crate::csv_out::records(rd).skip(1) {
             let line = line?;
             let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(16);
             split_csv_into(&line, &mut p);
@@ -942,6 +942,7 @@ pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Opti
         Ok(x) => x,
         Err(e) => {
             eprintln!("Masstin - Error: reading the CSV failed: {}", e);
+            crate::mark_failed();
             return;
         }
     };
@@ -989,11 +990,19 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
     for l in &summary_lines {
         crate::banner::print_phase_detail("", l);
     }
+    if let Some(why) = &ents.not_run {
+        // nothing is written: an earlier hunt's result in the timeline, its
+        // findings table and its report stay as they were
+        eprintln!("Masstin - Error: the hunt could not run: {} Nothing was written.", why);
+        crate::mark_failed();
+        return;
+    }
     // with the timeline annotated, no -o means no findings table (it used
     // to go to stdout, which is where the summary goes)
     if output.is_some() || annotate.is_none() {
         if let Err(e) = write_csv(&rows, alpha, output, &ents, dialect) {
             eprintln!("Masstin - Error: cannot write findings CSV: {}", e);
+            crate::mark_failed();
             return;
         }
     }
@@ -1012,7 +1021,10 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         };
         match report::write(path, &h, &stories, seed.as_ref()) {
             Ok(()) => crate::banner::print_phase_detail("Report:", &format!("{} ({} origin(s){})", path, stories.len(), seed.as_ref().map(|s| format!(", seed reconstruction with {} hop(s)", s.hops.len())).unwrap_or_default())),
-            Err(e) => eprintln!("Masstin - Error: cannot write report: {}", e),
+            Err(e) => {
+                eprintln!("Masstin - Error: cannot write report: {}", e);
+                crate::mark_failed();
+            }
         }
     }
     if let Some(a) = annotate {
@@ -1022,7 +1034,10 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
                     crate::banner::print_phase_detail("Timeline:", &l);
                 }
             }
-            Err(e) => eprintln!("Masstin - Error: cannot write the hunt into the timeline: {}", e),
+            Err(e) => {
+                eprintln!("Masstin - Error: cannot write the hunt into the timeline: {}", e);
+                crate::mark_failed();
+            }
         }
     }
     crate::banner::print_phase_detail("Done:", &format!("{} rows in {:.1}s", rows.len(), clock.elapsed().as_secs_f64()));
@@ -1139,7 +1154,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
     for f in files {
         let layout = {
             let rd = std::io::BufReader::new(std::fs::File::open(f)?);
-            let header = rd.lines().next().transpose()?.unwrap_or_default();
+            let header = crate::csv_out::records(rd).next().transpose()?.unwrap_or_default();
             match crate::csv_out::Layout::of(&header) {
                 Some(l) => l,
                 None => continue,
@@ -1153,7 +1168,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
         let mut pending: Vec<(usize, u32, String)> = Vec::new();
         {
             let rd = std::io::BufReader::new(std::fs::File::open(f)?);
-            for line in rd.lines().skip(1) {
+            for line in crate::csv_out::records(rd).skip(1) {
                 let line = line?;
                 let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
                 split_csv_into(&line, &mut p);
@@ -1217,14 +1232,16 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
         }
         // pass B: the file again, with its tail
         let path = std::path::Path::new(f);
-        let tmp = path.with_extension(format!("{}.masstin-tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("csv")));
+        // a name of this process: the window marking the same timeline at
+        // the same moment has its own
+        let tmp = path.with_extension(format!("{}.masstin-tmp-{}", path.extension().and_then(|e| e.to_str()).unwrap_or("csv"), std::process::id()));
         let mut carried = 0usize;
         {
             let rd = std::io::BufReader::new(std::fs::File::open(f)?);
             let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
             w.write_all(crate::csv_out::HEADER.as_bytes())?;
             w.write_all(b"\n")?;
-            for (n, line) in rd.lines().skip(1).enumerate() {
+            for (n, line) in crate::csv_out::records(rd).skip(1).enumerate() {
                 let line = line?;
                 let mut p: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
                 let line = line.trim_end_matches(['\r', '\n']);
@@ -1298,6 +1315,9 @@ struct Entities {
     names: Interner,
     aliases: Vec<BTreeSet<String>>,
     of_node: Vec<u32>,
+    /// why the hunt could not be computed at all (no baseline, no window,
+    /// an empty panel): its caller writes nothing and ends in an error
+    not_run: Option<String>,
 }
 
 /// IP -> host name for masstin timeline CSVs, by the same-login test on
@@ -1379,7 +1399,7 @@ fn build_entities_from(c: &Corpus, res: HashMap<String, resolve::Resolution>) ->
             }
         }
     }
-    (Entities { names, aliases, of_node }, res)
+    (Entities { names, aliases, of_node, not_run: None }, res)
 }
 
 fn entity_label(e: &Entities, id: u32) -> String {
@@ -1467,7 +1487,7 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
 fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>, Entities) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
-    let (ents, res) = build_entities(&*c, alpha);
+    let (mut ents, res) = build_entities(&*c, alpha);
     lines.push(format!(
         "Machines: {} graph nodes -> {} machines ({} IP(s) folded into a host name: unanimous same-login evidence, chance coincidence significant at FDR {})",
         c.nodes.names.len(),
@@ -1540,6 +1560,23 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     let fam_cov: Vec<(bool, bool)> = c.fams.names.iter().map(|f| super::coverage_kinds(f)).collect();
     let base_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| is_base(*d)).collect();
     let win_days: BTreeSet<i32> = evs.iter().map(|e| e.day).filter(|d| !is_base(*d)).collect();
+    let all_days = evs.iter().map(|e| e.day);
+    let span = match (all_days.clone().min(), all_days.max()) {
+        (Some(a), Some(b)) => format!("the timeline runs from {} to {}", day_str(a), day_str(b)),
+        _ => "the timeline has no connection between two machines".to_string(),
+    };
+    let stop = if win_days.is_empty() {
+        Some(format!("No connection on or after the cutoff {} ({}): there is nothing to hunt. Check --investigation-from: it is the first day of the period under investigation.", day_str(cutoff_day), span))
+    } else if base_days.len() < 2 {
+        Some(format!("{} day(s) with connections before the cutoff {} ({}): the hunt needs at least two days of baseline to tell what is new from what is habitual. Move --investigation-from later, or add older logs.", base_days.len(), day_str(cutoff_day), span))
+    } else {
+        None
+    };
+    if let Some(why) = stop {
+        lines.push(why.clone());
+        ents.not_run = Some(why);
+        return (Vec::new(), lines, alpha, Vec::new(), None, ents);
+    }
 
     // ── coverage per destination machine: log-file spans from the loader,
     //    or (older graphs) the days with events ──
@@ -1579,7 +1616,9 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     let anchor = match cov_ok.values().chain(cov_fail.values()).filter_map(|s| s.range(..cutoff_day).next_back().copied()).max() {
         Some(a) => a,
         None => {
-            lines.push("No destination has log coverage before the cutoff: nothing can be compared. Check --investigation-from and the coverage spans written by the loader.".to_string());
+            let why = "No destination has log coverage before the cutoff: nothing can be compared. Check --investigation-from and the coverage spans written by the loader.".to_string();
+            lines.push(why.clone());
+            ents.not_run = Some(why);
             return (Vec::new(), lines, alpha, Vec::new(), None, ents);
         }
     };
@@ -1639,7 +1678,9 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         }
     }
     if best.0 == 0 {
-        lines.push("Panel is empty: no destination is covered continuously up to the last covered baseline day. Nothing can be compared.".to_string());
+        let why = "Panel is empty: no destination is covered continuously up to the last covered baseline day. Nothing can be compared.".to_string();
+        lines.push(why.clone());
+        ents.not_run = Some(why);
         return (Vec::new(), lines, alpha, Vec::new(), None, ents);
     }
     let s_day = best.1;
@@ -3423,6 +3464,59 @@ mod tests {
 
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir().join(format!("masstin-annot-{}-{}", std::process::id(), name)).to_string_lossy().to_string()
+    }
+
+    /// A note of several lines survives the hunt, run after run: the
+    /// timeline keeps its rows and the note its text. (Read line by line,
+    /// the row was cut in two and a row of rubbish added on every run.)
+    #[test]
+    fn a_note_of_several_lines_survives_the_hunt() {
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        for d in 1..=10 {
+            lines.push(format!("{}{}", login(d, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "0x10"), crate::csv_out::EMPTY_TAIL));
+        }
+        let note = "pivot?\nasked the owner, waiting\r\nsee \"ticket 12\", then close";
+        lines.push(format!("{},,,,suspicious,{}", login(11, 10, "10.0.0.99", "SRV01", "mallory", "SUCCESSFUL_LOGON", "0x99"), crate::csv_out::q(note)));
+        lines.push(format!("{}{}", login(11, 11, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "0x11"), crate::csv_out::EMPTY_TAIL));
+        let path = tmp_path("multiline.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let files = vec![path.clone()];
+        let cfg = hunt_settings("2026-01-11T00:00:00Z");
+        for run in 0..3 {
+            run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+            let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&path).unwrap().records().map(|r| r.unwrap()).collect();
+            assert_eq!(rows.len(), 12, "run {}", run);
+            assert!(rows.iter().all(|r| r.len() == 19), "run {}", run);
+            assert_eq!((&rows[10][5], &rows[10][17], &rows[10][18]), ("mallory", "suspicious", note), "run {}", run);
+            assert!(&rows[10][14] == "significant" || &rows[10][14] == "candidate", "run {}: {}", run, &rows[10][14]);
+            assert_eq!((&rows[11][5], &rows[11][14]), ("alice", "habitual"), "run {}", run);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A hunt that cannot be computed (the cutoff typed with the wrong
+    /// year: no baseline, or no window) leaves the timeline as it was,
+    /// with the result of the hunt before.
+    #[test]
+    fn a_hunt_that_cannot_run_leaves_the_timeline_alone() {
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        for d in 1..=10 {
+            lines.push(format!("{}{}", login(d, 9, "10.0.0.5", "SRV01", "alice", "SUCCESSFUL_LOGON", "0x10"), crate::csv_out::EMPTY_TAIL));
+        }
+        lines.push(format!("{}{}", login(11, 10, "10.0.0.99", "SRV01", "mallory", "SUCCESSFUL_LOGON", "0x99"), crate::csv_out::EMPTY_TAIL));
+        let path = tmp_path("norun.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let files = vec![path.clone()];
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None }));
+        let hunted = std::fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&hunted).contains(",baseline,"));
+        // 2025 for 2026: nothing before the cutoff; 2027: nothing after it;
+        // the second day of the data: one day of baseline
+        for cutoff in ["2025-01-11T00:00:00Z", "2027-01-11T00:00:00Z", "2026-01-02T00:00:00Z"] {
+            run_csv(&files, &super::super::NEO4J, &hunt_settings(cutoff), None, None, Some(Annotate { files: &files, carry_marks: None }));
+            assert_eq!(std::fs::read(&path).unwrap(), hunted, "cutoff {}", cutoff);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The hunt written into the timeline: every row gets the state of

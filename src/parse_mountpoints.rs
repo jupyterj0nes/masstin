@@ -35,16 +35,16 @@ pub fn parse_mountpoints(ntuser_dir: &Path, src_hostname: &str) -> Vec<LogData> 
 
     for path in &dat_files {
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let upper = filename.to_uppercase();
-        if !upper.ends_with("_NTUSER.DAT") || upper.contains(".LOG") {
+        // `<user>_NTUSER.DAT`, in any case. The user is cut off the file
+        // name itself: its upper-case copy can have another length (`ı`
+        // becomes `I`), and a position taken from one cut the other in the
+        // middle of a character.
+        const SUFFIX: &str = "_NTUSER.DAT";
+        let cut = filename.len().saturating_sub(SUFFIX.len());
+        if !filename.is_char_boundary(cut) || !filename[cut..].eq_ignore_ascii_case(SUFFIX) {
             continue;
         }
-
-        let username = if let Some(pos) = upper.find("_NTUSER.DAT") {
-            filename[..pos].to_string()
-        } else {
-            "unknown".to_string()
-        };
+        let username = if cut == 0 { "unknown".to_string() } else { filename[..cut].to_string() };
 
         if crate::parse::is_debug_mode() {
             eprintln!("[DEBUG] MountPoints2: parsing {}'s NTUSER.DAT...", username);
@@ -111,7 +111,11 @@ fn event(timestamp: String, server: &str, unc_path: &str, username: &str, src_ho
         target_domain_name: String::new(),
         logon_type: String::new(),
         workstation_name: src_hostname.to_string(),
-        ip_address: extract_ip_if_present(server),
+        // the machine the hive came from is the source; its address is not
+        // in the hive. (The server's own address used to be written here:
+        // a share mounted by IP read as a connection from the server to
+        // itself, which every loader drops.)
+        ip_address: String::new(),
         logon_id: String::new(),
         filename: file.to_string(),
         detail: if deleted {
@@ -227,6 +231,26 @@ mod tests {
         assert!(share_of("{f5bd6a54-0000-0000-0000-100000000000}").is_none());
         assert_eq!(extract_ip_if_present("10.0.0.5"), "10.0.0.5");
         assert_eq!(extract_ip_if_present("FS01"), "");
+    }
+
+    #[test]
+    fn a_share_mounted_by_address_is_a_connection_to_it_not_from_it() {
+        let e = event("2026-11-16T08:59:03Z".into(), "10.10.0.37", r"\10.10.0.37\SYSVOL", "ryan.devlead", "DEV-SRV01", "ryan.devlead_NTUSER.DAT", false);
+        assert_eq!((e.computer.as_str(), e.workstation_name.as_str(), e.ip_address.as_str()), ("10.10.0.37", "DEV-SRV01", ""));
+    }
+
+    #[test]
+    fn the_user_is_cut_off_the_file_name_whatever_its_letters() {
+        let dir = std::env::temp_dir().join(format!("masstin_mp2_names_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // not hives: the point is that the names are taken without a panic
+        // (`ı` is two bytes and its upper case `I` one)
+        for n in ["yıldız_NTUSER.DAT", "ııııııııııı_ntuser.dat", "_NTUSER.DAT", "ß_NTUSER.DAT", "NTUSER.DAT", "x_NTUSER.DAT.LOG1"] {
+            std::fs::write(dir.join(n), b"not a hive").unwrap();
+        }
+        assert!(parse_mountpoints(&dir, "LAB").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Real hive from the lab: `MASSTIN_MP2_FIXTURE=<dir with user_NTUSER.DAT and its logs>`.

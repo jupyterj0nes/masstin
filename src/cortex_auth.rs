@@ -73,7 +73,10 @@ impl Auth {
         let kinds: Vec<bool> = match forced.as_deref() {
             Some("advanced") => vec![true],
             Some("standard") => vec![false],
-            _ => vec![false, true],
+            // Advanced first: its request carries a hash of the key, never
+            // the key. Tried as Standard first, an Advanced key travelled
+            // as it is in `Authorization` before the tenant refused it.
+            _ => vec![true, false],
         };
         let mut last = String::new();
         for advanced in kinds {

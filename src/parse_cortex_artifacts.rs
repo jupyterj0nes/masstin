@@ -129,7 +129,7 @@ pub fn mountpoint_row(r: &Value) -> Option<LogData> {
         target_domain_name: domain,
         logon_type: String::new(),
         workstation_name: host,
-        ip_address: crate::parse_mountpoints::extract_ip_if_present(&server),
+        ip_address: String::new(),
         logon_id: String::new(),
         filename: "cortex_forensics_registry".to_string(),
         detail: format!("MountPoints2: {}", unc),
@@ -173,8 +173,20 @@ pub async fn parse_cortex_artifacts_data(
         }
     };
 
+    // Cortex returns at most a million records to one query; these two
+    // have no window to split, so a result that large is said, not taken
+    // as complete
+    let cut = |what: &str, n: usize| {
+        if n >= 999_000 {
+            crate::banner::print_warning(&format!(
+                "{}: Cortex returned {} records, its limit for one query: the result is cut and rows are missing from the timeline",
+                what, n
+            ));
+        }
+    };
     match crate::parse_cortex::run_xql(client, &start_url, &results_url, &stream_url, auth, UAL_QUERY, debug).await {
         Ok(recs) => {
+            cut("User Access Logging", recs.len());
             let before = rows.len();
             for r in &recs {
                 for ld in ual_rows(r) {
@@ -187,6 +199,7 @@ pub async fn parse_cortex_artifacts_data(
     }
     match crate::parse_cortex::run_xql(client, &start_url, &results_url, &stream_url, auth, MOUNTPOINTS_QUERY, debug).await {
         Ok(recs) => {
+            cut("MountPoints2", recs.len());
             let before = rows.len();
             for r in &recs {
                 if let Some(ld) = mountpoint_row(r) {
@@ -245,9 +258,11 @@ mod tests {
         let ld = mountpoint_row(&r).unwrap();
         assert_eq!((ld.computer.as_str(), ld.workstation_name.as_str(), ld.target_user_name.as_str(), ld.target_domain_name.as_str()), ("FS01", "WS07", "ana", "CORP"));
         assert_eq!((ld.event_type.as_str(), ld.event_id.as_str(), ld.detail.as_str()), ("CONNECT", "MountPoints2", "MountPoints2: \\\\FS01\\Finance$"));
-        // a server given as an address fills the address column too
+        // a server given as an address is still the destination: the
+        // address column is the source's, and the hive does not hold it
         let ip = json!({"host_name": "WS07", "path": "x\\MountPoints2\\##10.0.0.9#c$", "key_last_modified": 1794297731000i64});
-        assert_eq!(mountpoint_row(&ip).unwrap().ip_address, "10.0.0.9");
+        let ld = mountpoint_row(&ip).unwrap();
+        assert_eq!((ld.computer.as_str(), ld.workstation_name.as_str(), ld.ip_address.as_str()), ("10.0.0.9", "WS07", ""));
         // a volume GUID key, or a key without its time, is no share
         assert!(mountpoint_row(&json!({"host_name": "WS07", "path": "x\\MountPoints2\\{1234}", "key_last_modified": 1794297731000i64})).is_none());
         assert!(mountpoint_row(&json!({"host_name": "WS07", "path": "x\\MountPoints2\\##FS01#a"})).is_none());

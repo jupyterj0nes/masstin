@@ -95,9 +95,32 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> (Vec<Lo
     let mut events = Vec::new();
     let mut mdb_details: Vec<(String, usize)> = Vec::new();
 
-    // Load role mappings and server hostname from SystemIdentity.mdb
-    let role_map = load_role_mappings(mdb_files);
-    let server_hostname = load_server_hostname(mdb_files);
+    // Role names and the server's own name come from SystemIdentity.mdb,
+    // which lies beside the client databases of that server. One run can
+    // hold the databases of several servers (one folder each): each
+    // database takes them from its own folder. (They used to be read once,
+    // from the first SystemIdentity.mdb found, and the rows of every other
+    // server were written with the first one's name.)
+    let is_identity = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).map(|n| n.eq_ignore_ascii_case("SystemIdentity.mdb")).unwrap_or(false);
+    let identities = mdb_files.iter().filter(|p| is_identity(p)).count();
+    let mut per_folder: HashMap<Option<PathBuf>, (HashMap<String, String>, String)> = HashMap::new();
+    let mut identity_of = |mdb: &PathBuf| -> (HashMap<String, String>, String) {
+        let folder = mdb.parent().map(|p| p.to_path_buf());
+        per_folder
+            .entry(folder.clone())
+            .or_insert_with(|| {
+                let own: Vec<PathBuf> = mdb_files.iter().filter(|p| p.parent().map(|x| x.to_path_buf()) == folder).cloned().collect();
+                if own.iter().any(|p| is_identity(p)) {
+                    (load_role_mappings(&own), load_server_hostname(&own))
+                } else if identities == 1 {
+                    // a single server whose files were given apart
+                    (load_role_mappings(mdb_files), load_server_hostname(mdb_files))
+                } else {
+                    (HashMap::new(), String::new())
+                }
+            })
+            .clone()
+    };
 
     let client_files: Vec<&PathBuf> = mdb_files.iter()
         .filter(|p| {
@@ -124,6 +147,7 @@ pub fn parse_ual_databases(mdb_files: &[PathBuf], source_label: &str) -> (Vec<Lo
         };
 
         let mdb_full_path = mdb_path.to_string_lossy().to_string();
+        let (role_map, server_hostname) = identity_of(mdb_path);
         let mut mdb_event_count = 0;
         for row in &rows {
             let new_events = ual_row_to_logdata_entries(row, &role_map, &server_hostname, &mdb_full_path);
