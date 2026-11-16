@@ -18,6 +18,7 @@ pub use crate::merge_neo4j_nodes::*;
 mod merge_memgraph_nodes;
 pub use crate::merge_memgraph_nodes::*;
 mod merge;
+pub mod ingest_record;
 pub use crate::merge::*;
 use serde_json::Value;
 mod parse_elastic;
@@ -483,6 +484,7 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
+    let ingest_started = chrono::Utc::now();
     // Clean and normalize paths
     config.directory = {
         let mut dirs = Vec::new();
@@ -825,6 +827,26 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
 
     if failed() {
         return Err("the run did not complete: see the error above.".into());
+    }
+    // What the timeline was read from, next to it (`<name>.ingest.json`):
+    // the evidence given, the command, the date. See `ingest_record`.
+    if let Some(out) = config.output.as_deref().filter(|o| std::path::Path::new(o).is_file()) {
+        let ingests = match config.action {
+            ActionType::Parse | ActionType::ParseWindows | ActionType::ParseLinux | ActionType::ParseMac | ActionType::ParseImage | ActionType::ParseMassive | ActionType::CarveImage | ActionType::ParseCustom | ActionType::ParserElastic => {
+                use clap::ValueEnum;
+                let action = config.action.to_possible_value().map(|v| v.get_name().to_string()).unwrap_or_default();
+                let args: Vec<String> = std::env::args().collect();
+                ingest_record::of_parse(&action, &config.file, &config.directory, ingest_record::command_line(&args), ingest_started).into_iter().collect()
+            }
+            ActionType::Merge => ingest_record::of_merge(&config.file),
+            _ => Vec::new(),
+        };
+        if !ingests.is_empty() {
+            match ingest_record::write(out, ingests) {
+                Ok(p) => crate::banner::print_phase_detail("Ingest record:", &format!("{} (what this timeline was read from)", p.display())),
+                Err(e) => eprintln!("Masstin - Warning: cannot write the ingest record next to {}: {}", out, e),
+            }
+        }
     }
     Ok(())
 }
