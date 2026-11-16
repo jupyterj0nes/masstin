@@ -21,6 +21,7 @@ mod remote;
 mod studio;
 mod ingest;
 mod table;
+mod viewers;
 mod when;
 
 use std::borrow::Cow;
@@ -347,15 +348,22 @@ pub struct Viewer {
     show_db: bool,
     studio: Studio,
     db_form: DbForm,
-    /// the timeline as a plain table
+    /// Timeline mode: the centre of the window is the rows of the CSV, in
+    /// the file's own 19 columns, instead of the graph
     show_table: bool,
     table_find: String,
-    table_rows: Vec<u32>,
-    table_key: (String, usize, usize),
-    /// the table shows the file's own 19 columns, every row of it
-    table_csv: bool,
+    /// the rows of a connection or a host, when the timeline is narrowed
+    /// to them (and a counter that changes with it, for the cache)
+    table_scope: Option<table::TableScope>,
+    table_scope_gen: u64,
+    /// the row picked in the timeline (file, row)
+    table_sel: Option<(u16, u32)>,
+    /// "Open in…" opens the whole file, not a copy of the rows shown
+    table_open_whole: bool,
+    /// the programs a timeline opens in, found on first use
+    viewer_apps: Option<Vec<viewers::ViewerApp>>,
     table_raw_rows: Vec<(u16, u32)>,
-    table_raw_key: (String, usize, usize),
+    table_raw_key: (String, usize, usize, u64),
     table_raw_cache: HashMap<(u16, u32), Vec<String>>,
     /// timelines opened lately, for the welcome and the menu
     recent: Vec<String>,
@@ -773,11 +781,13 @@ impl Viewer {
             db_form: DbForm::default(),
             show_table: false,
             table_find: String::new(),
-            table_rows: Vec::new(),
-            table_key: (String::new(), usize::MAX, 0),
-            table_csv: false,
+            table_scope: None,
+            table_scope_gen: 0,
+            table_sel: None,
+            table_open_whole: false,
+            viewer_apps: None,
             table_raw_rows: Vec::new(),
-            table_raw_key: (String::new(), usize::MAX, 0),
+            table_raw_key: (String::new(), usize::MAX, 0, 0),
             table_raw_cache: HashMap::new(),
             recent: ingest::load_recent(),
             show_help: false,
@@ -4480,10 +4490,47 @@ impl Viewer {
                     eprintln!("masstin: cannot write {}: {}", self.notes.path.display(), e);
                 }
             }
-            "table" => self.show_table = true,
-            "table-csv" => {
-                self.show_table = true;
-                self.table_csv = true;
+            // the two modes, and what moves between them
+            "table" | "table-csv" | "timeline" => self.show_table = true,
+            "graph" => self.show_table = false,
+            other if other.starts_with("timeline-edge=") => {
+                let i: usize = other["timeline-edge=".len()..].parse().unwrap_or(0);
+                self.timeline_of_edge(i);
+            }
+            other if other.starts_with("timeline-node=") => {
+                let i: usize = other["timeline-node=".len()..].parse().unwrap_or(0);
+                self.timeline_of_node(i);
+            }
+            other if other.starts_with("timeline-find=") => self.table_find = other["timeline-find=".len()..].to_string(),
+            // the n-th row of the file: picked, and to its connection in the graph
+            other if other.starts_with("timeline-row=") => {
+                let i: u32 = other["timeline-row=".len()..].parse().unwrap_or(0);
+                self.pick_row((0, i));
+            }
+            other if other.starts_with("timeline-to-graph=") => {
+                let i: u32 = other["timeline-to-graph=".len()..].parse().unwrap_or(0);
+                self.row_to_graph((0, i));
+            }
+            // "Open in…" with the program of this name (or the system's)
+            other if other.starts_with("timeline-open=") => {
+                let name = other["timeline-open=".len()..].to_string();
+                let apps = viewers::all();
+                eprintln!("masstin: programs found: {}", apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "));
+                let i = apps.iter().position(|a| a.name.eq_ignore_ascii_case(&name));
+                self.open_rows_in(i, false);
+                eprintln!("masstin: {}", self.status);
+            }
+            // the copy "Open in…" hands to a program, written and named on stderr
+            "timeline-copy" => {
+                let rows: Vec<(u16, u32)> = match &self.table_scope {
+                    Some(sc) => sc.rows.clone(),
+                    None => Vec::new(),
+                };
+                let label = self.table_scope.as_ref().map(|s| s.label.clone()).unwrap_or_default();
+                match self.write_rows_copy(&rows, &label) {
+                    Ok(p) => eprintln!("masstin: rows copy {}", p),
+                    Err(e) => eprintln!("masstin: cannot write the rows copy: {}", e),
+                }
             }
             "style" => self.show_labels = true,
             "when" => self.show_when = true,
@@ -4941,6 +4988,15 @@ impl Viewer {
         let bar = |fill: Color32, m: egui::Margin| egui::Frame::new().fill(fill).inner_margin(m);
         egui::Panel::top("menu").frame(bar(theme::PANEL, egui::Margin::symmetric(6, 3))).show_separator_line(false).show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").frame(bar(theme::PANEL, egui::Margin::symmetric(10, 6))).show_separator_line(false).show(ui, |ui| self.toolbar(ui));
+        // Timeline mode: the rows of the CSV take the centre; what belongs
+        // to the picture (its filters, the time strip, the legend) waits
+        if self.show_table {
+            egui::Panel::bottom("status").frame(bar(theme::PANEL, egui::Margin::symmetric(12, 4))).show_separator_line(false).show(ui, |ui| self.status_bar(ui));
+            if self.show_inspector && self.table_sel.is_some() {
+                egui::Panel::right("inspector").default_size(400.0).resizable(true).frame(bar(theme::PANEL, egui::Margin::same(14))).show(ui, |ui| self.inspector(ui));
+            }
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| self.timeline_view(ui));
+        } else {
         if self.filters_active() {
             egui::Panel::top("chips").frame(bar(theme::PANEL_2, egui::Margin::symmetric(12, 6))).show_separator_line(false).show(ui, |ui| {
                 self.filter_chips(ui);
@@ -4959,6 +5015,7 @@ impl Viewer {
             let r = self.canvas_rect;
             self.legend_overlay(&ctx, r);
             self.limit_banner(&ctx, r);
+        }
         }
         self.color_window(&ctx);
         self.mark_window(&ctx);
@@ -4982,7 +5039,6 @@ impl Viewer {
         self.poll_job(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);
-        self.table_window(&ctx);
         self.drop_overlay(&ctx);
         self.labels_window(&ctx);
         self.when_window(&ctx);

@@ -419,6 +419,32 @@ impl Store {
         Ok(f.layout.to_v19(&fields))
     }
 
+    /// The header line of a file, as written (no line end).
+    pub fn header_text(&self, file: u16) -> std::io::Result<String> {
+        let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
+        let mut rd = std::io::BufReader::new(std::fs::File::open(&f.path)?);
+        let mut text = String::new();
+        csv_out::read_record(&mut rd, &mut text)?;
+        Ok(text.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    /// These rows of a file exactly as it has them (no line end), in the
+    /// order asked: the file is opened once.
+    pub fn raw_texts(&self, file: u16, lines: &[u32]) -> std::io::Result<Vec<String>> {
+        let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
+        let mut rd = std::io::BufReader::new(std::fs::File::open(&f.path)?);
+        let mut out = Vec::with_capacity(lines.len());
+        let mut text = String::new();
+        for line in lines {
+            let at = *f.offsets.get(*line as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such row"))?;
+            rd.seek(SeekFrom::Start(at))?;
+            text.clear();
+            csv_out::read_record(&mut rd, &mut text)?;
+            out.push(text.trim_end_matches(['\r', '\n']).to_string());
+        }
+        Ok(out)
+    }
+
     /// The rows of a file whose text holds `needle` (any case), in the
     /// file's order: the whole file is read once.
     pub fn file_rows_matching(&self, file: u16, needle: &str) -> std::io::Result<Vec<u32>> {

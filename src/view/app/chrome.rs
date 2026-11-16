@@ -75,7 +75,7 @@ impl Viewer {
                     ui.close();
                     self.ingest.open = true;
                 }
-                if icon_button(ui, ic::TABLE, "Rows as a table…").on_hover_text("The timeline's rows in time order, with a find box; open it with the system's CSV application from there").clicked() {
+                if icon_button(ui, ic::TABLE, "Timeline: the rows of the CSV").on_hover_text("The timeline row by row in its 19 columns, with a find box and \"Open in…\" (a spreadsheet, an editor). The same as the Graph / Timeline switch of the toolbar").clicked() {
                     ui.close();
                     self.show_table = true;
                 }
@@ -336,6 +336,26 @@ impl Viewer {
         theme::brand_line(ui);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
+            // the two faces of the same timeline: the picture and the rows
+            egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::ACCENT)).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::same(2)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (timeline, label, icon, tip) in [
+                    (false, "Graph", ic::GRAPH, "The timeline as a picture: who connected to what"),
+                    (true, "Timeline", ic::TABLE, "The timeline row by row, in the 19 columns of the CSV, as written. A right click on a connection or a host of the graph shows its rows here; a double click on a row here shows its connection in the graph"),
+                ] {
+                    let on = self.show_table == timeline;
+                    let b = egui::Button::new(egui::RichText::new(format!("{icon}  {label}")).size(14.0).strong().color(if on { theme::ACCENT_INK } else { theme::TEXT })).fill(if on { theme::ACCENT } else { Color32::TRANSPARENT }).corner_radius(CornerRadius::same(7)).min_size(Vec2::new(104.0, 30.0));
+                    if ui.add(b).on_hover_text(tip).clicked() {
+                        self.show_table = timeline;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            if self.show_table {
+                // the picture's tools wait in Graph mode
+                ui.label(egui::RichText::new("the rows of the CSV, as written").color(theme::MUTED).size(12.5));
+                return;
+            }
             if tool(ui, ic::FUNNEL, "Filter pane", self.show_filters).clicked() {
                 self.show_filters = !self.show_filters;
             }
@@ -359,7 +379,7 @@ impl Viewer {
             });
             ui.add_space(6.0);
             // quick search: a host name, applied on Enter
-            let w = (ui.available_width() - 420.0).clamp(160.0, 360.0);
+            let w = (ui.available_width() - 610.0).clamp(90.0, 360.0);
             let r = ui.add(egui::TextEdit::singleline(&mut self.quick).hint_text(format!("{}  find a host and open its neighbourhood", ic::MAGNIFYING_GLASS)).desired_width(w));
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.quick.trim().is_empty() {
                 self.draft.view = View::Around;
@@ -1156,6 +1176,10 @@ impl Viewer {
                 let name = self.store.hosts.name(host).to_string();
                 ui.label(theme::semibold(&name, 13.5));
                 ui.separator();
+                if icon_button(ui, ic::TABLE, "Show its rows in the timeline").on_hover_text("Timeline mode, on the rows of the CSV behind every connection of this host that the graph shows").clicked() {
+                    ui.close();
+                    self.timeline_of_node(i);
+                }
                 if icon_button(ui, ic::CIRCLES_THREE_PLUS, "Expand around").clicked() {
                     ui.close();
                     self.draft.view = View::Around;
@@ -1226,6 +1250,7 @@ impl Viewer {
                 let title = format!("{} -> {}", self.store.hosts.name(e.src), self.store.hosts.name(e.dst));
                 let users: Vec<u32> = e.users.clone();
                 let (src, dst) = (e.src, e.dst);
+                let n_rows = e.rows.len();
                 ui.label(theme::semibold(&title, 13.5));
                 ui.label(egui::RichText::new(match e.user {
                     Some(u) => format!("as {} · {} event(s)", self.store.users.name(u), e.count),
@@ -1238,6 +1263,10 @@ impl Viewer {
                     self.tab = Tab::Selection;
                     self.show_inspector = true;
                     self.load_rows(k);
+                }
+                if icon_button(ui, ic::TABLE, &format!("Show its {} row(s) in the timeline", n_rows)).on_hover_text("Timeline mode, on the rows of the CSV this connection is drawn from").clicked() {
+                    ui.close();
+                    self.timeline_of_edge(k);
                 }
                 ui.separator();
                 for v in 1..4u8 {

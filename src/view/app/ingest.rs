@@ -1304,12 +1304,17 @@ pub(super) fn reveal_in_folder(path: &str) -> Result<(), String> {
 }
 
 fn recent_path() -> Option<PathBuf> {
+    config_file("recent.json")
+}
+
+/// A file of the window's own settings (the user's configuration folder).
+pub(super) fn config_file(name: &str) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else {
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }?;
-    Some(base.join("masstin").join("recent.json"))
+    Some(base.join("masstin").join(name))
 }
 
 pub(super) fn load_recent() -> Vec<String> {
