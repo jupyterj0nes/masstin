@@ -242,8 +242,14 @@ static AUDIT_SES_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#" ses=(\d+)"#).unwrap());
 static AUDIT_OP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"msg='op=(\S+)"#).unwrap());
+// A PAM authentication failure of sshd, with the remote host and, when the
+// account exists, its name. Two shapes: today's `pam_unix(sshd:auth):` (and
+// the other auth modules) and the `sshd(pam_unix)[pid]:` of old systems
+// (RHEL 4/5), which write nothing else about a failed attempt. `user=` is
+// absent when the account does not exist. Only failures: pam_sss writes
+// "authentication success" with the same fields.
 static PAM_FAIL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"pam_unix\(sshd:[^\)]*\).*rhost=(\S+)\s+user=(\S+)"#).unwrap()
+    Regex::new(r#"(?:pam_(?:unix|sss|ldap|krb5|winbind)\(sshd:auth\)|sshd(?:-session)?\(pam_unix\)\[\d+\]):\s*authentication failure;.*?rhost=(\S+)(?:\s+user=([^\s\]]+))?"#).unwrap()
 });
 static XINETD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"START: ssh .* from=::ffff:(\S+)"#).unwrap());
@@ -365,6 +371,131 @@ fn parse_rfc3164_timestamp(
     // Linux source (wtmp, audit, journald are epoch-based).
     let utc = tz.to_utc(&dt);
     Some(DateTime::<Utc>::from_utc(utc, Utc).to_rfc3339())
+}
+
+fn month_number(m: &str) -> Option<u32> {
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|x| *x == m).map(|i| i as u32 + 1)
+}
+
+/// From one line to the next: +1 when the year turns (December to
+/// January), -1 when a line written late goes back over it (January to
+/// December), 0 otherwise. Half a year of distance tells a turn from the
+/// ordinary disorder of lines around midnight.
+fn year_turn(prev_month: u32, month: u32) -> i32 {
+    if prev_month >= month + 6 {
+        1
+    } else if month >= prev_month + 6 {
+        -1
+    } else {
+        0
+    }
+}
+
+static DPKG_DATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(20\d{2})-(\d{2})-(\d{2})\s+\d{2}:\d{2}").unwrap());
+
+/// The latest date the system's own records prove it was running: the last
+/// line of dpkg.log and the last record of wtmp, next to the log. Dates
+/// written with their year, unlike a file's modification time, which a
+/// copy replaces.
+fn latest_dated_record(dir: &Path) -> Option<NaiveDate> {
+    static CACHE: Lazy<std::sync::Mutex<HashMap<PathBuf, Option<NaiveDate>>>> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(v) = CACHE.lock().unwrap().get(dir) {
+        return *v;
+    }
+    let today = Utc::now().date_naive();
+    let mut best: Option<NaiveDate> = None;
+    let mut take = |d: NaiveDate| {
+        if d <= today && best.map_or(true, |b| d > b) {
+            best = Some(d);
+        }
+    };
+    for name in ["dpkg.log", "dpkg.log.1"] {
+        if let Ok(lines) = crate::textlines::open_plain_or_gzip(&dir.join(name)) {
+            for line in lines {
+                if let Some(c) = DPKG_DATE_RE.captures(&line) {
+                    if let Some(d) = NaiveDate::from_ymd_opt(c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0), c[3].parse().unwrap_or(0)) {
+                        take(d);
+                    }
+                }
+            }
+        }
+    }
+    let wtmp = dir.join("wtmp");
+    if fs::metadata(&wtmp).map(|m| m.len() > 0).unwrap_or(false) {
+        for e in parse_utmp_file(&wtmp, "", false) {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&e.ts_rfc3339) {
+                take(dt.naive_utc().date());
+            }
+        }
+    }
+    CACHE.lock().unwrap().insert(dir.to_path_buf(), best);
+    best
+}
+
+/// The years of a syslog file whose lines carry none (RFC3164).
+///
+/// The file is read once for the date of its last line and for how many
+/// times the year turns inside it. The last line gets the latest year that
+/// keeps it on or before the day the file ended, and each line before a
+/// turn one year less. A year taken from the START of the file (or of a
+/// sibling) dated January after a December with the December's year.
+///
+/// The day the file ended, from the most to the least certain: the
+/// logrotate `-YYYYMMDD` suffix; the file's last write, plus a day for the
+/// time zone; and when that last write is more than a year after the
+/// system's last dated record (dpkg.log, wtmp), which is what a copy that
+/// lost the dates looks like, a month after that record. Any day within a
+/// year after the true end gives the right year.
+struct Rfc3164Years {
+    last_year: i32,
+    turns: i32,
+    source: &'static str,
+}
+
+impl Rfc3164Years {
+    fn for_file(path: &Path, fname: &str, year_hint: Option<i32>) -> Self {
+        let mut turns = 0i32;
+        let mut prev: Option<u32> = None;
+        let mut last: Option<(u32, u32)> = None;
+        if let Ok(lines) = crate::textlines::open_plain_or_gzip(path) {
+            for line in lines {
+                if let Some(cap) = RFC3164_RE.captures(&line) {
+                    if let (Some(m), Ok(d)) = (month_number(&cap[1]), cap[2].trim().parse::<u32>()) {
+                        if let Some(p) = prev {
+                            turns += year_turn(p, m);
+                        }
+                        prev = Some(m);
+                        last = Some((m, d));
+                    }
+                }
+            }
+        }
+        let (end, source): (Option<NaiveDate>, &'static str) = match rotation_date_from_name(fname) {
+            Some(rot) => (Some(rot), "logrotate suffix"),
+            None => {
+                let written = fs::metadata(path).ok().and_then(|m| m.modified().ok()).map(|t| DateTime::<Utc>::from(t).naive_utc().date() + chrono::Duration::days(1));
+                let record = latest_dated_record(path.parent().unwrap_or(Path::new(".")));
+                match (written, record) {
+                    (Some(w), Some(r)) if w > r + chrono::Duration::days(366) => (Some(r + chrono::Duration::days(31)), "last dated record of the system; the file's own date is over a year later"),
+                    (Some(w), _) => (Some(w), "the file's last write"),
+                    (None, Some(r)) => (Some(r + chrono::Duration::days(31)), "last dated record of the system"),
+                    (None, None) => (None, "year hint"),
+                }
+            }
+        };
+        let last_year = match (end, last) {
+            (Some(e), Some(md)) => {
+                if md <= (e.month(), e.day()) {
+                    e.year()
+                } else {
+                    e.year() - 1
+                }
+            }
+            (Some(e), None) => e.year(),
+            (None, _) => year_hint.unwrap_or_else(|| get_file_year(path)),
+        };
+        Rfc3164Years { last_year, turns, source }
+    }
 }
 
 /// logrotate `dateext` suffix → the date the file was rotated. Tolerates
@@ -925,31 +1056,14 @@ fn parse_secure_or_messages(
                     .unwrap_or("")
                     .to_lowercase();
     let is_secure = fname.starts_with("secure") || fname.starts_with("auth.log");
-    // A logrotate `-YYYYMMDD` suffix beats every other year heuristic: the
-    // per-directory hint comes from the CURRENT wtmp/dpkg.log and would
-    // stamp a 2024 `secure-20240616` with the 2026 of its siblings.
-    let rotation = rotation_date_from_name(&fname);
-    // The current `secure` / `auth.log` has no suffix; its last-write date
-    // bounds its lines the same way (a file written in January that holds
-    // December lines). A day of slack covers the time zone.
-    let rotation = rotation.or_else(|| {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| DateTime::<Utc>::from(t).naive_utc().date() + chrono::Duration::days(1))
-    });
-    let file_year = match rotation_date_from_name(&fname) {
-        Some(rot) => {
-            if is_debug_mode() {
-                println!("    year {} for {} (from logrotate suffix)", rot.year(), fname);
-            }
-            rot.year()
-        }
-        None => year_hint.unwrap_or_else(|| get_file_year(path)),
-    };
+    // Lines without a year take it from the END of the file: the year of
+    // its last line, and one less each time the year turns reading back.
+    let years = Rfc3164Years::for_file(path, &fname, year_hint);
+    let mut years_seen = 0i32;
+    let mut prev_month: Option<u32> = None;
 
     if is_debug_mode() {
-        println!("    reading {} (year hint: {}) ...", path.display(), file_year);
+        println!("    reading {} (last line in {}, the year turns {} time(s) inside; {}) ...", path.display(), years.last_year, years.turns, years.source);
     }
 
     let mut lines = match crate::textlines::open_plain_or_gzip(path) {
@@ -971,7 +1085,14 @@ fn parse_secure_or_messages(
             // Message starts after "hostname " (4th capture + space + rest)
             let header_end = cap.get(0).unwrap().end();
             let msg = if header_end < line.len() { &line[header_end..] } else { "" };
-            if let Some(ts) = parse_rfc3164_timestamp(month, day, time, file_year, rotation, tz) {
+            if let Some(m) = month_number(month) {
+                if let Some(p) = prev_month {
+                    years_seen += year_turn(p, m);
+                }
+                prev_month = Some(m);
+            }
+            let line_year = years.last_year - (years.turns - years_seen);
+            if let Some(ts) = parse_rfc3164_timestamp(month, day, time, line_year, None, tz) {
                 (ts, msg.to_string())
             } else {
                 continue;
@@ -1192,10 +1313,10 @@ fn parse_secure_or_messages(
 
         // 4) PAM failure: "pam_unix(sshd:...) rhost=SRC user=USER" — kept
         //    only as a fallback, see `pam_fallback` above.
-        if is_secure {
+        if is_secure || fname.starts_with("messages") {
             if let Some(cap) = PAM_FAIL_RE.captures(&msg) {
                 let src  = cap[1].to_string();
-                let user = cap[2].to_string();
+                let user = cap.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
                 if !filter_ip || !src.is_empty() {
                     pam_fallback.push(RawEvt {
                         ts_rfc3339:  when.clone(),
@@ -2665,6 +2786,96 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
     // Cleanup temp extraction dir
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[cfg(test)]
+mod rfc3164_year_tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("masstin_y_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn written(path: &Path, text: &str, ymd: Option<(i32, u32, u32)>) {
+        fs::write(path, text).unwrap();
+        if let Some((y, m, d)) = ymd {
+            let t = NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(12, 0, 0).unwrap().and_utc();
+            fs::File::options().write(true).open(path).unwrap().set_modified(t.into()).unwrap();
+        }
+    }
+
+    fn times(path: &Path) -> Vec<String> {
+        parse_secure_or_messages(path, "srv01", true, Some(1999), &crate::linux_tz::LocalTz::Utc).into_iter().map(|e| format!("{} {}", &e.ts_rfc3339[..19], e.remote)).collect()
+    }
+
+    fn line(stamp: &str, pid: u32, ip: &str) -> String {
+        format!("{} srv01 sshd[{}]: Accepted password for admin from {} port 50000 ssh2\n", stamp, pid, ip)
+    }
+
+    fn crossing() -> String {
+        [line("Dec 31 23:58:10", 1201, "10.0.0.9"), line("Jan  2 10:00:00", 1302, "10.0.0.66"), line("Jan  5 03:12:44", 1407, "203.0.113.50")].concat()
+    }
+
+    #[test]
+    fn a_file_in_use_that_crosses_the_new_year() {
+        // dpkg.log was last rotated in December: its year is the old one
+        let d = dir("live");
+        written(&d.join("dpkg.log"), "2024-12-14 06:25:01 startup archives unpack\n", None);
+        written(&d.join("auth.log"), &crossing(), Some((2025, 1, 6)));
+        assert_eq!(times(&d.join("auth.log")), ["2024-12-31T23:58:10 10.0.0.9", "2025-01-02T10:00:00 10.0.0.66", "2025-01-05T03:12:44 203.0.113.50"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_copy_that_lost_its_dates_is_dated_by_the_systems_records() {
+        let d = dir("copy");
+        written(&d.join("dpkg.log"), "2024-12-14 06:25:01 startup archives unpack\n", None);
+        written(&d.join("auth.log"), &crossing(), Some((2026, 5, 1)));
+        assert_eq!(times(&d.join("auth.log")), ["2024-12-31T23:58:10 10.0.0.9", "2025-01-02T10:00:00 10.0.0.66", "2025-01-05T03:12:44 203.0.113.50"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pam_failures_are_the_fallback_of_a_file_without_sshd_results() {
+        // RHEL 4/5: `sshd(pam_unix)[pid]`, in `messages`, no user when the
+        // account does not exist
+        let d = dir("pam");
+        let old = "Jun 14 15:16:01 combo sshd(pam_unix)[19939]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=218.188.2.4 
+Jun 15 02:04:59 combo sshd(pam_unix)[20882]: authentication failure; logname= uid=0 euid=0 tty=NODEVssh ruser= rhost=220-135-151-1.hinet-ip.hinet.net  user=root
+";
+        written(&d.join("messages"), old, Some((2005, 6, 20)));
+        let rows: Vec<String> = parse_secure_or_messages(&d.join("messages"), "combo", false, None, &crate::linux_tz::LocalTz::Utc).into_iter().map(|e| format!("{} {} {} [{}]", &e.ts_rfc3339[..19], e.evt, e.remote, e.user)).collect();
+        assert_eq!(rows, ["2005-06-14T15:16:01 SSH_FAILED 218.188.2.4 []", "2005-06-15T02:04:59 SSH_FAILED 220-135-151-1.hinet-ip.hinet.net [root]"]);
+        // today's shape still read; a success of pam_sss is not a failure
+        let new = "Jun 14 15:16:01 srv sshd[77]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=10.0.0.5  user=ana
+Jun 14 15:16:02 srv sshd[77]: pam_sss(sshd:auth): authentication success; logname= uid=0 euid=0 tty=ssh ruser= rhost=10.0.0.5 user=ana
+";
+        written(&d.join("secure"), new, Some((2005, 6, 20)));
+        let rows: Vec<String> = parse_secure_or_messages(&d.join("secure"), "srv", false, None, &crate::linux_tz::LocalTz::Utc).into_iter().map(|e| format!("{} {} [{}]", e.evt, e.remote, e.user)).collect();
+        assert_eq!(rows, ["SSH_FAILED 10.0.0.5 [ana]"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_rotated_file_is_dated_by_its_suffix() {
+        let d = dir("rot");
+        let log = [line("Dec 30 08:00:00", 1, "10.0.0.1"), line("Jan  2 09:00:00", 2, "10.0.0.2")].concat();
+        written(&d.join("secure-20260104"), &log, Some((2030, 5, 1)));
+        assert_eq!(times(&d.join("secure-20260104")), ["2025-12-30T08:00:00 10.0.0.1", "2026-01-02T09:00:00 10.0.0.2"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_late_line_at_midnight_does_not_turn_the_year_twice() {
+        let d = dir("plain");
+        let log = [line("Nov  3 10:00:00", 1, "10.0.0.1"), line("Jan  1 00:00:01", 2, "10.0.0.2"), line("Dec 31 23:59:59", 3, "10.0.0.3"), line("Jan  1 00:00:02", 4, "10.0.0.4")].concat();
+        written(&d.join("auth.log"), &log, Some((2025, 1, 1)));
+        assert_eq!(times(&d.join("auth.log")), ["2024-11-03T10:00:00 10.0.0.1", "2025-01-01T00:00:01 10.0.0.2", "2024-12-31T23:59:59 10.0.0.3", "2025-01-01T00:00:02 10.0.0.4"]);
+        let _ = fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

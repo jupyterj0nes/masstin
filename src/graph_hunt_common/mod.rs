@@ -95,20 +95,54 @@ pub fn is_no_account(t: &str) -> bool {
 /// Parse the string form of a stored timestamp from either backend:
 /// `2026-09-23T15:35:09Z`, `...09.336951Z`, `...09+00:00`, Memgraph's
 /// `2026-09-23T15:35:09.000000` (no zone).
+///
+/// The result is UTC. A time written with an offset is converted (it used
+/// to be cut off: `22:00:00-05:00` was read as 22:00 UTC, five hours
+/// early, and could land on the wrong side of the cutoff); a time with no
+/// zone is UTC, as every masstin parser writes it.
 pub fn parse_ts(s: &str) -> Option<NaiveDateTime> {
-    let mut t = s.trim().trim_end_matches('Z').to_string();
+    let mut t = s.trim().to_string();
     if let Some(i) = t.find('[') { t.truncate(i); }
-    if let Some(tpos) = t.find('T') {
-        if let Some(p) = t[tpos..].find(|c| c == '+' || c == '-') {
-            t.truncate(tpos + p);
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&t) {
+        return Some(dt.naive_utc());
+    }
+    // an offset without the colon ("+0100")
+    for f in ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%dT%H:%M:%S%z"] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(&t, f) {
+            return Some(dt.naive_utc());
         }
     }
+    let t = t.trim_end_matches('Z');
     for f in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(&t, f) {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(t, f) {
             return Some(dt);
         }
     }
     crate::timefmt::parse_fallback(s)
+}
+
+#[cfg(test)]
+mod parse_ts_tests {
+    use super::parse_ts;
+
+    fn at(s: &str) -> String {
+        parse_ts(s).map(|d| d.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn an_offset_is_applied_not_cut_off() {
+        // the same instant, written four ways
+        assert_eq!(at("2026-10-20T03:00:00Z"), "2026-10-20T03:00:00.000");
+        assert_eq!(at("2026-10-19T22:00:00-05:00"), "2026-10-20T03:00:00.000");
+        assert_eq!(at("2026-10-20T04:00:00+01:00"), "2026-10-20T03:00:00.000");
+        assert_eq!(at("2026-10-20T04:00:00+0100"), "2026-10-20T03:00:00.000");
+        // what the backends store
+        assert_eq!(at("2026-09-23T15:35:09.336951Z"), "2026-09-23T15:35:09.336");
+        assert_eq!(at("2026-09-23T15:35:09+00:00"), "2026-09-23T15:35:09.000");
+        assert_eq!(at("2026-09-23T15:35:09.000000"), "2026-09-23T15:35:09.000");
+        assert_eq!(at("2026-09-23T15:35:09+02:00[Europe/Madrid]"), "2026-09-23T13:35:09.000");
+        assert_eq!(at("not a time"), "");
+    }
 }
 
 
