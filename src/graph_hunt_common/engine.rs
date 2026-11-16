@@ -1102,6 +1102,8 @@ pub struct Annotate<'a> {
     pub files: &'a [String],
     /// an earlier timeline whose verdict / notes are copied by row hash
     pub carry_marks: Option<&'a str>,
+    /// what to do with a timeline that already carries a hunt
+    pub if_hunted: super::record::IfHunted,
 }
 
 fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, clock: std::time::Instant, annotate: Option<Annotate>) {
@@ -1167,10 +1169,29 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         }
     }
     if let Some(a) = annotate {
-        match annotate_timelines(a.files, &corpus, &ents, &rows, alpha, cfg, a.carry_marks) {
-            Ok(lines) => {
+        match annotate_timelines(a.files, &corpus, &ents, &rows, alpha, cfg, a.carry_marks, a.if_hunted) {
+            Ok((lines, written)) => {
                 for l in lines {
                     crate::banner::print_phase_detail("Timeline:", &l);
+                }
+                // what the hunt was run with, next to each timeline: the
+                // columns say what a row is, not from which date on
+                let rec = super::record::HuntRecord {
+                    masstin_hunt: 1,
+                    masstin_version: env!("CARGO_PKG_VERSION").to_string(),
+                    hunted_at: super::record::fmt_utc(chrono::Utc::now()),
+                    investigation_from: super::record::fmt_utc(cfg.cutoff),
+                    window_end: cfg.end.map(super::record::fmt_utc).unwrap_or_default(),
+                    alpha,
+                    connections: rows.iter().filter(|r| r.evaluable).count() as u64,
+                    significant: rows.iter().filter(|r| r.evaluable && r.group != 3 && r.q <= alpha).count() as u64,
+                    timelines: a.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect(),
+                };
+                for f in &written {
+                    match super::record::write(f, &rec) {
+                        Ok(p) => crate::banner::print_phase_detail("Hunt record:", &format!("{} (what this hunt was run with)", p.display())),
+                        Err(e) => eprintln!("Masstin - Warning: cannot write the hunt record next to {}: {}", f, e),
+                    }
                 }
             }
             Err(e) => {
@@ -1264,7 +1285,7 @@ pub(crate) fn replace_file(tmp: &std::path::Path, path: &std::path::Path) -> std
 
 /// Write the hunt's verdict on every row of the timeline files, in place.
 /// Returns one summary line per file.
-fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Conn], alpha: f64, cfg: &Settings, carry_marks: Option<&str>) -> std::io::Result<Vec<String>> {
+fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Conn], alpha: f64, cfg: &Settings, carry_marks: Option<&str>, if_hunted: super::record::IfHunted) -> std::io::Result<(Vec<String>, Vec<String>)> {
     use std::io::{BufRead, Write};
     let cutoff_day = day_of(cfg.cutoff.timestamp());
     let end_ts = cfg.end.map(|e| e.timestamp());
@@ -1290,7 +1311,30 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
         None => None,
     };
     let mut summary = Vec::new();
+    // the files the hunt was written into (the timeline, or its new copy)
+    let mut written: Vec<String> = Vec::new();
     for f in files {
+        // A timeline that already carries a hunt: said, with what it was
+        // hunted with, and then as `--if-hunted` answers
+        let mut target = std::path::PathBuf::from(f);
+        if let Some(prev) = super::record::previous(f)? {
+            use super::record::IfHunted;
+            let now = format!("investigation from {} UTC; alpha {}", super::record::fmt_utc(cfg.cutoff), alpha);
+            match if_hunted {
+                IfHunted::Keep => {
+                    summary.push(format!("{}: already hunted ({}). Kept as it is (--if-hunted keep): this hunt ({}) is not written into it", f, prev.describe(), now));
+                    continue;
+                }
+                IfHunted::New => {
+                    target = super::record::new_name(f, cfg.cutoff);
+                    summary.push(format!("{}: already hunted ({}). It keeps that hunt; this one ({}) goes to a new timeline (--if-hunted new)", f, prev.describe(), now));
+                    summary.push(format!("New timeline: {} -> {}", f, target.display()));
+                }
+                IfHunted::Overwrite => {
+                    summary.push(format!("{}: already hunted ({}). Its hunt columns are replaced by this hunt ({}); --if-hunted keep leaves them, --if-hunted new writes a new timeline", f, prev.describe(), now));
+                }
+            }
+        }
         let layout = {
             let rd = std::io::BufReader::new(std::fs::File::open(f)?);
             let header = crate::csv_out::records(rd).next().transpose()?.unwrap_or_default();
@@ -1459,9 +1503,11 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
             }
             w.flush()?;
         }
-        if let Err(e) = replace_file(&tmp, path) {
-            return Err(std::io::Error::new(e.kind(), format!("{}: cannot replace the file ({}); the annotated copy is {}", f, e, tmp.display())));
+        if let Err(e) = replace_file(&tmp, &target) {
+            return Err(std::io::Error::new(e.kind(), format!("{}: cannot replace the file ({}); the annotated copy is {}", target.display(), e, tmp.display())));
         }
+        let f = &target.to_string_lossy().to_string();
+        written.push(f.clone());
         let count = |s: u8| states.iter().filter(|(x, _)| *x == s).count();
         summary.push(format!(
             "{}: {} rows written with the hunt: {} significant, {} candidate, {} habitual, {} not evaluated, {} baseline, {} outside the hunt ({} session end(s) took their login's state{})",
@@ -1480,7 +1526,7 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
             }
         ));
     }
-    Ok(summary)
+    Ok((summary, written))
 }
 
 struct Entities {
@@ -3847,7 +3893,7 @@ mod tests {
         let path = tmp_path("sessid.csv");
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         let files = vec![path.clone()];
-        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None }));
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
         let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&path).unwrap().records().map(|r| r.unwrap()).collect();
         let w = &rows[20..];
         assert_eq!(w.len(), 6);
@@ -3928,7 +3974,7 @@ mod tests {
         let out = tmp_path("rarity.findings.csv");
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         let files = vec![path.clone()];
-        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-13T00:00:00Z"), Some(&out), None, Some(Annotate { files: &files, carry_marks: None }));
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-13T00:00:00Z"), Some(&out), None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
         let findings: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&out).unwrap().records().map(|r| r.unwrap()).collect();
         let head = csv::ReaderBuilder::new().from_path(&out).unwrap().headers().unwrap().clone();
         let col = |name: &str| head.iter().position(|h| h == name).unwrap_or_else(|| panic!("no column {}", name));
@@ -4024,7 +4070,7 @@ mod tests {
         let files = vec![path.clone()];
         let cfg = hunt_settings("2026-01-11T00:00:00Z");
         for run in 0..3 {
-            run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+            run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
             let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new().from_path(&path).unwrap().records().map(|r| r.unwrap()).collect();
             assert_eq!(rows.len(), 12, "run {}", run);
             assert!(rows.iter().all(|r| r.len() == 19), "run {}", run);
@@ -4048,13 +4094,13 @@ mod tests {
         let path = tmp_path("norun.csv");
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         let files = vec![path.clone()];
-        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None }));
+        run_csv(&files, &super::super::NEO4J, &hunt_settings("2026-01-11T00:00:00Z"), None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
         let hunted = std::fs::read(&path).unwrap();
         assert!(String::from_utf8_lossy(&hunted).contains(",baseline,"));
         // 2025 for 2026: nothing before the cutoff; 2027: nothing after it;
         // the second day of the data: one day of baseline
         for cutoff in ["2025-01-11T00:00:00Z", "2027-01-11T00:00:00Z", "2026-01-02T00:00:00Z"] {
-            run_csv(&files, &super::super::NEO4J, &hunt_settings(cutoff), None, None, Some(Annotate { files: &files, carry_marks: None }));
+            run_csv(&files, &super::super::NEO4J, &hunt_settings(cutoff), None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
             assert_eq!(std::fs::read(&path).unwrap(), hunted, "cutoff {}", cutoff);
         }
         let _ = std::fs::remove_file(&path);
@@ -4081,7 +4127,7 @@ mod tests {
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         let files = vec![path.clone()];
         let cfg = hunt_settings("2026-01-11T00:00:00Z");
-        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
 
         let text = std::fs::read_to_string(&path).unwrap();
         let rows: Vec<Vec<String>> = text.lines().map(|l| csv_fields(l)).collect();
@@ -4108,7 +4154,7 @@ mod tests {
         assert!(local[14..].iter().all(|s| s.is_empty()), "{:?}", local);
 
         // the same hunt again on the annotated file: identical bytes
-        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None }));
+        run_csv(&files, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files, carry_marks: None, if_hunted: Default::default() }));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 
         // a 14-column copy of the same events, with the marks carried
@@ -4122,7 +4168,7 @@ mod tests {
         body14[0] = crate::csv_out::HEADER_14.to_string();
         std::fs::write(&fresh, format!("{}\n", body14.join("\n"))).unwrap();
         let files2 = vec![fresh.clone()];
-        run_csv(&files2, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files2, carry_marks: Some(&path) }));
+        run_csv(&files2, &super::super::NEO4J, &cfg, None, None, Some(Annotate { files: &files2, carry_marks: Some(&path), if_hunted: Default::default() }));
         let again: Vec<Vec<String>> = std::fs::read_to_string(&fresh).unwrap().lines().map(|l| csv_fields(l)).collect();
         assert_eq!(again[12][17], "benign");
         assert_eq!(again[12][18], "known jump");

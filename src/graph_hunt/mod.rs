@@ -103,6 +103,7 @@ pub fn graph_hunt_csv(
     sigma: Option<&str>,
     annotate: bool,
     carry_marks: Option<&str>,
+    if_hunted: crate::graph_hunt_common::record::IfHunted,
 ) {
     let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
@@ -118,7 +119,7 @@ pub fn graph_hunt_csv(
     crate::banner::print_phase_detail("Cutoff:", &settings.cutoff.to_rfc3339());
     crate::banner::print_phase_detail("Alpha (FDR):", &format!("{}", alpha));
     crate::banner::print_phase("2", "4", "No graph database: everything is computed in memory");
-    let ann = if annotate { Some(engine::Annotate { files, carry_marks }) } else { None };
+    let ann = if annotate { Some(engine::Annotate { files, carry_marks, if_hunted }) } else { None };
     engine::run_csv(files, &crate::graph_hunt_common::NEO4J, &settings, output, report, ann);
 }
 

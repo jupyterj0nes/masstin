@@ -36,7 +36,13 @@ For the complete Event ID mapping, see [CSV Format and Event Classification](htt
 | `verdict` | the analyst (the viewer, a case tool, or by hand) | `suspicious`, `confirmed`, `benign`, or empty |
 | `notes` | the analyst | Free text (`#tags` welcome) |
 
-`graph-hunt-csv` writes the hunt's verdict into every row of the timeline it reads, in place (a temporary file is renamed over the original once complete). The hunt's unit is the connection (origin, destination, account, result, day), so every row of the same connection on the same day carries the same `hunt`, `hunt_score` and `hunt_why`. The six states of `hunt`:
+`graph-hunt-csv` writes the hunt's verdict into every row of the timeline it reads, in place (a temporary file is renamed over the original once complete).
+
+**What a hunt was run with.** The columns say what each row is, not from which date on the hunt judged. Every hunt therefore leaves a record next to the timeline it wrote, `<name>.hunt.json`: the start of the investigation (`investigation_from`), the end of the window when one was given, `alpha`, the masstin that hunted and when, how many connections it judged and how many were significant, and the timelines hunted together. The 19 columns are not touched by it. A timeline that travels without its record still shows the start to the day: the rows of every day before it are `baseline`, so the investigation started after the last day with `baseline` rows and by the first day with judged ones.
+
+**Hunting a timeline that is already hunted.** masstin says so before writing, with what the earlier hunt was run with (from the record, or read off the rows) and what this one is run with, and `--if-hunted` decides: `overwrite` (the default) replaces the hunt in place, `keep` leaves that timeline as it is, `new` writes the timeline with the new hunt to `<name>.hunt-<date>.csv` next to it and the one given keeps the hunt it had. The window asks the same three before it runs a hunt.
+
+ The hunt's unit is the connection (origin, destination, account, result, day), so every row of the same connection on the same day carries the same `hunt`, `hunt_score` and `hunt_why`. The six states of `hunt`:
 
 | `hunt` | Meaning |
 |--------|---------|

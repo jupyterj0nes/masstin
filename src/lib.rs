@@ -339,6 +339,23 @@ pub struct Cli {
     #[arg(long)]
     no_annotate: bool,
 
+    /// For `graph-hunt-csv`: what to do with a timeline given with -f that
+    /// already carries a hunt (rows with a `hunt` state, or a hunt record
+    /// next to it): `overwrite` (the default) writes this hunt over the
+    /// one it had, in place; `keep` leaves that timeline as it is (it
+    /// still counts in the statistics; nothing is written into it); `new`
+    /// writes the timeline with this hunt to a new file next to it,
+    /// `<name>.hunt-<YYYY-MM-DD of --investigation-from>.csv`, and the one
+    /// given keeps the hunt it had (the line `New timeline: OLD -> NEW`
+    /// names it). Whatever the answer, masstin says that the timeline was
+    /// hunted before and with what: the start of the investigation, alpha
+    /// and the date of that hunt from its record
+    /// (`<name>.hunt.json`, written by every hunt next to the timeline),
+    /// or, without a record, the days between which it started, read off
+    /// the `baseline` rows. A timeline never hunted is written in place.
+    #[arg(long, value_name = "overwrite|keep|new")]
+    if_hunted: Option<String>,
+
     /// For `merge` / `graph-hunt-csv`: an earlier timeline whose `verdict`
     /// and `notes` are copied onto the rows with the same 14 event columns
     /// (after the evidence was parsed again, for instance).
@@ -768,6 +785,17 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.sigma.as_deref(),
                 !config.no_annotate,
                 config.carry_marks.as_deref(),
+                match config.if_hunted.as_deref() {
+                    None => Default::default(),
+                    Some(v) => match crate::graph_hunt_common::record::IfHunted::parse(v) {
+                        Some(x) => x,
+                        None => {
+                            eprintln!("Masstin - Error: --if-hunted {}: one of overwrite, keep, new", v);
+                            crate::mark_failed();
+                            return Ok(());
+                        }
+                    },
+                },
             );
         }
         ActionType::GraphHuntNeo4j => {
