@@ -132,7 +132,7 @@ impl Scan {
             parts.push(n(self.mac_json, "log show export", "log show exports"));
         }
         if self.elastic_json > 0 {
-            parts.push(n(self.elastic_json, "Winlogbeat JSON file", "Winlogbeat JSON files"));
+            parts.push(n(self.elastic_json, "Windows-event JSON file", "Windows-event JSON files"));
         }
         if !self.timelines.is_empty() {
             parts.push(n(self.timelines.len(), "masstin timeline", "masstin timelines"));
@@ -210,7 +210,7 @@ pub fn judge(s: &Scan) -> Verdict {
         return Verdict { parser: Some(PARSE_MAC), sure: true, title: "macOS logs".into(), why: format!("{}{}.", n(s.logarchives, "logarchive bundle", "logarchive bundles"), if s.mac_json > 0 { format!(", {}", n(s.mac_json, "log show export", "log show exports")) } else { String::new() }) };
     }
     if ela > 0 && win == 0 && lin == 0 && mac == 0 {
-        return Verdict { parser: Some(PARSER_ELASTIC), sure: true, title: "Winlogbeat JSON".into(), why: format!("{} exported from Elasticsearch.", n(ela, "JSON file", "JSON files")) };
+        return Verdict { parser: Some(PARSER_ELASTIC), sure: true, title: "Windows events as JSON".into(), why: format!("{} of Windows events (Winlogbeat, evtx_dump, Velociraptor or flat).", n(ela, "JSON file", "JSON files")) };
     }
     if win > 0 && lin > 0 && mac == 0 && ela == 0 {
         return Verdict { parser: Some(PARSE_MASSIVE), sure: true, title: "Windows and Linux together".into(), why: "The massive pass takes the Windows triage packages and EVTX and the Linux logs and triages side by side, into one timeline.".into() };
@@ -296,9 +296,9 @@ fn look_at(p: &Path, s: &mut Scan) {
         }
     } else if crate::parse_image_windows::is_first_image_segment(p) {
         s.images.push(p.to_string_lossy().to_string());
-    } else if lower.ends_with(".json") || lower.ends_with(".ndjson") {
+    } else if lower.ends_with(".json") || lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
         let head = head_of(p, 4096);
-        if head.contains("\"winlog\"") || head.contains("\"event_id\"") && head.contains("\"@timestamp\"") {
+        if crate::parse_elastic::head_holds_windows_events(&head) {
             s.elastic_json += 1;
             s.elastic_paths.push(p.to_string_lossy().to_string());
         } else if head.contains("\"eventMessage\"") || head.contains("\"processImagePath\"") || head.contains("\"subsystem\"") {

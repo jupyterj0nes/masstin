@@ -30,7 +30,7 @@ pub(super) const PARSERS: [Parser; 6] = [
     Parser { action: "parse-mac", icon: ic::LAPTOP, title: "macOS", desc: "a .logarchive bundle (the Unified Log) or a `log show` JSON export" },
     Parser { action: "parse-image", icon: ic::HARD_DRIVES, title: "Disk image", desc: "E01, dd / raw, VMDK, VHD / VHDX: the logs are read from the file system inside, shadow copies included" },
     Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: disk images, Windows and Linux triages, loose EVTX and Linux logs, read together into one timeline" },
-    Parser { action: "parser-elastic", icon: ic::CLOUD, title: "Winlogbeat JSON", desc: "Windows events exported from Elasticsearch as Winlogbeat JSON" },
+    Parser { action: "parser-elastic", icon: ic::CLOUD, title: "Windows events as JSON", desc: "Windows events exported as JSON: Winlogbeat, evtx_dump, Velociraptor, or flat (NXLog, Sentinel)" },
 ];
 
 const P_WINDOWS: usize = 0;
@@ -583,7 +583,7 @@ impl Viewer {
                     count_chip(ui, ic::TERMINAL_WINDOW, s.linux_tars, plural(s.linux_tars, "Linux triage", "Linux triages"), EDGE_OK);
                     count_chip(ui, ic::LAPTOP, s.logarchives, "logarchive", CANDIDATE);
                     count_chip(ui, ic::LAPTOP, s.mac_json, "log show JSON", CANDIDATE);
-                    count_chip(ui, ic::CLOUD, s.elastic_json, "Winlogbeat JSON", theme::VIOLET);
+                    count_chip(ui, ic::CLOUD, s.elastic_json, "Windows JSON", theme::VIOLET);
                     count_chip(ui, ic::TABLE, s.timelines.len(), plural(s.timelines.len(), "timeline", "timelines"), theme::CYAN);
                     count_chip(ui, ic::ARCHIVE, s.archives, plural(s.archives, "other archive", "other archives"), theme::DIM);
                 });

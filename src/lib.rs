@@ -415,7 +415,7 @@ enum ActionType {
     LoadMemgraph,
     /// Merge multiple CSV timelines into a single chronological file
     Merge,
-    /// Advanced, a part of `parse` without its look first: Winlogbeat JSON logs exported from Elasticsearch
+    /// Advanced, a part of `parse` without its look first: Windows events exported as JSON (Winlogbeat / Elastic Agent, evtx_dump, Velociraptor, and the flat JSON of NXLog, OTRF Security-Datasets and Microsoft Sentinel). Another shape is read with a rule: parse-custom
     ParserElastic,
     /// Query Cortex XDR API for network connections (RDP/SMB/SSH)
     ParseCortex,
@@ -813,7 +813,7 @@ fn part_name(a: &ActionType) -> &'static str {
         ActionType::ParseWindows => "Windows event logs and triages",
         ActionType::ParseLinux => "Linux logs and triages",
         ActionType::ParseMac => "macOS logs",
-        ActionType::ParserElastic => "Winlogbeat JSON",
+        ActionType::ParserElastic => "Windows events as JSON",
         ActionType::ParseImage => "disk images",
         ActionType::ParseMassive => "the evidence: images, triages and logs in one pass",
         ActionType::ParseCustom => "the files the rules read",
@@ -928,12 +928,12 @@ fn resolve_parse(config: &Cli) -> Result<Vec<ParseStep>, String> {
                 steps.push(ParseStep { action: ActionType::ParseMac, files: exports, dirs: bundles });
             }
             if !s.elastic_paths.is_empty() {
-                crate::banner::print_phase_result(&format!("{} Winlogbeat JSON file(s) -> read by the Winlogbeat parser", s.elastic_paths.len()));
+                crate::banner::print_phase_result(&format!("{} Windows-event JSON file(s) -> read by the JSON event parser", s.elastic_paths.len()));
                 steps.push(ParseStep { action: ActionType::ParserElastic, files: s.elastic_paths.clone(), dirs: Vec::new() });
             }
             if steps.is_empty() && custom.is_empty() && volumes.is_empty() && given_tl.is_empty() {
                 return Err(format!(
-                    "Nothing masstin knows how to read in {}: no event logs, triage packages, disk images, Linux or macOS logs, Winlogbeat JSON or timelines. Text logs (VPN, firewall, proxy) are read with --rules.",
+                    "Nothing masstin knows how to read in {}: no event logs, triage packages, disk images, Linux or macOS logs, Windows events as JSON or timelines. Text logs (VPN, firewall, proxy) are read with --rules.",
                     rest.join(", ")
                 ));
             }
@@ -1156,7 +1156,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
                     // Check if Winlogbeat JSON
                     if !is_winlogbeat_file(file) {
                         return Err(format!(
-                            "File {} does not appear to be a valid Winlogbeat JSON file.",
+                            "File {} holds no Windows events as JSON in a shape masstin reads (Winlogbeat, evtx_dump, Velociraptor, or flat as NXLog and Sentinel write it). For another shape, write a rule: parse-custom.",
                             file
                         ));
                     }
@@ -1423,30 +1423,7 @@ fn is_evtx_file(file_path: &str) -> bool {
 //   Checks if a file is a valid Winlogbeat JSON file
 // -----------------------------------------------------------------------------
 fn is_winlogbeat_file(file_path: &str) -> bool {
-    let file = File::open(file_path);
-    if file.is_err() {
-        return false;
-    }
-
-    let reader = BufReader::new(file.unwrap());
-
-    // the first lines decide; a file that is not Winlogbeat is not read whole
-    for line in crate::textlines::EvidenceLines::new(reader).take(1000) {
-        // Try to parse each line as JSON
-        if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            // The winlog.* shape: Winlogbeat writes it, and so does Elastic
-            // Agent's Windows integration (agent.type "filebeat"), so the
-            // shape decides, not the shipper's name.
-            let w = json.get("winlog");
-            if w.and_then(|w| w.get("event_id")).is_some()
-                && (w.and_then(|w| w.get("channel")).is_some() || w.and_then(|w| w.get("provider_name")).is_some())
-            {
-                return true;
-            }
-        }
-    }
-
-    false
+    crate::parse_elastic::holds_windows_events(file_path)
 }
 
 // -----------------------------------------------------------------------------

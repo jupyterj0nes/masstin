@@ -34,7 +34,7 @@ masstin -a parse -d /evidence/case-2026-03 --carve -o timeline.csv
    ```
 
 2. **The massive pass** reads the Windows evidence, the Linux evidence, the disk images (their file systems, shadow copies included) and every archive, nested or not, in one go. On evidence of one kind its timeline is the one the narrower parser writes (byte for byte on EVTX folders, KAPE triages and disk images; the same rows on Linux triages).
-3. **macOS and Winlogbeat**, which the massive pass does not read, are read by `parse-mac` and `parser-elastic` wherever the look finds them, in a folder or given with `-f`.
+3. **macOS and Windows events as JSON**, which the massive pass does not read, are read by `parse-mac` and `parser-elastic` wherever the look finds them, in a folder or given with `-f`.
 4. **Timelines.** masstin timelines given with `-f` are merged in as they are. The ones lying inside the folders are left out and named on the console (an earlier run's output, another case's timeline): give one with `-f` to merge it in. A folder of timelines and nothing else is merged.
 
 Two things that cannot be guessed are options, merged into the same timeline (each part is written to a temporary file, and the parts are merged, sorted and without duplicates):
@@ -265,9 +265,22 @@ masstin -a parse-image -f DC01.e01 -o timeline.csv
 
 Each UAL record generates two timeline entries (first seen + last seen). Server hostname is resolved from `SystemIdentity.mdb`. Roles are mapped to protocols: File Server → `SMB`, Remote Access → `RDP`, Web Server → `HTTP`, etc. [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-ual/)
 
-## Parse Winlogbeat JSON
+## Parse Windows events exported as JSON
 
-Parses Winlogbeat JSON logs forwarded to Elasticsearch (and the same `winlog.*` documents written by Elastic Agent's Windows integration). Each document is reduced to the event and its fields and goes through the same per-event mapping as `parse-windows`, chosen by the event's channel, so the same event gives the same row from an EVTX or from Elastic. Documents without a channel are mapped by event id where the id belongs to one family only.
+Reads Windows events that a tool exported as JSON, in the shapes below. A file is read whether it holds one document per line, one array, or what `evtx_dump` prints by default (a `Record N` line, then the document over several lines).
+
+| Shape | Where the event sits | Written by |
+|---|---|---|
+| Winlogbeat | `winlog.event_id`, `winlog.channel`, `winlog.event_data.*` | Winlogbeat, Elastic Agent's Windows integration |
+| evtx_dump | `Event.System.*`, `Event.EventData.*` | `evtx_dump` and tools built on the same library |
+| Velociraptor | `System.EventID.Value`, `System.Channel`, `EventData.*` | Velociraptor's EVTX artifacts |
+| Flat | `EventID`, `Channel`, `Hostname` or `Computer`, and the event's fields at the top (`TargetUserName`, `IpAddress`, ...) | NXLog, the OTRF Security-Datasets, Microsoft Sentinel's `SecurityEvent` |
+
+**Times.** Every row is UTC. A time that says its zone, or an epoch, is converted. NXLog writes the event's time as the host's local time with no zone (`EventTime`): its offset is taken from the two times the record gives for its reception (`EventReceivedTime`, local, and the shipper's `@timestamp`, UTC), to the quarter of an hour. `@timestamp` alone is the reception, seconds after the event, and is used only when the record has nothing better. A record with a local time and nothing to tell the offset is written as if it were UTC, and the run says how many.
+
+Another shape (Splunk's renamed fields, a SIEM's own export) is read with a rule: see [custom parsers](custom-parsers.md); the rule studio of the window builds one from a sample.
+
+Each document is reduced to the event and its fields and goes through the same per-event mapping as `parse-windows`, chosen by the event's channel, so the same event gives the same row from an EVTX or from Elastic. Documents without a channel are mapped by event id where the id belongs to one family only.
 
 ```bash
 masstin -a parser-elastic -d /evidence/winlogbeat/ -o elastic-timeline.csv
