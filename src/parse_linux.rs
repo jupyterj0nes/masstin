@@ -377,15 +377,20 @@ fn month_number(m: &str) -> Option<u32> {
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|x| *x == m).map(|i| i as u32 + 1)
 }
 
-/// From one line to the next: +1 when the year turns (December to
-/// January), -1 when a line written late goes back over it (January to
-/// December), 0 otherwise. Half a year of distance tells a turn from the
-/// ordinary disorder of lines around midnight.
+/// From one line to the next: +1 when the year turns (the month goes
+/// down: December to January, or June to January after a quiet half
+/// year), -1 when a line written late goes back over the turn (January to
+/// December), 0 otherwise. Lines only ever go back by moments, so going
+/// back is one month at most: any other change of month is time moving
+/// forward, however long the file was quiet (January to August is the
+/// same year). A file quiet from January to December of one year reads
+/// as a late line; nothing in the lines tells the two apart.
 fn year_turn(prev_month: u32, month: u32) -> i32 {
-    if prev_month >= month + 6 {
+    if (month + 12 - prev_month) % 12 == 11 {
+        // one month back: over the turn only from January to December
+        if month > prev_month { -1 } else { 0 }
+    } else if month < prev_month {
         1
-    } else if month >= prev_month + 6 {
-        -1
     } else {
         0
     }
@@ -2856,6 +2861,19 @@ Jun 14 15:16:02 srv sshd[77]: pam_sss(sshd:auth): authentication success; lognam
         written(&d.join("secure"), new, Some((2005, 6, 20)));
         let rows: Vec<String> = parse_secure_or_messages(&d.join("secure"), "srv", false, None, &crate::linux_tz::LocalTz::Utc).into_iter().map(|e| format!("{} {} [{}]", e.evt, e.remote, e.user)).collect();
         assert_eq!(rows, ["SSH_FAILED 10.0.0.5 [ana]"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_quiet_stretch_is_not_a_turn_of_the_year() {
+        assert_eq!((year_turn(12, 1), year_turn(1, 12), year_turn(2, 1), year_turn(1, 8), year_turn(3, 10), year_turn(6, 12), year_turn(6, 1), year_turn(11, 2), year_turn(5, 5)), (1, -1, 0, 0, 0, 0, 1, 1, 0));
+        // a host that logged in January and again in August, same year
+        let d = dir("quiet");
+        written(&d.join("auth.log"), &[line("Jan 10 08:00:00", 1, "10.0.0.1"), line("Aug 20 09:00:00", 2, "10.0.0.2")].concat(), Some((2025, 8, 21)));
+        assert_eq!(times(&d.join("auth.log")), ["2025-01-10T08:00:00 10.0.0.1", "2025-08-20T09:00:00 10.0.0.2"]);
+        // quiet from June to January: the year turned in between
+        written(&d.join("secure"), &[line("Jun 10 08:00:00", 1, "10.0.0.1"), line("Jan 20 09:00:00", 2, "10.0.0.2")].concat(), Some((2025, 1, 21)));
+        assert_eq!(times(&d.join("secure")), ["2024-06-10T08:00:00 10.0.0.1", "2025-01-20T09:00:00 10.0.0.2"]);
         let _ = fs::remove_dir_all(&d);
     }
 
