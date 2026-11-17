@@ -169,6 +169,26 @@ pub struct Store {
     pub rows_bad_time: usize,
     pub t_min: i64,
     pub t_max: i64,
+    /// per edge: the seconds the session that logon opened lasted (its
+    /// logoff on the same host with the same logon ID, the first after it);
+    /// `u32::MAX` when the timeline does not say
+    session: Vec<u32>,
+    /// successful logons, and how many of them have their session
+    pub logons: usize,
+    pub sessions_known: usize,
+}
+
+/// A logon ID as a number to pair by; 0 when the row has none.
+fn logon_id_key(cell: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let t = cell.trim();
+    let digits = t.trim_start_matches("0x").trim_start_matches("0X").trim_start_matches('0');
+    if t.is_empty() || t == "-" || digits.is_empty() {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    t.to_ascii_lowercase().hash(&mut h);
+    h.finish() | 1
 }
 
 impl Store {
@@ -206,11 +226,16 @@ impl Store {
         // `full`: the name as the file writes it (`SRV01.corp.example`), so the
         // host answers to it too wherever a host is named (a search, a
         // neighbourhood, `--focus`); empty when the row gives none
-        let mut host_of = |raw: &str, full: &str, hosts: &mut Interner| -> u32 {
+        // the host a raw name is, by its label
+        let label_of = |raw: &str| -> String {
             let label = resolved.get(raw).map(|r| r.0.as_str()).unwrap_or(raw);
             // a machine account named as a computer (`PTR-SRV01$`) is that computer
             let label = label.strip_suffix('$').filter(|l| !l.is_empty()).unwrap_or(label);
-            let label = manual.get(&label.to_uppercase()).map(String::as_str).unwrap_or(label);
+            manual.get(&label.to_uppercase()).map(String::as_str).unwrap_or(label).to_string()
+        };
+        let mut host_of = |raw: &str, full: &str, hosts: &mut Interner| -> u32 {
+            let label = label_of(raw);
+            let label = label.as_str();
             let id = hosts.id(label);
             if aliases.len() <= id as usize {
                 aliases.push(vec![label.to_string()]);
@@ -234,6 +259,11 @@ impl Store {
         let mut whys = Interner::default();
         whys.id("");
         let mut edges: Vec<Edge> = Vec::new();
+        // the logon ID of each edge, and every logoff that carries one (most
+        // have no origin and are no edge): (host label, logon ID, time)
+        let mut edge_lid: Vec<u64> = Vec::new();
+        let mut logoff_hosts = Interner::default();
+        let mut logoffs: Vec<(u32, u64, i64)> = Vec::new();
         let mut notes = HashMap::new();
         let mut files = Vec::new();
         let (mut rows_total, mut rows_without_origin, mut rows_bad_time) = (0usize, 0usize, 0usize);
@@ -279,6 +309,13 @@ impl Store {
                         continue;
                     }
                 };
+                let lid = logon_id_key(&b[11]);
+                if lid != 0 && result_code(b[2].trim()) == R_LOGOFF {
+                    let host = short_name(&clean_host(&b[1]), &ambiguous);
+                    if !host.is_empty() {
+                        logoffs.push((logoff_hosts.id(&label_of(&host)), lid, t));
+                    }
+                }
                 let (origin, dest, _acct, _cls) = match row_key(&b, &ambiguous) {
                     Some(k) => k,
                     None => {
@@ -309,6 +346,7 @@ impl Store {
                 } else {
                     (H_NONE, f32::NAN, 0, V_NONE)
                 };
+                edge_lid.push(lid);
                 edges.push(Edge {
                     t,
                     src,
@@ -345,7 +383,37 @@ impl Store {
         let in_adj = Csr::build(n, edges.iter().enumerate().map(|(i, e)| (e.dst, i as u32)), &edges);
         let t_min = by_time.first().map(|&i| edges[i as usize].t).unwrap_or(0);
         let t_max = by_time.last().map(|&i| edges[i as usize].t).unwrap_or(0);
-        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max })
+        // each logon's session: its logoff is the first one after it on the
+        // same host with the same logon ID
+        let host_id: Vec<Option<u32>> = logoff_hosts.names.iter().map(|n| hosts.get(n)).collect();
+        let mut ends: Vec<(u32, u64, i64)> = logoffs.into_iter().filter_map(|(h, id, t)| host_id[h as usize].map(|h| (h, id, t))).collect();
+        ends.sort_unstable();
+        let mut session = vec![u32::MAX; edges.len()];
+        let (mut logons, mut sessions_known) = (0usize, 0usize);
+        for (i, e) in edges.iter().enumerate() {
+            if e.result != R_OK {
+                continue;
+            }
+            logons += 1;
+            let id = edge_lid[i];
+            if id == 0 {
+                continue;
+            }
+            let k = ends.partition_point(|x| *x < (e.dst, id, e.t));
+            if let Some(&(h, l, end)) = ends.get(k) {
+                if h == e.dst && l == id {
+                    session[i] = (end - e.t).clamp(0, u32::MAX as i64 - 1) as u32;
+                    sessions_known += 1;
+                }
+            }
+        }
+        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known })
+    }
+
+    /// How long the session a logon opened lasted, in seconds, when the
+    /// timeline has its logoff (paired by logon ID on the host logged on to).
+    pub fn session_of(&self, edge: u32) -> Option<i64> {
+        self.session.get(edge as usize).filter(|d| **d != u32::MAX).map(|d| *d as i64)
     }
 
     /// Whether a file changed on disk since it was read (or written here).

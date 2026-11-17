@@ -313,6 +313,22 @@ pub struct Viewer {
     trail_on: Vec<bool>,
     path_results: [bool; 4],
     path_skip_machine: bool,
+    /// hops are chained by the session the one before opened (its logon
+    /// ID), not by time alone
+    path_by_session: bool,
+    /// by session: a logon with no logoff is followed for the gap
+    path_session_gap: bool,
+    /// the search runs over the whole timeline, not over what the filters select
+    path_scope_all: bool,
+    /// only the logins of these accounts are hops
+    path_user: String,
+    /// the search's own time window (empty: the bar's, or none)
+    path_from: String,
+    path_to: String,
+    /// the list of names open under a box of the Paths window
+    path_suggest: Option<Suggest>,
+    /// hosts and accounts by name, for those lists: (key, hosts, accounts)
+    path_names: (usize, std::rc::Rc<Vec<String>>, std::rc::Rc<Vec<String>>),
     path_found: Vec<Path>,
     path_msg: String,
     overlay: Option<Overlay>,
@@ -563,6 +579,141 @@ pub(crate) fn parse_rows(text: &str) -> Result<Vec<(u16, u32)>, String> {
 /// a path or a cone, with a word under each host.
 /// A path or a cone marked on the map: the map stays as the filters draw
 /// it and these connections stand out on it.
+/// The list of names open under a box: which box, whether it shows every
+/// name (the arrow) or the ones that match what is typed, the row the keys
+/// are on.
+pub(crate) struct Suggest {
+    field: u8,
+    all: bool,
+    at: Option<usize>,
+}
+
+/// `1234567` as `1,234,567`.
+fn group_digits(n: usize) -> String {
+    let d = n.to_string();
+    let mut out = String::with_capacity(d.len() + d.len() / 3);
+    for (i, ch) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The names a box offers for what is typed: the ones that start with it,
+/// then the ones that contain it; every one when nothing is typed.
+fn suggestions<'a>(names: &'a [String], typed: &str) -> Vec<&'a String> {
+    let needle = typed.trim().to_lowercase();
+    if needle.is_empty() {
+        return names.iter().collect();
+    }
+    let (mut first, mut rest) = (Vec::new(), Vec::new());
+    for n in names {
+        let l = n.to_lowercase();
+        if l.starts_with(&needle) {
+            first.push(n);
+        } else if l.contains(&needle) {
+            rest.push(n);
+        }
+    }
+    first.extend(rest);
+    first
+}
+
+/// A text box that offers the names it could mean: as it is typed, the
+/// ones that contain the text (click one, or the arrow keys and Enter), and
+/// from the arrow next to it, every one. Says whether Enter was pressed
+/// with no name picked from the list (the form's own Enter).
+fn suggest_box(ui: &mut egui::Ui, me: u8, state: &mut Option<Suggest>, text: &mut String, width: f32, hint: &str, names: &[String]) -> bool {
+    let mine = state.as_ref().map_or(false, |s| s.field == me);
+    let mut step = 0i32;
+    if mine {
+        ui.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                step = 1;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                step = -1;
+            }
+        });
+    }
+    let (edit, arrow) = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let edit = ui.add(egui::TextEdit::singleline(text).desired_width(width).hint_text(hint));
+            let arrow = ui.add(egui::Button::new(egui::RichText::new(super::icons::CARET_DOWN).size(12.0)).min_size(Vec2::new(20.0, 20.0))).on_hover_text(format!("Every one the timeline has ({}), to pick from", group_digits(names.len())));
+            (edit, arrow)
+        })
+        .inner;
+    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if arrow.clicked() {
+        *state = if mine && state.as_ref().map_or(false, |s| s.all) { None } else { Some(Suggest { field: me, all: true, at: None }) };
+    } else if edit.changed() || edit.gained_focus() {
+        *state = Some(Suggest { field: me, all: false, at: None });
+    } else if mine && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *state = None;
+    }
+    let Some(st) = state.as_mut().filter(|s| s.field == me) else { return enter };
+    let list: Vec<&String> = if st.all { names.iter().collect() } else { suggestions(names, text) };
+    if step != 0 && !list.is_empty() {
+        let n = list.len() as i32;
+        st.at = Some(match st.at {
+            None => if step > 0 { 0 } else { (n - 1) as usize },
+            Some(k) => (k as i32 + step).rem_euclid(n) as usize,
+        });
+    }
+    if enter {
+        let picked = st.at.and_then(|k| list.get(k)).map(|n| (*n).clone());
+        *state = None;
+        return match picked {
+            Some(n) => {
+                *text = n;
+                false
+            }
+            None => true,
+        };
+    }
+    // the one name there is, already written: nothing to offer
+    if !st.all && list.len() == 1 && list[0].eq_ignore_ascii_case(text.trim()) {
+        return false;
+    }
+    let mut chosen: Option<String> = None;
+    let at = st.at;
+    let shown = egui::Popup::from_response(&edit).open(true).close_behavior(egui::PopupCloseBehavior::IgnoreClicks).show(|ui| {
+        ui.set_width(edit.rect.width().max(260.0));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        if list.is_empty() {
+            ui.label(egui::RichText::new("Nothing in the timeline is called like that.").small().color(theme::MUTED));
+            return;
+        }
+        ui.label(egui::RichText::new(if list.len() == names.len() { format!("{} in the timeline: type to narrow", group_digits(names.len())) } else { format!("{} of {}", group_digits(list.len()), group_digits(names.len())) }).small().color(theme::MUTED));
+        let row_h = ui.spacing().interact_size.y;
+        let mut area = egui::ScrollArea::vertical().max_height(236.0).auto_shrink([false, true]);
+        if let (true, Some(k)) = (step != 0, at) {
+            area = area.vertical_scroll_offset((k as f32 * (row_h + ui.spacing().item_spacing.y) - 96.0).max(0.0));
+        }
+        area.show_rows(ui, row_h, list.len(), |ui, range| {
+            for k in range {
+                if ui.add(egui::Button::selectable(at == Some(k), list[k].as_str())).clicked() {
+                    chosen = Some(list[k].clone());
+                }
+            }
+        });
+    });
+    if let Some(n) = chosen {
+        *text = n;
+        *state = None;
+        return false;
+    }
+    // a press anywhere else puts the list away
+    let inside = |p: Pos2| edit.rect.contains(p) || arrow.rect.contains(p) || shown.as_ref().map_or(false, |r| r.response.rect.contains(p));
+    if ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().map_or(false, |p| !inside(p))) {
+        *state = None;
+    }
+    false
+}
+
 struct Trail {
     title: String,
     edges: std::collections::HashSet<u32>,
@@ -878,6 +1029,14 @@ impl Viewer {
             trail_on: Vec::new(),
             path_results: [true, false, false, false],
             path_skip_machine: true,
+            path_by_session: false,
+            path_session_gap: false,
+            path_scope_all: false,
+            path_user: String::new(),
+            path_from: String::new(),
+            path_to: String::new(),
+            path_suggest: None,
+            path_names: (usize::MAX, Default::default(), Default::default()),
             path_found: Vec::new(),
             path_msg: String::new(),
             overlay: None,
@@ -3774,32 +3933,135 @@ impl Viewer {
         self.store.hosts_matching(&Pattern::parse_list(t)).into_iter().next()
     }
 
-    fn path_query(&self, origin: u32, dest: u32) -> PathQuery {
-        PathQuery {
+    /// The filters as one line, for whoever is about to search inside them.
+    fn filter_summary(&self) -> String {
+        let f = &self.filter;
+        let mut v: Vec<String> = vec![match f.view {
+            View::Findings => "the hunt's findings only".to_string(),
+            View::All => "everything".to_string(),
+            View::Around => format!("the neighbourhood of {} ({} hop(s))", if f.around.is_empty() { "?" } else { &f.around }, f.hops),
+        }];
+        if f.results.iter().any(|r| !r) {
+            v.push(RESULT_NAMES.iter().enumerate().filter(|(i, _)| f.results[*i]).map(|(_, n)| *n).collect::<Vec<_>>().join(" + "));
+        }
+        for (name, text) in [("host", &f.host), ("account", &f.user), ("logon type", &f.logon_type)] {
+            if !text.trim().is_empty() {
+                v.push(format!("{} {}", name, text.trim()));
+            }
+        }
+        if !f.from.is_empty() || !f.to.is_empty() {
+            v.push(format!("{} → {}", if f.from.is_empty() { "start" } else { &f.from }, if f.to.is_empty() { "end" } else { &f.to }));
+        }
+        if f.min_score > 0 {
+            v.push(format!("score ≥ {}", f.min_score));
+        }
+        if f.view != View::Findings && f.hunt.iter().any(|h| !h) {
+            v.push("some hunt states left out".to_string());
+        }
+        if f.verdict.iter().any(|x| !x) {
+            v.push("some marks left out".to_string());
+        }
+        v.join("  ·  ")
+    }
+
+    /// The search as the form has it: (the query, the rows it may use).
+    fn path_query(&self, origin: u32, dest: u32) -> (PathQuery, usize) {
+        let n = self.store.edges.len();
+        let users = Pattern::parse_list(&self.path_user);
+        // the window: the search's own, else the bar's when it runs inside the filters
+        let own = |text: &str, bar: &str| -> Option<i64> { parse_time(text).or_else(|| if self.path_scope_all { None } else { parse_time(bar) }) };
+        let (from, to) = (own(&self.path_from, &self.filter.from), own(&self.path_to, &self.filter.to));
+        let mut rows = n;
+        let only = if self.path_scope_all && users.is_empty() {
+            None
+        } else {
+            let mut ok = vec![self.path_scope_all; n];
+            if !self.path_scope_all {
+                let mut f = self.filter.clone();
+                if parse_time(&self.path_from).is_some() {
+                    f.from = self.path_from.clone();
+                }
+                if parse_time(&self.path_to).is_some() {
+                    f.to = self.path_to.clone();
+                }
+                for ei in f.select(&self.store) {
+                    ok[ei as usize] = true;
+                }
+            }
+            if !users.is_empty() {
+                for (i, e) in self.store.edges.iter().enumerate() {
+                    if ok[i] && !Pattern::any_account(&users, self.store.users.name(e.user)) {
+                        ok[i] = false;
+                    }
+                }
+            }
+            rows = ok.iter().filter(|x| **x).count();
+            Some(std::rc::Rc::new(ok))
+        };
+        let q = PathQuery {
             origin,
             dest,
-            from: super::query::parse_time(&self.filter.from),
-            to: super::query::parse_time(&self.filter.to),
+            from,
+            to,
             max_hops: self.path_hops.max(1),
             max_gap: (self.path_gap_h.max(0.01) * 3600.0) as i64,
             max_paths: self.path_max.max(1),
             results: self.path_results,
             skip_machine_accounts: self.path_skip_machine,
-        }
+            by_session: self.path_by_session,
+            gap_without_session: self.path_session_gap,
+            only,
+        };
+        (q, rows)
+    }
+
+    /// What was searched, in words: "by session, in 1,204 of 39,679 rows (what the filters select)".
+    fn path_scope_text(&self, q: &PathQuery, rows: usize) -> String {
+        let how = if q.by_session { if q.gap_without_session { "by session (the gap where a logon has no logoff)" } else { "by session" } } else { "by time" };
+        let whose = if self.path_user.trim().is_empty() { String::new() } else { format!(", account {}", self.path_user.trim()) };
+        format!("{}, in {} of {} rows ({}{})", how, group_digits(rows), group_digits(self.store.edges.len()), if self.path_scope_all { "the whole timeline" } else { "what the filters select" }, whose)
     }
 
     fn run_paths(&mut self) {
         let (Some(o), Some(d)) = (self.host_named(&self.path_origin), self.host_named(&self.path_dest)) else {
-            self.path_msg = "name an origin and a destination the timeline knows".into();
+            self.path_msg = "Name an origin and a destination the timeline knows (the arrow next to each box lists them).".into();
             return;
         };
-        let q = self.path_query(o, d);
-        self.path_found = paths::find_paths(&self.store, &q);
-        if self.path_found.is_empty() {
-            self.path_msg = format!("no time-respecting path from {} to {} within {} hops and {:.1} h per hop", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, self.path_gap_h);
+        if o == d {
+            self.path_msg = "Origin and destination are the same host.".into();
             return;
         }
-        self.path_msg = format!("{} path(s), shortest first", self.path_found.len());
+        let (q, rows) = self.path_query(o, d);
+        let scope = self.path_scope_text(&q, rows);
+        self.path_found = paths::find_paths(&self.store, &q);
+        if self.path_found.is_empty() {
+            // why not, as far as a wider search can tell
+            let mut hints: Vec<String> = Vec::new();
+            let mut wider = q.clone();
+            if q.by_session {
+                wider.by_session = false;
+                let n = paths::find_paths(&self.store, &wider).len();
+                if n > 0 {
+                    hints.push(format!("By time alone there {}: the sessions that would link the hops are not in the timeline (no logoff with their logon ID), or the next hop left after the session ended. Tick «the gap where a logon has no logoff», or chain by time.", if n == 1 { "is 1 path".to_string() } else { format!("are {} paths", n) }));
+                }
+            }
+            if hints.is_empty() && (q.only.is_some() || q.from.is_some() || q.to.is_some()) {
+                wider.only = None;
+                wider.from = None;
+                wider.to = None;
+                let n = paths::find_paths(&self.store, &wider).len();
+                if n > 0 {
+                    let what = if self.path_scope_all { "the account or the dates set here leave out a login the path needs. Empty them to see it.".to_string() } else { format!("the filters{} leave out a login the path needs. Set «Search in» to the whole timeline, or widen the filters.", if self.path_user.trim().is_empty() { "" } else { " or the account" }) };
+                    hints.push(format!("In the whole timeline, any account and any date, there {}: {}", if n == 1 { "is 1".to_string() } else { format!("are {}", n) }, what));
+                }
+            }
+            if hints.is_empty() {
+                hints.push("Try more hops, a longer gap, or letting failed logons and connections count as hops.".to_string());
+            }
+            self.path_msg = format!("No path from {} to {} within {} hops{}. Searched {}.\n{}", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, if q.by_session && !q.gap_without_session { String::new() } else { format!(" and {:.1} h per hop", self.path_gap_h) }, scope, hints.join("\n"));
+            return;
+        }
+        self.path_msg = format!("{} path(s), shortest first. Searched {}.", self.path_found.len(), scope);
         let all: Vec<u32> = self.path_found.iter().flat_map(|p| p.edges.iter().copied()).collect();
         let hops = self.hops_along(&self.path_found);
         let labels = hops.iter().map(|(h, k)| (*h, if *k == 0 { "origin".to_string() } else { format!("hop {}", k) })).collect();
@@ -3837,7 +4099,8 @@ impl Viewer {
             self.path_msg = if forward { "name the origin of the cone".into() } else { "name the destination of the cone".into() };
             return;
         };
-        let q = self.path_query(h, h);
+        let (q, rows) = self.path_query(h, h);
+        let scope = self.path_scope_text(&q, rows);
         let t0 = if forward { q.from.unwrap_or(self.store.t_min) } else { q.to.unwrap_or(self.store.t_max) };
         let (reach, support) = paths::cone(&self.store, h, t0, &q, forward);
         let mut edges: Vec<u32> = reach.values().filter_map(|r| r.via).collect();
@@ -3845,7 +4108,7 @@ impl Viewer {
         let labels: HashMap<u32, String> = reach.iter().map(|(host, r)| (*host, if r.hop == 0 { (if forward { "origin" } else { "destination" }).to_string() } else { format!("hop {} · {}", r.hop, &fmt_time(r.t)[5..16]) })).collect();
         let hops: HashMap<u32, usize> = reach.iter().map(|(host, r)| (*host, r.hop)).collect();
         self.path_found.clear();
-        self.path_msg = format!("{} host(s) {} {} within {} hops", reach.len().saturating_sub(1), if forward { "reachable from" } else { "that could reach" }, self.store.hosts.name(h), q.max_hops);
+        self.path_msg = format!("{} host(s) {} {} within {} hops. Searched {}.", reach.len().saturating_sub(1), if forward { "reachable from" } else { "that could reach" }, self.store.hosts.name(h), q.max_hops, scope);
         if edges.is_empty() {
             return;
         }
@@ -3906,8 +4169,24 @@ impl Viewer {
         self.fit_pending = true;
     }
 
+    /// Hosts and accounts by name, for the lists under the boxes.
+    fn path_name_lists(&mut self) -> (std::rc::Rc<Vec<String>>, std::rc::Rc<Vec<String>>) {
+        let key = self.store.hosts.len().wrapping_mul(31).wrapping_add(self.store.users.len()).wrapping_mul(31).wrapping_add(self.store.edges.len());
+        if self.path_names.0 != key {
+            let by_name = |v: &[String]| -> Vec<String> {
+                let mut v: Vec<String> = v.iter().filter(|n| !n.trim().is_empty()).cloned().collect();
+                // names before addresses, each in the order of the alphabet
+                v.sort_by_cached_key(|n| (n.parse::<std::net::IpAddr>().is_ok(), n.to_lowercase()));
+                v
+            };
+            self.path_names = (key, std::rc::Rc::new(by_name(&self.store.hosts.names)), std::rc::Rc::new(by_name(&self.store.users.names)));
+        }
+        (self.path_names.1.clone(), self.path_names.2.clone())
+    }
+
     fn paths_window(&mut self, ctx: &egui::Context) {
         if !self.show_paths {
+            self.path_suggest = None;
             return;
         }
         let mut open = true;
@@ -3915,29 +4194,77 @@ impl Viewer {
         let mut cone: Option<bool> = None;
         let mut pick: Option<usize> = None;
         let mut reshow = false;
-        egui::Window::new("Paths").open(&mut open).default_width(560.0).resizable(true).show(ctx, |ui| {
-            ui.label(egui::RichText::new("A path is a chain of logins where every hop happens after the previous one and no later than the gap allowed; no host is entered twice. The cones say what a host could reach from the window's start, or what could have reached it by the window's end.").color(MUTED));
-            egui::Grid::new("paths-form").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Origin");
-                let r = ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.path_origin).hint_text("host or IP"));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    find = true;
-                }
-                ui.label("Destination");
-                let r = ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.path_dest).hint_text("host or IP"));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    find = true;
-                }
-                ui.end_row();
-                ui.label("Max hops");
-                ui.add(egui::DragValue::new(&mut self.path_hops).range(1..=12));
-                ui.label("Max gap per hop (h)");
-                ui.add(egui::DragValue::new(&mut self.path_gap_h).range(0.05..=24.0 * 90.0).speed(0.5).fixed_decimals(1));
-                ui.end_row();
-                ui.label("Max paths");
-                ui.add(egui::DragValue::new(&mut self.path_max).range(1..=2000).speed(1));
-                ui.label("Hops are");
+        let (hosts, accounts) = self.path_name_lists();
+        let screen_h = ctx.content_rect().height();
+        // sized by what it holds (a fixed width, as tall as its contents, and
+        // scrolling when the screen is shorter), so nothing is ever cut
+        egui::Window::new(format!("{}  Paths", super::icons::PATH)).id(egui::Id::new("paths-window-2")).open(&mut open).resizable(false).collapsible(true).show(ctx, |ui| {
+            ui.set_width(660.0);
+            // (a window that is not resized by hand offers its last size as the room there is: say how tall it may get)
+            ui.set_max_height((screen_h - 150.0).max(240.0));
+            egui::ScrollArea::vertical().max_height((screen_h - 150.0).max(240.0)).auto_shrink([false, true]).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new("A path is a chain of logins from one host to another, each hop after the one before, no host entered twice: how someone could have moved from the origin to the destination. Hover any ? for what a setting does.").color(MUTED)).wrap());
+
+                theme::section_help(ui, "From where to where", "The host the chain starts at and the one it ends at. Type part of a name or an address and pick from the list that opens, or use the arrow to see every host of the timeline. «Paths from here» and «Paths to here» in a host's right-click menu fill these boxes. For «Reach from origin» only the origin is needed; for «Ways into destination», only the destination.");
                 ui.horizontal(|ui| {
+                    ui.label("Origin");
+                    find |= suggest_box(ui, 0, &mut self.path_suggest, &mut self.path_origin, 200.0, "host or address", &hosts);
+                    if ui.button(super::icons::ARROWS_CLOCKWISE).on_hover_text("Swap origin and destination").clicked() {
+                        std::mem::swap(&mut self.path_origin, &mut self.path_dest);
+                    }
+                    ui.label("Destination");
+                    find |= suggest_box(ui, 1, &mut self.path_suggest, &mut self.path_dest, 200.0, "host or address", &hosts);
+                });
+
+                theme::section_help(ui, "How one hop leads to the next", "By time: the next hop leaves the host after the one that entered it, and no later than the gap. It is what «could have happened», and it finds the most.\n\nBy session (logon ID): the next hop leaves the host while the session the hop before opened there is still open, between that logon and its logoff, which the timeline pairs by their logon ID. It is far stronger evidence that the two hops are one movement, but it needs the logoff to be in the timeline: where it is not, the logon cannot be followed (or is followed for the gap, if you tick that).");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.path_by_session, false, format!("{}  by time", super::icons::CLOCK)).on_hover_text("Coherent in time: each hop after the one before and within the gap. Finds every chain that could have happened");
+                    ui.selectable_value(&mut self.path_by_session, true, format!("{}  by session (logon ID)", super::icons::KEY)).on_hover_text("The stricter reading: the next hop leaves while the session the hop before opened is still open (its logon and logoff share a logon ID). Not always possible: it needs the logoffs in the timeline");
+                    ui.label(egui::RichText::new(format!("{} of {} logons have their session", group_digits(self.store.sessions_known), group_digits(self.store.logons))).small().color(if self.path_by_session && self.store.sessions_known == 0 { CANDIDATE } else { MUTED })).on_hover_text("Successful logons of this timeline whose logoff is in it too (same host, same logon ID). Only these can be followed by session");
+                });
+                if self.path_by_session {
+                    ui.checkbox(&mut self.path_session_gap, "the gap where a logon has no logoff").on_hover_text("A logon whose logoff is not in the timeline is followed for the gap below instead of not at all: sessions where the timeline has them, time where it does not");
+                }
+                ui.horizontal(|ui| {
+                    theme::label_help(ui, "Max gap per hop (h)", "The longest a hop may wait after the one before it, in hours. By session it only counts for logons with no logoff, when that box is ticked: a session lasts what it lasts.");
+                    ui.add_enabled(!self.path_by_session || self.path_session_gap, egui::DragValue::new(&mut self.path_gap_h).range(0.05..=24.0 * 90.0).speed(0.5).fixed_decimals(1));
+                    ui.add_space(10.0);
+                    theme::label_help(ui, "Max hops", "The longest chain looked for: 3 is origin → A → B → destination.");
+                    ui.add(egui::DragValue::new(&mut self.path_hops).range(1..=12));
+                    ui.add_space(10.0);
+                    theme::label_help(ui, "Max paths", "How many paths are listed, shortest first.");
+                    ui.add(egui::DragValue::new(&mut self.path_max).range(1..=2000).speed(1));
+                });
+
+                theme::section_help(ui, "Which logins can be a hop", "The search does not look at every row unless you ask. By default it runs inside what the filters on the left select (the same rows the canvas draws from): with «Findings» on, only the hunt's findings can be hops, and a path through an ordinary login is not found. Choose the whole timeline to ignore the filters. On top of either, the account and the dates here narrow it further.");
+                ui.horizontal(|ui| {
+                    ui.label("Search in");
+                    ui.selectable_value(&mut self.path_scope_all, false, format!("{}  what the filters select", super::icons::FUNNEL)).on_hover_text("Only the rows the filters on the left let through can be hops: the view, the results, hosts, accounts, time window, hunt states and marks");
+                    ui.selectable_value(&mut self.path_scope_all, true, "the whole timeline").on_hover_text("Every row of the timeline can be a hop, whatever the filters say (the bar's time window included)");
+                });
+                if !self.path_scope_all {
+                    ui.add(egui::Label::new(egui::RichText::new(format!("The filters now: {}", self.filter_summary())).small().color(MUTED)).wrap());
+                }
+                ui.horizontal(|ui| {
+                    theme::label_help(ui, "Account", "Only logins of this account are hops: the chain one account made. Part of a name is enough; * is a wildcard, ! in front leaves an account out, a comma separates several. Empty: any account.");
+                    find |= suggest_box(ui, 2, &mut self.path_suggest, &mut self.path_user, 170.0, "any account", &accounts);
+                    ui.add_space(6.0);
+                    theme::label_help(ui, "From", "The first hop is at or after this moment and the last one at or before «To», in the timeline's time (UTC): 2026-11-03 or 2026-11-03 14:30. Empty: the time window of the filters, or the whole timeline when the search ignores them.");
+                    let bar = |t: &str, none: &str| if self.path_scope_all || t.is_empty() { none.to_string() } else { t.to_string() };
+                    let (hint_from, hint_to) = (bar(&self.filter.from, "the start"), bar(&self.filter.to, "the end"));
+                    for (k, (text, hint)) in [(&mut self.path_from, hint_from), (&mut self.path_to, hint_to)].into_iter().enumerate() {
+                        let bad = !text.trim().is_empty() && parse_time(text).is_none();
+                        let r = ui.add(egui::TextEdit::singleline(text).desired_width(128.0).hint_text(hint).text_color_opt(bad.then_some(SIGNIFICANT)));
+                        if bad {
+                            r.on_hover_text("Not a date: write it as 2026-11-03 or 2026-11-03 14:30");
+                        }
+                        if k == 0 {
+                            ui.label("To");
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    theme::label_help(ui, "Hops are", "Which events count as a hop. A logon that succeeded is a movement; a failed one or a connection is an attempt, worth adding when looking for what someone tried. Machine accounts (NAME$) log on to each other all day and are left out unless asked.");
                     for (i, name) in RESULT_NAMES.iter().enumerate() {
                         if ui.add(egui::Button::selectable(self.path_results[i], *name)).clicked() {
                             self.path_results[i] = !self.path_results[i];
@@ -3945,61 +4272,62 @@ impl Viewer {
                     }
                     ui.checkbox(&mut self.path_skip_machine, "no machine accounts");
                 });
-                ui.end_row();
-            });
-            ui.label(egui::RichText::new(format!("Time window: the bar's From / To ({} → {})", if self.filter.from.is_empty() { "start" } else { &self.filter.from }, if self.filter.to.is_empty() { "end" } else { &self.filter.to })).small().color(MUTED));
-            ui.horizontal(|ui| {
-                ui.label("Show it");
-                let was = self.path_in_map;
-                ui.selectable_value(&mut self.path_in_map, false, format!("{}  alone", super::icons::PATH)).on_hover_text("Only the hosts and connections of the path are drawn, in columns by hop, so it reads left to right. Everything else leaves the canvas until you go back to the view");
-                ui.selectable_value(&mut self.path_in_map, true, format!("{}  marked on the map", super::icons::CROSSHAIR)).on_hover_text("The map stays as it is, with every host where it was, and the path stands out on it: thicker, in the logo's colours, with the rest dimmed. For seeing where the path runs among everything else");
-                theme::help(ui, "Two ways to look at the same path. Alone: the canvas is reduced to the path's hosts, laid out hop by hop. Marked on the map: nothing is taken away or moved, the path's connections are drawn thick and bright over the rest, which is dimmed. Change it at any time: the path found is shown again the other way.");
-                if was != self.path_in_map {
-                    reshow = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Find paths").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
-                    find = true;
-                }
-                if ui.button("Reach from origin").on_hover_text("earliest-arrival cone forward in time").clicked() {
-                    cone = Some(true);
-                }
-                if ui.button("Ways into destination").on_hover_text("cone backward in time").clicked() {
-                    cone = Some(false);
-                }
-                if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").on_hover_text("Leave the path or the cone and draw again what the filters select").clicked() {
-                    self.overlay = None;
-                    self.trail = None;
-                    self.path_found.clear();
-                    self.path_msg.clear();
-                    self.requery(false);
-                }
-            });
-            if !self.path_msg.is_empty() {
-                ui.label(egui::RichText::new(&self.path_msg).color(if self.path_found.is_empty() && self.overlay.is_none() { CANDIDATE } else { TEXT }));
-            }
-            if !self.path_found.is_empty() {
-                ui.separator();
-                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, p) in self.path_found.iter().enumerate() {
-                        let mut text = String::new();
-                        if let Some(&first) = p.edges.first() {
-                            text.push_str(self.store.hosts.name(self.store.edges[first as usize].src));
-                        }
-                        for &ei in &p.edges {
-                            let e = &self.store.edges[ei as usize];
-                            let u = self.store.users.name(e.user);
-                            text.push_str(&format!("  -({}{})->  {}", if u.is_empty() { "?" } else { u }, &fmt_time(e.t)[10..16].replace(' ', " "), self.store.hosts.name(e.dst)));
-                        }
-                        let span = p.span(&self.store);
-                        let label = format!("{}.  {} hop(s) · {}  ·  {}", i + 1, p.hops(), if span >= 3600 { format!("{:.1} h", span as f32 / 3600.0) } else { format!("{} min", span / 60) }, text);
-                        if ui.add(egui::Button::new(egui::RichText::new(label).small()).frame(false).wrap()).clicked() {
-                            pick = Some(i);
-                        }
+
+                theme::section_help(ui, "Show it", "Two ways to look at the same path. Alone: the canvas is reduced to the path's hosts, laid out hop by hop. Marked on the map: nothing is taken away or moved, the path's connections are drawn thick and bright over the rest, which is dimmed. Change it at any time: the path found is shown again the other way.");
+                ui.horizontal(|ui| {
+                    let was = self.path_in_map;
+                    ui.selectable_value(&mut self.path_in_map, false, format!("{}  alone", super::icons::PATH)).on_hover_text("Only the hosts and connections of the path are drawn, in columns by hop, so it reads left to right. Everything else leaves the canvas until you go back to the view");
+                    ui.selectable_value(&mut self.path_in_map, true, format!("{}  marked on the map", super::icons::CROSSHAIR)).on_hover_text("The map stays as it is, with every host where it was, and the path stands out on it: thicker, in the logo's colours, with the rest dimmed. For seeing where the path runs among everything else");
+                    if was != self.path_in_map {
+                        reshow = true;
                     }
                 });
-            }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Find paths").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).on_hover_text("Every chain of logins from the origin to the destination, as set above. Enter in a box does the same").clicked() {
+                        find = true;
+                    }
+                    if ui.button("Reach from origin").on_hover_text("Every host a chain of logins could have reached from the origin, with the hop and the moment it was first reached (the destination is not used)").clicked() {
+                        cone = Some(true);
+                    }
+                    if ui.button("Ways into destination").on_hover_text("Every host from which a chain of logins could have reached the destination, walking back in time (the origin is not used)").clicked() {
+                        cone = Some(false);
+                    }
+                    if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").on_hover_text("Leave the path or the cone and draw again what the filters select").clicked() {
+                        self.overlay = None;
+                        self.trail = None;
+                        self.path_found.clear();
+                        self.path_msg.clear();
+                        self.requery(false);
+                    }
+                });
+                if !self.path_msg.is_empty() {
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&self.path_msg).color(if self.path_msg.starts_with("No ") || self.path_msg.starts_with("Name ") || self.path_msg.starts_with("Origin and") { CANDIDATE } else { TEXT })).wrap());
+                }
+                if !self.path_found.is_empty() {
+                    ui.separator();
+                    egui::ScrollArea::vertical().id_salt("paths-found").max_height((screen_h * 0.3).clamp(110.0, 320.0)).auto_shrink([false, true]).show(ui, |ui| {
+                        for (i, p) in self.path_found.iter().enumerate() {
+                            let mut text = String::new();
+                            if let Some(&first) = p.edges.first() {
+                                text.push_str(self.store.hosts.name(self.store.edges[first as usize].src));
+                            }
+                            for &ei in &p.edges {
+                                let e = &self.store.edges[ei as usize];
+                                let u = self.store.users.name(e.user);
+                                text.push_str(&format!("  -({}{})->  {}", if u.is_empty() { "?" } else { u }, &fmt_time(e.t)[10..16].replace(' ', " "), self.store.hosts.name(e.dst)));
+                            }
+                            let span = p.span(&self.store);
+                            let label = format!("{}.  {} hop(s) · {}  ·  {}", i + 1, p.hops(), if span >= 3600 { format!("{:.1} h", span as f32 / 3600.0) } else { format!("{} min", span / 60) }, text);
+                            if ui.add(egui::Button::new(egui::RichText::new(label).small()).frame(false).wrap()).on_hover_text("Show this path alone (or marked on the map)").clicked() {
+                                pick = Some(i);
+                            }
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+            });
         });
         if find {
             self.run_paths();
@@ -5196,6 +5524,18 @@ impl Viewer {
             "paths-map" => self.path_in_map = true,
             "paths-alone" => self.path_in_map = false,
             "paths-reshow" => self.reshow_path(),
+            "paths-open" => self.show_paths = true,
+            "paths-session" => self.path_by_session = true,
+            "paths-session-gap" => {
+                self.path_by_session = true;
+                self.path_session_gap = true;
+            }
+            "paths-time" => self.path_by_session = false,
+            "paths-all" => self.path_scope_all = true,
+            "paths-filtered" => self.path_scope_all = false,
+            other if other.starts_with("paths-user=") => self.path_user = other["paths-user=".len()..].to_string(),
+            other if other.starts_with("paths-from=") => self.path_from = other["paths-from=".len()..].to_string(),
+            other if other.starts_with("paths-to=") => self.path_to = other["paths-to=".len()..].to_string(),
             other if other.starts_with("paths=") => {
                 let spec = &other["paths=".len()..];
                 let mut it = spec.splitn(3, ':');
@@ -5356,6 +5696,19 @@ impl Viewer {
 #[cfg(test)]
 mod rows_option_tests {
     use super::{host_answers, parse_event, parse_rows};
+
+    /// The names a box offers: the ones that start with what is typed
+    /// first, then the ones that contain it, in any case; all when empty.
+    #[test]
+    fn a_box_offers_the_names_that_match() {
+        let names: Vec<String> = ["10.0.0.5", "DC01", "SRV-DC02", "WS01"].iter().map(|s| s.to_string()).collect();
+        let got = |t: &str| -> Vec<String> { super::suggestions(&names, t).into_iter().cloned().collect() };
+        assert_eq!(got("dc"), ["DC01", "SRV-DC02"]);
+        assert_eq!(got(" 01 "), ["DC01", "WS01"]);
+        assert_eq!(got("").len(), 4);
+        assert!(got("zz").is_empty());
+        assert_eq!((super::group_digits(0), super::group_digits(999), super::group_digits(1000), super::group_digits(5034507)), ("0".to_string(), "999".to_string(), "1,000".to_string(), "5,034,507".to_string()));
+    }
 
     #[test]
     fn an_event_is_named_by_what_it_is() {

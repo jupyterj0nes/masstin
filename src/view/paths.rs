@@ -3,7 +3,11 @@
 //!
 //! A path from A to B is a chain of logins where every hop happens after
 //! the previous one, no later than `max_gap` seconds after it, and no host
-//! is entered twice. The search is a depth-first walk over each host's
+//! is entered twice. Asked **by session**, the hop out of a host must leave
+//! while the session the hop into it opened is still open: between that
+//! logon and its logoff, which the timeline pairs by logon ID (a logon
+//! whose logoff the timeline does not have cannot be followed, unless the
+//! gap is asked for in its place). The search is a depth-first walk over each host's
 //! outgoing edges, which are sorted by time, so the candidates of the next
 //! hop start at a binary search and everything earlier is skipped.
 //!
@@ -32,11 +36,19 @@ pub struct PathQuery {
     pub results: [bool; 4],
     /// leave out machine accounts (`NAME$`)
     pub skip_machine_accounts: bool,
+    /// the next hop leaves inside the session the hop before opened,
+    /// instead of within `max_gap` of it
+    pub by_session: bool,
+    /// by session: a logon with no logoff in the timeline is followed for
+    /// `max_gap` (instead of not at all)
+    pub gap_without_session: bool,
+    /// the only logins that may be a hop, by store edge; `None`: any
+    pub only: Option<std::rc::Rc<Vec<bool>>>,
 }
 
 impl Default for PathQuery {
     fn default() -> Self {
-        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true }
+        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true, by_session: false, gap_without_session: false, only: None }
     }
 }
 
@@ -57,14 +69,32 @@ impl Path {
     }
 }
 
-fn hop_ok(s: &Store, e: &Edge, q: &PathQuery) -> bool {
+fn hop_ok(s: &Store, ei: u32, e: &Edge, q: &PathQuery) -> bool {
     if !q.results[e.result as usize] {
         return false;
+    }
+    if let Some(only) = &q.only {
+        if !only.get(ei as usize).copied().unwrap_or(false) {
+            return false;
+        }
     }
     if q.skip_machine_accounts && is_machine_account(s.users.name(e.user)) {
         return false;
     }
     true
+}
+
+/// How long after hop `ei` the next one may leave; `None`: it cannot be
+/// followed (by session, and the timeline has no logoff for it).
+fn window(s: &Store, q: &PathQuery, ei: u32) -> Option<i64> {
+    if !q.by_session {
+        return Some(q.max_gap);
+    }
+    match s.session_of(ei) {
+        Some(d) => Some(d),
+        None if q.gap_without_session => Some(q.max_gap),
+        None => None,
+    }
 }
 
 /// Every time-respecting path from `origin` to `dest`, shortest first,
@@ -106,16 +136,18 @@ fn dfs(s: &Store, q: &PathQuery, host: u32, not_before: i64, not_after: i64, vis
         if e.t > not_after {
             break;
         }
-        if !hop_ok(s, e, q) || visited.contains(&e.dst) {
+        if !hop_ok(s, ei, e, q) || visited.contains(&e.dst) {
             continue;
         }
         chain.push(ei);
         if e.dst == q.dest {
             out.push(Path { edges: chain.clone() });
-        } else {
+        } else if let Some(w) = window(s, q, ei) {
             visited.insert(e.dst);
             let next_after = (e.t + 1).max(not_before);
-            let window_end = (e.t + q.max_gap).min(not_after);
+            // the gap (or the session) runs from THIS hop; only the end of
+            // the time window is carried along
+            let window_end = e.t.saturating_add(w).min(q.to.unwrap_or(i64::MAX));
             dfs(s, q, e.dst, next_after, window_end, visited, chain, out, budget);
             visited.remove(&e.dst);
         }
@@ -191,10 +223,10 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         next: usize,
         /// no login after this can be a hop (the last arrival plus the gap)
         until: i64,
-        /// arrivals that can still be continued: (time, hops, login), in
-        /// time order and with more hops the later they are (one that is
-        /// later and no shorter than another is never the better choice)
-        arrivals: VecDeque<(i64, usize, u32)>,
+        /// arrivals that can still be continued: (time, hops, login, the
+        /// last moment it can be continued), in time order; one that is
+        /// later, no shorter and lasts no less than another replaces it
+        arrivals: VecDeque<(i64, usize, u32, i64)>,
         queued: bool,
     }
     let mut best: HashMap<u32, Reach> = HashMap::new();
@@ -223,11 +255,12 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
             if h == seed {
                 (ei, 0usize, None)
             } else {
-                while host.arrivals.front().map_or(false, |a| a.0 < te.saturating_sub(q.max_gap)) {
-                    host.arrivals.pop_front();
-                }
-                // the oldest arrival before this login is the one with the fewest hops
-                match host.arrivals.iter().find(|a| a.0 < te) {
+                host.arrivals.retain(|a| a.3 >= te);
+                // walking back by session, it is THIS login's session that
+                // must hold the hop already found out of the host
+                let back = if q.by_session && !forward { window(s, q, ei).unwrap_or(-1) } else { i64::MAX };
+                // of the arrivals this login can continue, the one with the fewest hops
+                match host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back).min_by_key(|a| a.1) {
                     Some(a) => (ei, a.1, Some(a.2)),
                     None => {
                         if let Some(n) = nth(h, host.next) {
@@ -242,7 +275,7 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         let e = &s.edges[ei as usize];
         let te = etau(ei);
         let v = if forward { e.dst } else { e.src };
-        if v != seed && v != h && hops < q.max_hops && hop_ok(s, e, q) {
+        if v != seed && v != h && hops < q.max_hops && hop_ok(s, ei, e, q) {
             if !best.contains_key(&v) {
                 best.insert(v, Reach { hop: hops + 1, t: e.t, via: Some(ei) });
                 if let Some(en) = enabling {
@@ -253,11 +286,12 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
             }
             let first_next = first_at(v, te.saturating_add(1));
             let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
-            while hv.arrivals.back().map_or(false, |a| a.1 >= hops + 1) {
+            let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
+            while hv.arrivals.back().map_or(false, |a| a.1 >= hops + 1 && a.3 <= expiry) {
                 hv.arrivals.pop_back();
             }
-            hv.arrivals.push_back((te, hops + 1, ei));
-            hv.until = hv.until.max(te.saturating_add(q.max_gap));
+            hv.arrivals.push_back((te, hops + 1, ei, expiry));
+            hv.until = hv.until.max(expiry);
             if !hv.queued {
                 hv.next = hv.next.max(first_next);
                 if let Some(n) = nth(v, hv.next) {
@@ -492,6 +526,78 @@ mod tests {
                 assert_eq!(only_paths, 0, "{}: hosts with a path that the cone misses", o);
             }
         }
+    }
+
+    /// The gap is between one hop and the next, not from the first hop to
+    /// every other; by session, a hop leaves while the session before it is
+    /// open; and the logins allowed are the only hops.
+    #[test]
+    fn the_gap_is_per_hop_and_sessions_chain() {
+        let path = std::env::temp_dir().join(format!("masstin-sess-{}.csv", std::process::id()));
+        let row = |hour: u32, src: &str, dst: &str, user: &str, et: &str, id: &str| format!("2026-01-05T{:02}:00:00Z,{},{},4624,3,{},CORP,,{},,,{},,Security.evtx,,,,,", hour, dst, et, user, src, id);
+        let body = [
+            crate::csv_out::HEADER.to_string(),
+            row(1, "10.0.0.1", "B", "ana", "SUCCESSFUL_LOGON", "0xb1"),
+            // five hours after each hop: inside a gap of six, hop by hop
+            row(6, "B", "C", "ana", "SUCCESSFUL_LOGON", "0xc1"),
+            row(11, "C", "D", "bob", "SUCCESSFUL_LOGON", "0xd1"),
+            // the session on B ends at 08:00 (a logoff has no origin), the one on C at 07:00
+            row(8, "", "B", "ana", "LOGOFF", "0xb1"),
+            row(7, "", "C", "ana", "LOGOFF", "0xc1"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        assert_eq!((s.logons, s.sessions_known), (3, 2));
+        let q = PathQuery { origin: h("10.0.0.1"), dest: h("D"), max_gap: 6 * 3600, ..Default::default() };
+        // 01:00 -> 06:00 -> 11:00: each within six hours of the one before
+        assert_eq!(find_paths(&s, &q).len(), 1);
+        assert_eq!(find_paths(&s, &PathQuery { max_gap: 4 * 3600, ..q.clone() }).len(), 0);
+        // by session: B is left at 06:00 inside its session (01:00 to 08:00)...
+        let sess = PathQuery { by_session: true, ..q.clone() };
+        assert_eq!(find_paths(&s, &PathQuery { dest: h("C"), ..sess.clone() }).len(), 1);
+        // ...but C is left at 11:00, four hours after its session ended
+        assert_eq!(find_paths(&s, &sess).len(), 0);
+        let reach = |q: &PathQuery, fwd: bool| -> Vec<String> {
+            let seed = if fwd { q.origin } else { q.dest };
+            let mut v: Vec<String> = cone(&s, seed, if fwd { 0 } else { i64::MAX }, q, fwd).0.keys().map(|k| s.hosts.name(*k).to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(reach(&sess, true), ["10.0.0.1", "B", "C"]);
+        assert_eq!(reach(&q, true), ["10.0.0.1", "B", "C", "D"]);
+        // back from C by session: B, and the address that entered B
+        assert_eq!(reach(&PathQuery { dest: h("C"), ..sess.clone() }, false), ["10.0.0.1", "B", "C"]);
+        // back from D by session: C alone (the hop out of C was after its session)
+        assert_eq!(reach(&sess, false), ["C", "D"]);
+        assert_eq!(reach(&q, false), ["10.0.0.1", "B", "C", "D"]);
+        // only ana's logins: D is bob's
+        let ana: Vec<bool> = s.edges.iter().map(|e| s.users.name(e.user).starts_with("ana")).collect();
+        let only = PathQuery { only: Some(std::rc::Rc::new(ana)), ..q.clone() };
+        assert_eq!(find_paths(&s, &only).len(), 0);
+        assert_eq!(find_paths(&s, &PathQuery { dest: h("C"), ..only.clone() }).len(), 1);
+        assert_eq!(reach(&only, true), ["10.0.0.1", "B", "C"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A logon with no logoff in the timeline: not followed by session,
+    /// unless the gap is asked for in its place.
+    #[test]
+    fn a_session_without_its_logoff_needs_the_gap() {
+        let path = std::env::temp_dir().join(format!("masstin-sess2-{}.csv", std::process::id()));
+        let row = |hour: u32, src: &str, dst: &str, id: &str| format!("2026-01-05T{:02}:00:00Z,{},SUCCESSFUL_LOGON,4624,3,ana,CORP,,{},,,{},,Security.evtx,,,,,", hour, dst, src, id);
+        let body = [crate::csv_out::HEADER.to_string(), row(1, "10.0.0.1", "B", "0xb1"), row(2, "B", "C", "0xc1")].join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        assert_eq!(s.sessions_known, 0);
+        let q = PathQuery { origin: h("10.0.0.1"), dest: h("C"), by_session: true, ..Default::default() };
+        assert_eq!(find_paths(&s, &q).len(), 0);
+        assert_eq!(find_paths(&s, &PathQuery { gap_without_session: true, ..q.clone() }).len(), 1);
+        assert_eq!(cone(&s, q.origin, 0, &q, true).0.len(), 2);
+        assert_eq!(cone(&s, q.origin, 0, &PathQuery { gap_without_session: true, ..q.clone() }, true).0.len(), 3);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
