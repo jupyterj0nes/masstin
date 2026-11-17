@@ -218,6 +218,9 @@ impl Store {
             id
         };
         let mut users = Interner::default();
+        // An account is one account however its name is cased: `Administrator`
+        // and `administrator` are the same one, shown as it was first written.
+        let mut user_of: HashMap<String, u32> = HashMap::new();
         let mut logon_types = Interner::default();
         let mut event_ids = Interner::default();
         let mut whys = Interner::default();
@@ -302,7 +305,17 @@ impl Store {
                     t,
                     src,
                     dst,
-                    user: users.id(b[5].trim()),
+                    user: {
+                        let raw = b[5].trim();
+                        match user_of.get(&raw.to_lowercase()) {
+                            Some(&u) => u,
+                            None => {
+                                let u = users.id(raw);
+                                user_of.insert(raw.to_lowercase(), u);
+                                u
+                            }
+                        }
+                    },
                     logon_type: logon_types.id(b[4].trim()),
                     event_id: event_ids.id(b[3].trim()),
                     why,

@@ -458,6 +458,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An account is one account however its name is cased.
+    #[test]
+    fn an_account_is_the_same_in_any_case() {
+        let path = std::env::temp_dir().join(format!("masstin-query-case-{}.csv", std::process::id()));
+        let lines = vec![
+            csv_out::HEADER.to_string(),
+            row(1, 9, "10.0.0.5", "SRV09", "Administrator", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(1, 10, "10.0.0.5", "SRV09", "administrator", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(1, 11, "10.0.0.5", "SRV09", "ADMINISTRATOR", "SUCCESSFUL_LOGON", ",,,,,"),
+            row(1, 12, "10.0.0.5", "SRV09", "alice", "SUCCESSFUL_LOGON", ",,,,,"),
+        ];
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        assert_eq!(s.users.len(), 2);
+        let g = GraphView::build(&s, &Filter { view: View::All, ..Filter::default() });
+        // one connection of the administrator with its three logins, shown as first written
+        assert_eq!(g.edges.len(), 2);
+        let admin = g.edges.iter().find(|e| e.count == 3).expect("the three logins in one connection");
+        assert_eq!(s.users.name(admin.user.unwrap()), "Administrator");
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn store() -> (Store, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("masstin-query-{}.csv", std::process::id()));
         let mut lines = vec![csv_out::HEADER.to_string()];

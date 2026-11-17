@@ -455,6 +455,25 @@ impl Viewer {
     /// The filters that differ from "everything", as chips; removing one
     /// applies at once.
     pub(super) fn filter_chips(&mut self, ui: &mut egui::Ui) -> bool {
+        // A selection, a path or a cone is on the canvas instead of what the
+        // filters select: said by one chip, which goes back to the view. The
+        // filters' own chips would say something the canvas is not showing.
+        if let Some(title) = self.overlay.as_ref().map(|o| o.title.clone()) {
+            let mut back = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                ui.label(egui::RichText::new(format!("{}", ic::CROSSHAIR)).color(theme::DIM).size(13.0));
+                if chip(ui, &title, theme::ACCENT) {
+                    back = true;
+                }
+                ui.label(egui::RichText::new("only this is drawn: the filters are not applied to it. The chip goes back to the view").color(theme::DIM).size(12.0));
+            });
+            if back {
+                self.overlay = None;
+                self.requery(false);
+            }
+            return true;
+        }
         let f = self.filter.clone();
         let mut chips: Vec<(String, Color32, Box<dyn Fn(&mut Filter)>)> = Vec::new();
         let host_c = theme::ACCENT;

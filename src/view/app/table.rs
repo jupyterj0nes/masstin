@@ -777,9 +777,7 @@ impl Viewer {
                     } else if i % 2 == 1 {
                         ui.painter().rect_filled(rect, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(255, 255, 255, 4));
                     }
-                    if resp.double_clicked() {
-                        act = Some(RowAct::Graph(key));
-                    } else if resp.clicked() {
+                    if resp.clicked() {
                         let mods = ui.input(|i| i.modifiers);
                         act = Some(if mods.command { RowAct::Toggle(key) } else if mods.shift { RowAct::Range(key) } else { RowAct::Select(key) });
                     } else if resp.secondary_clicked() && !self.table_multi.contains(&key) {
@@ -816,7 +814,7 @@ impl Viewer {
                             }
                             ui.separator();
                         }
-                        if icon_button(ui, ic::GRAPH, "Show its connection in the graph").on_hover_text("Graph mode, with the connection of this row selected (a double click does the same)").clicked() {
+                        if icon_button(ui, ic::GRAPH, "Show its connection in the graph").on_hover_text("Graph mode, with the connection of this row selected").clicked() {
                             ui.close();
                             act = Some(RowAct::Graph(key));
                         }
