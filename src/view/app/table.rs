@@ -84,6 +84,31 @@ impl TableLook {
         }
     }
 
+    /// The size of text the widths are measured at.
+    pub const BASE_FONT: f32 = 12.0;
+
+    /// How much the columns follow the text: smaller text, narrower
+    /// columns, so more of the row is in sight (which is what smaller
+    /// text is asked for).
+    pub fn scale(&self) -> f32 {
+        self.font / Self::BASE_FONT
+    }
+
+    /// The width a column is drawn with, at this size of text.
+    pub fn width(&self, col: usize) -> f32 {
+        (self.widths[col] * self.scale()).round().max(16.0)
+    }
+
+    /// The margin with the row's line, at this size of text.
+    pub fn gutter(&self) -> f32 {
+        (GUTTER * self.scale()).round().max(30.0)
+    }
+
+    /// A column dragged to this width on screen.
+    pub fn set_drawn_width(&mut self, col: usize, drawn: f32) {
+        self.set_width(col, drawn / self.scale());
+    }
+
     /// The height of a row at this size of text.
     pub fn row_height(&self) -> f32 {
         (self.font + 8.0).round()
@@ -99,7 +124,7 @@ impl TableLook {
     pub fn column_at(&self, x: f32) -> Option<usize> {
         let mut left = 0.0;
         for c in self.shown() {
-            let right = left + self.widths[c] + COL_GAP;
+            let right = left + self.width(c) + COL_GAP;
             if x >= left && x < right {
                 return Some(c);
             }
@@ -860,7 +885,8 @@ impl Viewer {
         let row_h = look.row_height();
         let cols = raw_columns();
         let shown = look.shown();
-        let width: f32 = GUTTER + COL_GAP + shown.iter().map(|c| look.widths[*c] + COL_GAP).sum::<f32>();
+        let gutter = look.gutter();
+        let width: f32 = gutter + COL_GAP + shown.iter().map(|c| look.width(*c) + COL_GAP).sum::<f32>();
         let mut resize: Option<(usize, f32)> = None;
         let mut hide: Option<usize> = None;
         let rows: Vec<(u16, u32)> = self.table_raw_rows().to_vec();
@@ -874,13 +900,13 @@ impl Viewer {
             ui.set_min_width(width);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new("line").size(look.font - 1.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
+                ui.add_sized([gutter, row_h], egui::Label::new(egui::RichText::new("line").size(look.font - 1.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
                 ui.add_space(COL_GAP);
                 // A column's name: a right click (or a click) opens what can be
                 // done with the column: filter by a text it contains or does
                 // not, hide it. The gap after it drags its width.
                 for &ci in &shown {
-                    let (name, w) = (cols[ci], look.widths[ci]);
+                    let (name, w) = (cols[ci], look.width(ci));
                     let on = self.table_filters.iter().any(|f| f.col == Some(ci));
                     let head = egui::Button::new(egui::RichText::new(name).size(look.font - 1.5).monospace().color(if on { theme::ACCENT } else { theme::MUTED })).frame(false).truncate().min_size(Vec2::new(w, row_h));
                     let resp = ui.add_sized([w, row_h], head).on_hover_text(format!("{}: right click (or click) to filter by a text it contains or does not, or to hide the column. Drag its right edge for its width", name));
@@ -943,9 +969,9 @@ impl Viewer {
                     let r = ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = COL_GAP;
                         let num = if several { format!("{}:{}", key.0 + 1, key.1 + 2) } else { (key.1 + 2).to_string() };
-                        ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new(num).size(look.font - 1.0).monospace().color(theme::DIM)).selectable(false));
+                        ui.add_sized([gutter, row_h], egui::Label::new(egui::RichText::new(num).size(look.font - 1.0).monospace().color(theme::DIM)).selectable(false));
                         for &k in &shown {
-                            let w = &look.widths[k];
+                            let w = &look.width(k);
                             let text = fields.get(k).map(|s| s.as_str()).unwrap_or("");
                             let color = match k {
                                 0 | 3 | 4 | 11 => theme::MUTED,
@@ -980,7 +1006,7 @@ impl Viewer {
                     }
                     if resp.secondary_clicked() {
                         // the cell under the click: its column by where the pointer is
-                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + GUTTER + COL_GAP))).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
+                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + gutter + COL_GAP))).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
                     }
                     resp.context_menu(|ui| {
                         ui.set_min_width(250.0);
@@ -1030,7 +1056,12 @@ impl Viewer {
             });
         });
         if let Some((ci, w)) = resize {
-            self.table_look.set_width(ci, w);
+            // (a width dragged is the width on screen; "as it came" is the stored one)
+            if w == RAW_WIDTHS[ci] {
+                self.table_look.set_width(ci, w);
+            } else {
+                self.table_look.set_drawn_width(ci, w);
+            }
             self.table_look_dirty = true;
         }
         if let Some(ci) = hide {
@@ -1060,6 +1091,12 @@ mod tests {
         assert_eq!(l.font, TableLook::FONT.1);
         l.set_font(1.0);
         assert_eq!(l.font, TableLook::FONT.0);
+        // the columns follow the text: at 8 pt they take two thirds of their room
+        assert_eq!((l.width(0), l.gutter()), (140.0, 41.0));
+        l.set_drawn_width(0, 100.0);
+        assert_eq!((l.widths[0], l.width(0)), (150.0, 100.0));
+        l.set_font(12.0);
+        assert_eq!(l.width(0), 150.0);
         l.set_width(0, 5.0);
         assert_eq!(l.widths[0], TableLook::WIDTH.0);
         l.set_width(0, 300.0);

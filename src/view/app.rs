@@ -1891,10 +1891,13 @@ impl Viewer {
         // not think of a right click.
         {
             let n = self.graph.edges[i].rows.len();
+            // the rows ticked below, when some are: then it is about them alone
+            let ticked: Vec<(u16, u32)> = self.rows.as_ref().map(|(_, r, _)| r.iter().enumerate().filter(|(k, _)| self.row_pick.get(*k).copied().unwrap_or(false)).map(|(_, r)| (r.file, r.line)).collect()).unwrap_or_default();
             // 0 the timeline here, 1 agentc00pr, 2 the system's CSV program, 3.. a program of the list
             let mut go: Option<usize> = None;
             let apps = self.viewer_list();
-            ui.label(egui::RichText::new(format!("SEE ITS {} ROW{} IN", n, if n == 1 { "" } else { "S" })).small().color(MUTED));
+            let title = if ticked.is_empty() { format!("SEE ITS {} ROW{} IN", n, if n == 1 { "" } else { "S" }) } else { format!("SEE THE {} TICKED ROW{} IN", ticked.len(), if ticked.len() == 1 { "" } else { "S" }) };
+            ui.label(egui::RichText::new(title).small().color(if ticked.is_empty() { MUTED } else { ACCENT })).on_hover_text("Every row of the connection, or only the ones ticked in the list below when some are");
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                 if ui.add(egui::Button::new(theme::semibold(format!("{}  Timeline", super::icons::TABLE), 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).on_hover_text("Timeline mode, on the rows of the CSV this connection is drawn from: every column, as the file has them").clicked() {
@@ -1922,8 +1925,13 @@ impl Viewer {
             });
             ui.add_space(8.0);
             if let Some(g) = go {
-                let (label, rows) = (self.graph_edge_label(i), self.rows_of_graph_edge(i));
+                let (label, rows) = if ticked.is_empty() {
+                    (self.graph_edge_label(i), self.rows_of_graph_edge(i))
+                } else {
+                    (format!("{} row{} ticked of {}", ticked.len(), if ticked.len() == 1 { "" } else { "s" }, self.graph_edge_label(i)), ticked.clone())
+                };
                 match g {
+                    0 if !ticked.is_empty() => self.show_rows_in_timeline(label, rows),
                     0 => self.timeline_of_edge(i),
                     1 => self.rows_to_agentc00pr(&rows, &label),
                     2 => self.rows_in_program(&rows, &label, None),
