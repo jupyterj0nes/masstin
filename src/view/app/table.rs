@@ -31,13 +31,18 @@ pub(super) fn column_named(name: &str) -> Option<usize> {
 #[serde(default)]
 pub(super) struct TableLook {
     pub font: f32,
+    /// the width of a column the analyst set by hand (see `fixed`), at
+    /// `BASE_FONT`
     pub widths: [f32; 19],
     pub hidden: [bool; 19],
+    /// columns whose width the analyst dragged: the others take the width
+    /// of what they hold
+    pub fixed: [bool; 19],
 }
 
 impl Default for TableLook {
     fn default() -> Self {
-        TableLook { font: 12.0, widths: RAW_WIDTHS, hidden: [false; 19] }
+        TableLook { font: 12.0, widths: RAW_WIDTHS, hidden: [false; 19], fixed: [false; 19] }
     }
 }
 
@@ -111,7 +116,7 @@ impl TableLook {
 
     /// The height of a row at this size of text.
     pub fn row_height(&self) -> f32 {
-        (self.font + 8.0).round()
+        (self.font * 1.5).round()
     }
 
     /// The columns shown, in the file's order.
@@ -119,12 +124,31 @@ impl TableLook {
         (0..19).filter(|c| !self.hidden[*c]).collect()
     }
 
+    /// The room between two columns, at this size of text: what tells one
+    /// value from the next, and no more. In the header it is the handle
+    /// that drags the width of the column before it.
+    pub fn gap(&self) -> f32 {
+        (12.0 * self.scale()).round().max(6.0)
+    }
+
+    /// The width a column is drawn with: the one the analyst dragged, or
+    /// the one that fits what it holds.
+    pub fn drawn(&self, fitted: &[f32; 19]) -> [f32; 19] {
+        let mut out = *fitted;
+        for c in 0..19 {
+            if self.fixed[c] {
+                out[c] = self.width(c);
+            }
+        }
+        out
+    }
+
     /// The column at a horizontal position, `x` measured from where the
     /// first column starts (each column is its width and the gap after it).
-    pub fn column_at(&self, x: f32) -> Option<usize> {
+    pub fn column_at(&self, x: f32, drawn: &[f32; 19]) -> Option<usize> {
         let mut left = 0.0;
         for c in self.shown() {
-            let right = left + self.width(c) + COL_GAP;
+            let right = left + drawn[c] + self.gap();
             if x >= left && x < right {
                 return Some(c);
             }
@@ -134,9 +158,20 @@ impl TableLook {
     }
 }
 
-/// The gap between two columns: in the header it is the handle that
-/// drags the width of the column before it.
-const COL_GAP: f32 = 8.0;
+/// The value a column is made to fit: of these, the one that 19 of 20 are
+/// no longer than (by characters). Empty when there is none.
+pub(super) fn fit_value(values: &mut Vec<String>) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values.sort_by_key(|v| v.chars().count());
+    let last = values.len() - 1;
+    let at = ((last as f32 * 0.95).ceil() as usize).min(last);
+    std::mem::take(&mut values[at])
+}
+
+/// How many of the rows shown are read to fit the columns to them.
+const FIT_SAMPLE: usize = 240;
 
 /// One filter of the timeline: the rows whose column (or any column) holds
 /// the text, or the ones that do not. Any case; an empty text is "the
@@ -365,6 +400,46 @@ impl Viewer {
             self.table_raw_key = key;
         }
         &self.table_raw_rows
+    }
+
+    /// The width each column needs for what it holds among the rows shown,
+    /// at the size of text in use: its longest value, and of its name as
+    /// much as a short name takes (a long name over short values is cut,
+    /// and read whole on hover). Read off a sample of the rows, once per
+    /// set of rows and size of text.
+    fn fitted_widths(&mut self, ui: &egui::Ui, rows: &[(u16, u32)]) -> [f32; 19] {
+        let font = self.table_look.font;
+        let key = (self.table_raw_key.clone(), font.to_bits());
+        if let Some((k, w)) = &self.table_fit {
+            if *k == key {
+                return *w;
+            }
+        }
+        // The value each column is made to fit, by its characters: the one
+        // 19 of 20 are no longer than. Made to fit its longest value, a
+        // column is as wide as the one row in a thousand that has a path
+        // in it, and empty in all the others; that value is cut, and the
+        // column dragged when it is the one wanted.
+        let mut values: Vec<Vec<String>> = vec![Vec::new(); 19];
+        let step = (rows.len() / FIT_SAMPLE).max(1);
+        for r in rows.iter().step_by(step).take(FIT_SAMPLE) {
+            let Ok(fields) = self.store.raw_row(r.0, r.1) else { continue };
+            for (c, v) in fields.into_iter().enumerate().take(19) {
+                values[c].push(v);
+            }
+        }
+        let longest: Vec<String> = values.into_iter().map(|mut v| fit_value(&mut v)).collect();
+        let cols = raw_columns();
+        let (name_room, most) = (font * 7.0, font * 30.0);
+        let mut out = [0.0f32; 19];
+        for c in 0..19 {
+            let value = if longest[c].is_empty() { 0.0 } else { ui.painter().layout_no_wrap(longest[c].clone(), FontId::proportional(font), TEXT).size().x };
+            let name = ui.painter().layout_no_wrap(cols[c].to_string(), FontId::monospace(font - 1.5), TEXT).size().x;
+            // a little over the measure: the sample is not every row
+            out[c] = (value * 1.04 + 2.0).min(most).max(name.min(name_room)).ceil();
+        }
+        self.table_fit = Some((key, out));
+        out
     }
 
     /// One more filter on the timeline (the same one twice is once).
@@ -692,8 +767,8 @@ impl Viewer {
                             self.table_look.hidden = [false; 19];
                             self.table_look_dirty = true;
                         }
-                        if ui.button("Widths as they came").clicked() {
-                            self.table_look.widths = RAW_WIDTHS;
+                        if ui.button("Fit every column to what it holds").on_hover_text("Each column as wide as its values among the rows shown, and no wider: what a column is by itself. A column you dragged keeps your width until this").clicked() {
+                            self.table_look.fixed = [false; 19];
                             self.table_look_dirty = true;
                         }
                     });
@@ -885,11 +960,22 @@ impl Viewer {
         let row_h = look.row_height();
         let cols = raw_columns();
         let shown = look.shown();
-        let gutter = look.gutter();
-        let width: f32 = gutter + COL_GAP + shown.iter().map(|c| look.width(*c) + COL_GAP).sum::<f32>();
+        let gap = look.gap();
         let mut resize: Option<(usize, f32)> = None;
+        let mut refit: Option<usize> = None;
         let mut hide: Option<usize> = None;
         let rows: Vec<(u16, u32)> = self.table_raw_rows().to_vec();
+        // every column as wide as what it holds among the rows shown (or as
+        // the analyst dragged it), and the margin as wide as its longest line
+        let fitted = self.fitted_widths(ui, &rows);
+        let drawn = look.drawn(&fitted);
+        let several_files = self.store.files.len() > 1;
+        let longest = rows.iter().map(|r| r.1).max().unwrap_or(0) as usize + 2;
+        let gutter = {
+            let text = if several_files { format!("{}:{}", self.store.files.len(), longest) } else { longest.to_string() };
+            (ui.painter().layout_no_wrap(text, FontId::monospace(look.font - 1.0), TEXT).size().x + 4.0).ceil().max(look.font * 2.0)
+        };
+        let width: f32 = gutter + gap + shown.iter().map(|c| drawn[*c] + gap).sum::<f32>();
         if self.table_raw_cache.len() > 4000 {
             self.table_raw_cache.clear();
         }
@@ -900,16 +986,20 @@ impl Viewer {
             ui.set_min_width(width);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add_sized([gutter, row_h], egui::Label::new(egui::RichText::new("line").size(look.font - 1.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
-                ui.add_space(COL_GAP);
+                ui.add_sized([gutter, row_h], egui::Label::new(egui::RichText::new("line").size(look.font - 1.5).color(theme::DIM)).truncate()).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
+                ui.add_space(gap);
                 // A column's name: a right click (or a click) opens what can be
                 // done with the column: filter by a text it contains or does
                 // not, hide it. The gap after it drags its width.
                 for &ci in &shown {
-                    let (name, w) = (cols[ci], look.width(ci));
+                    let (name, w) = (cols[ci], drawn[ci]);
                     let on = self.table_filters.iter().any(|f| f.col == Some(ci));
-                    let head = egui::Button::new(egui::RichText::new(name).size(look.font - 1.5).monospace().color(if on { theme::ACCENT } else { theme::MUTED })).frame(false).truncate().min_size(Vec2::new(w, row_h));
-                    let resp = ui.add_sized([w, row_h], head).on_hover_text(format!("{}: right click (or click) to filter by a text it contains or does not, or to hide the column. Drag its right edge for its width", name));
+                    // the name starts where the values start, and is cut where they end
+                    let (cell, resp) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::click());
+                    let color = if on { theme::ACCENT } else if resp.hovered() { TEXT } else { theme::MUTED };
+                    let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    inner.add(egui::Label::new(egui::RichText::new(name).size(look.font - 1.5).monospace().color(color)).truncate().selectable(false));
+                    let resp = resp.on_hover_text(format!("{}: right click (or click) to filter by a text it contains or does not, or to hide the column. Drag its right edge for its width", name));
                     let mut menu = |ui: &mut egui::Ui| {
                         ui.set_min_width(260.0);
                         if self.table_filter_draft.0 != ci {
@@ -936,8 +1026,8 @@ impl Viewer {
                             hide = Some(ci);
                             ui.close();
                         }
-                        if icon_button(ui, ic::CORNERS_OUT, "Its width as it came").clicked() {
-                            resize = Some((ci, RAW_WIDTHS[ci]));
+                        if icon_button(ui, ic::CORNERS_OUT, "Fit it to what it holds").on_hover_text("As wide as its values among the rows shown, and no wider (what it is unless you drag it)").clicked() {
+                            refit = Some(ci);
                             ui.close();
                         }
                     };
@@ -945,7 +1035,7 @@ impl Viewer {
                     let open = (resp.clicked() || resp.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
                     egui::Popup::menu(&resp).open_memory(open).show(&mut menu);
                     // the handle of its width
-                    let (grip, grip_resp) = ui.allocate_exact_size(Vec2::new(COL_GAP, row_h), Sense::drag());
+                    let (grip, grip_resp) = ui.allocate_exact_size(Vec2::new(gap, row_h), Sense::drag());
                     let hot = grip_resp.hovered() || grip_resp.dragged();
                     if hot {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -957,8 +1047,13 @@ impl Viewer {
                 }
             });
             theme::hairline(ui);
+            // (set here too: the rows that fit are counted with this spacing, and with
+            // the default one fewer rows were drawn than the window has room for)
+            ui.spacing_mut().item_spacing.y = 0.0;
             egui::ScrollArea::vertical().id_salt("table-raw-rows").auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // a row is as tall as its text asks, not as a button is
+                ui.spacing_mut().interact_size.y = row_h;
                 for i in range {
                     let key = rows[i];
                     if !self.table_raw_cache.contains_key(&key) {
@@ -967,11 +1062,11 @@ impl Viewer {
                     }
                     let fields = &self.table_raw_cache[&key];
                     let r = ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = COL_GAP;
+                        ui.spacing_mut().item_spacing.x = gap;
                         let num = if several { format!("{}:{}", key.0 + 1, key.1 + 2) } else { (key.1 + 2).to_string() };
                         ui.add_sized([gutter, row_h], egui::Label::new(egui::RichText::new(num).size(look.font - 1.0).monospace().color(theme::DIM)).selectable(false));
                         for &k in &shown {
-                            let w = &look.width(k);
+                            let w = drawn[k];
                             let text = fields.get(k).map(|s| s.as_str()).unwrap_or("");
                             let color = match k {
                                 0 | 3 | 4 | 11 => theme::MUTED,
@@ -984,7 +1079,13 @@ impl Viewer {
                                 2 if text == "FAILED_LOGON" => EDGE_FAIL,
                                 _ => TEXT,
                             };
-                            ui.add_sized([*w, row_h], egui::Label::new(egui::RichText::new(text).size(look.font).color(color)).truncate().selectable(false));
+                            // a value starts at the left of its column: centred, every
+                            // short value left its room empty on both sides
+                            let (cell, _) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::hover());
+                            if !text.is_empty() && ui.is_rect_visible(cell) {
+                                let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                inner.add(egui::Label::new(egui::RichText::new(text).size(look.font).color(color)).truncate().selectable(false));
+                            }
                         }
                     });
                     let rect = r.response.rect.expand2(Vec2::new(4.0, 0.0));
@@ -1006,7 +1107,7 @@ impl Viewer {
                     }
                     if resp.secondary_clicked() {
                         // the cell under the click: its column by where the pointer is
-                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + gutter + COL_GAP))).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
+                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + gutter + gap), &drawn)).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
                     }
                     resp.context_menu(|ui| {
                         ui.set_min_width(250.0);
@@ -1056,12 +1157,13 @@ impl Viewer {
             });
         });
         if let Some((ci, w)) = resize {
-            // (a width dragged is the width on screen; "as it came" is the stored one)
-            if w == RAW_WIDTHS[ci] {
-                self.table_look.set_width(ci, w);
-            } else {
-                self.table_look.set_drawn_width(ci, w);
-            }
+            // a column dragged keeps the width it was given
+            self.table_look.set_drawn_width(ci, w);
+            self.table_look.fixed[ci] = true;
+            self.table_look_dirty = true;
+        }
+        if let Some(ci) = refit {
+            self.table_look.fixed[ci] = false;
             self.table_look_dirty = true;
         }
         if let Some(ci) = hide {
@@ -1084,7 +1186,13 @@ mod tests {
     #[test]
     fn the_look_of_the_timeline_stays_usable() {
         let mut l = TableLook::default();
-        assert_eq!((l.font, l.shown().len(), l.row_height()), (12.0, 19, 20.0));
+        assert_eq!((l.font, l.shown().len(), l.row_height()), (12.0, 19, 18.0));
+        // a column is made to fit what 19 of 20 of its values are no longer than
+        let mut v: Vec<String> = (0..20).map(|k| "x".repeat(k + 1)).collect();
+        v.push("y".repeat(500));
+        assert_eq!(fit_value(&mut v).len(), 20);
+        assert_eq!(fit_value(&mut vec!["only".to_string()]), "only");
+        assert_eq!(fit_value(&mut Vec::new()), "");
         l.set_font(14.3);
         assert_eq!(l.font, 14.5);
         l.set_font(100.0);
@@ -1102,17 +1210,27 @@ mod tests {
         l.set_width(0, 300.0);
         l.set_width(99, 300.0);
         assert_eq!(l.widths[0], 300.0);
+        // a column takes the width of what it holds, unless the analyst dragged it
+        let fitted = [50.0f32; 19];
+        assert_eq!(l.drawn(&fitted)[0], 50.0);
+        l.fixed[0] = true;
+        let drawn = l.drawn(&fitted);
+        assert_eq!((drawn[0], drawn[1], l.gap()), (300.0, 50.0, 12.0));
         // a click by where it falls: column 0 is 300 wide and the gap after it
-        assert_eq!(l.column_at(0.0), Some(0));
-        assert_eq!(l.column_at(307.0), Some(0));
-        assert_eq!(l.column_at(308.0), Some(1));
-        assert_eq!(l.column_at(-1.0), None);
+        assert_eq!(l.column_at(0.0, &drawn), Some(0));
+        assert_eq!(l.column_at(311.0, &drawn), Some(0));
+        assert_eq!(l.column_at(312.0, &drawn), Some(1));
+        assert_eq!(l.column_at(-1.0, &drawn), None);
         // hidden columns take no room
         l.hidden[0] = true;
         l.hidden[1] = true;
         assert_eq!(l.shown()[0], 2);
-        assert_eq!(l.column_at(0.0), Some(2));
-        assert_eq!(l.column_at(1.0e6), None);
+        assert_eq!(l.column_at(0.0, &drawn), Some(2));
+        assert_eq!(l.column_at(1.0e6, &drawn), None);
+        // the gap follows the text, and stays a gap
+        l.set_font(8.0);
+        assert_eq!(l.gap(), 8.0);
+        l.set_font(12.0);
         // by its name in the file
         assert_eq!((column_named("TARGET_USER_NAME"), column_named(" hunt_score "), column_named("line")), (Some(5), Some(15), None));
         // what was kept reads back; what does not read is the defaults

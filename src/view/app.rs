@@ -373,6 +373,9 @@ pub struct Viewer {
     /// the ones hidden, as the analyst left them (kept between sessions)
     table_look: table::TableLook,
     table_look_dirty: bool,
+    /// the width each column needs for what the rows shown hold, at the
+    /// size of text it was measured with: ((rows shown, text size), widths)
+    table_fit: Option<(((String, usize, usize, u64), u32), [f32; 19])>,
     /// the rows of a connection or a host, when the timeline is narrowed
     /// to them (and a counter that changes with it, for the cache)
     table_scope: Option<table::TableScope>,
@@ -880,6 +883,7 @@ impl Viewer {
             table_ctx_cell: None,
             table_look: table::TableLook::load(),
             table_look_dirty: false,
+            table_fit: None,
             table_scope: None,
             table_scope_gen: 0,
             table_sel: None,
@@ -4768,6 +4772,7 @@ impl Viewer {
                 if let Some((c, w)) = other["timeline-width=".len()..].split_once(':') {
                     if let (Some(ci), Ok(w)) = (table::column_named(c), w.parse::<f32>()) {
                         self.table_look.set_width(ci, w);
+                        self.table_look.fixed[ci] = true;
                     }
                 }
             }
