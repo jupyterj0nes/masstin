@@ -362,6 +362,13 @@ pub struct Viewer {
     /// the file's own 19 columns, instead of the graph
     show_table: bool,
     table_find: String,
+    /// Timeline mode: the filters that add up, each "this column (or any)
+    /// contains this" or "does not"
+    table_filters: Vec<table::RowFilter>,
+    /// what is being typed in a column's filter box: (column, text)
+    table_filter_draft: (usize, String),
+    /// the cell a right click fell on: (column, its text)
+    table_ctx_cell: Option<(usize, String)>,
     /// the rows of a connection or a host, when the timeline is narrowed
     /// to them (and a counter that changes with it, for the cache)
     table_scope: Option<table::TableScope>,
@@ -864,6 +871,9 @@ impl Viewer {
             hunt_ask: None,
             hunt_answered: false,
             table_find: String::new(),
+            table_filters: Vec::new(),
+            table_filter_draft: (usize::MAX, String::new()),
+            table_ctx_cell: None,
             table_scope: None,
             table_scope_gen: 0,
             table_sel: None,
@@ -4633,6 +4643,14 @@ impl Viewer {
                 self.hunt_form.merge_hosts = crate::graph_hunt_common::hostmap::Level::parse(&other["hunt-hosts=".len()..]);
             }
             "agent" => self.open_agentc00pr(),
+            // the events of the N-th connection drawn, in agentc00pr's viewer
+            other if other.starts_with("agent-edge=") => {
+                let k: usize = other["agent-edge=".len()..].parse().unwrap_or(0);
+                if k < self.graph.edges.len() {
+                    let (label, rows) = (self.graph_edge_label(k), self.rows_of_graph_edge(k));
+                    self.rows_to_agentc00pr(&rows, &label);
+                }
+            }
             other if other.starts_with("agent-new=") => {
                 if let (Some(d), Some((name, parent))) = (self.agent.as_mut(), other["agent-new=".len()..].split_once('|')) {
                     d.new_case = true;
@@ -4673,6 +4691,15 @@ impl Viewer {
                 self.timeline_of_node(i);
             }
             other if other.starts_with("timeline-find=") => self.table_find = other["timeline-find=".len()..].to_string(),
+            // a filter of the timeline, added to the ones there: `+user:alice`,
+            // `-event_type:logoff`, `+10.0.0.5` (any column); `timeline-filter=` clears them
+            other if other.starts_with("timeline-filter=") => match table::RowFilter::parse(&other["timeline-filter=".len()..]) {
+                Some(f) => self.add_table_filter(f),
+                None => {
+                    self.table_filters.clear();
+                    self.table_scope_gen += 1;
+                }
+            },
             // the n-th row of the file: picked, and to its connection in the graph
             other if other.starts_with("timeline-row=") => {
                 let i: u32 = other["timeline-row=".len()..].parse().unwrap_or(0);

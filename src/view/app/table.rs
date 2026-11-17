@@ -19,6 +19,82 @@ fn raw_columns() -> Vec<&'static str> {
     crate::csv_out::HEADER.split(',').collect()
 }
 
+/// One filter of the timeline: the rows whose column (or any column) holds
+/// the text, or the ones that do not. Any case; an empty text is "the
+/// column is empty". Filters add up: a row is shown when it passes all.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RowFilter {
+    /// the column, in the file's order; None: any column
+    pub col: Option<usize>,
+    /// lower case
+    pub text: String,
+    /// true: the rows that do NOT hold it
+    pub negate: bool,
+}
+
+impl RowFilter {
+    pub fn new(col: Option<usize>, text: &str, negate: bool) -> RowFilter {
+        RowFilter { col, text: text.trim().to_lowercase(), negate }
+    }
+
+    /// `+user:alice`, `-event_type:logoff`, `+10.0.0.5`: the sign (none is
+    /// `+`), a column by its name in the file or any column, the text.
+    pub fn parse(s: &str) -> Option<RowFilter> {
+        let s = s.trim();
+        let (negate, rest) = match s.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        let cols = raw_columns();
+        match rest.split_once(':').and_then(|(c, t)| cols.iter().position(|n| n.eq_ignore_ascii_case(c.trim())).map(|i| (i, t))) {
+            Some((i, t)) => Some(RowFilter::new(Some(i), t, negate)),
+            None => Some(RowFilter::new(None, rest, negate)),
+        }
+    }
+
+    /// The filter in words, for its chip.
+    pub fn label(&self) -> String {
+        let cols = raw_columns();
+        let what = match (self.col.and_then(|c| cols.get(c)), self.text.is_empty()) {
+            (Some(c), true) => format!("{} is empty", c),
+            (Some(c), false) => format!("{}: {}", c, self.text),
+            (None, _) => self.text.clone(),
+        };
+        format!("{} {}", if self.negate { "−" } else { "+" }, what)
+    }
+
+    /// Whether a row passes: `lower` is its text in lower case, `fields`
+    /// its columns (lower case too).
+    fn passes(&self, lower: &str, fields: &[std::borrow::Cow<str>]) -> bool {
+        let hit = match self.col {
+            Some(c) => {
+                let v = fields.get(c).map(|v| v.trim()).unwrap_or("");
+                if self.text.is_empty() { v.is_empty() } else { v.contains(&self.text) }
+            }
+            None => lower.contains(&self.text),
+        };
+        hit != self.negate
+    }
+}
+
+/// Whether a row (its text as the file has it) holds the find box and
+/// passes every filter.
+pub(super) fn row_passes(text: &str, find: &str, filters: &[RowFilter]) -> bool {
+    let lower = text.to_lowercase();
+    if !find.is_empty() && !lower.contains(find) {
+        return false;
+    }
+    if filters.is_empty() {
+        return true;
+    }
+    let mut fields: Vec<std::borrow::Cow<str>> = Vec::with_capacity(20);
+    crate::graph_hunt_common::engine::split_csv_into(&lower, &mut fields);
+    filters.iter().all(|f| f.passes(&lower, &fields))
+}
+
 /// The rows the table is narrowed to: those of a connection or of a host.
 pub(super) struct TableScope {
     pub label: String,
@@ -33,6 +109,8 @@ enum RowAct {
     Range((u16, u32)),
     /// exactly the rows picked (or this one), in the graph
     Exact((u16, u32)),
+    /// the rows picked (or this one), in agentc00pr's viewer
+    Agent((u16, u32)),
     Graph((u16, u32)),
     Copy((u16, u32)),
     Connection((u16, u32)),
@@ -109,8 +187,10 @@ impl Viewer {
         let key = (self.table_find.trim().to_lowercase(), self.store.files.len(), self.store.rows_total, self.table_scope_gen);
         if self.table_raw_key != key {
             let mut out = Vec::new();
+            let filters = self.table_filters.clone();
+            let plain = key.0.is_empty() && filters.is_empty();
             match &self.table_scope {
-                Some(sc) if key.0.is_empty() => out = sc.rows.clone(),
+                Some(sc) if plain => out = sc.rows.clone(),
                 Some(sc) => {
                     let mut k = 0usize;
                     while k < sc.rows.len() {
@@ -121,7 +201,7 @@ impl Viewer {
                         }
                         let lines: Vec<u32> = sc.rows[k..j].iter().map(|r| r.1).collect();
                         match self.store.raw_texts(f, &lines) {
-                            Ok(texts) => out.extend(lines.iter().zip(texts).filter(|(_, t)| t.to_lowercase().contains(&key.0)).map(|(l, _)| (f, *l))),
+                            Ok(texts) => out.extend(lines.iter().zip(texts).filter(|(_, t)| row_passes(t, &key.0, &filters)).map(|(l, _)| (f, *l))),
                             Err(e) => self.status = format!("Cannot read {}: {}", self.store.files[f as usize].path, e),
                         }
                         k = j;
@@ -129,10 +209,10 @@ impl Viewer {
                 }
                 None => {
                     for f in 0..self.store.files.len() as u16 {
-                        if key.0.is_empty() {
+                        if plain {
                             out.extend((0..self.store.file_rows(f) as u32).map(|l| (f, l)));
                         } else {
-                            match self.store.file_rows_matching(f, &key.0) {
+                            match self.store.file_rows_where(f, &|t| row_passes(t, &key.0, &filters)) {
                                 Ok(v) => out.extend(v.into_iter().map(|l| (f, l))),
                                 Err(e) => self.status = format!("Cannot read {}: {}", self.store.files[f as usize].path, e),
                             }
@@ -145,6 +225,16 @@ impl Viewer {
             self.table_raw_key = key;
         }
         &self.table_raw_rows
+    }
+
+    /// One more filter on the timeline (the same one twice is once).
+    pub(super) fn add_table_filter(&mut self, f: RowFilter) {
+        if !self.table_filters.contains(&f) {
+            self.table_filters.push(f);
+            self.table_scope_gen += 1;
+            self.table_sel = None;
+            self.table_multi.clear();
+        }
     }
 
     /// Timeline mode on these rows only.
@@ -160,11 +250,11 @@ impl Viewer {
         self.show_table = true;
     }
 
-    fn rows_of_graph_edge(&self, k: usize) -> Vec<(u16, u32)> {
+    pub(super) fn rows_of_graph_edge(&self, k: usize) -> Vec<(u16, u32)> {
         self.graph.edges[k].rows.iter().map(|&ei| (self.store.edges[ei as usize].file, self.store.edges[ei as usize].line)).collect()
     }
 
-    fn graph_edge_label(&self, k: usize) -> String {
+    pub(super) fn graph_edge_label(&self, k: usize) -> String {
         let e = &self.graph.edges[k];
         let who = match e.user {
             Some(u) => format!(" as {}", self.store.users.name(u)),
@@ -345,7 +435,7 @@ impl Viewer {
     /// Open what the timeline shows in a program: the rows on screen as a
     /// copy when the table is narrowed, else (or when asked) the file.
     pub(super) fn open_rows_in(&mut self, viewer: Option<usize>, whole: bool) {
-        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty();
+        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty() || !self.table_filters.is_empty();
         let (path, line) = if whole || !narrowed {
             let f = self.table_sel.map(|s| s.0).unwrap_or(0);
             let Some(info) = self.store.files.get(f as usize) else { return };
@@ -399,9 +489,12 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let shown = self.table_raw_rows().len();
         let total = self.store.rows_total;
-        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty();
+        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty() || !self.table_filters.is_empty();
         let apps = self.viewer_list();
         let mut clear_scope = false;
+        let mut new_filter: Option<RowFilter> = None;
+        let mut drop_filter: Option<usize> = None;
+        let mut clear_filters = false;
         let mut open_req: Option<(Option<usize>, bool)> = None;
         let mut add_program = false;
         let mut to_agent = false;
@@ -416,7 +509,15 @@ impl Viewer {
                         clear_scope = true;
                     }
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.table_find).desired_width(260.0).hint_text(format!("{}  find in the rows", ic::MAGNIFYING_GLASS)));
+                ui.add(egui::TextEdit::singleline(&mut self.table_find).desired_width(240.0).hint_text(format!("{}  find in the rows", ic::MAGNIFYING_GLASS)));
+                // what is typed can be kept as a filter that adds up, or turned round
+                let typed = !self.table_find.trim().is_empty();
+                if ui.add_enabled(typed, egui::Button::new(egui::RichText::new("+ keep").color(theme::ACCENT)).min_size(Vec2::new(0.0, 24.0))).on_hover_text("Keep it as a filter: only the rows that hold this text, in any column. It adds to the filters there, and the box is free for another").clicked() {
+                    new_filter = Some(RowFilter::new(None, &self.table_find, false));
+                }
+                if ui.add_enabled(typed, egui::Button::new(egui::RichText::new("− exclude").color(EDGE_FAIL)).min_size(Vec2::new(0.0, 24.0))).on_hover_text("Leave out the rows that hold this text, in any column. It adds to the filters there").clicked() {
+                    new_filter = Some(RowFilter::new(None, &self.table_find, true));
+                }
                 let label = if narrowed { format!("{} of {} rows", shown, total) } else { format!("{} rows, all of the file(s)", shown) };
                 ui.label(egui::RichText::new(label).color(theme::MUTED).size(12.5));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -460,8 +561,44 @@ impl Viewer {
                 });
             });
         });
+        // the filters that add up, each a chip that takes it off
+        if !self.table_filters.is_empty() {
+            egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 0, bottom: 8 }).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                    ui.label(egui::RichText::new(format!("{}  filters", ic::FUNNEL)).color(theme::MUTED).size(12.0));
+                    for (i, f) in self.table_filters.iter().enumerate() {
+                        let color = if f.negate { EDGE_FAIL } else { theme::ACCENT };
+                        let chip = egui::Button::new(egui::RichText::new(format!("{}   {}", f.label(), ic::X)).color(color).size(12.0)).fill(draw::fade(color, 0.14)).stroke(Stroke::new(1.0, draw::fade(color, 0.5))).corner_radius(CornerRadius::same(8));
+                        if ui.add(chip).on_hover_text(if f.negate { "Rows that hold this are left out. Click to take the filter off" } else { "Only rows that hold this are shown. Click to take the filter off" }).clicked() {
+                            drop_filter = Some(i);
+                        }
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("clear all").color(theme::MUTED).size(12.0)).frame(false)).clicked() {
+                        clear_filters = true;
+                    }
+                });
+            });
+        }
         theme::hairline(ui);
-        let act = self.timeline_rows(ui);
+        let (act, from_rows) = self.timeline_rows(ui);
+        if from_rows.is_some() {
+            new_filter = from_rows;
+        }
+        if let Some(f) = new_filter {
+            if f.col.is_none() {
+                self.table_find.clear();
+            }
+            self.add_table_filter(f);
+        }
+        if let Some(i) = drop_filter {
+            self.table_filters.remove(i);
+            self.table_scope_gen += 1;
+        }
+        if clear_filters {
+            self.table_filters.clear();
+            self.table_scope_gen += 1;
+        }
 
         if clear_scope {
             self.table_scope = None;
@@ -498,6 +635,11 @@ impl Viewer {
             Some(RowAct::Exact(row)) => {
                 let rows: Vec<(u16, u32)> = if self.table_multi.contains(&row) { self.table_multi.iter().copied().collect() } else { vec![row] };
                 self.rows_to_graph_view(&rows);
+            }
+            Some(RowAct::Agent(row)) => {
+                let rows: Vec<(u16, u32)> = if self.table_multi.contains(&row) { self.table_multi.iter().copied().collect() } else { vec![row] };
+                let what = if rows.len() > 1 { format!("the {} rows picked", rows.len()) } else { format!("line {}", row.1 + 2) };
+                self.rows_to_agentc00pr(&rows, &what);
             }
             Some(RowAct::Graph(row)) => self.row_to_graph(row),
             Some(RowAct::Copy(row)) => match self.store.raw_texts(row.0, &[row.1]) {
@@ -551,7 +693,7 @@ impl Viewer {
     /// The rows, in the file's 19 columns, read from the file as they
     /// scroll into view. The margin on the left is the row's line in its
     /// file (1 is the header), the number an editor shows.
-    fn timeline_rows(&mut self, ui: &mut egui::Ui) -> Option<RowAct> {
+    fn timeline_rows(&mut self, ui: &mut egui::Ui) -> (Option<RowAct>, Option<RowFilter>) {
         let row_h = 20.0;
         let cols = raw_columns();
         let width: f32 = GUTTER + 8.0 + RAW_WIDTHS.iter().map(|w| w + 8.0).sum::<f32>();
@@ -561,13 +703,38 @@ impl Viewer {
         }
         let several = self.store.files.len() > 1;
         let mut act: Option<RowAct> = None;
+        let mut filter: Option<RowFilter> = None;
         egui::ScrollArea::both().id_salt("table-raw").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_min_width(width);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new("line").size(10.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
-                for (name, w) in cols.iter().zip(RAW_WIDTHS.iter()) {
-                    ui.add_sized([*w, row_h], egui::Label::new(egui::RichText::new(*name).size(10.5).monospace().color(theme::MUTED)));
+                // a column's name opens its filter: what it must hold, or must not
+                for (ci, (name, w)) in cols.iter().zip(RAW_WIDTHS.iter()).enumerate() {
+                    let on = self.table_filters.iter().any(|f| f.col == Some(ci));
+                    let head = egui::Button::new(egui::RichText::new(*name).size(10.5).monospace().color(if on { theme::ACCENT } else { theme::MUTED })).frame(false).min_size(Vec2::new(*w, row_h));
+                    let resp = ui.add(head).on_hover_text("Click: filter by this column (contains, or does not)");
+                    egui::Popup::menu(&resp).show(|ui| {
+                        ui.set_min_width(250.0);
+                        if self.table_filter_draft.0 != ci {
+                            self.table_filter_draft = (ci, String::new());
+                        }
+                        ui.label(egui::RichText::new(format!("{} contains…", name)).color(theme::MUTED).small());
+                        let edit = ui.add(egui::TextEdit::singleline(&mut self.table_filter_draft.1).desired_width(230.0).hint_text("text (empty: the column is empty)"));
+                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("+ keep only").color(theme::ACCENT)).on_hover_text("Only the rows whose column holds the text (Enter does this)").clicked() || enter {
+                                filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, false));
+                                self.table_filter_draft.1.clear();
+                                ui.close();
+                            }
+                            if ui.button(egui::RichText::new("− exclude").color(EDGE_FAIL)).on_hover_text("Leave out the rows whose column holds the text").clicked() {
+                                filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, true));
+                                self.table_filter_draft.1.clear();
+                                ui.close();
+                            }
+                        });
+                    });
                 }
             });
             theme::hairline(ui);
@@ -619,9 +786,36 @@ impl Viewer {
                         // a right click on a row outside the selection is about that row
                         act = Some(RowAct::Select(key));
                     }
+                    if resp.secondary_clicked() {
+                        // the cell under the click: its column by where the pointer is
+                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| {
+                            let mut x = r.response.rect.left() + GUTTER + 8.0;
+                            RAW_WIDTHS.iter().position(|w| {
+                                let inside = p.x >= x && p.x < x + w + 8.0;
+                                x += w + 8.0;
+                                inside
+                            })
+                        }).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
+                    }
                     resp.context_menu(|ui| {
                         ui.set_min_width(250.0);
                         ui.label(egui::RichText::new(format!("line {}", key.1 + 2)).color(theme::MUTED).small());
+                        // the cell clicked: keep only its value, or leave it out
+                        if let Some((ci, value)) = self.table_ctx_cell.clone() {
+                            let name = cols.get(ci).copied().unwrap_or("");
+                            let v = value.trim();
+                            let short: String = v.chars().take(40).collect();
+                            let shown = if v.is_empty() { "(empty)".to_string() } else if v.chars().count() > 40 { format!("{}…", short) } else { short };
+                            if ui.add(egui::Button::new(egui::RichText::new(format!("+  Keep only {} = {}", name, shown)).color(theme::ACCENT)).frame(false)).on_hover_text("Only the rows whose column holds this (contains). It adds to the filters there").clicked() {
+                                ui.close();
+                                filter = Some(RowFilter::new(Some(ci), v, false));
+                            }
+                            if ui.add(egui::Button::new(egui::RichText::new(format!("−  Exclude {} = {}", name, shown)).color(EDGE_FAIL)).frame(false)).on_hover_text("Leave out the rows whose column holds this. It adds to the filters there").clicked() {
+                                ui.close();
+                                filter = Some(RowFilter::new(Some(ci), v, true));
+                            }
+                            ui.separator();
+                        }
                         if icon_button(ui, ic::GRAPH, "Show its connection in the graph").on_hover_text("Graph mode, with the connection of this row selected (a double click does the same)").clicked() {
                             ui.close();
                             act = Some(RowAct::Graph(key));
@@ -631,6 +825,11 @@ impl Viewer {
                         if icon_button(ui, ic::CROSSHAIR, &label).on_hover_text("A graph of the selection alone: one edge per row, ungrouped, and only the hosts they name. Ctrl + click and Shift + click pick several rows").clicked() {
                             ui.close();
                             act = Some(RowAct::Exact(key));
+                        }
+                        let label = if n_sel > 1 { format!("Show these {} rows in agentc00pr", n_sel) } else { "Show this row in agentc00pr".to_string() };
+                        if icon_button(ui, ic::APP_WINDOW, &label).on_hover_text("agentc00pr's viewer on the case this timeline is in, showing only these rows: its filters, its notables, the other tools' rows of the same moment. A timeline that is in no case yet is taken to one first").clicked() {
+                            ui.close();
+                            act = Some(RowAct::Agent(key));
                         }
                         if icon_button(ui, ic::FUNNEL, "Only the rows of its connection").clicked() {
                             ui.close();
@@ -645,13 +844,43 @@ impl Viewer {
                 }
             });
         });
-        act
+        (act, filter)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Filters of the timeline: contains by default, one way or the other,
+    /// by a column or by any, and they add up.
+    #[test]
+    fn filters_add_up_and_go_both_ways() {
+        let row = "2026-11-03T08:00:00+00:00,SRV01.corp.test,SUCCESSFUL_LOGON,4624,3,Alice,CORP,WS01,10.0.0.5,,,0x1,,Security.evtx,significant,42,new,,";
+        let f = |s: &str| RowFilter::parse(s).unwrap();
+        // the sign, the column by its name in the file, any case
+        assert_eq!(f("+target_user_name:ALI"), RowFilter { col: Some(5), text: "ali".into(), negate: false });
+        assert_eq!(f("-event_type:logoff"), RowFilter { col: Some(2), text: "logoff".into(), negate: true });
+        assert_eq!(f("10.0.0.5"), RowFilter { col: None, text: "10.0.0.5".into(), negate: false });
+        assert_eq!(f("-nosuchcolumn:x"), RowFilter { col: None, text: "nosuchcolumn:x".into(), negate: true });
+        assert_eq!(RowFilter::parse(""), None);
+        assert_eq!((f("+target_user_name:ali").label(), f("-10.0").label(), RowFilter::new(Some(7), "", false).label()), ("+ target_user_name: ali".to_string(), "− 10.0".to_string(), "+ src_computer is empty".to_string()));
+        let pass = |find: &str, fs: &[&str]| row_passes(row, find, &fs.iter().map(|s| f(s)).collect::<Vec<_>>());
+        assert!(pass("", &[]));
+        assert!(pass("alice", &[]) && !pass("bob", &[]));
+        // contains, in its column only
+        assert!(pass("", &["+target_user_name:ali"]) && !pass("", &["+src_computer:ali"]));
+        assert!(pass("", &["-target_user_name:bob"]) && !pass("", &["-target_user_name:ali"]));
+        // any column
+        assert!(pass("", &["+10.0.0"]) && !pass("", &["-10.0.0"]));
+        // they add up: every one must hold
+        assert!(pass("", &["+target_user_name:alice", "+event_id:4624", "-event_type:failed"]));
+        assert!(!pass("", &["+target_user_name:alice", "-event_id:4624"]));
+        assert!(!pass("srv01", &["+target_user_name:bob"]));
+        // an empty text is "the column is empty"
+        assert!(row_passes(row, "", &[RowFilter::new(Some(9), "", false)]) && !row_passes(row, "", &[RowFilter::new(Some(7), "", false)]));
+        assert!(row_passes(row, "", &[RowFilter::new(Some(7), "", true)]));
+    }
 
     fn timeline(name: &str, rows: &[&str]) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("masstin_table_{}_{}", std::process::id(), name));

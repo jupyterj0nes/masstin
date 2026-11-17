@@ -86,7 +86,44 @@ fn same_folder(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// What names a row of the timeline to agentc00pr's `--event`:
+/// `TIME,USER,ORIGIN,DESTINATION`, from the row as the file has it (so
+/// agentc00pr, which reads the same file, finds it): the time as written,
+/// the account, the origin (the name unless it is the destination's own,
+/// else the address) and the destination. None for a row with no time or
+/// no destination.
+pub(super) fn event_of_row(fields: &[String]) -> Option<String> {
+    let clean = |i: usize| -> String {
+        let t = fields.get(i).map(|s| s.trim()).unwrap_or("");
+        if t == "-" || t.contains(',') { String::new() } else { t.to_string() }
+    };
+    let (time, dest, user, name, ip) = (clean(0), clean(1), clean(5), clean(7), clean(8));
+    if time.is_empty() || dest.is_empty() {
+        return None;
+    }
+    let short = |s: &str| s.split('.').next().unwrap_or(s).to_uppercase();
+    let origin = if !name.is_empty() && short(&name) != short(&dest) { name } else { ip };
+    Some(format!("{time},{user},{origin},{dest}"))
+}
+
+/// The arguments that open agentc00pr's window on a case, on these events
+/// when some are named: a file of them, one per line.
+fn window_arguments(folder: &str, events: &[String]) -> Result<Vec<String>, String> {
+    let mut a: Vec<String> = ["--case", folder, "--panel", "investigate", "--load-all"].iter().map(|s| s.to_string()).collect();
+    if !events.is_empty() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("masstin-events-{}-{}.txt", std::process::id(), stamp));
+        std::fs::write(&path, events.join("\n")).map_err(|e| format!("cannot write the events for agentc00pr ({}): {}", path.display(), e))?;
+        a.push("--events-file".into());
+        a.push(path.to_string_lossy().to_string());
+    }
+    Ok(a)
+}
+
 pub(super) struct AgentDialog {
+    /// the events agentc00pr's window opens on once the case is settled
+    /// (a connection, or the rows picked); empty: the whole timeline
+    pub events: Vec<String>,
     /// the case these timelines are tied to, when they are
     pub link: Option<Link>,
     pub exe: Option<PathBuf>,
@@ -221,7 +258,60 @@ impl Viewer {
             };
             new_case = false;
         }
-        self.agent = Some(AgentDialog { link, exe, cases, new_case, name, parent: last_parent(), pick, msg: String::new(), rx: None });
+        self.agent = Some(AgentDialog { events: Vec::new(), link, exe, cases, new_case, name, parent: last_parent(), pick, msg: String::new(), rx: None });
+    }
+
+    /// These rows in agentc00pr's viewer: its window on the case the
+    /// timeline is in, showing only them. A timeline tied to a case that
+    /// has it goes straight there; otherwise the dialog settles the case
+    /// first (a new one, another one) and the window opens on the rows
+    /// after it.
+    pub(super) fn rows_to_agentc00pr(&mut self, rows: &[(u16, u32)], what: &str) {
+        let mut events: Vec<String> = Vec::new();
+        let mut unnamed = 0usize;
+        for r in rows {
+            match self.store.raw_row(r.0, r.1).ok().and_then(|f| event_of_row(&f)) {
+                Some(e) => {
+                    if !events.contains(&e) {
+                        events.push(e);
+                    }
+                }
+                None => unnamed += 1,
+            }
+        }
+        if events.is_empty() {
+            self.status = format!("{}: no row with a time and a destination to show in agentc00pr", what);
+            return;
+        }
+        let exe = find_agentc00pr();
+        let link = link_of(&self.files, std::env::var("AGENTC00PR_CASE").ok());
+        let folder = match &link {
+            Some(Link::OpenedFrom(f)) | Some(Link::TakenTo(f)) if self.files.iter().all(|t| in_case(f, t) != Some(false)) => Some(f.clone()),
+            _ => None,
+        };
+        match (exe, folder) {
+            (Some(exe), Some(folder)) => {
+                let n = events.len();
+                let started = window_arguments(&folder, &events).and_then(|args| {
+                    let mut win = std::process::Command::new(&exe);
+                    win.args(&args);
+                    win.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    win.spawn().map(|_| ()).map_err(|e| format!("agentc00pr's window did not start: {}", e))
+                });
+                self.status = match started {
+                    Ok(()) => format!("agentc00pr opened on {}, on the {} event(s) of {}{}", folder, n, what, if unnamed > 0 { format!(" ({} row(s) without a time or a destination left out)", unnamed) } else { String::new() }),
+                    Err(e) => e,
+                };
+            }
+            // not tied to a case that has the timeline (or no agentc00pr):
+            // the dialog first, the rows after it
+            _ => {
+                self.open_agentc00pr();
+                if let Some(d) = self.agent.as_mut() {
+                    d.events = events;
+                }
+            }
+        }
     }
 
     /// Put the open timelines into the case and open agentc00pr on it.
@@ -253,6 +343,7 @@ impl Viewer {
         }
         let args = add_arguments(&folder, new_name.as_deref(), &self.files);
         let files = self.files.clone();
+        let events = d.events.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         d.rx = Some(rx);
         d.msg = format!("Putting {} timeline(s) into {}…", self.files.len(), folder);
@@ -292,10 +383,18 @@ impl Viewer {
             };
             // the timelines say from now on which case they are in
             remember_link(&files, &folder);
+            let args = match window_arguments(&folder, &events) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
             let mut win = std::process::Command::new(&exe);
-            win.args(["--case", &folder, "--panel", "investigate", "--load-all"]);
+            win.args(&args);
             win.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             let _ = tx.send(match win.spawn() {
+                Ok(_) if !events.is_empty() => Ok(format!("agentc00pr opened on {}, on the {} event(s) picked", folder, events.len())),
                 Ok(_) => Ok(if added > 0 { format!("agentc00pr opened on {} ({} piece(s) of evidence came in with the timeline's ingest record)", folder, added) } else { format!("agentc00pr opened on {}", folder) }),
                 Err(e) => Err(format!("the case is ready in {}, but agentc00pr's window did not start: {}", folder, e)),
             });
@@ -358,6 +457,9 @@ impl Viewer {
             }
             if files.is_empty() {
                 ui.label(egui::RichText::new("No timeline is open.").color(theme::MUTED));
+            }
+            if !d.events.is_empty() {
+                ui.label(egui::RichText::new(format!("{}  Once the timeline is in a case, agentc00pr opens on the {} event(s) picked here, and only them.", ic::CROSSHAIR, d.events.len())).color(theme::ACCENT));
             }
             ui.add_space(4.0);
             match &d.link {
@@ -486,6 +588,25 @@ mod tests {
         std::fs::write(dir.join("case-b").join("case.json"), serde_json::json!({"evidence": []}).to_string()).unwrap();
         assert_eq!(in_case(&b, &tl), Some(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row is named to agentc00pr by what the file says of it.
+    #[test]
+    fn a_row_is_named_to_agentc00pr_as_the_file_has_it() {
+        let row = |t: &str, dst: &str, user: &str, sc: &str, si: &str| -> Vec<String> { vec![t.into(), dst.into(), "SUCCESSFUL_LOGON".into(), "4624".into(), "3".into(), user.into(), "CORP".into(), sc.into(), si.into()] };
+        assert_eq!(event_of_row(&row("2026-11-03T11:12:56.143498Z", "SRV01.corp.test", "alice", "WS01", "10.0.0.7")).as_deref(), Some("2026-11-03T11:12:56.143498Z,alice,WS01,SRV01.corp.test"));
+        assert_eq!(event_of_row(&row("2026-11-03T11:12:56.143498Z", "SRV01", "alice", "-", "10.0.0.7")).as_deref(), Some("2026-11-03T11:12:56.143498Z,alice,10.0.0.7,SRV01"));
+        // the server's own name as the origin says nothing: the address
+        assert_eq!(event_of_row(&row("2026-11-03T11:12:56Z", "SRV01.corp.test", "alice", "srv01", "10.0.0.7")).as_deref(), Some("2026-11-03T11:12:56Z,alice,10.0.0.7,SRV01.corp.test"));
+        assert_eq!(event_of_row(&row("2026-11-03T11:12:56Z", "SRV01", "-", "", "")).as_deref(), Some("2026-11-03T11:12:56Z,,,SRV01"));
+        assert_eq!(event_of_row(&row("", "SRV01", "alice", "WS01", "")), None);
+        assert_eq!(event_of_row(&row("2026-11-03T11:12:56Z", "", "alice", "WS01", "")), None);
+        // the window's arguments: the case, and a file of the events when some are named
+        assert_eq!(window_arguments("D:/c/x", &[]).unwrap(), vec!["--case", "D:/c/x", "--panel", "investigate", "--load-all"]);
+        let a = window_arguments("D:/c/x", &["t,u,o,d".to_string(), "t2,u,o,d".to_string()]).unwrap();
+        assert_eq!((a.len(), a[5].as_str()), (7, "--events-file"));
+        assert_eq!(std::fs::read_to_string(&a[6]).unwrap(), "t,u,o,d\nt2,u,o,d");
+        let _ = std::fs::remove_file(&a[6]);
     }
 
     #[test]

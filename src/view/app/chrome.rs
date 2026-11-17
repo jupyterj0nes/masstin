@@ -1272,6 +1272,11 @@ impl Viewer {
                     ui.close();
                     self.timeline_of_edge(k);
                 }
+                if icon_button(ui, ic::APP_WINDOW, &format!("Show its {} event(s) in agentc00pr", n_rows)).on_hover_text("agentc00pr's viewer on the case this timeline is in, showing only the events of this connection (every account of a grouped one). A timeline that is in no case yet is taken to one first").clicked() {
+                    ui.close();
+                    let (label, rows) = (self.graph_edge_label(k), self.rows_of_graph_edge(k));
+                    self.rows_to_agentc00pr(&rows, &label);
+                }
                 ui.separator();
                 for v in 1..4u8 {
                     let c = verdict_color(v).unwrap();

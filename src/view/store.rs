@@ -486,6 +486,21 @@ impl Store {
         Ok(out)
     }
 
+    /// The rows of a file whose text `keep` accepts, in the file's order:
+    /// the whole file is read once.
+    pub fn file_rows_where(&self, file: u16, keep: &dyn Fn(&str) -> bool) -> std::io::Result<Vec<u32>> {
+        let f = self.files.get(file as usize).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
+        let rd = std::io::BufReader::new(std::fs::File::open(&f.path)?);
+        let mut out = Vec::new();
+        // line 0 of the file is the header: data row k is file line k + 1
+        for (k, line) in csv_out::records(rd).enumerate().skip(1) {
+            if keep(line?.trim_end_matches(['\r', '\n'])) {
+                out.push((k - 1) as u32);
+            }
+        }
+        Ok(out)
+    }
+
     /// The rows of a file whose text holds `needle` (any case), in the
     /// file's order: the whole file is read once.
     pub fn file_rows_matching(&self, file: u16, needle: &str) -> std::io::Result<Vec<u32>> {
