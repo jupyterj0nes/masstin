@@ -1401,6 +1401,12 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
     // manifests):
     //  * 4648 is logged on the SOURCE host; the host it authenticated to is
     //    TargetServerName. Reading Computer as destination reversed the edge.
+    //    Its logon ID is the SUBJECT's: the session ON THE SOURCE whose
+    //    process used the credentials (the event has no logon ID of the
+    //    target: no session exists there yet). It is the logon ID of the
+    //    4624 that opened that session on the source, so a hop out of a
+    //    host can be told to have been made by the session a hop into it
+    //    opened.
     //  * 4776: Workstation.  4778/4779: AccountName, AccountDomain,
     //    ClientName, ClientAddress, LogonID.
     //  * 5140: the user is the subject.
@@ -1409,9 +1415,9 @@ pub(crate) fn map_security(rec: &WinRec, file: &str) -> Option<LogData> {
             let target = v("TargetServerName");
             let t = target.trim();
             if !t.is_empty() && t != "-" && !t.eq_ignore_ascii_case("localhost") && t != "127.0.0.1" {
-                (t.to_string(), v("TargetUserName"), v("TargetDomainName"), computer.clone(), String::new(), v("TargetLogonId"))
+                (t.to_string(), v("TargetUserName"), v("TargetDomainName"), computer.clone(), String::new(), v("SubjectLogonId"))
             } else {
-                (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("TargetLogonId"))
+                (computer.clone(), v("TargetUserName"), v("TargetDomainName"), v("WorkstationName"), v("IpAddress"), v("SubjectLogonId"))
             }
         }
         "4776" => (computer.clone(), v("TargetUserName"), String::new(), v("Workstation"), String::new(), String::new()),

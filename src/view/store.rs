@@ -186,6 +186,22 @@ pub struct Store {
     /// successful logons, and how many of them have their session
     pub logons: usize,
     pub sessions_known: usize,
+    /// per edge: its logon ID as a number to pair by (0: none)
+    lid: Vec<u64>,
+    /// what a session did on the network, by the source's own record of
+    /// it (a Windows 4648, an auditd `connect`): (the host the session is
+    /// on, its logon ID) -> (time, destination), in time order
+    launched: HashMap<(u32, u64), Vec<(i64, u32)>>,
+    /// how many such records the timeline has
+    pub launches: usize,
+}
+
+/// A row written from the ORIGIN of a connection, whose logon ID is the
+/// one of the session on the origin that made it: a Windows 4648 (explicit
+/// credentials used by a process of that session) and an auditd `connect`
+/// record of a login session.
+fn is_launch_record(event_id: &str) -> bool {
+    matches!(event_id, "4648" | "AUDIT_CONNECT")
 }
 
 /// A logon ID as a number to pair by; 0 when the row has none.
@@ -417,7 +433,42 @@ impl Store {
                 }
             }
         }
-        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known })
+        // what each session is recorded to have connected to
+        let mut launched: HashMap<(u32, u64), Vec<(i64, u32)>> = HashMap::new();
+        let mut launches = 0usize;
+        for (i, e) in edges.iter().enumerate() {
+            if edge_lid[i] != 0 && e.src != e.dst && is_launch_record(event_ids.name(e.event_id)) {
+                launched.entry((e.src, edge_lid[i])).or_default().push((e.t, e.dst));
+                launches += 1;
+            }
+        }
+        for v in launched.values_mut() {
+            v.sort_unstable();
+        }
+        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known, lid: edge_lid, launched, launches })
+    }
+
+    /// The logon ID of an edge, as the number it is paired by (0: none).
+    pub fn logon_key(&self, edge: u32) -> u64 {
+        self.lid.get(edge as usize).copied().unwrap_or(0)
+    }
+
+    /// Whether the hop `next` (out of the host that `into` entered) was
+    /// made by the session `into` opened, by that host's own record of it:
+    /// a 4648 or an auditd `connect` with the logon ID of `into`, to the
+    /// host `next` enters, at the moment of `next` (the record is written
+    /// as the connection is made: up to five minutes before the logon it
+    /// ends in, for a password typed by hand, and never after it but for
+    /// the clocks of two machines), and inside the session.
+    pub fn launched_by(&self, into: u32, next: u32) -> bool {
+        let (a, b) = (&self.edges[into as usize], &self.edges[next as usize]);
+        let id = self.logon_key(into);
+        if id == 0 || b.src != a.dst {
+            return false;
+        }
+        let Some(records) = self.launched.get(&(a.dst, id)) else { return false };
+        let end = self.session_of(into).map_or(i64::MAX, |d| a.t.saturating_add(d).saturating_add(5));
+        records.iter().any(|&(t, dst)| dst == b.dst && t >= a.t && t <= end && b.t >= t - 5 && b.t <= t + 300)
     }
 
     /// How long the session a logon opened lasted, in seconds, when the

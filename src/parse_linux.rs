@@ -1438,6 +1438,178 @@ fn parse_secure_or_messages(
     out
 }
 
+// ───────────────────── auditd: what a login session connected to ─────────────────────
+// A login leaves the host's audit log with a session id (`ses=`), and the
+// kernel stamps it on every record of every process of that session. Where
+// the audit rules record `connect` (a common hardening rule:
+// `-a always,exit -F arch=b64 -S connect -F a2=16 -F success=1`), each
+// outgoing connection is a SYSCALL record with the session's `ses=` and
+// its program, followed by a SOCKADDR record with the address and port:
+//
+//   type=SYSCALL msg=audit(1763418000.123:456): arch=c000003e syscall=42 success=yes exit=0 ... pid=1250 auid=1000 ... ses=5 comm="ssh" exe="/usr/bin/ssh" key="netconn"
+//   type=SOCKADDR msg=audit(1763418000.123:456): saddr=020000160A0A00260000000000000000
+//
+// That is the source's own record of the hop out, tied to the session that
+// made it: not "a login left this host while that session was open" but
+// "that session connected there". It becomes a row of the timeline written
+// from the SOURCE (as a Windows 4648 is): origin this host, destination the
+// address, `AUDIT_CONNECT`, and as its logon ID the one of the session's
+// own login row (the pid of its sshd), so the two can be told to be one
+// session by whoever reads the timeline.
+
+/// An outgoing connection of a login session, from a `connect` record.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AuditConnect {
+    pub(crate) secs: i64,
+    /// the host whose audit log it is: the origin
+    pub(crate) host: String,
+    pub(crate) addr: String,
+    pub(crate) port: u16,
+    pub(crate) ses: u64,
+    /// the account that logged in (the session's `auid`)
+    pub(crate) user: String,
+    pub(crate) comm: String,
+    pub(crate) exe: String,
+    pub(crate) filename: String,
+}
+
+/// The ports that are a way into another machine (the ones the Cortex
+/// network parser keeps): SSH, telnet, RPC, NetBIOS, SMB, RDP, VNC, WinRM.
+/// A session's web or DNS traffic is not a lateral movement.
+const REMOTE_ACCESS_PORTS: [u16; 9] = [22, 23, 135, 139, 445, 3389, 5900, 5985, 5986];
+
+/// What the audit logs of this run said, kept until the timeline is
+/// written: the outgoing connections, and for each host the (session id,
+/// pid of its sshd, time) of its logins.
+static AUDIT_CONNECTS: std::sync::Mutex<Vec<AuditConnect>> = std::sync::Mutex::new(Vec::new());
+static AUDIT_SESSIONS: std::sync::Mutex<Vec<(String, u64, u32, i64)>> = std::sync::Mutex::new(Vec::new());
+
+/// `msg=audit(1763418000.123:456)` -> (seconds, serial): the event a record belongs to.
+fn audit_stamp(line: &str) -> Option<(i64, u64)> {
+    let rest = &line[line.find("msg=audit(")? + 10..];
+    let end = rest.find(')')?;
+    let (time, serial) = rest[..end].split_once(':')?;
+    Some((time.parse::<f64>().ok()?.trunc() as i64, serial.parse().ok()?))
+}
+
+/// The address and port of a `saddr=` (the raw sockaddr, in hex): IPv4
+/// (family 2) and IPv6 (family 10); None for anything else (a unix socket,
+/// netlink).
+pub(crate) fn audit_saddr(hex: &str) -> Option<(String, u16)> {
+    let b: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()?;
+    if b.len() < 8 {
+        return None;
+    }
+    let family = u16::from_le_bytes([b[0], b[1]]);
+    let port = u16::from_be_bytes([b[2], b[3]]);
+    match family {
+        2 => Some((std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]).to_string(), port)),
+        10 if b.len() >= 24 => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&b[8..24]);
+            let v6 = std::net::Ipv6Addr::from(a);
+            // an IPv4 destination reached through an IPv6 socket
+            Some((v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| v6.to_string()), port))
+        }
+        _ => None,
+    }
+}
+
+static AUDIT_SYSCALL_NR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bsyscall=(\d+)\b"#).unwrap());
+static AUDIT_EXIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bexit=(-?\d+)\b"#).unwrap());
+static AUDIT_COMM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bcomm="([^"]*)""#).unwrap());
+static AUDIT_EXE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bexe="([^"]*)""#).unwrap());
+static AUDIT_SADDR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bsaddr=([0-9A-Fa-f]+)\b"#).unwrap());
+static AUDIT_LADDR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"\bladdr=([0-9A-Fa-f:.]+) lport=(\d+)"#).unwrap());
+
+/// A `connect` SYSCALL record of a login session: (event, session id,
+/// account, program, executable). `connect` is 42 on x86-64, 203 on
+/// arm64, 362 on 32-bit x86; an enriched log also names it. A connect that
+/// is still in progress when the call returns (`exit=-115`, a non-blocking
+/// socket) is a connection being made, like one that returned 0.
+fn audit_connect_syscall(line: &str, uid_name: &dyn Fn(&str) -> Option<String>) -> Option<((i64, u64), u64, String, String, String)> {
+    let named = line.contains("SYSCALL=connect");
+    let nr = AUDIT_SYSCALL_NR_RE.captures(line).and_then(|c| c[1].parse::<u32>().ok());
+    if !named && !matches!(nr, Some(42) | Some(203) | Some(362)) {
+        return None;
+    }
+    let exit: i64 = AUDIT_EXIT_RE.captures(line).and_then(|c| c[1].parse().ok())?;
+    if exit != 0 && exit != -115 {
+        return None;
+    }
+    let ses: u64 = AUDIT_SES_RE.captures(line).and_then(|c| c.get(1)?.as_str().parse().ok())?;
+    if ses == 4294967295 {
+        // no login session: a daemon
+        return None;
+    }
+    let user = AUDIT_USER_AUID_RE
+        .captures(line)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .or_else(|| AUDIT_USER_AUID_NUM_RE.captures(line).and_then(|c| uid_name(c.get(1)?.as_str())))
+        .unwrap_or_default();
+    let text = |re: &Regex| re.captures(line).map(|c| c[1].to_string()).unwrap_or_default();
+    Some((audit_stamp(line)?, ses, user, text(&AUDIT_COMM_RE), text(&AUDIT_EXE_RE)))
+}
+
+/// The rows of the outgoing connections, in time order, as lines of the
+/// timeline: `(timestamp, line)`. The logon ID of each is the pid of the
+/// sshd of its session's login on that host (the logon ID of that login's
+/// row), from the latest login record with that session id before it; a
+/// session whose login is not in the logs is named by its id (`ses:5`).
+/// The same program connecting to the same place again within half a
+/// minute is the same connection being made (a retry, both address
+/// families), and is written once.
+pub(crate) fn audit_connect_rows(mut connects: Vec<AuditConnect>, sessions: &[(String, u64, u32, i64)]) -> Vec<(String, String)> {
+    fn q(s: &str) -> String {
+        if s.is_empty() {
+            "\"\"".to_string()
+        } else if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    connects.sort_by(|a, b| (a.secs, &a.host, a.ses, &a.addr, a.port).cmp(&(b.secs, &b.host, b.ses, &b.addr, b.port)));
+    let mut last: HashMap<(String, u64, String, u16), i64> = HashMap::new();
+    let mut out = Vec::new();
+    for c in connects {
+        let key = (c.host.clone(), c.ses, c.addr.clone(), c.port);
+        if last.get(&key).map_or(false, |t| c.secs - *t < 30) {
+            last.insert(key, c.secs);
+            continue;
+        }
+        last.insert(key, c.secs);
+        let Some(t) = NaiveDateTime::from_timestamp_opt(c.secs, 0) else { continue };
+        let ts = DateTime::<Utc>::from_utc(t, Utc).to_rfc3339();
+        let pid = sessions.iter().filter(|(h, ses, _, at)| *h == c.host && *ses == c.ses && *at <= c.secs).max_by_key(|x| x.3).map(|x| x.2);
+        let logon_id = match pid {
+            Some(p) => p.to_string(),
+            None => format!("ses:{}", c.ses),
+        };
+        let logon_type = match c.port {
+            22 => "SSH",
+            3389 | 5900 => "10",
+            _ => "3",
+        };
+        let program = if c.exe.is_empty() || c.exe.ends_with(&format!("/{}", c.comm)) { c.comm.clone() } else { format!("{} ({})", c.comm, c.exe) };
+        let detail = format!("{} to {}:{}, auditd login session {}", if program.is_empty() { "a program" } else { &program }, c.addr, c.port, c.ses);
+        let line = format!(
+            "{},{},CONNECT,AUDIT_CONNECT,{},\"\",\"\",{},\"\",{},\"\",{},{},{}{}\n",
+            q(&ts),
+            q(&c.addr),
+            logon_type,
+            q(&c.host),
+            q(&c.user),
+            q(&logon_id),
+            q(&detail),
+            q(&c.filename),
+            crate::csv_out::EMPTY_TAIL,
+        );
+        out.push((ts, line));
+    }
+    out
+}
+
 // audit.log* ------------------------------------------------------------------
 // One SSH login leaves several auditd records: USER_AUTH for each PAM /
 // key stage (`op=pubkey_auth`, `op=key`, `op=PAM:authentication`) and then
@@ -1464,7 +1636,32 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
             return Vec::new();
         }
     };
+    // the `connect` of a login session waiting for the record with its address
+    let mut connecting: Option<((i64, u64), u64, String, String, String)> = None;
     for line in &mut lines {
+        if line.contains("type=SYSCALL") {
+            connecting = audit_connect_syscall(&line, &uid_name);
+            continue;
+        }
+        if line.contains("type=SOCKADDR") {
+            if let Some((event, ses, user, comm, exe)) = connecting.take() {
+                if audit_stamp(&line) == Some(event) {
+                    let to = AUDIT_LADDR_RE
+                        .captures(&line)
+                        .and_then(|c| Some((c[1].to_string(), c[2].parse::<u16>().ok()?)))
+                        .or_else(|| AUDIT_SADDR_RE.captures(&line).and_then(|c| audit_saddr(&c[1])));
+                    if let Some((addr, port)) = to {
+                        let local = addr.parse::<std::net::IpAddr>().map_or(true, |a| a.is_loopback() || a.is_unspecified());
+                        if !local && REMOTE_ACCESS_PORTS.contains(&port) {
+                            if let Ok(mut all) = AUDIT_CONNECTS.lock() {
+                                all.push(AuditConnect { secs: event.0, host: dst_host.to_string(), addr, port, ses, user, comm, exe, filename: path.display().to_string() });
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let cap = match AUDIT_RE.captures(&line) {
             Some(c) => c,
             None => continue,
@@ -1477,6 +1674,21 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         let evt_type = &cap[1];
         let ip = cap[2].to_string();
         let res = &cap[3];
+
+        // the session a login opened, and the pid of its sshd (the logon
+        // ID of its row): what an outgoing connection of that session is
+        // tied to its login by
+        if res == "success" && (evt_type == "USER_LOGIN" || evt_type == "USER_START") {
+            let ses: Option<u64> = AUDIT_SES_RE.captures(&line).and_then(|c| c.get(1)?.as_str().parse().ok());
+            let pid: Option<u32> = AUDIT_PID_RE.captures(&line).and_then(|c| c.get(1)?.as_str().parse().ok());
+            if let (Some(ses), Some(pid), Some((secs, _))) = (ses, pid, audit_stamp(&line)) {
+                if ses != 4294967295 && pid != 0 {
+                    if let Ok(mut all) = AUDIT_SESSIONS.lock() {
+                        all.push((dst_host.to_string(), ses, pid, secs));
+                    }
+                }
+            }
+        }
 
         if filter_ip && !looks_like_ip(&ip) {
             continue;
@@ -1773,8 +1985,8 @@ fn write_empty_csv(output: Option<&String>) {
     }
 }
 
-fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
-    if rows.is_empty() {
+fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Option<&String>) {
+    if rows.is_empty() && outgoing.is_empty() {
         eprintln!("[WARN] nothing matched lateral-movement filter");
         write_empty_csv(output);
         return;
@@ -1991,7 +2203,12 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
     };
     use std::io::Write as _;
     sink.write_all(header.as_bytes()).unwrap();
+    // the outgoing connections of the audit logs, in their place in time
+    let mut outgoing = outgoing.into_iter().peekable();
     for r in ordered {
+        while outgoing.peek().map_or(false, |(ts, _)| ts.as_str() <= r.ts_rfc3339.as_str()) {
+            sink.write_all(outgoing.next().unwrap().1.as_bytes()).unwrap();
+        }
         let is_ip = looks_like_ip(&r.remote);
         let (src_computer, src_ip) = if is_ip { ("", r.remote.as_str()) } else { (r.remote.as_str(), "") };
         // Every Linux row with a remote source is an SSH session (sshd
@@ -2016,6 +2233,9 @@ fn build_dataframe(rows: &[RawEvt], output: Option<&String>) {
             q(&r.filename),
             crate::csv_out::EMPTY_TAIL,
         );
+        sink.write_all(line.as_bytes()).unwrap();
+    }
+    for (_, line) in outgoing {
         sink.write_all(line.as_bytes()).unwrap();
     }
     sink.flush().unwrap();
@@ -2888,8 +3108,23 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // Phase 3: Generate output
     if !quiet { crate::banner::print_output_start(); }
     resolve_audit_uids(&mut collected);
-    let total_events = collected.len();
-    build_dataframe(&collected, output);
+    // what the login sessions connected to, by the audit logs' own records
+    let mut connects = AUDIT_CONNECTS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
+    let sessions = AUDIT_SESSIONS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
+    if !archive_dirs.is_empty() {
+        for c in connects.iter_mut() {
+            let norm = c.filename.replace('\\', "/");
+            if let Some((d, name)) = archive_dirs.iter().map(|(d, n)| (d.to_string_lossy().replace('\\', "/"), n)).find(|(d, _)| !d.is_empty() && norm.starts_with(d.as_str())) {
+                c.filename = format!("{}:{}", name, norm[d.len()..].trim_start_matches('/'));
+            }
+        }
+    }
+    let outgoing = audit_connect_rows(connects, &sessions);
+    if !outgoing.is_empty() && !quiet {
+        crate::banner::print_info(&format!("{} outgoing connection(s) of login sessions (auditd connect records): each is a row written from its origin, with the logon ID of the session's login", outgoing.len()));
+    }
+    let total_events = collected.len() + outgoing.len();
+    build_dataframe(&collected, outgoing, output);
 
     if !quiet {
         crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
@@ -3210,6 +3445,71 @@ mod loose_evidence_tests {
 #[cfg(test)]
 mod review_2026_11_tests {
     use super::*;
+
+    /// What a login session connected to, by the audit log's own records:
+    /// a row written from the origin, with the logon ID of the session's
+    /// login (the pid of its sshd), one per connection.
+    #[test]
+    fn auditd_connect_records_become_rows_of_the_session() {
+        let dir = std::env::temp_dir().join(format!("masstin-auditconn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let log = [
+            // the login: sshd 4242 opens login session 5 for uid 1000
+            r#"type=USER_LOGIN msg=audit(1763418000.100:400): pid=4242 uid=0 auid=1000 ses=5 msg='op=login id=1000 exe="/usr/sbin/sshd" hostname=10.0.0.5 addr=10.0.0.5 terminal=/dev/pts/0 res=success'"#,
+            // that session runs ssh to 10.10.0.38:22 (0x0A0A0026, port 0x0016)
+            r#"type=SYSCALL msg=audit(1763418060.200:410): arch=c000003e syscall=42 success=yes exit=0 a0=3 a1=7ffd0 a2=10 a3=0 items=0 ppid=4250 pid=4300 auid=1000 uid=1000 gid=1000 euid=1000 suid=1000 fsuid=1000 egid=1000 sgid=1000 fsgid=1000 tty=pts0 ses=5 comm="ssh" exe="/usr/bin/ssh" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418060.200:410): saddr=020000160A0A00260000000000000000"#,
+            // the same again a few seconds later: the same connection being made
+            r#"type=SYSCALL msg=audit(1763418065.200:411): arch=c000003e syscall=42 success=yes exit=0 a0=3 a2=10 items=0 ppid=4250 pid=4300 auid=1000 uid=1000 tty=pts0 ses=5 comm="ssh" exe="/usr/bin/ssh" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418065.200:411): saddr=020000160A0A00260000000000000000"#,
+            // a web request of the session, a daemon's connect, a loopback one, a failed one: not rows
+            r#"type=SYSCALL msg=audit(1763418070.200:412): arch=c000003e syscall=42 success=yes exit=0 a0=3 a2=10 items=0 pid=4301 auid=1000 uid=1000 ses=5 comm="curl" exe="/usr/bin/curl" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418070.200:412): saddr=020001BB5DB8D8220000000000000000"#,
+            r#"type=SYSCALL msg=audit(1763418071.200:413): arch=c000003e syscall=42 success=yes exit=0 a0=3 a2=10 items=0 pid=900 auid=4294967295 uid=0 ses=4294967295 comm="smbd" exe="/usr/sbin/smbd" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418071.200:413): saddr=020001BD0A0A00260000000000000000"#,
+            r#"type=SYSCALL msg=audit(1763418072.200:414): arch=c000003e syscall=42 success=yes exit=0 a0=3 a2=10 items=0 pid=4302 auid=1000 uid=1000 ses=5 comm="ssh" exe="/usr/bin/ssh" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418072.200:414): saddr=020000167F0000010000000000000000"#,
+            r#"type=SYSCALL msg=audit(1763418073.200:415): arch=c000003e syscall=42 success=no exit=-111 a0=3 a2=10 items=0 pid=4303 auid=1000 uid=1000 ses=5 comm="ssh" exe="/usr/bin/ssh" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418073.200:415): saddr=020000160A0A00270000000000000000"#,
+            // SMB from the same session, on a non-blocking socket (still connecting), in the enriched form
+            r#"type=SYSCALL msg=audit(1763418120.300:420): arch=c000003e syscall=42 success=no exit=-115 a0=4 a2=10 items=0 pid=4310 auid=1000 uid=1000 ses=5 comm="smbclient" exe="/usr/bin/smbclient" key="netconn" ARCH=x86_64 SYSCALL=connect AUID="alice" UID="alice""#,
+            r#"type=SOCKADDR msg=audit(1763418120.300:420): saddr=020001BD0A0A00250000000000000000 SADDR={ saddr_fam=inet laddr=10.10.0.37 lport=445 }"#,
+            // a session with no login in the log, to RDP over IPv6
+            r#"type=SYSCALL msg=audit(1763418200.300:430): arch=c00000b7 syscall=203 success=yes exit=0 a0=4 items=0 pid=5000 auid=1001 uid=1001 ses=9 comm="xfreerdp" exe="/usr/bin/xfreerdp" key="netconn""#,
+            r#"type=SOCKADDR msg=audit(1763418200.300:430): saddr=0A000D3D00000000FD000000000000000000000000000007000000000000"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", log)).unwrap();
+        let host = format!("auditconn-{}", std::process::id());
+        let passwd: HashMap<u32, String> = [(1000u32, "alice".to_string())].into_iter().collect();
+        let logins = parse_audit(&path, &host, true, &passwd);
+        assert_eq!(logins.iter().filter(|e| e.evt == "SSH_SUCCESS").count(), 1);
+        assert_eq!(logins[0].pid, 4242);
+        // (the lists are shared by every audit log read in this process: take this host's)
+        let mine: Vec<AuditConnect> = AUDIT_CONNECTS.lock().unwrap().iter().filter(|c| c.host == host).cloned().collect();
+        let sessions: Vec<(String, u64, u32, i64)> = AUDIT_SESSIONS.lock().unwrap().iter().filter(|x| x.0 == host).cloned().collect();
+        AUDIT_CONNECTS.lock().unwrap().retain(|c| c.host != host);
+        AUDIT_SESSIONS.lock().unwrap().retain(|x| x.0 != host);
+        assert_eq!(sessions, vec![(host.clone(), 5, 4242, 1763418000)]);
+        assert_eq!(mine.iter().map(|c| (c.addr.as_str(), c.port, c.ses, c.user.as_str(), c.comm.as_str())).collect::<Vec<_>>(), vec![
+            ("10.10.0.38", 22, 5, "alice", "ssh"),
+            ("10.10.0.38", 22, 5, "alice", "ssh"),
+            ("10.10.0.37", 445, 5, "alice", "smbclient"),
+            ("fd00::7", 3389, 9, "uid:1001", "xfreerdp"),
+        ]);
+        let rows = audit_connect_rows(mine, &sessions);
+        let cells: Vec<Vec<String>> = rows.iter().map(|(_, l)| l.trim_end().split(',').map(|c| c.trim_matches('"').to_string()).collect()).collect();
+        assert_eq!(rows.len(), 3, "{:?}", rows);
+        // time, destination, CONNECT, AUDIT_CONNECT, logon type, -, -, origin, -, the session's account, -, the logon ID of the login
+        assert_eq!(cells[0][..12], ["2025-11-17T22:21:00+00:00", "10.10.0.38", "CONNECT", "AUDIT_CONNECT", "SSH", "", "", host.as_str(), "", "alice", "", "4242"]);
+        assert_eq!(cells[1][..12], ["2025-11-17T22:22:00+00:00", "10.10.0.37", "CONNECT", "AUDIT_CONNECT", "3", "", "", host.as_str(), "", "alice", "", "4242"]);
+        assert_eq!((cells[2][1].as_str(), cells[2][4].as_str(), cells[2][11].as_str()), ("fd00::7", "10", "ses:9"));
+        assert!(rows[0].1.contains(r#","ssh to 10.10.0.38:22, auditd login session 5","#), "{}", rows[0].1);
+        assert_eq!(audit_saddr("0100"), None);
+        assert_eq!(audit_saddr("020000160A0A0026"), Some(("10.10.0.38".to_string(), 22)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("masstin_rev_{}_{}", name, std::process::id()));

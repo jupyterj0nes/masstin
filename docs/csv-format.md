@@ -20,7 +20,7 @@ Every parse action (and `merge`) produces a unified CSV with 19 columns. The fir
 | `src_ip` | Source IP address |
 | `subject_user_name` | Subject user account |
 | `subject_domain_name` | Subject domain |
-| `logon_id` | Logon ID for session correlation |
+| `logon_id` | Logon ID for session correlation: the session the row opened or closed on the destination (Windows: the logon ID of 4624 / 4634 / 4647; Linux: the process id of the sshd of the connection, on the logon and on its end). In a row written from the ORIGIN of a connection it is the session ON THE ORIGIN that made it: `4648` (the subject's logon ID) and `AUDIT_CONNECT` (the logon ID of the login of that auditd session) |
 | `detail` | Additional context: SubStatus, process name, SSH auth method, UAL role |
 | `log_filename` | Source file: the path of the evidence when parsed from a folder; for a file taken out of a forensic image, the image and the place inside it, never the temp folder it sat in while masstin ran: `HRServer.e01:live:Security.evtx`, `HRServer.e01:vss_0:Security.evtx` (`HRServer.e01:partition_1:live:…` for a partition other than the first), `HRServer.e01:UAL:Current.mdb`, `HRServer.e01:ntuser:Administrator/NTUSER.DAT`, `HRServer.e01:tasks:Microsoft/Windows/…`, `HRServer.e01:partition_0:/var/log/auth.log`; an EVTX inside a zip as `archive.zip -> logs/Security.evtx` |
 

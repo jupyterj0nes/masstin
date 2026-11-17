@@ -44,11 +44,16 @@ pub struct PathQuery {
     pub gap_without_session: bool,
     /// the only logins that may be a hop, by store edge; `None`: any
     pub only: Option<std::rc::Rc<Vec<bool>>>,
+    /// the next hop was MADE by the session the hop before opened: the
+    /// host in between has its own record of that session connecting to
+    /// the next one (a 4648, an auditd `connect`). Neither the gap nor the
+    /// end of the session is asked for besides: the record is the proof
+    pub launched: bool,
 }
 
 impl Default for PathQuery {
     fn default() -> Self {
-        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true, by_session: false, gap_without_session: false, only: None }
+        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true, by_session: false, gap_without_session: false, only: None, launched: false }
     }
 }
 
@@ -87,6 +92,10 @@ fn hop_ok(s: &Store, ei: u32, e: &Edge, q: &PathQuery) -> bool {
 /// How long after hop `ei` the next one may leave; `None`: it cannot be
 /// followed (by session, and the timeline has no logoff for it).
 fn window(s: &Store, q: &PathQuery, ei: u32) -> Option<i64> {
+    if q.launched {
+        // whenever the session's own record says (see `Store::launched_by`)
+        return Some(i64::MAX / 4);
+    }
     if !q.by_session {
         return Some(q.max_gap);
     }
@@ -164,6 +173,9 @@ fn dfs(s: &Store, q: &PathQuery, hops: usize, room: usize, host: u32, not_before
         }
         // the last hop enters the destination and no other does
         if last != (e.dst == q.dest) || visited.contains(&e.dst) || !hop_ok(s, ei, e, q) {
+            continue;
+        }
+        if q.launched && chain.last().map_or(false, |&before| !s.launched_by(before, ei)) {
             continue;
         }
         chain.push(ei);
@@ -277,7 +289,8 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
                 let first_next = first_at(v, te.saturating_add(1));
                 let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
                 let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
-                while hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
+                // (an arrival is told from another by its own records when they are asked for: none replaces another)
+                while !q.launched && hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
                     hv.arrivals.pop_back();
                 }
                 hv.arrivals.push_back((te, hops, ei, expiry));
@@ -312,7 +325,9 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
                 // must hold the hop already found out of the host
                 let back = if q.by_session && !forward { window(s, q, ei).unwrap_or(-1) } else { i64::MAX };
                 // of the arrivals this login can continue, the one with the fewest hops
-                match host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back).min_by_key(|a| a.1) {
+                // asked for the session's own record of the hop: the arrival and this login are tied by it
+                let made = |a: &(i64, usize, u32, i64)| !q.launched || if forward { s.launched_by(a.2, ei) } else { s.launched_by(ei, a.2) };
+                match host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back && made(a)).min_by_key(|a| a.1) {
                     Some(a) => (ei, a.1, Some(a.2)),
                     None => {
                         if let Some(n) = nth(h, host.next) {
@@ -666,6 +681,19 @@ mod tests {
             if kind == "SUCCESSFUL_LOGON" && next(3) > 0 {
                 lines.push(format!("{},{},LOGOFF,4634,3,{},CORP,,,,,0x{:x},,Security.evtx,,,,,", stamp(slot + next(9)), hosts[b], user, 0x100 + i));
             }
+            // what that session did next, by the record of the host it is on
+            // (a 4648 with the session's logon ID), with the logon it ends in or without it
+            if kind == "SUCCESSFUL_LOGON" && next(2) == 0 {
+                let mut to = next(6) as usize;
+                if to == b {
+                    to = (to + 1) % 6;
+                }
+                let at = slot + 1 + next(3);
+                lines.push(format!("{},{},CONNECT,4648,3,{},CORP,{},,,,0x{:x},,Security.evtx,,,,,", stamp(at), hosts[to], user, hosts[b], 0x100 + i));
+                if next(4) > 0 {
+                    lines.push(format!("{},{},SUCCESSFUL_LOGON,4624,3,{},CORP,,{},,,0x{:x},,Security.evtx,,,,,", stamp(at), hosts[to], user, hosts[b], 0x9000 + i));
+                }
+            }
         }
         let path = std::env::temp_dir().join(format!("masstin-chance-{}-{}-{}.csv", tag, std::process::id(), seed));
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
@@ -689,6 +717,25 @@ mod tests {
         let (ea, eb) = (&s.edges[a], &s.edges[b]);
         if eb.src != ea.dst || eb.t <= ea.t {
             return false;
+        }
+        if q.launched {
+            // some record written from the host in between, with the logon
+            // ID of `a`, of a connection to where `b` goes, when `b` goes,
+            // while the session of `a` is open (when its end is known)
+            let id = s.logon_key(a as u32);
+            let open_until = s.session_of(a as u32).map(|d| ea.t + d + 5);
+            return id != 0
+                && (0..s.edges.len()).any(|r| {
+                    let er = &s.edges[r];
+                    matches!(s.event_ids.name(er.event_id), "4648" | "AUDIT_CONNECT")
+                        && s.logon_key(r as u32) == id
+                        && er.src == ea.dst
+                        && er.dst == eb.dst
+                        && er.t >= ea.t
+                        && open_until.map_or(true, |u| er.t <= u)
+                        && eb.t >= er.t - 5
+                        && eb.t <= er.t + 300
+                });
         }
         let room = if !q.by_session {
             Some(q.max_gap)
@@ -770,6 +817,8 @@ mod tests {
     #[test]
     fn the_search_finds_what_trying_every_chain_finds() {
         let mut checked = (0usize, 0usize, 0usize);
+        // paths whose every hop the session before it is recorded to have made
+        let mut made = 0usize;
         for seed in 0..60u64 {
             let (s, path) = chance_store(seed, "all");
             let h = |n: &str| s.hosts.get(n);
@@ -798,15 +847,19 @@ mod tests {
                     to: [None, Some(mid), Some(s.t_max - 3600)][pick(3)],
                     by_session: false,
                     gap_without_session: false,
+                    launched: false,
                     max_paths: 100_000,
                 };
                 let chain = pick(2);
-                for mode in 0..3 {
+                for mode in 0..4 {
                     // the session modes on half the combinations (they share the rest)
                     if mode > 0 && chain == 0 {
                         continue;
                     }
-                    let q = PathQuery { by_session: mode > 0, gap_without_session: mode == 2, ..q.clone() };
+                    let q = PathQuery { by_session: mode == 1 || mode == 2, gap_without_session: mode == 2, launched: mode == 3, ..q.clone() };
+                    if mode == 3 {
+                        made += every_route(&s, &q).len();
+                    }
                     let want = every_route(&s, &q);
                     let (got, cut) = search(&s, &q);
                     assert!(!cut);
@@ -843,7 +896,8 @@ mod tests {
             let _ = std::fs::remove_file(path);
         }
         println!("{} searches checked: {} paths, {} hosts in cones", checked.0, checked.1, checked.2);
-        assert!(checked.1 > 5_000 && checked.2 > 20_000, "{:?}", checked);
+        println!("{} of the paths with every hop made by the session before it", made);
+        assert!(checked.1 > 5_000 && checked.2 > 20_000 && made > 200, "{:?} {}", checked, made);
     }
 
     /// So many chains that a length is not walked to its end: the search
