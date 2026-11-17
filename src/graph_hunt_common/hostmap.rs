@@ -9,13 +9,12 @@
 //! login was recorded twice. This module adds the evidence that says it
 //! outright, and keeps apart what can be trusted from what cannot:
 //!
-//! - `own`: the machine's own network configuration. No parser writes it
-//!   yet (it is in the SYSTEM hive); a fact of this kind in the timeline's
-//!   masstin file (key `hosts`) is read, and settles which of two
-//!   addresses is a host's.
+//! - `own`: the machine's own network configuration (the addresses of its
+//!   interfaces in its SYSTEM hive, see `parse_hostcfg`), read when the
+//!   evidence was parsed and kept in the timeline's masstin file (key
+//!   `hosts`). It settles which of two addresses is a host's.
 //! - `locator`: the domain controller a machine found and bound to, by
-//!   name and address (Group Policy 5308), kept in the timeline's masstin
-//!   file (key `hosts`) when the evidence was parsed.
+//!   name and address (Group Policy 5308), kept in the same place.
 //! - `machine-account`: the computer account `NAME$` authenticated from
 //!   the address (4624 network logon, 4768). The account is the machine's
 //!   own secret: only that machine (or whoever stole or relayed it) logs
@@ -116,7 +115,7 @@ impl Level {
     }
     pub fn explain(self) -> &'static str {
         match self {
-            Level::Strict => "only the domain controller a machine found and bound to (Group Policy 5308)",
+            Level::Strict => "what a machine says of itself (its SYSTEM hive) or of its domain controller (Group Policy 5308)",
             Level::Standard => "also a machine account (NAME$) authenticated from the address",
             Level::Broad => "also a name the client gave, and the same-login test",
         }

@@ -20,6 +20,7 @@ pub use crate::merge_memgraph_nodes::*;
 mod merge;
 pub mod ingest_record;
 pub mod timeline_file;
+mod parse_hostcfg;
 pub use crate::merge::*;
 use serde_json::Value;
 mod parse_elastic;
@@ -365,10 +366,11 @@ pub struct Cli {
     /// origins (`DEV-DC01` and `10.10.0.37`), each with part of its
     /// connections; merged, the hunt profiles one machine, and a login
     /// from a host to its own address is no connection. The level says
-    /// which evidence is taken without asking: `strict` (the domain
-    /// controller a machine found and bound to, by name and address:
-    /// Group Policy 5308, kept in `<name>.masstin` when the evidence was
-    /// parsed), `standard` (also the machine's own account, `NAME$`,
+    /// which evidence is taken without asking: `strict` (what a machine
+    /// says of itself, the addresses of its interfaces in its SYSTEM
+    /// hive, or of its domain controller, the one it found and bound to
+    /// in Group Policy 5308; both kept in `<name>.masstin` when the
+    /// evidence was parsed), `standard` (also the machine's own account, `NAME$`,
     /// authenticated from the address: 4624 network logon, 4768), `broad`
     /// (also the name the client itself gave in the event, and the
     /// same-login test). At every level an address stays as it is when
@@ -505,7 +507,7 @@ enum ActionType {
     /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.
     #[value(alias = "graph-hunt-csv")]
     GraphHuntCsv,
-    /// Whose address is it: the table of the addresses of masstin timelines (-f) and the host each is, with the evidence: `locator` (the domain controller a machine found and bound to, by name and address: Group Policy 5308, kept in `<name>.masstin` when the evidence was parsed); `machine-account` (the computer account NAME$ authenticated from the address); `declared` (the name the client gave in the event that has its address); `same-login` (the statistical test). Each address says at which level it is merged without asking (strict, standard, broad: see --merge-hosts), or why it is left to you (several names at it, its host at two addresses in the same period, nothing says whose it is), and how many rows have it as their origin. -o writes the table as CSV. Nothing is changed in the timelines.
+    /// Whose address is it: the table of the addresses of masstin timelines (-f) and the host each is, with the evidence: `own` (the machine's own network configuration: the SYSTEM hive of a triage, loose or in a zip) and `locator` (the domain controller a machine found and bound to, by name and address: Group Policy 5308), both kept in `<name>.masstin` when the evidence was parsed; `machine-account` (the computer account NAME$ authenticated from the address); `declared` (the name the client gave in the event that has its address); `same-login` (the statistical test). Each address says at which level it is merged without asking (strict, standard, broad: see --merge-hosts), or why it is left to you (several names at it, its host at two addresses in the same period, nothing says whose it is), and how many rows have it as their origin. -o writes the table as CSV. Nothing is changed in the timelines.
     #[value(alias = "hosts")]
     HostMap,
     /// Open the graph viewer (a window) on timeline CSVs (-f): the lateral-movement graph with its hunt states, filters, neighbourhoods, a replay in time order and the analyst's marks, written back into the CSV. Without -f it opens on a welcome, to open a timeline or ingest evidence (drop it on the window). --focus HOST opens on a host's neighbourhood; --start-time / --end-time bound the window.
@@ -929,7 +931,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         }
         if !facts.is_empty() {
             match crate::graph_hunt_common::hostmap::write_facts(out, &facts) {
-                Ok(_) => crate::banner::print_phase_detail("Hosts:", &format!("{} address(es) the evidence names the host of (a domain controller found by a member: Group Policy 5308), kept in the timeline's masstin file for --merge-hosts and host-map", facts.len())),
+                Ok(_) => crate::banner::print_phase_detail("Hosts:", &format!("{} address(es) the evidence names the host of (a machine's own network configuration in its SYSTEM hive, the domain controller a member found in Group Policy 5308), kept in the timeline's masstin file for --merge-hosts and host-map", facts.len())),
                 Err(e) => eprintln!("Masstin - Warning: cannot write the host facts of {}: {}", out, e),
             }
         }

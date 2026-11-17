@@ -49,6 +49,7 @@ A timeline names the origin of a connection by its name when the event gives one
 
 | Evidence | What it is | Where it comes from |
 |---|---|---|
+| `own` | the machine's own network configuration: the address of each interface, static or the DHCP lease it held | the SYSTEM hive of a triage (a folder or a zip), kept in `<name>.masstin` by the parsers (key `hosts`) |
 | `locator` | the domain controller a machine found and bound to, by name and address | Group Policy 5308, kept in `<name>.masstin` by the parsers |
 | `machine-account` | the computer account `NAME$` authenticated from the address | the rows: 4624 network logon and 4768 that succeeded |
 | `declared` | the name the client gave in the event that has its address | the rows: `src_computer` next to `src_ip` (not when the name is the destination's own) |
@@ -56,11 +57,11 @@ A timeline names the origin of a connection by its name when the event gives one
 
 `--merge-hosts LEVEL` makes `graph-hunt-csv` read each such address as its host for the whole hunt: the two origins are one machine with all its connections, and a login from a host to its own address is no connection. The level says how much is taken without asking:
 
-- `strict`: `locator` only: the domain controller a machine found and bound to.
-- `standard`: also `machine-account`, when the name is a machine the timelines know (a destination, a declared origin, a host of `locator`). A `NAME$` that is nothing else may be a service account, and counts at `broad` only.
+- `strict`: `own` and `locator`: what a machine says of itself or of its domain controller.
+- `standard`: also `machine-account`, when the name is a machine the timelines know (a destination, a declared origin, a host of `own` / `locator`). A `NAME$` that is nothing else may be a service account, and counts at `broad` only.
 - `broad`: everything.
 
-At every level an address is left as it is, and the table says why, when the evidence disagrees: several names at one address in the same period (NAT, a proxy, a jump host, a forged name), an address that changed hands (a node of the graph is one machine for the whole timeline, so it is merged into neither), or a host seen at two addresses in the same period with nothing stronger (`locator`) to tell which is its. The last one is deliberate: a second interface looks like that, and so does a machine account relayed or used from somewhere else. No level is proof against someone who holds a machine's account and uses it from an address where the real machine is never seen: `strict` does not read accounts at all, and the table shows the evidence of every merge so it can be checked. `--merge-hosts-skip` leaves addresses out; the hunt's record says the level and how many addresses were merged. The timeline's columns keep both names.
+At every level an address is left as it is, and the table says why, when the evidence disagrees: several names at one address in the same period (NAT, a proxy, a jump host, a forged name), an address that changed hands (a node of the graph is one machine for the whole timeline, so it is merged into neither), or a host seen at two addresses in the same period with nothing of its own (`own`, `locator`) to tell which is its. The last one is deliberate: a second interface looks like that, and so does a machine account relayed or used from somewhere else. No level is proof against someone who holds a machine's account and uses it from an address where the real machine is never seen: `strict` does not read accounts at all, and the table shows the evidence of every merge so it can be checked. `--merge-hosts-skip` leaves addresses out; the hunt's record says the level and how many addresses were merged. The timeline's columns keep both names.
 
 ### Output
 

@@ -2567,6 +2567,11 @@ fn find_evtx_files(directories: &[String]) -> DiscoveryResult {
                 if !path.is_file() {
                     continue;
                 }
+                // the machine's own addresses, for the host map: no row
+                if crate::parse_hostcfg::is_system_hive(&path.to_string_lossy()) {
+                    crate::parse_hostcfg::note(crate::parse_hostcfg::facts_from_file(path));
+                    continue;
+                }
 
                 match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
                     Some("evtx") => {
@@ -2665,6 +2670,14 @@ fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec
                 zip_path: this_chain.clone(),
                 evtx_name: name,
             });
+        } else if crate::parse_hostcfg::is_system_hive(&name) {
+            // the machine's own addresses, for the host map: no row
+            if entry.size() <= crate::parse_hostcfg::MAX_HIVE {
+                let mut raw = Vec::with_capacity(entry.size() as usize);
+                if entry.read_to_end(&mut raw).is_ok() {
+                    crate::parse_hostcfg::note(crate::parse_hostcfg::facts_from_bytes(raw, &format!("{} -> {}", this_chain, name)));
+                }
+            }
         } else if name_lower.ends_with(".zip") {
             // ZIP anidado → lo leemos en memoria y llamamos recursivamente
             let mut nested_data = Vec::with_capacity(entry.size() as usize);
@@ -2722,6 +2735,13 @@ fn recurse_zip<R: Read + Seek>(
                 zip_path: format!("{} -> {}", parent_chain, current_zip_name),
                 evtx_name: name,
             });
+        } else if crate::parse_hostcfg::is_system_hive(&name) {
+            if entry.size() <= crate::parse_hostcfg::MAX_HIVE {
+                let mut raw = Vec::with_capacity(entry.size() as usize);
+                if entry.read_to_end(&mut raw).is_ok() {
+                    crate::parse_hostcfg::note(crate::parse_hostcfg::facts_from_bytes(raw, &format!("{} -> {} -> {}", parent_chain, current_zip_name, name)));
+                }
+            }
         } else if name_lower.ends_with(".zip") {
             // ZIP dentro de ZIP dentro de ZIP…​
             let mut nested_data = Vec::with_capacity(entry.size() as usize);
