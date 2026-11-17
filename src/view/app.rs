@@ -632,6 +632,17 @@ fn path_rows(store: &Store, filter: &Filter, whole: bool, account: &str, from: &
 /// counts enters the destination, or what the one reaches and what reaches
 /// the other never meet.
 fn why_no_path(store: &Store, q: &PathQuery) -> String {
+    let why = why_no_path_itself(store, q);
+    // a machine named in some rows and by its address in others is two hosts
+    if store.hosts.names.iter().any(|n| n.parse::<std::net::IpAddr>().is_ok()) {
+        format!("{}
+Some hosts of this timeline are addresses: a machine that appears by its name in some rows and by its address in others is two hosts, and a path breaks there. Tools › Hosts and addresses says whose each address is and merges the ones the evidence is sure of.", why)
+    } else {
+        why
+    }
+}
+
+fn why_no_path_itself(store: &Store, q: &PathQuery) -> String {
     let (o, d) = (store.hosts.name(q.origin), store.hosts.name(q.dest));
     // the logins of a host by result, and how many of them may be a hop
     let tally = |rows: &[u32]| -> ([usize; 4], usize) {

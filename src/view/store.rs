@@ -47,7 +47,17 @@ pub fn verdict_code(s: &str) -> u8 {
     VERDICT_NAMES.iter().position(|n| *n == s).map(|i| i as u8).unwrap_or(V_NONE)
 }
 
-fn result_code(event_type: &str) -> u8 {
+/// What a row is for the graph. A Kerberos ticket (4768 a TGT, 4769 a
+/// service ticket, 4770 a renewal) or an NTLM validation (4776) that
+/// succeeded is an authentication AT the domain controller, not a logon
+/// session ON it: the account proved who it is there, on its way to
+/// somewhere else. It is a connection with no logon in it, whatever the
+/// timeline calls it (timelines write it as a successful logon). A failed
+/// one (4771, a 4768 / 4769 / 4776 with an error) stays a failure.
+fn result_code(event_type: &str, event_id: &str) -> u8 {
+    if event_type == "SUCCESSFUL_LOGON" && matches!(event_id, "4768" | "4769" | "4770" | "4776") {
+        return R_CONNECT;
+    }
     match event_type {
         "SUCCESSFUL_LOGON" => R_OK,
         "FAILED_LOGON" => R_FAIL,
@@ -310,7 +320,7 @@ impl Store {
                     }
                 };
                 let lid = logon_id_key(&b[11]);
-                if lid != 0 && result_code(b[2].trim()) == R_LOGOFF {
+                if lid != 0 && result_code(b[2].trim(), b[3].trim()) == R_LOGOFF {
                     let host = short_name(&clean_host(&b[1]), &ambiguous);
                     if !host.is_empty() {
                         logoffs.push((logoff_hosts.id(&label_of(&host)), lid, t));
@@ -368,7 +378,7 @@ impl Store {
                     line: line_no,
                     score,
                     file: fi as u16,
-                    result: result_code(b[2].trim()),
+                    result: result_code(b[2].trim(), b[3].trim()),
                     hunt,
                     verdict,
                     src_is_ip,
@@ -1018,6 +1028,63 @@ mod tests {
         assert!(s.mark(&[(0, 0)], verdict_code("suspicious"), "x").is_err());
         assert_eq!(s.edges[0].verdict, V_NONE);
         assert!(s.notes.is_empty());
+    }
+
+    /// A Kerberos ticket or an NTLM validation that succeeded is an
+    /// authentication at the domain controller, not a logon on it: a
+    /// connection for the graph. A failed one stays a failure, and a real
+    /// logon a logon.
+    #[test]
+    fn a_ticket_is_not_a_logon_on_the_domain_controller() {
+        let path = std::env::temp_dir().join(format!("masstin-tickets-{}.csv", std::process::id()));
+        let line = |min: u32, eid: &str, et: &str| format!("2026-01-05T10:{:02}:00Z,DC01,{},{},3,ana,CORP,,10.0.0.5,,,,,Security.evtx,,,,,", min, et, eid);
+        let body = [
+            csv_out::HEADER.to_string(),
+            line(1, "4768", "SUCCESSFUL_LOGON"),
+            line(2, "4769", "SUCCESSFUL_LOGON"),
+            line(3, "4770", "SUCCESSFUL_LOGON"),
+            line(4, "4776", "SUCCESSFUL_LOGON"),
+            line(5, "4771", "FAILED_LOGON"),
+            line(6, "4768", "FAILED_LOGON"),
+            line(7, "4624", "SUCCESSFUL_LOGON"),
+            line(8, "4648", "CONNECT"),
+        ]
+        .join("
+");
+        std::fs::write(&path, format!("{}
+", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let got: Vec<u8> = s.by_time.iter().map(|&i| s.edges[i as usize].result).collect();
+        assert_eq!(got, [R_CONNECT, R_CONNECT, R_CONNECT, R_CONNECT, R_FAIL, R_FAIL, R_OK, R_CONNECT]);
+        assert_eq!(s.logons, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A Linux timeline pairs a logon with its end too: the logon ID is
+    /// the process id of the sshd of the connection, on both rows. The
+    /// same id used again later is another session.
+    #[test]
+    fn an_ssh_session_is_paired_by_the_pid_of_its_sshd() {
+        let path = std::env::temp_dir().join(format!("masstin-sshsess-{}.csv", std::process::id()));
+        let line = |hm: &str, et: &str, eid: &str, user: &str, src: &str, pid: &str| format!("2026-11-17T{}:00+00:00,web01,{},{},SSH,{},,,{},,,{},,auth.log,,,,,", hm, et, eid, user, src, pid);
+        let body = [
+            csv_out::HEADER.to_string(),
+            line("10:00", "SUCCESSFUL_LOGON", "SSH_SUCCESS", "alice", "10.0.0.5", "4242"),
+            line("10:05", "SUCCESSFUL_LOGON", "SSH_SUCCESS", "bob", "10.0.0.9", "5000"),
+            line("10:20", "LOGOFF", "LOGOUT", "alice", "10.0.0.5", "4242"),
+            line("11:00", "LOGOFF", "LOGOUT", "bob", "10.0.0.9", "5000"),
+            // the pid handed out again, and never closed in the log
+            line("12:00", "SUCCESSFUL_LOGON", "SSH_SUCCESS", "carol", "10.0.0.7", "4242"),
+        ]
+        .join("
+");
+        std::fs::write(&path, format!("{}
+", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let of = |user: &str| -> Option<i64> { s.edges.iter().position(|e| e.result == R_OK && s.users.name(e.user).starts_with(user)).and_then(|i| s.session_of(i as u32)) };
+        assert_eq!((of("alice"), of("bob"), of("carol")), (Some(20 * 60), Some(55 * 60), None));
+        assert_eq!((s.logons, s.sessions_known), (3, 2));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

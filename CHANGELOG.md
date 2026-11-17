@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The viewer: a Kerberos ticket is not a logon on the domain controller.** A TGT (4768), a service ticket (4769), a renewal (4770) or an NTLM validation (4776) that succeeded is an authentication AT the domain controller on the way to somewhere else, not a session ON it. The viewer now draws and filters them as *connect*, whatever the timeline calls them (older timelines included), so a path or a cone no longer hops to a domain controller because a ticket was asked of it. A failed one stays a failure. The timeline CSV is not changed.
+- **Paths by session work on Linux too**: the logon ID of an SSH logon is the process id of its sshd, the same on the row of its end, so the two are paired like a Windows logon and its logoff (now covered by a test).
+- **Paths: when no path is found and the timeline has hosts that are addresses**, the window points to Tools › Hosts and addresses: a machine named in some rows and by its address in others is two hosts, and a path breaks there.
 - **Paths: the shortest are found first, always.** The search walks one length at a time (one hop, then two…), so a search that stops at «Max paths» keeps the shortest paths there are, not the first chains it met. When there are so many chains that a length cannot be walked to its end, the window says the search was cut short.
 - **Paths: a search that finds nothing says why.** Nothing logs on from the origin, or none of its logins counts as a hop (and which it has: «2 logon FAILED»); the same for the destination; or how many hosts the origin reaches and how many could reach the destination, when the two never meet. A path from a search before is no longer left on the canvas.
 - **Fixed: a cone could miss a host** when a login left a host in the very second another login entered it. Found by a new test that checks every search against trying every chain, on timelines made by chance with every option in every combination (155,520 searches).
