@@ -315,6 +315,7 @@ impl Viewer {
         let mut clear_scope = false;
         let mut open_req: Option<(Option<usize>, bool)> = None;
         let mut add_program = false;
+        let mut to_agent = false;
         let mut forget: Option<String> = None;
         let mut reveal = false;
         egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
@@ -358,6 +359,10 @@ impl Viewer {
                             });
                         }
                         ui.separator();
+                        if icon_button(ui, ic::APP_WINDOW, "agentc00pr: into a case…").on_hover_text("The case workbench of the family. The timelines open here go into a case of agentc00pr, with the evidence they were read from").clicked() {
+                            ui.close();
+                            to_agent = true;
+                        }
                         if icon_button(ui, ic::PLUS, "Add a program…").on_hover_text("Any program that opens a CSV: it stays on this list").clicked() {
                             ui.close();
                             add_program = true;
@@ -392,6 +397,9 @@ impl Viewer {
         }
         if let Some((viewer, whole)) = open_req {
             self.open_rows_in(viewer, whole);
+        }
+        if to_agent {
+            self.open_agentc00pr();
         }
         if add_program {
             if let Some(p) = rfd::FileDialog::new().set_title("A program to open timelines with").pick_file() {

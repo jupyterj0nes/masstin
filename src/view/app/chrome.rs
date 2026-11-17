@@ -288,7 +288,7 @@ impl Viewer {
                     self.stop_film(false);
                 }
                 ui.separator();
-                if icon_button(ui, ic::APP_WINDOW, "Open the case in agentc00pr").on_hover_text("Launches agentc00pr, the case tool that reads this timeline and the CSVs of caarea, faramir and allymacb").clicked() {
+                if icon_button(ui, ic::APP_WINDOW, "Open the case in agentc00pr").on_hover_text("Takes the timelines open here into a case of agentc00pr (a new one, or one it has), with the evidence they were read from, and opens it there").clicked() {
                     ui.close();
                     self.open_agentc00pr();
                 }
@@ -425,7 +425,7 @@ impl Viewer {
                     self.hud = !self.hud;
                 }
                 ui.add_space(4.0);
-                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  agentc00pr", ic::APP_WINDOW))).min_size(Vec2::new(0.0, 28.0))).on_hover_text("Open the case tool").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  agentc00pr", ic::APP_WINDOW))).min_size(Vec2::new(0.0, 28.0))).on_hover_text("On to agentc00pr, the case workbench: the timelines open here go into a case of it, with the evidence they were read from").clicked() {
                     self.open_agentc00pr();
                 }
                 let hunt = egui::Button::new(theme::semibold(format!("{}  Hunt", ic::DETECTIVE), 13.5).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 28.0)).corner_radius(CornerRadius::same(7));
@@ -1480,24 +1480,6 @@ impl Viewer {
         self.open_files(files);
     }
 
-    pub(super) fn open_agentc00pr(&mut self) {
-        let exe = std::env::current_exe().ok();
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(e) = &exe {
-            if let Some(dir) = e.parent() {
-                candidates.push(dir.join("agentc00pr.exe"));
-                candidates.push(dir.join("agentc00pr"));
-            }
-        }
-        candidates.push(std::path::PathBuf::from("agentc00pr"));
-        for c in candidates {
-            if std::process::Command::new(&c).spawn().is_ok() {
-                self.status = format!("agentc00pr started ({})", c.display());
-                return;
-            }
-        }
-        self.status = "agentc00pr is not next to masstin nor on the PATH".into();
-    }
 }
 
 /// One line that says what a filter keeps, for the cards.

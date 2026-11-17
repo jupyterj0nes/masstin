@@ -20,6 +20,7 @@ mod hunt;
 mod remote;
 mod studio;
 mod ingest;
+mod agent;
 mod table;
 mod viewers;
 mod when;
@@ -348,6 +349,8 @@ pub struct Viewer {
     show_db: bool,
     studio: Studio,
     db_form: DbForm,
+    /// "On to agentc00pr": the dialog, while it is open
+    agent: Option<agent::AgentDialog>,
     /// the open timelines that already carry a hunt, while the analyst is
     /// asked what to do with them; and that the answer was given
     hunt_ask: Option<Vec<(String, crate::graph_hunt_common::record::Previous)>>,
@@ -784,6 +787,7 @@ impl Viewer {
             studio: Studio::default(),
             db_form: DbForm::default(),
             show_table: false,
+            agent: None,
             hunt_ask: None,
             hunt_answered: false,
             table_find: String::new(),
@@ -4496,6 +4500,16 @@ impl Viewer {
                     eprintln!("masstin: cannot write {}: {}", self.notes.path.display(), e);
                 }
             }
+            // on to agentc00pr: the dialog, a new case of that name in that folder, go
+            "agent" => self.open_agentc00pr(),
+            other if other.starts_with("agent-new=") => {
+                if let (Some(d), Some((name, parent))) = (self.agent.as_mut(), other["agent-new=".len()..].split_once('|')) {
+                    d.new_case = true;
+                    d.name = name.to_string();
+                    d.parent = parent.to_string();
+                }
+            }
+            "agent-go" => self.agent_go(),
             // the answer to "already hunted": overwrite, keep or new
             other if other.starts_with("hunt-answer=") => {
                 if let Some(x) = crate::graph_hunt_common::record::IfHunted::parse(&other["hunt-answer=".len()..]) {
@@ -5055,6 +5069,7 @@ impl Viewer {
         self.labels_window(&ctx);
         self.when_window(&ctx);
         self.about_window(&ctx);
+        self.agent_window(&ctx);
         self.host_window(&ctx);
         self.edge_window(&ctx);
         self.merge_host_window(&ctx);
