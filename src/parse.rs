@@ -235,6 +235,11 @@ const OPENSSH_EVENT_IDS: &[&str] = &["3","4"];
 // relevant; process/pipe/file/registry events are tool-attribution territory,
 // out of masstin's scope.
 const SYSMON_EVENT_IDS: &[&str] = &["3"];
+// Group Policy Operational 5308: the domain controller the machine found
+// and bound to, by name and address. No row of the timeline (it is no
+// login): a fact about whose an address is, kept in the timeline's masstin
+// file for the host map (graph_hunt_common::hostmap).
+const GROUPPOLICY_EVENT_IDS: &[&str] = &["5308"];
 // Admin / lateral-movement service ports. Sysmon logs EVERY connection, so the
 // parser keeps only connections whose SERVICE port is one of these — same port
 // set parse-cortex uses with --admin-ports — to control volume.
@@ -1220,7 +1225,7 @@ type BuildFn = fn(&str) -> Option<WinRec>;
 /// rest as prefixes (`microsoft-windows-winrm/` takes the Operational log
 /// and any other of that provider). `family_for_channel` and the skip rule
 /// of `parselog` read the same list.
-const FAMILY_PREFIXES: [&str; 13] = [
+const FAMILY_PREFIXES: [&str; 14] = [
     "security",
     "microsoft-windows-smbserver/",
     "microsoft-windows-smbclient/security",
@@ -1234,6 +1239,7 @@ const FAMILY_PREFIXES: [&str; 13] = [
     "microsoft-windows-wmi-activity/",
     "microsoft-windows-sysmon/",
     "openssh/",
+    "microsoft-windows-grouppolicy/",
 ];
 
 fn prefix_matches(prefix: &str, channel_lower: &str) -> bool {
@@ -1249,7 +1255,7 @@ pub(crate) fn channel_has_family(channel: &str) -> bool {
 
 pub(crate) fn family_for_channel(channel: &str, event_id: &str) -> Option<(BuildFn, MapFn)> {
     let c = channel.to_ascii_lowercase();
-    let table: [(&str, &[&str], BuildFn, MapFn); 13] = [
+    let table: [(&str, &[&str], BuildFn, MapFn); 14] = [
         (FAMILY_PREFIXES[0], SECURITY_EVENT_IDS, build_event, map_security),
         (FAMILY_PREFIXES[1], SMBSERVER_EVENT_IDS, build_event2, map_smb_server),
         (FAMILY_PREFIXES[2], SMBCLIENT_EVENT_IDS, build_event, map_smb_client),
@@ -1263,6 +1269,7 @@ pub(crate) fn family_for_channel(channel: &str, event_id: &str) -> Option<(Build
         (FAMILY_PREFIXES[10], WMI_EVENT_IDS, build_wmi, map_wmi),
         (FAMILY_PREFIXES[11], SYSMON_EVENT_IDS, build_event, map_sysmon),
         (FAMILY_PREFIXES[12], OPENSSH_EVENT_IDS, build_event, map_openssh),
+        (FAMILY_PREFIXES[13], GROUPPOLICY_EVENT_IDS, build_event, map_group_policy),
     ];
     table.iter()
         .find(|(prefix, ids, _, _)| prefix_matches(prefix, &c) && ids.contains(&event_id))
@@ -1898,6 +1905,27 @@ pub(crate) fn pair_openssh(rows: Vec<LogData>) -> Vec<LogData> {
 // ---------------------------------------------------------------------------------------
 pub fn parse_winrm(file: &str, lateral_event_ids: Vec<&str>) -> Vec<LogData> {
     evtx_rows(file, &lateral_event_ids, build_event, map_winrm)
+}
+
+/// Group Policy 5308: no row, a fact for the host map (the domain
+/// controller's name and address, as the machine that wrote it found them).
+pub(crate) fn map_group_policy(rec: &WinRec, _file: &str) -> Option<LogData> {
+    let (name, address) = (rec.f("DCName"), strip_ipv4_mapped(rec.f("DCIPAddress").trim()));
+    let name = name.trim().trim_start_matches('\\');
+    if name.is_empty() || address.is_empty() || address.parse::<std::net::IpAddr>().is_err() {
+        return None;
+    }
+    let when = crate::graph_hunt_common::parse_ts(&rec.time).map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+    let on = rec.computer.split('.').next().unwrap_or("").to_uppercase();
+    crate::graph_hunt_common::hostmap::note_fact(crate::graph_hunt_common::hostmap::Fact {
+        host: name.to_string(),
+        address,
+        kind: "locator".to_string(),
+        from: when.clone(),
+        to: when,
+        source: format!("Group Policy 5308 on {}: the domain controller it found", on),
+    });
+    None
 }
 
 pub(crate) fn map_winrm(rec: &WinRec, file: &str) -> Option<LogData> {

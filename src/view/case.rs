@@ -5,6 +5,11 @@
 //! subnets (`views`), the presentation (`story`) and the notes. While a case
 //! is open nothing is written next to the timelines; the marks (`verdict`,
 //! `notes`) stay in the CSV itself.
+//!
+//! The same file, under the timeline's name and next to it, is where
+//! masstin itself keeps what it knows of a timeline (what it was read from,
+//! what its hunt was run with: see `timeline_file`). Saving a case over
+//! such a file keeps those keys as they are on disk.
 
 use std::path::{Path, PathBuf};
 
@@ -47,7 +52,17 @@ impl CaseFile {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let mut c = self.clone();
         c.masstin_case = 1;
-        let text = serde_json::to_string_pretty(&c).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut value = serde_json::to_value(&c).map_err(std::io::Error::other)?;
+        // what masstin itself wrote there (ingests, hunt) is not the
+        // viewer's to change: it stays as it is on disk now
+        if let (Some(obj), Some(disk)) = (value.as_object_mut(), std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(t.trim_start_matches('\u{feff}')).ok())) {
+            for k in crate::timeline_file::RECORD_KEYS {
+                if let Some(v) = disk.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        let text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
@@ -85,6 +100,26 @@ impl CaseFile {
         }
         (found, missing)
     }
+}
+
+/// The masstin file of the first of these timelines (`<name>.masstin` next
+/// to it), when it has one: its case. The parsers and the hunt make that
+/// file to keep what they know of the timeline; what the analyst keeps
+/// goes into the same one, not into more files next to the timeline. The
+/// first time (the file holds nothing of the viewer's yet) it starts from
+/// what is already kept next to the timeline, read and not written.
+pub fn of_timeline(timelines: &[String]) -> Option<(PathBuf, CaseFile)> {
+    let first = timelines.first()?;
+    let raw = crate::timeline_file::read_all(first)?;
+    let path = crate::timeline_file::path_for(first);
+    let mut c = CaseFile::load(&path).ok()?;
+    if !["views", "story", "notes"].iter().any(|k| raw.contains_key(*k)) {
+        let side = CaseFile::from_side_files(timelines);
+        c.views = side.views;
+        c.story = side.story;
+        c.notes = side.notes;
+    }
+    Some((path, c))
 }
 
 /// The path as an absolute one, so a case names its timelines wherever it is
@@ -148,6 +183,15 @@ mod tests {
         // nothing went next to the timeline
         assert_eq!(std::fs::read_dir(dir.join("share")).unwrap().count(), 1);
 
+        // what masstin wrote into that file meanwhile stays when the case is saved again
+        let mut disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&case).unwrap()).unwrap();
+        disk["hunt"] = serde_json::json!({"masstin_hunt": 1, "alpha": 0.05});
+        disk["ingests"] = serde_json::json!([{"action": "parse"}]);
+        std::fs::write(&case, disk.to_string()).unwrap();
+        c.save(&case).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&case).unwrap()).unwrap();
+        assert_eq!((disk["hunt"]["alpha"].as_f64(), disk["ingests"][0]["action"].as_str(), disk["story"]["title"].as_str()), (Some(0.05), Some("parse"), Some("the intrusion")));
+
         let back = CaseFile::load(&case).unwrap();
         assert_eq!(back.masstin_case, 1);
         assert_eq!(back.views.merges, vec![("10.0.0.5".to_string(), "SRV01".to_string())]);
@@ -166,6 +210,36 @@ mod tests {
         let (found, missing) = back.locate(&dir.join("acme.masstin"));
         assert!(found.is_empty());
         assert_eq!(missing, vec![csv]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_masstin_file_of_a_timeline_is_its_case() {
+        let dir = std::env::temp_dir().join(format!("masstin-case-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("timeline.csv").to_string_lossy().to_string();
+        std::fs::write(&csv, "x\n").unwrap();
+        // no masstin file: no case of its own
+        assert!(of_timeline(&[csv.clone()]).is_none());
+        // views kept next to the timeline before, then a hunt writes the masstin file
+        let mut vf = ViewsFile::default();
+        vf.merges.push(("10.0.0.5".into(), "SRV01".into()));
+        vf.save(&ViewsFile::path_for(&csv)).unwrap();
+        crate::timeline_file::set(&csv, "hunt", serde_json::json!({"masstin_hunt": 1, "alpha": 0.05})).unwrap();
+        let (path, mut c) = of_timeline(&[csv.clone()]).unwrap();
+        assert_eq!(path, dir.join("timeline.masstin"));
+        assert_eq!(c.views.merges, vec![("10.0.0.5".to_string(), "SRV01".to_string())], "what was next to the timeline is taken the first time");
+        // saved as the case: the hunt stays, and from now on the file is the one read
+        c.views.merges.push(("10.0.0.6".into(), "SRV02".into()));
+        c.save(&path).unwrap();
+        std::fs::remove_file(ViewsFile::path_for(&csv)).unwrap();
+        let (_, back) = of_timeline(&[csv.clone()]).unwrap();
+        assert_eq!(back.views.merges.len(), 2);
+        assert_eq!(crate::timeline_file::get(&csv, "hunt").unwrap()["alpha"].as_f64(), Some(0.05));
+        // something else under that name is no case
+        std::fs::write(&path, "not json").unwrap();
+        assert!(of_timeline(&[csv]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

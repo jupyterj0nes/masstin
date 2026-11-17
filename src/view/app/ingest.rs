@@ -325,10 +325,15 @@ impl Viewer {
         // its subnets and its merges are read from ITS views file. Only the
         // merges were, so the next change of style wrote the views of the
         // timeline open before (or none) over the ones this timeline had.
-        let own = if in_case { None } else { Some(ViewsFile::load(&ViewsFile::path_for(&files[0]))) };
-        let merges = match &own {
-            Some(vf) => vf.merges.clone(),
-            None => self.merges.clone(),
+        // A timeline with its masstin file next to it (the parsers and the
+        // hunt make it) is opened as that case: what is kept goes there,
+        // not into more files next to the timeline.
+        let own_case = if in_case { None } else { case::of_timeline(&files) };
+        let own = if in_case || own_case.is_some() { None } else { Some(ViewsFile::load(&ViewsFile::path_for(&files[0]))) };
+        let merges = match (&own_case, &own) {
+            (Some((_, c)), _) => c.views.merges.clone(),
+            (None, Some(vf)) => vf.merges.clone(),
+            (None, None) => self.merges.clone(),
         };
         match Store::load_with(&files, self.alpha, &merges) {
             Ok(s) => {
@@ -343,6 +348,14 @@ impl Viewer {
                     }
                     self.case_missing.clear();
                 }
+                if let Some((_, c)) = &own_case {
+                    self.saved = c.views.views.clone();
+                    self.subnet_defs = c.views.subnets.clone();
+                    if let Some(st) = c.views.last_style.clone() {
+                        self.style = st;
+                    }
+                    self.case_missing.clear();
+                }
                 // what was typed for the timeline open before is not this
                 // one's: the hunt's dates, seeds and files, the merge's list
                 self.hunt_form = super::hunt::HuntForm::default();
@@ -351,9 +364,18 @@ impl Viewer {
                 self.views_path = ViewsFile::path_for(&self.files[0]);
                 self.story_path = Story::path_for(&self.files[0]);
                 if !in_case {
-                    self.case = None;
-                    self.story = Story::load(&self.story_path);
-                    self.notes = Notes::load(&Notes::path_for(&self.files[0]));
+                    match own_case {
+                        Some((p, c)) => {
+                            self.story = c.story;
+                            self.notes = Notes { path: p.clone(), notes: c.notes };
+                            self.case = Some(p);
+                        }
+                        None => {
+                            self.case = None;
+                            self.story = Story::load(&self.story_path);
+                            self.notes = Notes::load(&Notes::path_for(&self.files[0]));
+                        }
+                    }
                 }
                 self.remembered.clear();
                 if self.draft.view == View::Findings && !self.store.edges.iter().any(|e| e.hunt != 0) {

@@ -1,5 +1,5 @@
-//! The record of a hunt, kept next to the timeline it was written into:
-//! `<timeline>.hunt.json`. The hunt columns of a timeline say what every
+//! The record of a hunt, kept in the file of the timeline it was written
+//! into (`<timeline>.masstin`, key `hunt`; see `timeline_file`). The hunt columns of a timeline say what every
 //! row is (significant, candidate, baseline…) but not what the hunt was run
 //! with; a timeline hunted with one start of the investigation and read
 //! later next to others hunted with another cannot be told apart by its
@@ -39,31 +39,40 @@ pub struct HuntRecord {
     /// of them, significant at alpha
     #[serde(default)]
     pub significant: u64,
+    /// `--merge-hosts`: the level addresses were read as their host at
+    /// (`strict`, `standard`, `broad`), empty when they were not, and how
+    /// many were
+    #[serde(default)]
+    pub merge_hosts: String,
+    #[serde(default)]
+    pub hosts_merged: u64,
     /// the timelines hunted together (their file names): the hunt of one
     /// depends on the others
     #[serde(default)]
     pub timelines: Vec<String>,
 }
 
-/// `timeline.csv` -> `timeline.hunt.json`, next to it.
-pub fn path_for(timeline: &str) -> PathBuf {
-    let p = Path::new(timeline);
-    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".to_string());
-    p.with_file_name(format!("{}.hunt.json", stem))
-}
+/// The key of the timeline's file the hunt is kept under.
+pub const KEY: &str = "hunt";
 
 pub fn write(timeline: &str, rec: &HuntRecord) -> std::io::Result<PathBuf> {
-    let path = path_for(timeline);
-    let text = serde_json::to_string_pretty(rec).map_err(std::io::Error::other)?;
-    std::fs::write(&path, text)?;
-    Ok(path)
+    crate::timeline_file::set(timeline, KEY, serde_json::to_value(rec).map_err(std::io::Error::other)?)
 }
 
 /// The record of a timeline, when it has one that reads.
 pub fn read(timeline: &str) -> Option<HuntRecord> {
-    let text = std::fs::read_to_string(path_for(timeline)).ok()?;
-    let rec: HuntRecord = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let rec: HuntRecord = serde_json::from_value(crate::timeline_file::get(timeline, KEY)?).ok()?;
     if rec.masstin_hunt == 0 { None } else { Some(rec) }
+}
+
+/// A timeline written anew from another (`--if-hunted new`) was read from
+/// the same evidence: its file says so too, and what that evidence said
+/// of whose an address is.
+pub fn carry_ingests(from: &str, to: &str) {
+    if let Some(i) = crate::ingest_record::read(from) {
+        let _ = crate::ingest_record::write(to, i);
+    }
+    let _ = super::hostmap::write_facts(to, &super::hostmap::read_facts(from));
 }
 
 pub fn fmt_utc(t: chrono::DateTime<chrono::Utc>) -> String {
@@ -133,6 +142,9 @@ impl Previous {
                 parts.push(format!("window end {} UTC", r.window_end));
             }
             parts.push(format!("alpha {}", r.alpha));
+            if !r.merge_hosts.is_empty() {
+                parts.push(format!("{} address(es) read as their host (--merge-hosts {})", r.hosts_merged, r.merge_hosts));
+            }
             let who = if r.masstin_version.is_empty() { "masstin".to_string() } else { format!("masstin {}", r.masstin_version) };
             parts.push(if r.hunted_at.is_empty() { format!("by {}", who) } else { format!("by {} on {} UTC", who, r.hunted_at) });
         } else {
@@ -210,17 +222,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_record_sits_next_to_the_timeline_and_reads_back() {
+    fn the_record_sits_in_the_file_of_the_timeline_and_reads_back() {
         let dir = std::env::temp_dir().join(format!("masstin_hunt_record_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tl = dir.join("case.2026.csv").to_string_lossy().to_string();
-        assert_eq!(path_for(&tl), dir.join("case.2026.hunt.json"));
         assert!(read(&tl).is_none());
-        let rec = HuntRecord { masstin_hunt: 1, masstin_version: "1.5.0".into(), hunted_at: "2026-11-16 22:00:00".into(), investigation_from: "2026-11-09 00:00:00".into(), window_end: String::new(), alpha: 0.05, connections: 1109, significant: 24, timelines: vec!["case.2026.csv".into()] };
+        let rec = HuntRecord { masstin_hunt: 1, masstin_version: "1.5.0".into(), hunted_at: "2026-11-16 22:00:00".into(), investigation_from: "2026-11-09 00:00:00".into(), window_end: String::new(), alpha: 0.05, connections: 1109, significant: 24, merge_hosts: "standard".into(), hosts_merged: 7, timelines: vec!["case.2026.csv".into()] };
         let path = write(&tl, &rec).unwrap();
-        assert_eq!(path, dir.join("case.2026.hunt.json"));
+        assert_eq!(path, dir.join("case.2026.masstin"));
+        assert_eq!(read(&tl), Some(rec.clone()));
+        // the ingests kept in the same file stay, and go on to a copy
+        let ing = crate::ingest_record::Ingest { action: "parse".into(), sources: vec!["D:\\ev\\dc01".into()], ..Default::default() };
+        crate::ingest_record::write(&tl, vec![ing.clone()]).unwrap();
         assert_eq!(read(&tl), Some(rec));
-        // something else under that name is no record
+        let copy = dir.join("case.2026.hunt-2026-11-12.csv").to_string_lossy().to_string();
+        carry_ingests(&tl, &copy);
+        assert_eq!(crate::ingest_record::read(&copy), Some(vec![ing]));
+        assert!(read(&copy).is_none());
+        // a masstin file without a hunt has no record
         std::fs::write(&path, "{\"views\":[]}").unwrap();
         assert!(read(&tl).is_none());
         std::fs::write(&path, "not json").unwrap();
@@ -255,7 +274,7 @@ mod tests {
         assert_eq!(p.started(), "after 2026-11-07 and by 2026-11-10 (read off the rows: no record)");
         assert!(p.describe().contains("alpha and date of the hunt unknown") && p.describe().ends_with("5 row(s) with a hunt state, 1 significant"), "{}", p.describe());
         // with its record: exact
-        let rec = HuntRecord { masstin_hunt: 1, masstin_version: "1.5.0".into(), hunted_at: "2026-11-16 22:00:00".into(), investigation_from: "2026-11-09 00:00:00".into(), window_end: String::new(), alpha: 0.05, connections: 3, significant: 1, timelines: vec!["hunted.csv".into()] };
+        let rec = HuntRecord { masstin_hunt: 1, masstin_version: "1.5.0".into(), hunted_at: "2026-11-16 22:00:00".into(), investigation_from: "2026-11-09 00:00:00".into(), window_end: String::new(), alpha: 0.05, connections: 3, significant: 1, merge_hosts: String::new(), hosts_merged: 0, timelines: vec!["hunted.csv".into()] };
         write(&hunted, &rec).unwrap();
         let p = previous(&hunted).unwrap().unwrap();
         assert_eq!(p.started(), "2026-11-09 00:00:00 UTC");

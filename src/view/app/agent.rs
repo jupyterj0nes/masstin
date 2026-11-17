@@ -3,7 +3,7 @@
 //! already has, with the options agentc00pr's own command line gives
 //! (`--new-case`, `--add`, `--scan`), and its window opens on that case.
 //! Nothing of masstin's is written for it: a timeline carries the record
-//! of its ingest next to it (`<name>.ingest.json`), and agentc00pr brings
+//! of its ingest in its file next to it (`<name>.masstin`), and agentc00pr brings
 //! the evidence named there into the case with masstin as already run.
 
 use super::*;
@@ -239,7 +239,7 @@ impl Viewer {
             theme::section(ui, "What goes");
             for f in files.iter().take(4) {
                 let name = std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
-                let with = if crate::ingest_record::read(f).is_some() { "with its ingest record: the evidence it was read from comes into the case, masstin as already run on it" } else { "no ingest record next to it: the timeline alone" };
+                let with = if crate::ingest_record::read(f).is_some() { "with its ingest record: the evidence it was read from comes into the case, masstin as already run on it" } else { "no ingest record with it: the timeline alone" };
                 ui.horizontal(|ui| {
                     ui.label(theme::semibold(&name, 12.5)).on_hover_text(f);
                     ui.label(egui::RichText::new(with).color(theme::MUTED).small());

@@ -20,6 +20,7 @@ use chrono::NaiveDateTime;
 
 pub mod algos;
 pub mod engine;
+pub mod hostmap;
 pub mod record;
 pub mod report;
 pub mod resolve;

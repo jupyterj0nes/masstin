@@ -43,6 +43,25 @@ The full design, with the reasons behind each choice, is in [docs/graph-hunt-sta
 
 `--only-detectors` / `--skip-detectors` take the signal names above (mutually exclusive).
 
+### Whose address is it: the host map
+
+A timeline names the origin of a connection by its name when the event gives one and by its address when it does not, so one machine is often two origins, `DEV-DC01` and `10.10.0.37`, each with part of its connections. The same-login test above folds an address into a name only when one login was recorded twice. The rest is in the timeline too, said outright, and `masstin -a host-map -f timeline.csv` shows it: one line per address, the host it is, the evidence, and how many rows have that address as their origin.
+
+| Evidence | What it is | Where it comes from |
+|---|---|---|
+| `locator` | the domain controller a machine found and bound to, by name and address | Group Policy 5308, kept in `<name>.masstin` by the parsers |
+| `machine-account` | the computer account `NAME$` authenticated from the address | the rows: 4624 network logon and 4768 that succeeded |
+| `declared` | the name the client gave in the event that has its address | the rows: `src_computer` next to `src_ip` (not when the name is the destination's own) |
+| `same-login` | the statistical test | the rows |
+
+`--merge-hosts LEVEL` makes `graph-hunt-csv` read each such address as its host for the whole hunt: the two origins are one machine with all its connections, and a login from a host to its own address is no connection. The level says how much is taken without asking:
+
+- `strict`: `locator` only: the domain controller a machine found and bound to.
+- `standard`: also `machine-account`, when the name is a machine the timelines know (a destination, a declared origin, a host of `locator`). A `NAME$` that is nothing else may be a service account, and counts at `broad` only.
+- `broad`: everything.
+
+At every level an address is left as it is, and the table says why, when the evidence disagrees: several names at one address in the same period (NAT, a proxy, a jump host, a forged name), an address that changed hands (a node of the graph is one machine for the whole timeline, so it is merged into neither), or a host seen at two addresses in the same period with nothing stronger (`locator`) to tell which is its. The last one is deliberate: a second interface looks like that, and so does a machine account relayed or used from somewhere else. No level is proof against someone who holds a machine's account and uses it from an address where the real machine is never seen: `strict` does not read accounts at all, and the table shows the evidence of every merge so it can be checked. `--merge-hosts-skip` leaves addresses out; the hunt's record says the level and how many addresses were merged. The timeline's columns keep both names.
+
 ### Output
 
 **In the timeline.** `graph-hunt-csv` writes its verdict into the timeline it reads: every row gets `hunt` (`significant`, `candidate`, `habitual`, `not_evaluated`, `baseline`, or empty for a row that did not enter the hunt), `hunt_score` (0 to 100, how rare: 30 is one in a thousand) and `hunt_why`, in place; `verdict` and `notes`, the analyst's columns, are kept. A session end takes the state of the login it closes. The states are defined in [csv-format.md](csv-format.md#the-analysis-tail). `--no-annotate` leaves the timeline as it is; `--carry-marks old.csv` copies `verdict` / `notes` from an earlier timeline of the same evidence. Without `-o`, nothing else is written.

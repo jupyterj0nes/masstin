@@ -1,5 +1,6 @@
-//! The record of an ingest, kept next to the timeline it wrote:
-//! `<timeline>.ingest.json`. A timeline says what happened on the machines;
+//! The record of an ingest, kept in the file of the timeline it wrote
+//! (`<timeline>.masstin`, key `ingests`; see `timeline_file`). A timeline
+//! says what happened on the machines;
 //! it does not say what evidence it was read from. Whoever takes the
 //! timeline further (a case tool, a colleague, the analyst a month later)
 //! finds it here: the evidence given, the command that read it, when, and
@@ -11,20 +12,7 @@
 //! evidence on disk to name.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct IngestRecord {
-    /// the format's version (1)
-    #[serde(default)]
-    pub masstin_ingest: u32,
-    /// the timeline's file name
-    #[serde(default)]
-    pub timeline: String,
-    /// the runs of the parsers that made the timeline, in order
-    #[serde(default)]
-    pub ingests: Vec<Ingest>,
-}
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Ingest {
@@ -44,32 +32,21 @@ pub struct Ingest {
     pub masstin_version: String,
 }
 
-/// `timeline.csv` -> `timeline.ingest.json`, next to it.
-pub fn path_for(timeline: &str) -> PathBuf {
-    let p = Path::new(timeline);
-    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "timeline".to_string());
-    p.with_file_name(format!("{}.ingest.json", stem))
-}
+/// The key of the timeline's file the ingests are kept under.
+pub const KEY: &str = "ingests";
 
-pub fn read(timeline: &str) -> Option<IngestRecord> {
-    let text = std::fs::read_to_string(path_for(timeline)).ok()?;
-    let rec: IngestRecord = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
-    if rec.masstin_ingest == 0 { None } else { Some(rec) }
+/// The runs of the parsers that made the timeline, in order; None when its
+/// file names none.
+pub fn read(timeline: &str) -> Option<Vec<Ingest>> {
+    let v: Vec<Ingest> = serde_json::from_value(crate::timeline_file::get(timeline, KEY)?).ok()?;
+    if v.is_empty() { None } else { Some(v) }
 }
 
 pub fn write(timeline: &str, ingests: Vec<Ingest>) -> std::io::Result<PathBuf> {
-    let name = Path::new(timeline).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| timeline.to_string());
-    let rec = IngestRecord { masstin_ingest: 1, timeline: name, ingests };
-    let path = path_for(timeline);
-    std::fs::write(&path, serde_json::to_string_pretty(&rec).map_err(std::io::Error::other)?)?;
-    Ok(path)
+    crate::timeline_file::set(timeline, KEY, serde_json::to_value(ingests).map_err(std::io::Error::other)?)
 }
 
-/// A path as given, made absolute (not resolved: a mapped drive stays the
-/// drive the analyst typed).
-pub fn absolute(p: &str) -> String {
-    std::path::absolute(p).map(|a| a.to_string_lossy().to_string()).unwrap_or_else(|_| p.to_string())
-}
+use crate::timeline_file::absolute;
 
 /// One argument as a shell would need it written.
 fn quoted(a: &str) -> String {
@@ -101,7 +78,7 @@ pub fn of_parse(action: &str, files: &[String], dirs: &[String], command: String
 pub fn of_merge(timelines: &[String]) -> Vec<Ingest> {
     let mut out: Vec<Ingest> = Vec::new();
     for t in timelines {
-        for i in read(t).map(|r| r.ingests).unwrap_or_default() {
+        for i in read(t).unwrap_or_default() {
             if !out.contains(&i) {
                 out.push(i);
             }
@@ -121,7 +98,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tl = |n: &str| dir.join(n).to_string_lossy().to_string();
         let started = chrono::DateTime::parse_from_rfc3339("2026-11-16T21:40:00Z").unwrap().with_timezone(&chrono::Utc);
-        assert_eq!(path_for(&tl("a.case.csv")), dir.join("a.case.ingest.json"));
         assert!(read(&tl("a.csv")).is_none());
         // evidence files: their absolute paths, the command, the date
         let ev = dir.join("dc01.e01").to_string_lossy().to_string();
@@ -133,15 +109,14 @@ mod tests {
         assert!(std::path::Path::new(&of_parse("parse", &["rel.evtx".to_string()], &[], cmd.clone(), started).unwrap().sources[0]).is_absolute());
         // an action that reads no file names no evidence
         assert!(of_parse("parse-cortex", &[], &[], cmd.clone(), started).is_none());
-        write(&tl("a.csv"), vec![a.clone()]).unwrap();
-        let back = read(&tl("a.csv")).unwrap();
-        assert_eq!((back.masstin_ingest, back.timeline.as_str(), back.ingests.len()), (1, "a.csv", 1));
+        assert_eq!(write(&tl("a.csv"), vec![a.clone()]).unwrap(), dir.join("a.masstin"));
+        assert_eq!(read(&tl("a.csv")), Some(vec![a.clone()]));
         // a merge carries the ingests of what it merges, each once
         let b = of_parse("parse-linux", &[], &[dir.join("triage").to_string_lossy().to_string()], "masstin -a parse-linux -d triage -o b.csv".into(), started).unwrap();
         write(&tl("b.csv"), vec![b.clone(), a.clone()]).unwrap();
         assert_eq!(of_merge(&[tl("a.csv"), tl("b.csv"), tl("none.csv")]), vec![a, b]);
-        // something else under that name is no record
-        std::fs::write(path_for(&tl("a.csv")), "{\"views\":[]}").unwrap();
+        // a masstin file without ingests names none
+        std::fs::write(crate::timeline_file::path_for(&tl("a.csv")), "{\"views\":[]}").unwrap();
         assert!(read(&tl("a.csv")).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

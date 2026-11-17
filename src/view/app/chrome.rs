@@ -293,6 +293,10 @@ impl Viewer {
                     self.open_agentc00pr();
                 }
                 ui.separator();
+                if icon_button(ui, ic::LINK, "Hosts and addresses…").on_hover_text("Whose each address of the timelines is, with the evidence (the machine's own account, the domain controller a member found, the name a client gave), and the merges it allows: an address and its host drawn as one").clicked() {
+                    ui.close();
+                    self.open_hosts();
+                }
                 if icon_button(ui, ic::ARROWS_CLOCKWISE, &format!("Merged hosts… ({})", self.merges.len())).on_hover_text("Two names of the same machine drawn as one host, in this view and case only: the timeline CSV is not changed").clicked() {
                     ui.close();
                     self.show_merges = true;

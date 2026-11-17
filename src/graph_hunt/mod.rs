@@ -84,7 +84,7 @@ pub(crate) fn settings(
     let seed_from = bound(seed_from, "--seed-from")?;
     let seed_to = bound(seed_to, "--seed-to")?;
     let sigma: Vec<String> = sigma.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
-    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, sigma })
+    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, sigma, host_merges: std::collections::HashMap::new(), host_level: String::new() })
 }
 
 /// graph-hunt-csv: the same hunt straight from timeline CSVs, no database.
@@ -104,8 +104,9 @@ pub fn graph_hunt_csv(
     annotate: bool,
     carry_marks: Option<&str>,
     if_hunted: crate::graph_hunt_common::record::IfHunted,
+    merge_hosts: Option<(crate::graph_hunt_common::hostmap::Level, std::collections::HashSet<String>)>,
 ) {
-    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
+    let mut settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
         Some(s) => s,
         None => {
             crate::mark_failed();
@@ -118,6 +119,29 @@ pub fn graph_hunt_csv(
     }
     crate::banner::print_phase_detail("Cutoff:", &settings.cutoff.to_rfc3339());
     crate::banner::print_phase_detail("Alpha (FDR):", &format!("{}", alpha));
+    // addresses that are a host, read as that host by the whole hunt
+    if let Some((level, skip)) = merge_hosts {
+        match crate::graph_hunt_common::hostmap::build(files, alpha) {
+            Ok(table) => {
+                let merges = table.merges(level, &skip);
+                crate::banner::print_phase_detail("Hosts:", &format!("--merge-hosts {}: {} address(es) read as the host they are ({}){}", level.name(), merges.len(), level.explain(), if skip.is_empty() { String::new() } else { format!("; {} left out with --merge-hosts-skip", skip.len()) }));
+                for (a, h) in &merges {
+                    crate::banner::print_phase_detail("", &format!("{} -> {}", a, h));
+                }
+                let c = table.counts();
+                if c[3] > 0 {
+                    crate::banner::print_phase_detail("", &format!("{} address(es) left as they are because the evidence disagrees: `masstin -a host-map` names them", c[3]));
+                }
+                settings.host_merges = merges.into_iter().collect();
+                settings.host_level = level.name().to_string();
+            }
+            Err(e) => {
+                eprintln!("Masstin - Error: --merge-hosts: cannot read the timelines: {}", e);
+                crate::mark_failed();
+                return;
+            }
+        }
+    }
     crate::banner::print_phase("2", "4", "No graph database: everything is computed in memory");
     let ann = if annotate { Some(engine::Annotate { files, carry_marks, if_hunted }) } else { None };
     engine::run_csv(files, &crate::graph_hunt_common::NEO4J, &settings, output, report, ann);

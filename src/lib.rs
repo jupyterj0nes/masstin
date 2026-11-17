@@ -19,6 +19,7 @@ mod merge_memgraph_nodes;
 pub use crate::merge_memgraph_nodes::*;
 mod merge;
 pub mod ingest_record;
+pub mod timeline_file;
 pub use crate::merge::*;
 use serde_json::Value;
 mod parse_elastic;
@@ -351,11 +352,39 @@ pub struct Cli {
     /// names it). Whatever the answer, masstin says that the timeline was
     /// hunted before and with what: the start of the investigation, alpha
     /// and the date of that hunt from its record
-    /// (`<name>.hunt.json`, written by every hunt next to the timeline),
+    /// (kept in `<name>.masstin`, written by every hunt next to the timeline),
     /// or, without a record, the days between which it started, read off
     /// the `baseline` rows. A timeline never hunted is written in place.
     #[arg(long, value_name = "overwrite|keep|new")]
     if_hunted: Option<String>,
+
+    /// For `graph-hunt-csv`: read an address as the host it is, for the
+    /// whole hunt, when the timelines themselves say whose it is. A
+    /// timeline names an origin by its name when the event gives one and
+    /// by its address when it does not, so one machine is often two
+    /// origins (`DEV-DC01` and `10.10.0.37`), each with part of its
+    /// connections; merged, the hunt profiles one machine, and a login
+    /// from a host to its own address is no connection. The level says
+    /// which evidence is taken without asking: `strict` (the domain
+    /// controller a machine found and bound to, by name and address:
+    /// Group Policy 5308, kept in `<name>.masstin` when the evidence was
+    /// parsed), `standard` (also the machine's own account, `NAME$`,
+    /// authenticated from the address: 4624 network logon, 4768), `broad`
+    /// (also the name the client itself gave in the event, and the
+    /// same-login test). At every level an address stays as it is when
+    /// the evidence disagrees: several names at it (NAT, a proxy, an
+    /// address that changed hands) or its host seen at two addresses in
+    /// the same period. The timeline's columns are not changed. `masstin
+    /// -a host-map -f <timelines>` shows the table and the evidence of
+    /// every address first. Without the option nothing is merged this
+    /// way (the same-login test folds what it always did).
+    #[arg(long, value_name = "strict|standard|broad")]
+    merge_hosts: Option<String>,
+
+    /// With `--merge-hosts`: addresses to leave as they are whatever the
+    /// evidence says (comma separated).
+    #[arg(long, value_name = "ADDRESS,ADDRESS")]
+    merge_hosts_skip: Option<String>,
 
     /// For `merge` / `graph-hunt-csv`: an earlier timeline whose `verdict`
     /// and `notes` are copied onto the rows with the same 14 event columns
@@ -476,6 +505,9 @@ enum ActionType {
     /// Same hunt as graph-hunt / graph-hunt-neo4j but straight from masstin timeline CSVs (-f), no graph database: every statistic is computed in memory. Requires --investigation-from.
     #[value(alias = "graph-hunt-csv")]
     GraphHuntCsv,
+    /// Whose address is it: the table of the addresses of masstin timelines (-f) and the host each is, with the evidence: `locator` (the domain controller a machine found and bound to, by name and address: Group Policy 5308, kept in `<name>.masstin` when the evidence was parsed); `machine-account` (the computer account NAME$ authenticated from the address); `declared` (the name the client gave in the event that has its address); `same-login` (the statistical test). Each address says at which level it is merged without asking (strict, standard, broad: see --merge-hosts), or why it is left to you (several names at it, its host at two addresses in the same period, nothing says whose it is), and how many rows have it as their origin. -o writes the table as CSV. Nothing is changed in the timelines.
+    #[value(alias = "hosts")]
+    HostMap,
     /// Open the graph viewer (a window) on timeline CSVs (-f): the lateral-movement graph with its hunt states, filters, neighbourhoods, a replay in time order and the analyst's marks, written back into the CSV. Without -f it opens on a welcome, to open a timeline or ingest evidence (drop it on the window). --focus HOST opens on a host's neighbourhood; --start-time / --end-time bound the window.
     View,
 }
@@ -771,7 +803,51 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 return Err(Box::from("this masstin was built without the `ui` feature: `-a view` is not available"));
             }
         }
+        ActionType::HostMap => {
+            crate::banner::print_phase("1", "1", "Addresses and the hosts they are");
+            match crate::graph_hunt_common::hostmap::build(&config.file, config.alpha) {
+                Ok(table) => {
+                    for l in table.summary() {
+                        crate::banner::print_phase_detail("", &l);
+                    }
+                    println!();
+                    println!("{:<40} {:<28} {:<9} {:>8}  {}", "ADDRESS", "HOST", "MERGE", "ROWS", "EVIDENCE / WHY NOT");
+                    for e in &table.entries {
+                        let what = match (e.evidence().as_str(), e.note.as_str()) {
+                            ("", n) => n.to_string(),
+                            (ev, "") => ev.to_string(),
+                            (ev, n) => format!("{} -- {}", ev, n),
+                        };
+                        println!("{:<40} {:<28} {:<9} {:>8}  {}", e.address, if e.host.is_empty() { "-" } else { e.host.as_str() }, e.level_name(), e.rows, what);
+                    }
+                    if let Some(out) = config.output.as_deref() {
+                        match std::fs::write(out, table.to_csv()) {
+                            Ok(()) => crate::banner::print_phase_detail("Table:", out),
+                            Err(e) => {
+                                eprintln!("Masstin - Error: cannot write {}: {}", out, e);
+                                crate::mark_failed();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Masstin - Error: cannot read the timelines: {}", e);
+                    crate::mark_failed();
+                }
+            }
+        }
         ActionType::GraphHuntCsv => {
+            let merge_hosts = match config.merge_hosts.as_deref() {
+                None => None,
+                Some(v) => match crate::graph_hunt_common::hostmap::Level::parse(v) {
+                    Some(l) => Some((l, config.merge_hosts_skip.as_deref().unwrap_or("").split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect::<std::collections::HashSet<String>>())),
+                    None => {
+                        eprintln!("Masstin - Error: --merge-hosts {}: one of strict, standard, broad", v);
+                        crate::mark_failed();
+                        return Ok(());
+                    }
+                },
+            };
             crate::graph_hunt::graph_hunt_csv(
                 &config.file,
                 config.investigation_from.as_ref().unwrap(),
@@ -798,6 +874,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                         }
                     },
                 },
+                merge_hosts,
             );
         }
         ActionType::GraphHuntNeo4j => {
@@ -828,7 +905,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
     if failed() {
         return Err("the run did not complete: see the error above.".into());
     }
-    // What the timeline was read from, next to it (`<name>.ingest.json`):
+    // What the timeline was read from, in its file next to it (`<name>.masstin`):
     // the evidence given, the command, the date. See `ingest_record`.
     if let Some(out) = config.output.as_deref().filter(|o| std::path::Path::new(o).is_file()) {
         let ingests = match config.action {
@@ -841,9 +918,24 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             ActionType::Merge => ingest_record::of_merge(&config.file),
             _ => Vec::new(),
         };
+        // what the evidence said of whose an address is, outside the events
+        // of the timeline (see graph_hunt_common::hostmap)
+        let mut facts = crate::graph_hunt_common::hostmap::take_noted();
+        // a merged timeline keeps the facts of the ones merged
+        if config.action == ActionType::Merge {
+            for f in &config.file {
+                facts.extend(crate::graph_hunt_common::hostmap::read_facts(f));
+            }
+        }
+        if !facts.is_empty() {
+            match crate::graph_hunt_common::hostmap::write_facts(out, &facts) {
+                Ok(_) => crate::banner::print_phase_detail("Hosts:", &format!("{} address(es) the evidence names the host of (a domain controller found by a member: Group Policy 5308), kept in the timeline's masstin file for --merge-hosts and host-map", facts.len())),
+                Err(e) => eprintln!("Masstin - Warning: cannot write the host facts of {}: {}", out, e),
+            }
+        }
         if !ingests.is_empty() {
             match ingest_record::write(out, ingests) {
-                Ok(p) => crate::banner::print_phase_detail("Ingest record:", &format!("{} (what this timeline was read from)", p.display())),
+                Ok(p) => crate::banner::print_phase_detail("Ingest record:", &format!("{} (what this timeline was read from, kept in its masstin file)", p.display())),
                 Err(e) => eprintln!("Masstin - Warning: cannot write the ingest record next to {}: {}", out, e),
             }
         }
@@ -1397,11 +1489,19 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
         ActionType::View => {
             // no -f: the window opens on its welcome, to open or ingest one
         }
+        ActionType::HostMap => {
+            if config.file.is_empty() {
+                return Err(String::from("For host-map you must specify at least one timeline CSV with -f."));
+            }
+        }
         ActionType::GraphHuntCsv => {
             if config.file.is_empty() {
                 return Err(String::from(
                     "For graph-hunt-csv you must specify at least one timeline CSV with -f.",
                 ));
+            }
+            if config.merge_hosts_skip.is_some() && config.merge_hosts.is_none() {
+                return Err(String::from("--merge-hosts-skip names addresses to leave out of --merge-hosts: give --merge-hosts strict|standard|broad too."));
             }
             if config.investigation_from.is_none() {
                 return Err(String::from(

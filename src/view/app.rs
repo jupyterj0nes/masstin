@@ -21,6 +21,7 @@ mod remote;
 mod studio;
 mod ingest;
 mod agent;
+mod hosts;
 mod table;
 mod viewers;
 mod when;
@@ -351,6 +352,8 @@ pub struct Viewer {
     db_form: DbForm,
     /// "On to agentc00pr": the dialog, while it is open
     agent: Option<agent::AgentDialog>,
+    /// Tools › Hosts and addresses: the table, while it is open
+    hosts: Option<hosts::HostsDialog>,
     /// the open timelines that already carry a hunt, while the analyst is
     /// asked what to do with them; and that the answer was given
     hunt_ask: Option<Vec<(String, crate::graph_hunt_common::record::Previous)>>,
@@ -788,6 +791,7 @@ impl Viewer {
             db_form: DbForm::default(),
             show_table: false,
             agent: None,
+            hosts: None,
             hunt_ask: None,
             hunt_answered: false,
             table_find: String::new(),
@@ -4501,6 +4505,31 @@ impl Viewer {
                 }
             }
             // on to agentc00pr: the dialog, a new case of that name in that folder, go
+            // hosts and addresses: the table, a level, merge what it allows
+            "hosts" => self.open_hosts(),
+            other if other.starts_with("hosts-level=") => {
+                if let (Some(d), Some(l)) = (self.hosts.as_mut(), crate::graph_hunt_common::hostmap::Level::parse(&other["hosts-level=".len()..])) {
+                    d.level = l;
+                }
+            }
+            "hosts-merge" => {
+                let todo = match self.hosts.as_ref() {
+                    Some(hosts::HostsDialog { table: Ok(t), level, .. }) => Some((hosts::pending(t, *level, &self.merges), level.name())),
+                    _ => None,
+                };
+                if let Some((pairs, level)) = todo {
+                    self.merge_many(&pairs, &format!("the evidence of the timelines, level {}", level));
+                }
+            }
+            // the hunt's form on one of its four steps (0 to 3), not run
+            other if other.starts_with("hunt-step=") => {
+                self.show_hunt = true;
+                self.hunt_form.step = other["hunt-step=".len()..].parse::<usize>().unwrap_or(0).min(3);
+            }
+            // the hunt's tick box: `hunt-hosts=standard`, `hunt-hosts=off`
+            other if other.starts_with("hunt-hosts=") => {
+                self.hunt_form.merge_hosts = crate::graph_hunt_common::hostmap::Level::parse(&other["hunt-hosts=".len()..]);
+            }
             "agent" => self.open_agentc00pr(),
             other if other.starts_with("agent-new=") => {
                 if let (Some(d), Some((name, parent))) = (self.agent.as_mut(), other["agent-new=".len()..].split_once('|')) {
@@ -5070,6 +5099,7 @@ impl Viewer {
         self.when_window(&ctx);
         self.about_window(&ctx);
         self.agent_window(&ctx);
+        self.hosts_window(&ctx);
         self.host_window(&ctx);
         self.edge_window(&ctx);
         self.merge_host_window(&ctx);

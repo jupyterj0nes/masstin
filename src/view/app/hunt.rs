@@ -67,6 +67,11 @@ pub(super) struct HuntForm {
     /// what to do with a timeline that already carries a hunt (asked when
     /// Run is pressed on one)
     pub if_hunted: crate::graph_hunt_common::record::IfHunted,
+    /// read each address as the host it is, at this level (`--merge-hosts`);
+    /// None: not ticked
+    pub merge_hosts: Option<crate::graph_hunt_common::hostmap::Level>,
+    /// the level the tick box takes when it is ticked
+    pub merge_hosts_level: crate::graph_hunt_common::hostmap::Level,
     /// the findings table, required when the timeline is left untouched
     pub findings: String,
     pub report_on: bool,
@@ -88,6 +93,8 @@ impl Default for HuntForm {
             detectors: [true; 13],
             annotate: true,
             if_hunted: Default::default(),
+            merge_hosts: None,
+            merge_hosts_level: crate::graph_hunt_common::hostmap::Level::Standard,
             findings: String::new(),
             report_on: false,
             report: String::new(),
@@ -181,6 +188,10 @@ impl HuntForm {
         if let Some((flag, v)) = self.detector_arg() {
             args.push(flag.into());
             args.push(v);
+        }
+        if let Some(level) = self.merge_hosts {
+            args.push("--merge-hosts".into());
+            args.push(level.name().to_string());
         }
         if !self.annotate {
             args.push("--no-annotate".into());
@@ -507,6 +518,23 @@ impl Viewer {
     }
 
     fn hunt_step_results(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Hosts and their addresses");
+        let mut on = self.hunt_form.merge_hosts.is_some();
+        if ui.checkbox(&mut on, "Read each address as the host it is, when the timelines say whose it is").on_hover_text("--merge-hosts").changed() {
+            self.hunt_form.merge_hosts = if on { Some(self.hunt_form.merge_hosts_level) } else { None };
+        }
+        if let Some(level) = self.hunt_form.merge_hosts.as_mut() {
+            use crate::graph_hunt_common::hostmap::Level;
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                for (l, name) in [(Level::Strict, "Strict"), (Level::Standard, "Standard"), (Level::Broad, "Broad")] {
+                    ui.radio_value(level, l, name).on_hover_text(l.explain());
+                }
+                ui.label(egui::RichText::new(level.explain()).color(theme::MUTED).size(12.0));
+            });
+            self.hunt_form.merge_hosts_level = *level;
+        }
+        hint(ui, "A machine named by its name in some rows and by its address in others is two origins to the hunt, each with part of its connections. Ticked, the hunt reads them as one, and a login from a host to its own address is no connection. An address stays as it is when the evidence disagrees. Tools › Hosts and addresses shows the table and the evidence first; the timeline's columns are not changed.");
         theme::section(ui, "The verdicts");
         ui.radio_value(&mut self.hunt_form.annotate, true, "Written into the timeline: the hunt, score and why columns of every row (the verdicts and notes already there are kept)");
         ui.radio_value(&mut self.hunt_form.annotate, false, "The timeline left untouched: the findings go to a table of their own");
@@ -575,6 +603,10 @@ mod tests {
         assert_eq!(f.command(&files)[8..], ["--if-hunted".to_string(), "keep".to_string()]);
         f.if_hunted = IfHunted::Overwrite;
         assert_eq!(f.command(&files).len(), 8);
+        // the hosts tick box
+        f.merge_hosts = Some(crate::graph_hunt_common::hostmap::Level::Standard);
+        assert_eq!(f.command(&files)[8..], ["--merge-hosts".to_string(), "standard".to_string()]);
+        f.merge_hosts = None;
         f.if_hunted = IfHunted::New;
         f.annotate = false;
         f.findings = "D:/c/f.csv".into();

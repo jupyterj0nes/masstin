@@ -157,6 +157,13 @@ pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             opts.case = Some(opts.files.remove(k));
         }
     }
+    // a timeline that has its masstin file next to it is opened as that case
+    if opts.case.is_none() {
+        if let Some((p, c)) = case::of_timeline(&opts.files) {
+            c.save(&p).map_err(|e| format!("cannot write {}: {}", p.display(), e))?;
+            opts.case = Some(p.to_string_lossy().to_string());
+        }
+    }
     let mut case_merges = None;
     if let Some(p) = opts.case.clone() {
         let c = case::open_for(std::path::Path::new(&p), &opts.files)?;

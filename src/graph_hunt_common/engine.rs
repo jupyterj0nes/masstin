@@ -52,6 +52,13 @@ pub struct Settings {
     pub seed_to: Option<DateTime<Utc>>,
     /// Sigma hit files (Hayabusa / Chainsaw JSON), see sigma.rs
     pub sigma: Vec<String>,
+    /// addresses that are a host, by the evidence of the timelines
+    /// (`--merge-hosts`, see hostmap.rs): node name -> host name. Read
+    /// before the same-login test; empty when not asked for.
+    pub host_merges: HashMap<String, String>,
+    /// the level they were taken at (`strict`, `standard`, `broad`), for
+    /// the hunt record; empty when not asked for
+    pub host_level: String,
 }
 
 impl Settings {
@@ -434,7 +441,7 @@ pub(crate) fn clean_host(v: &str) -> String {
 
 /// A cleaned host cell that names no machine: empty, a placeholder, the
 /// machine itself by any of its loopback names.
-fn names_no_machine(v: &str) -> bool {
+pub(crate) fn names_no_machine(v: &str) -> bool {
     if LOCAL_SOURCES.iter().any(|l| l.eq_ignore_ascii_case(v)) || v.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -1174,7 +1181,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
                 for l in lines {
                     crate::banner::print_phase_detail("Timeline:", &l);
                 }
-                // what the hunt was run with, next to each timeline: the
+                // what the hunt was run with, in the file of each timeline: the
                 // columns say what a row is, not from which date on
                 let rec = super::record::HuntRecord {
                     masstin_hunt: 1,
@@ -1185,12 +1192,14 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
                     alpha,
                     connections: rows.iter().filter(|r| r.evaluable).count() as u64,
                     significant: rows.iter().filter(|r| r.evaluable && r.group != 3 && r.q <= alpha).count() as u64,
+                    merge_hosts: cfg.host_level.clone(),
+                    hosts_merged: cfg.host_merges.len() as u64,
                     timelines: a.files.iter().map(|f| std::path::Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone())).collect(),
                 };
                 for f in &written {
                     match super::record::write(f, &rec) {
-                        Ok(p) => crate::banner::print_phase_detail("Hunt record:", &format!("{} (what this hunt was run with)", p.display())),
-                        Err(e) => eprintln!("Masstin - Warning: cannot write the hunt record next to {}: {}", f, e),
+                        Ok(p) => crate::banner::print_phase_detail("Hunt record:", &format!("{} (what this hunt was run with, kept in its masstin file)", p.display())),
+                        Err(e) => eprintln!("Masstin - Warning: cannot write the hunt record of {}: {}", f, e),
                     }
                 }
             }
@@ -1506,6 +1515,9 @@ fn annotate_timelines(files: &[String], c: &Corpus, ents: &Entities, rows: &[Con
         if let Err(e) = replace_file(&tmp, &target) {
             return Err(std::io::Error::new(e.kind(), format!("{}: cannot replace the file ({}); the annotated copy is {}", target.display(), e, tmp.display())));
         }
+        if std::path::Path::new(f) != target.as_path() {
+            super::record::carry_ingests(f, &target.to_string_lossy());
+        }
         let f = &target.to_string_lossy().to_string();
         written.push(f.clone());
         let count = |s: u8| states.iter().filter(|(x, _)| *x == s).count();
@@ -1547,9 +1559,9 @@ pub(crate) fn ip_names_for_csv(files: &[String], alpha: f64) -> std::io::Result<
     Ok(resolve_corpus(&c, alpha).into_iter().map(|(ip, r)| (ip, (r.name, r.votes, r.p_chance))).collect())
 }
 
-fn build_entities(c: &Corpus, alpha: f64) -> (Entities, HashMap<String, resolve::Resolution>) {
+fn build_entities(c: &Corpus, alpha: f64, host_merges: &HashMap<String, String>) -> (Entities, HashMap<String, resolve::Resolution>) {
     let res = resolve_corpus(c, alpha);
-    build_entities_from(c, res)
+    build_entities_from(c, res, host_merges)
 }
 
 fn resolve_corpus(c: &Corpus, alpha: f64) -> HashMap<String, resolve::Resolution> {
@@ -1591,14 +1603,18 @@ fn resolve_corpus(c: &Corpus, alpha: f64) -> HashMap<String, resolve::Resolution
     res
 }
 
-fn build_entities_from(c: &Corpus, res: HashMap<String, resolve::Resolution>) -> (Entities, HashMap<String, resolve::Resolution>) {
+fn build_entities_from(c: &Corpus, res: HashMap<String, resolve::Resolution>, host_merges: &HashMap<String, String>) -> (Entities, HashMap<String, resolve::Resolution>) {
     let mut names = Interner::default();
     let mut aliases: Vec<BTreeSet<String>> = Vec::new();
     let mut of_node = Vec::with_capacity(c.nodes.names.len());
     for n in &c.nodes.names {
-        let label = match res.get(n) {
-            Some(r) => r.name.clone(),
-            None => n.clone(),
+        // what the evidence says outright first, then the same-login test
+        let label = match host_merges.get(n) {
+            Some(h) => h.clone(),
+            None => match res.get(n) {
+                Some(r) => r.name.clone(),
+                None => n.clone(),
+            },
         };
         let id = names.id(&label);
         if aliases.len() <= id as usize {
@@ -1719,7 +1735,11 @@ fn span_days(spans: &[i64]) -> BTreeSet<i32> {
 fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::SigmaHit]) -> (Vec<Conn>, Vec<String>, f64, Vec<report::OriginStory>, Option<report::SeedRecon>, Entities) {
     let mut lines = Vec::new();
     let alpha = cfg.alpha;
-    let (mut ents, res) = build_entities(&*c, alpha);
+    let (mut ents, res) = build_entities(&*c, alpha, &cfg.host_merges);
+    if !cfg.host_merges.is_empty() {
+        let used = c.nodes.names.iter().filter(|n| cfg.host_merges.contains_key(*n)).count();
+        lines.push(format!("Hosts: {} address(es) read as the host they are (--merge-hosts {}: the evidence of the timelines, see the host-map action); a login from a host to itself is no connection", used, cfg.host_level));
+    }
     lines.push(format!(
         "Machines: {} graph nodes -> {} machines ({} IP(s) folded into a host name: unanimous same-login evidence, chance coincidence significant at FDR {})",
         c.nodes.names.len(),
@@ -3599,7 +3619,7 @@ mod tests {
             rows.push((21, 14, "D", s.as_str(), "V", "SUCCESSFUL_LOGON"));
         }
         let mut c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new(), host_merges: HashMap::new(), host_level: String::new() };
         let (out, lines, _alpha, _stories, _seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
         let camp = |o: &str| out.iter().find(|r| r.origin == o).map(|r| r.campaign.clone()).unwrap_or_default();
         assert!(camp("A").contains("with B"), "A: {:?}", camp("A"));
@@ -3634,7 +3654,7 @@ mod tests {
             rows.push((21, 10, w.as_str(), "T", "U1", "SUCCESSFUL_LOGON"));
         }
         let mut c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new(), host_merges: HashMap::new(), host_level: String::new() };
         let (out, _lines, _alpha, _stories, _seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
         let to_t: Vec<&Conn> = out.iter().filter(|r| r.dest == "T" && r.origin.starts_with('W')).collect();
         assert_eq!(to_t.len(), 8);
@@ -3664,7 +3684,7 @@ mod tests {
         rows.push((21, 10, "A", "B", "A1", "SUCCESSFUL_LOGON"));
         rows.push((21, 11, "B", "C", "A2", "SUCCESSFUL_LOGON"));
         let mut c = corpus(&rows);
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new() };
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(21 * 86_400, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: vec!["a:a1".into(), "nobody".into()], seed_from: None, seed_to: None, sigma: Vec::new(), host_merges: HashMap::new(), host_level: String::new() };
         let (out, _lines, _alpha, stories, seed, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &[]);
         // seed A: hop 1 = A -> B as A1 on day 21, hop 2 = B -> C as A2 (new
         // connection, one session open on B: certainty 1)
@@ -3735,7 +3755,7 @@ mod tests {
             sigma::SigmaHit { t: day21 + 11 * 3600 + 1800, host: "c.corp.local".into(), title: "PsExec Service Installation".into(), level: "high".into(), tags: String::new() },
             sigma::SigmaHit { t: day21 + 13 * 3600, host: "C".into(), title: "Something later".into(), level: String::new(), tags: String::new() },
         ];
-        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new() };
+        let cfg = Settings { cutoff: chrono::DateTime::from_timestamp(day21, 0).unwrap(), end: None, alpha: 0.05, only: HashSet::new(), skip: HashSet::new(), seeds: Vec::new(), seed_from: None, seed_to: None, sigma: Vec::new(), host_merges: HashMap::new(), host_level: String::new() };
         let (out, lines, _, _, _, _) = analyse(&mut c, &super::super::NEO4J, &cfg, &hits);
         assert!(lines.iter().any(|l| l.starts_with("Sigma: 2 hit(s) read, 2 on 1 machine(s)")), "{:?}", lines);
         let bc = out.iter().find(|r| r.origin == "B" && r.dest == "C" && r.account == "A2").expect("B -> C row");
@@ -3806,6 +3826,8 @@ mod tests {
             seed_from: None,
             seed_to: None,
             sigma: Vec::new(),
+            host_merges: HashMap::new(),
+            host_level: String::new(),
         }
     }
 
