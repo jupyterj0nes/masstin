@@ -367,6 +367,13 @@ pub struct Viewer {
     table_filters: Vec<table::RowFilter>,
     /// what is being typed in a column's filter box: (column, text)
     table_filter_draft: (usize, String),
+    /// its tick: the filter being typed is "does not contain"
+    table_filter_not: bool,
+    /// the box was just opened: the keyboard goes to it
+    table_filter_focus: bool,
+    /// the filter typed on the bar: its column (None: any) and its tick
+    table_find_col: Option<usize>,
+    table_find_not: bool,
     /// the cell a right click fell on: (column, its text)
     table_ctx_cell: Option<(usize, String)>,
     /// Timeline mode: the size of its text, the width of each column and
@@ -880,6 +887,10 @@ impl Viewer {
             table_find: String::new(),
             table_filters: Vec::new(),
             table_filter_draft: (usize::MAX, String::new()),
+            table_filter_not: false,
+            table_filter_focus: false,
+            table_find_col: None,
+            table_find_not: false,
             table_ctx_cell: None,
             table_look: table::TableLook::load(),
             table_look_dirty: false,
@@ -4759,7 +4770,12 @@ impl Viewer {
                 let i: usize = other["timeline-node=".len()..].parse().unwrap_or(0);
                 self.timeline_of_node(i);
             }
-            other if other.starts_with("timeline-find=") => self.table_find = other["timeline-find=".len()..].to_string(),
+            // (a text looked for in any column is a filter like the others)
+            other if other.starts_with("timeline-find=") => {
+                if let Some(f) = table::RowFilter::parse(&format!("+{}", &other["timeline-find=".len()..])) {
+                    self.add_table_filter(f);
+                }
+            }
             // the look of the timeline: `timeline-font=14`, `timeline-hide=COLUMN`
             // (again shows it), `timeline-width=COLUMN:PIXELS`
             other if other.starts_with("timeline-font=") => self.table_look.set_font(other["timeline-font=".len()..].parse().unwrap_or(12.0)),

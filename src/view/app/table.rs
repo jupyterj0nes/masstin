@@ -158,6 +158,31 @@ impl TableLook {
     }
 }
 
+/// The filter box of a column: a text, which Enter applies as "contains",
+/// and a tick that makes it "does not contain". Gives the filter when it
+/// is applied (by Enter or its button); the box is then empty again.
+fn filter_box(ui: &mut egui::Ui, col: Option<usize>, text: &mut String, not: &mut bool, focus: &mut bool) -> Option<RowFilter> {
+    let edit = ui.add(egui::TextEdit::singleline(text).desired_width(250.0).hint_text("text, in any case: Enter applies (empty: the column is empty)"));
+    if *focus {
+        edit.request_focus();
+        *focus = false;
+    }
+    let mut apply = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    ui.horizontal(|ui| {
+        ui.checkbox(not, "does not contain").on_hover_text("Ticked: the rows whose column holds the text are left out");
+        if ui.button(egui::RichText::new("Apply").color(theme::ACCENT)).on_hover_text("The same as Enter in the box. It adds to the filters there").clicked() {
+            apply = true;
+        }
+    });
+    if !apply || (col.is_none() && text.trim().is_empty()) {
+        return None;
+    }
+    let f = RowFilter::new(col, text, *not);
+    text.clear();
+    *not = false;
+    Some(f)
+}
+
 /// The value a column is made to fit: of these, the one that 19 of 20 are
 /// no longer than (by characters). Empty when there is none.
 pub(super) fn fit_value(values: &mut Vec<String>) -> String {
@@ -359,7 +384,7 @@ impl Viewer {
     /// The rows shown (file, row): every row of the open files, or the
     /// rows the table is narrowed to, that hold the find box; cached.
     fn table_raw_rows(&mut self) -> &[(u16, u32)] {
-        let key = (self.table_find.trim().to_lowercase(), self.store.files.len(), self.store.rows_total, self.table_scope_gen);
+        let key = (String::new(), self.store.files.len(), self.store.rows_total, self.table_scope_gen);
         if self.table_raw_key != key {
             let mut out = Vec::new();
             let filters = self.table_filters.clone();
@@ -657,7 +682,7 @@ impl Viewer {
     /// Open what the timeline shows in a program: the rows on screen as a
     /// copy when the table is narrowed, else (or when asked) the file.
     pub(super) fn open_rows_in(&mut self, viewer: Option<usize>, whole: bool) {
-        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty() || !self.table_filters.is_empty();
+        let narrowed = self.table_scope.is_some() || !self.table_filters.is_empty();
         let (path, line) = if whole || !narrowed {
             let f = self.table_sel.map(|s| s.0).unwrap_or(0);
             let Some(info) = self.store.files.get(f as usize) else { return };
@@ -665,10 +690,11 @@ impl Viewer {
             (info.path.clone(), self.table_sel.filter(|s| s.0 == f).map(|s| s.1 + 2))
         } else {
             let rows: Vec<(u16, u32)> = self.table_raw_rows().to_vec();
-            let label = match (&self.table_scope, self.table_find.trim()) {
-                (Some(sc), "") => sc.label.clone(),
-                (Some(sc), f) => format!("{} {}", sc.label, f),
-                (None, f) => f.to_string(),
+            let filters = self.table_filters.iter().map(|f| f.label()).collect::<Vec<_>>().join(" ");
+            let label = match &self.table_scope {
+                Some(sc) if filters.is_empty() => sc.label.clone(),
+                Some(sc) => format!("{} {}", sc.label, filters),
+                None => filters,
             };
             match self.write_rows_copy(&rows, &label) {
                 Ok(p) => (p, None),
@@ -711,7 +737,7 @@ impl Viewer {
         let ctx = ui.ctx().clone();
         let shown = self.table_raw_rows().len();
         let total = self.store.rows_total;
-        let narrowed = self.table_scope.is_some() || !self.table_find.trim().is_empty() || !self.table_filters.is_empty();
+        let narrowed = self.table_scope.is_some() || !self.table_filters.is_empty();
         let apps = self.viewer_list();
         let mut clear_scope = false;
         let mut new_filter: Option<RowFilter> = None;
@@ -731,14 +757,30 @@ impl Viewer {
                         clear_scope = true;
                     }
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.table_find).desired_width(240.0).hint_text(format!("{}  find in the rows", ic::MAGNIFYING_GLASS)));
-                // what is typed can be kept as a filter that adds up, or turned round
-                let typed = !self.table_find.trim().is_empty();
-                if ui.add_enabled(typed, egui::Button::new(egui::RichText::new("+ keep").color(theme::ACCENT)).min_size(Vec2::new(0.0, 24.0))).on_hover_text("Keep it as a filter: only the rows that hold this text, in any column. It adds to the filters there, and the box is free for another").clicked() {
-                    new_filter = Some(RowFilter::new(None, &self.table_find, false));
-                }
-                if ui.add_enabled(typed, egui::Button::new(egui::RichText::new("− exclude").color(EDGE_FAIL)).min_size(Vec2::new(0.0, 24.0))).on_hover_text("Leave out the rows that hold this text, in any column. It adds to the filters there").clicked() {
-                    new_filter = Some(RowFilter::new(None, &self.table_find, true));
+                // A filter, typed: of which column (or any), the text, and a tick
+                // when it is the rows that do NOT hold it. Enter applies it; it
+                // adds to the filters there and the box is free for the next.
+                let cols = raw_columns();
+                egui::ComboBox::from_id_salt("timeline-filter-column").width(130.0).height(520.0).selected_text(match self.table_find_col {
+                    Some(c) => cols[c],
+                    None => "any column",
+                }).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.table_find_col, None, "any column");
+                    for (ci, name) in cols.iter().enumerate() {
+                        ui.selectable_value(&mut self.table_find_col, Some(ci), *name);
+                    }
+                }).response.on_hover_text("The column the text is looked for in");
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.table_find).desired_width(180.0).hint_text(format!("{}  contains… (Enter applies)", ic::MAGNIFYING_GLASS)));
+                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.checkbox(&mut self.table_find_not, "does not contain").on_hover_text("Ticked: the rows that hold the text are left out");
+                // (a column with no text is "the column is empty"; any column needs a text)
+                let can = self.table_find_col.is_some() || !self.table_find.trim().is_empty();
+                let add = ui.add_enabled(can, egui::Button::new(egui::RichText::new("Add filter").color(theme::ACCENT)).min_size(Vec2::new(0.0, 24.0))).on_hover_text("The same as Enter in the box").clicked();
+                if can && (enter || add) {
+                    new_filter = Some(RowFilter::new(self.table_find_col, &self.table_find, self.table_find_not));
+                    self.table_find.clear();
+                    self.table_find_not = false;
+                    edit.request_focus();
                 }
                 let label = if narrowed { format!("{} of {} rows", shown, total) } else { format!("{} rows, all of the file(s)", shown) };
                 ui.label(egui::RichText::new(label).color(theme::MUTED).size(12.5));
@@ -848,9 +890,6 @@ impl Viewer {
             new_filter = from_rows;
         }
         if let Some(f) = new_filter {
-            if f.col.is_none() {
-                self.table_find.clear();
-            }
             self.add_table_filter(f);
         }
         if let Some(i) = drop_filter {
@@ -1000,27 +1039,21 @@ impl Viewer {
                     let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(cell).layout(egui::Layout::left_to_right(egui::Align::Center)));
                     inner.add(egui::Label::new(egui::RichText::new(name).size(look.font - 1.5).monospace().color(color)).truncate().selectable(false));
                     let resp = resp.on_hover_text(format!("{}: right click (or click) to filter by a text it contains or does not, or to hide the column. Drag its right edge for its width", name));
+                    let open = (resp.clicked() || resp.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
+                    if open.is_some() {
+                        // opened: an empty box, ready to be typed in
+                        self.table_filter_draft = (ci, String::new());
+                        self.table_filter_not = false;
+                        self.table_filter_focus = true;
+                    }
                     let mut menu = |ui: &mut egui::Ui| {
                         ui.set_min_width(260.0);
-                        if self.table_filter_draft.0 != ci {
-                            self.table_filter_draft = (ci, String::new());
-                        }
                         ui.label(theme::semibold(name, 12.5).color(TEXT));
-                        ui.label(egui::RichText::new("the rows whose column…").color(theme::MUTED).small());
-                        let edit = ui.add(egui::TextEdit::singleline(&mut self.table_filter_draft.1).desired_width(240.0).hint_text("text, in any case (empty: the column is empty)"));
-                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new("+ contains").color(theme::ACCENT)).on_hover_text("Include: only the rows whose column contains the text (Enter does this). It adds to the filters there").clicked() || enter {
-                                filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, false));
-                                self.table_filter_draft.1.clear();
-                                ui.close();
-                            }
-                            if ui.button(egui::RichText::new("− does not contain").color(EDGE_FAIL)).on_hover_text("Exclude: leave out the rows whose column contains the text. It adds to the filters there").clicked() {
-                                filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, true));
-                                self.table_filter_draft.1.clear();
-                                ui.close();
-                            }
-                        });
+                        ui.label(egui::RichText::new("the rows whose column contains…").color(theme::MUTED).small());
+                        if let Some(f) = filter_box(ui, Some(ci), &mut self.table_filter_draft.1, &mut self.table_filter_not, &mut self.table_filter_focus) {
+                            filter = Some(f);
+                            ui.close();
+                        }
                         ui.separator();
                         if icon_button(ui, ic::EYE_SLASH, "Hide this column").on_hover_text("Columns, on the bar above, brings it back").clicked() {
                             hide = Some(ci);
@@ -1031,9 +1064,9 @@ impl Viewer {
                             ui.close();
                         }
                     };
-                    // one menu, opened by either button of the mouse
-                    let open = (resp.clicked() || resp.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
-                    egui::Popup::menu(&resp).open_memory(open).show(&mut menu);
+                    // one menu, opened by either button of the mouse; a click inside it
+                    // (in its box, to type) does not close it
+                    egui::Popup::menu(&resp).open_memory(open).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(&mut menu);
                     // the handle of its width
                     let (grip, grip_resp) = ui.allocate_exact_size(Vec2::new(gap, row_h), Sense::drag());
                     let hot = grip_resp.hovered() || grip_resp.dragged();
@@ -1108,23 +1141,25 @@ impl Viewer {
                     if resp.secondary_clicked() {
                         // the cell under the click: its column by where the pointer is
                         self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + gutter + gap), &drawn)).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
+                        // its filter box starts with the cell's value, ready to be changed
+                        if let Some((ci, v)) = &self.table_ctx_cell {
+                            self.table_filter_draft = (*ci, v.trim().to_string());
+                            self.table_filter_not = false;
+                            self.table_filter_focus = true;
+                        }
                     }
-                    resp.context_menu(|ui| {
+                    egui::Popup::context_menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                         ui.set_min_width(250.0);
                         ui.label(egui::RichText::new(format!("line {}", key.1 + 2)).color(theme::MUTED).small());
                         // the cell clicked: keep only its value, or leave it out
                         if let Some((ci, value)) = self.table_ctx_cell.clone() {
                             let name = cols.get(ci).copied().unwrap_or("");
-                            let v = value.trim();
-                            let short: String = v.chars().take(40).collect();
-                            let shown = if v.is_empty() { "(empty)".to_string() } else if v.chars().count() > 40 { format!("{}…", short) } else { short };
-                            if ui.add(egui::Button::new(egui::RichText::new(format!("+  Keep only {} = {}", name, shown)).color(theme::ACCENT)).frame(false)).on_hover_text("Only the rows whose column holds this (contains). It adds to the filters there").clicked() {
+                            let _ = value;
+                            ui.label(theme::semibold(name, 12.5).color(TEXT));
+                            ui.label(egui::RichText::new("the rows whose column contains… (this cell's value, to change)").color(theme::MUTED).small());
+                            if let Some(f) = filter_box(ui, Some(ci), &mut self.table_filter_draft.1, &mut self.table_filter_not, &mut self.table_filter_focus) {
                                 ui.close();
-                                filter = Some(RowFilter::new(Some(ci), v, false));
-                            }
-                            if ui.add(egui::Button::new(egui::RichText::new(format!("−  Exclude {} = {}", name, shown)).color(EDGE_FAIL)).frame(false)).on_hover_text("Leave out the rows whose column holds this. It adds to the filters there").clicked() {
-                                ui.close();
-                                filter = Some(RowFilter::new(Some(ci), v, true));
+                                filter = Some(f);
                             }
                             ui.separator();
                         }
