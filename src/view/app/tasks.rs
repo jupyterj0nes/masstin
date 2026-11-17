@@ -375,16 +375,18 @@ impl Viewer {
                         super::ingest::remember(&self.files);
                     }
                     self.hunt_form.if_hunted = Default::default();
-                    match self.reload_store() {
-                        Ok(()) => {
-                            self.remembered.clear();
-                            self.draft.view = View::Findings;
-                            self.requery(false);
-                            self.begin_reveal();
-                            self.status = format!("Hunt done: {}", self.status);
-                        }
-                        Err(e) => self.status = format!("Hunt done, but the timeline cannot be read again: {}", e),
-                    }
+                    // The timeline is read again away from the window, so the
+                    // sweep goes on until its findings are there to light up
+                    // (read here, the window froze for as long as it took).
+                    let (files, alpha, merges) = (self.files.clone(), self.alpha, self.merges.clone());
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let ctx2 = ctx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(Store::load_with(&files, alpha, &merges).map_err(|e| e.to_string()));
+                        ctx2.request_repaint();
+                    });
+                    self.hunt_loading = Some(rx);
+                    self.status = "Hunt done: reading its findings…".to_string();
                 }
                 JobKind::Ingest => {
                     if !open.is_empty() {
@@ -403,6 +405,34 @@ impl Viewer {
                         self.open_files(files);
                     }
                 }
+            }
+        }
+    }
+
+    /// The timeline a hunt wrote, read again in the background: when it is
+    /// there, the window shows its findings.
+    pub(super) fn poll_hunt_loaded(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.hunt_loading else { return };
+        match rx.try_recv() {
+            Ok(Ok(store)) => {
+                self.hunt_loading = None;
+                self.store = store;
+                self.remembered.clear();
+                self.draft.view = View::Findings;
+                self.requery(false);
+                self.begin_reveal();
+                self.status = format!("Hunt done: {}", self.status);
+            }
+            Ok(Err(e)) => {
+                self.hunt_loading = None;
+                self.hunt_sweep = None;
+                self.status = format!("Hunt done, but the timeline cannot be read again: {}", e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.hunt_loading = None;
+                self.hunt_sweep = None;
+                self.status = "Hunt done, but the timeline could not be read again".to_string();
             }
         }
     }
@@ -432,7 +462,7 @@ impl Viewer {
             return None;
         }
         let age = now.duration_since(start).as_secs_f32();
-        let at = 0.3 + rank * REVEAL_SECS;
+        let at = 0.05 + rank * REVEAL_SECS;
         if age < at {
             Some((false, 0.0))
         } else {

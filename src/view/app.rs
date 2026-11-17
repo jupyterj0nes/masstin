@@ -304,6 +304,13 @@ pub struct Viewer {
     path_hops: usize,
     path_gap_h: f32,
     path_max: usize,
+    /// a path (or a cone) is marked on the map as it is, instead of being
+    /// the only thing drawn
+    path_in_map: bool,
+    /// the path marked on the map
+    trail: Option<Trail>,
+    /// per connection drawn: it is part of the trail
+    trail_on: Vec<bool>,
     path_results: [bool; 4],
     path_skip_machine: bool,
     path_found: Vec<Path>,
@@ -435,6 +442,8 @@ pub struct Viewer {
     hunt_sweep: Option<std::time::Instant>,
     /// a hunt just ended: the findings appear one by one
     hunt_reveal: Option<std::time::Instant>,
+    /// the timeline a hunt just wrote, being read again away from the window
+    hunt_loading: Option<std::sync::mpsc::Receiver<Result<Store, String>>>,
     reveal_rank: Vec<f32>,
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
@@ -549,6 +558,16 @@ pub(crate) fn parse_rows(text: &str) -> Result<Vec<(u16, u32)>, String> {
 
 /// What the canvas shows instead of the filter's selection: the edges of
 /// a path or a cone, with a word under each host.
+/// A path or a cone marked on the map: the map stays as the filters draw
+/// it and these connections stand out on it.
+struct Trail {
+    title: String,
+    edges: std::collections::HashSet<u32>,
+    labels: HashMap<u32, String>,
+    /// how many of its connections the view does not draw
+    missing: usize,
+}
+
 struct Overlay {
     title: String,
     edges: Vec<u32>,
@@ -839,6 +858,9 @@ impl Viewer {
             path_hops: 6,
             path_gap_h: 24.0,
             path_max: 50,
+            path_in_map: false,
+            trail: None,
+            trail_on: Vec::new(),
             path_results: [true, false, false, false],
             path_skip_machine: true,
             path_found: Vec::new(),
@@ -930,6 +952,7 @@ impl Viewer {
             merge_form: MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() },
             hunt_sweep: None,
             hunt_reveal: None,
+            hunt_loading: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
             show_labels: false,
@@ -994,6 +1017,22 @@ impl Viewer {
             Some(o) if o.exact => GraphView::from_edges(&self.store, &Filter { grouping: super::query::Grouping::PerEvent, limit: o.edges.len().max(1), ..self.filter.clone() }, o.edges.clone()),
             Some(o) => GraphView::from_edges(&self.store, &self.filter, o.edges.clone()),
             None => GraphView::build(&self.store, &self.filter),
+        };
+        if let Some(t) = self.trail.as_mut() {
+            // a trail is marked on what is drawn; what it needs and the
+            // filters left out is drawn with it
+            let drawn: std::collections::HashSet<u32> = self.graph.edges.iter().flat_map(|e| e.rows.iter().copied()).collect();
+            let lacking: Vec<u32> = t.edges.iter().copied().filter(|e| !drawn.contains(e)).collect();
+            t.missing = lacking.len();
+            if !lacking.is_empty() {
+                let mut all: Vec<u32> = drawn.into_iter().collect();
+                all.extend(lacking);
+                self.graph = GraphView::from_edges(&self.store, &self.filter, all);
+            }
+        }
+        self.trail_on = match &self.trail {
+            Some(t) => self.graph.edges.iter().map(|e| e.rows.iter().any(|r| t.edges.contains(r))).collect(),
+            None => Vec::new(),
         };
         let restore = self.restore_places.take();
         let g = &self.graph;
@@ -1075,6 +1114,9 @@ impl Viewer {
         ];
         if let Some(o) = &self.overlay {
             parts.insert(0, o.title.clone());
+        }
+        if let Some(t) = &self.trail {
+            parts.insert(0, format!("{} marked on the map", t.title));
         }
         if self.graph.truncated {
             parts.push("limit reached: narrow the filters or raise the limit".into());
@@ -2899,12 +2941,26 @@ impl Viewer {
                 }
             }
             let selected = self.selected == Some(Sel::Edge(k));
+            let on_trail = self.trail_on.get(k).copied().unwrap_or(false);
+            let trailing = !self.trail_on.is_empty();
+            let alpha = if trailing && !on_trail && !selected { alpha * 0.22 } else { alpha };
+            if on_trail {
+                width = width * 1.8 + 2.6 * z.sqrt();
+                color = theme::MAGENTA;
+            }
             let stroke_color = if selected { ACCENT } else { color };
             let short = (pa - pb).length() < 14.0;
-            let plain = lod && !lit && !selected;
+            let plain = lod && !lit && !selected && !on_trail;
             let glow = !plain && (arcade || ((self.style.edge_glow || look.glow) && (look.glow || emphasised || progress < 1.0 || (lit && focus_any) || (look.finding && dimmed < 0.5))));
             if glow {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 6.0 * z.sqrt(), draw::fade(color, if progress < 1.0 { 0.45 } else if arcade { 0.22 } else { 0.16 } * alpha)) });
+            }
+            if on_trail && !short {
+                // its light: wide and soft under the line, breathing
+                let breath = if motion { 0.75 + 0.25 * (now * 2.6 + k as f32 * 0.7).sin() } else { 0.9 };
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 14.0 * z.sqrt(), draw::fade(theme::VIOLET, 0.16 * breath * alpha)) });
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 6.0 * z.sqrt(), draw::fade(theme::MAGENTA, 0.30 * breath * alpha)) });
+                keep_moving |= motion;
             }
             if flash > 0.0 {
                 painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + (6.0 + 26.0 * flash) * z.sqrt(), draw::fade(draw::lighten(color, 0.4), 0.55 * flash * alpha)) });
@@ -2928,7 +2984,12 @@ impl Viewer {
                 if !lod && !glow {
                     painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width * 2.4 + 1.5, draw::fade(stroke_color, 0.09 * alpha)) });
                 }
-                draw::gradient_curve(&painter, pa, pc, pb, width, draw::fade(stroke_color, alpha * 0.5), draw::fade(stroke_color, alpha));
+                if on_trail && !selected {
+                    // the logo's own run of colour, from where it leaves to where it lands
+                    draw::gradient_curve(&painter, pa, pc, pb, width, draw::fade(theme::CYAN, alpha), draw::fade(theme::MAGENTA, alpha));
+                } else {
+                    draw::gradient_curve(&painter, pa, pc, pb, width, draw::fade(stroke_color, alpha * 0.5), draw::fade(stroke_color, alpha));
+                }
             }
             edges_drawn += 1;
             if progress < 1.0 {
@@ -2940,7 +3001,7 @@ impl Viewer {
                 let size = (6.0 + width * 1.4).min(15.0) * z.sqrt().max(0.5);
                 draw::arrow(&painter, pb, dir, size, draw::fade(stroke_color, alpha));
             }
-            if motion && !short && (lit || look.finding || look.glow || emphasised) && animated.len() < if lod { 120 } else { 600 } && (!plain || lit) {
+            if motion && !short && (lit || look.finding || look.glow || emphasised || on_trail) && animated.len() < if lod { 120 } else { 600 } && (!plain || lit) {
                 animated.push(k);
             }
             // the account on the edge, like Neo4j's relationship caption
@@ -3028,6 +3089,14 @@ impl Viewer {
             let alpha = if lit { 1.0 } else { 1.0 - 0.82 * dimmed };
             let selected = self.selected == Some(Sel::Node(i));
             let hovered = self.hovered == Some(Sel::Node(i));
+            // a path marked on the map: its hosts keep their light and carry its ring, the others step back
+            let on_trail = !self.trail_on.is_empty() && look.edges.iter().any(|&k| self.trail_on.get(k as usize).copied().unwrap_or(false));
+            let alpha = if !self.trail_on.is_empty() && !on_trail && !selected && !hovered { alpha * 0.3 } else { alpha };
+            if on_trail && r > 2.0 {
+                let breath = if motion { 0.7 + 0.3 * (now * 2.6 + i as f32).sin() } else { 0.85 };
+                painter.circle_filled(p, r * 1.45 + 8.0, draw::fade(theme::VIOLET, 0.10 * breath));
+                painter.circle_stroke(p, r * 1.18 + 5.0, Stroke::new((2.2 * z.sqrt()).clamp(1.5, 3.5), draw::fade(theme::MAGENTA, 0.85 * breath)));
+            }
             let significant = n.hunt_rank == 0;
             let (fill, ring) = (look.fill, if significant { SIGNIFICANT } else { look.ring });
             let node_flash = if self.hunt_reveal.is_some() { look.edges.iter().filter_map(|&k| self.reveal_state(k as usize, frame_now)).filter(|(shown, _)| *shown).map(|(_, f)| f).fold(0.0f32, f32::max) } else { 0.0 };
@@ -3144,7 +3213,7 @@ impl Viewer {
                 let pos = self.drawn_label_pos(look);
                 labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod, self.style.node_style == NodeStyle::Arcade);
             }
-            if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)) {
+            if let Some(label) = self.overlay.as_ref().and_then(|o| o.labels.get(&n.host)).or_else(|| self.trail.as_ref().and_then(|t| t.labels.get(&n.host))) {
                 let galley = painter.layout_no_wrap(label.clone(), FontId::proportional((10.5 * z.sqrt() * fs).clamp(8.0, 14.0)), ACCENT);
                 let h = galley.size().y;
                 draw::pill(&painter, Pos2::new(p.x, labels::hop_badge_y(p, r, h, look.label_pos)), galley, draw::fade(CAPTION_BG, alpha), Some(draw::fade(ACCENT, 0.5 * alpha)), ACCENT);
@@ -3748,9 +3817,37 @@ impl Viewer {
     }
 
     fn set_overlay(&mut self, title: String, edges: Vec<u32>, labels: HashMap<u32, String>, hops: HashMap<u32, usize>) {
+        if self.path_in_map {
+            // marked on the map as it is: nothing moves, the path stands out
+            self.overlay = None;
+            self.trail = Some(Trail { title, edges: edges.into_iter().collect(), labels, missing: 0 });
+            self.requery(false);
+            return;
+        }
+        self.trail = None;
         self.overlay = Some(Overlay { title, edges, labels, hops, exact: false });
         self.requery(true);
         self.arrange_by_hops();
+    }
+
+    /// The path shown again the other way (alone, or marked on the map).
+    fn reshow_path(&mut self) {
+        let (title, edges, labels) = match (&self.overlay, &self.trail) {
+            (Some(o), _) if !o.exact => (o.title.clone(), o.edges.clone(), o.labels.clone()),
+            (_, Some(t)) => (t.title.clone(), t.edges.iter().copied().collect(), t.labels.clone()),
+            _ => return,
+        };
+        let mut hops: HashMap<u32, usize> = HashMap::new();
+        for (h, l) in &labels {
+            let k = l.strip_prefix("hop ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+            hops.insert(*h, k);
+        }
+        if let Some(o) = &self.overlay {
+            hops = o.hops.clone();
+        }
+        self.overlay = None;
+        self.trail = None;
+        self.set_overlay(title, edges, labels, hops);
     }
 
     /// Hosts in columns by hop, pinned, so a path reads left to right.
@@ -3781,6 +3878,7 @@ impl Viewer {
         let mut find = false;
         let mut cone: Option<bool> = None;
         let mut pick: Option<usize> = None;
+        let mut reshow = false;
         egui::Window::new("Paths").open(&mut open).default_width(560.0).resizable(true).show(ctx, |ui| {
             ui.label(egui::RichText::new("A path is a chain of logins where every hop happens after the previous one and no later than the gap allowed; no host is entered twice. The cones say what a host could reach from the window's start, or what could have reached it by the window's end.").color(MUTED));
             egui::Grid::new("paths-form").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
@@ -3815,6 +3913,16 @@ impl Viewer {
             });
             ui.label(egui::RichText::new(format!("Time window: the bar's From / To ({} → {})", if self.filter.from.is_empty() { "start" } else { &self.filter.from }, if self.filter.to.is_empty() { "end" } else { &self.filter.to })).small().color(MUTED));
             ui.horizontal(|ui| {
+                ui.label("Show it");
+                let was = self.path_in_map;
+                ui.selectable_value(&mut self.path_in_map, false, format!("{}  alone", super::icons::PATH)).on_hover_text("Only the hosts and connections of the path are drawn, in columns by hop, so it reads left to right. Everything else leaves the canvas until you go back to the view");
+                ui.selectable_value(&mut self.path_in_map, true, format!("{}  marked on the map", super::icons::CROSSHAIR)).on_hover_text("The map stays as it is, with every host where it was, and the path stands out on it: thicker, in the logo's colours, with the rest dimmed. For seeing where the path runs among everything else");
+                theme::help(ui, "Two ways to look at the same path. Alone: the canvas is reduced to the path's hosts, laid out hop by hop. Marked on the map: nothing is taken away or moved, the path's connections are drawn thick and bright over the rest, which is dimmed. Change it at any time: the path found is shown again the other way.");
+                if was != self.path_in_map {
+                    reshow = true;
+                }
+            });
+            ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(egui::RichText::new("Find paths").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
                     find = true;
                 }
@@ -3824,8 +3932,9 @@ impl Viewer {
                 if ui.button("Ways into destination").on_hover_text("cone backward in time").clicked() {
                     cone = Some(false);
                 }
-                if self.overlay.is_some() && ui.button("Back to the view").clicked() {
+                if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").clicked() {
                     self.overlay = None;
+                    self.trail = None;
                     self.path_found.clear();
                     self.path_msg.clear();
                     self.requery(false);
@@ -3858,6 +3967,8 @@ impl Viewer {
         });
         if find {
             self.run_paths();
+        } else if reshow {
+            self.reshow_path();
         }
         if let Some(f) = cone {
             self.run_cone(f);
@@ -4961,6 +5072,9 @@ impl Viewer {
                     self.layout.reheat(0.1);
                 }
             }
+            "paths-map" => self.path_in_map = true,
+            "paths-alone" => self.path_in_map = false,
+            "paths-reshow" => self.reshow_path(),
             other if other.starts_with("paths=") => {
                 let spec = &other["paths=".len()..];
                 let mut it = spec.splitn(3, ':');
@@ -5375,6 +5489,7 @@ impl Viewer {
         self.db_window(&ctx);
         self.studio_window(&ctx);
         self.poll_job(&ctx);
+        self.poll_hunt_loaded(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);
         self.drop_overlay(&ctx);

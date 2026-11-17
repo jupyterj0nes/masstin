@@ -28,6 +28,31 @@ pub const MEDIUM: &str = "medium";
 /// the 8-bit face of the arcade (Press Start 2P, OFL)
 pub const PIXEL: &str = "pixel";
 
+/// The small "?" that explains what is next to it, on hover: put after
+/// any control whose meaning is not in its name.
+pub fn help(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    let hot = resp.hovered();
+    let c = if hot { ACCENT } else { DIM };
+    ui.painter().circle_stroke(rect.center(), 7.0, Stroke::new(1.0, c));
+    ui.painter().text(rect.center() + Vec2::new(0.0, 0.5), egui::Align2::CENTER_CENTER, "?", FontId::proportional(10.5), c);
+    resp.on_hover_ui(|ui| {
+        ui.set_max_width(380.0);
+        ui.label(RichText::new(text).size(12.5));
+    })
+}
+
+/// The explanation at the foot of a menu: what the thing clicked is and
+/// what its actions do, for whoever opens the menu to find out.
+pub fn menu_help(ui: &mut egui::Ui, text: &str) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.set_max_width(300.0);
+        ui.label(RichText::new("?").color(ACCENT).size(12.0));
+        ui.add(egui::Label::new(RichText::new(text).color(MUTED).size(11.5)).wrap());
+    });
+}
+
 pub fn pixel_font(px: f32) -> FontId {
     FontId::new(px, FontFamily::Name(PIXEL.into()))
 }

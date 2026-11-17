@@ -458,6 +458,24 @@ impl Viewer {
         // A selection, a path or a cone is on the canvas instead of what the
         // filters select: said by one chip, which goes back to the view. The
         // filters' own chips would say something the canvas is not showing.
+        if let Some((title, missing)) = self.trail.as_ref().map(|t| (t.title.clone(), t.missing)) {
+            // a path marked on the map: the filters still say what the map
+            // is, so their chips follow this one
+            let mut back = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                ui.label(egui::RichText::new(format!("{}", ic::PATH)).color(theme::MAGENTA).size(13.0));
+                if chip(ui, &format!("{} · marked on the map", title), theme::MAGENTA) {
+                    back = true;
+                }
+                let note = if missing > 0 { format!("{} of its connections were outside the filters and are drawn with it. The chip takes the mark away", missing) } else { "the map is as the filters draw it; the path stands out. The chip takes the mark away".to_string() };
+                ui.label(egui::RichText::new(note).color(theme::DIM).size(12.0));
+            });
+            if back {
+                self.trail = None;
+                self.requery(false);
+            }
+        }
         if let Some(title) = self.overlay.as_ref().map(|o| o.title.clone()) {
             let mut back = false;
             ui.horizontal_wrapped(|ui| {
@@ -1357,8 +1375,9 @@ impl Viewer {
                     self.draft.view = View::All;
                     self.requery(false);
                 }
-                if self.overlay.is_some() && icon_button(ui, ic::ARROW_LEFT, "Back to the view").clicked() {
+                if (self.overlay.is_some() || self.trail.is_some()) && icon_button(ui, ic::ARROW_LEFT, "Back to the view").clicked() {
                     ui.close();
+                    self.trail = None;
                     self.overlay = None;
                     self.requery(false);
                 }
