@@ -98,49 +98,76 @@ fn window(s: &Store, q: &PathQuery, ei: u32) -> Option<i64> {
 }
 
 /// Every time-respecting path from `origin` to `dest`, shortest first,
-/// then earliest to complete.
+/// then the quickest to complete, then the earliest.
 pub fn find_paths(s: &Store, q: &PathQuery) -> Vec<Path> {
-    let mut out: Vec<Path> = Vec::new();
-    if q.origin == q.dest || q.max_hops == 0 {
-        return out;
-    }
-    let mut visited: HashSet<u32> = HashSet::new();
-    visited.insert(q.origin);
-    let mut chain: Vec<u32> = Vec::new();
-    // iterative DFS: (host, earliest time for the next hop, latest time, depth)
-    let mut budget = 2_000_000usize;
-    dfs(s, q, q.origin, q.from.unwrap_or(i64::MIN), q.to.unwrap_or(i64::MAX), &mut visited, &mut chain, &mut out, &mut budget);
-    out.sort_by(|a, b| a.hops().cmp(&b.hops()).then_with(|| a.span(s).cmp(&b.span(s))).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)));
-    // the same route with the same accounts (two rows of one logon, a
-    // retry a second later) is one path: the earliest stays
-    let mut seen: HashSet<Vec<(u32, u32, u32)>> = HashSet::new();
-    out.retain(|p| seen.insert(p.edges.iter().map(|&ei| { let e = &s.edges[ei as usize]; (e.src, e.dst, e.user) }).collect()));
-    out.truncate(q.max_paths);
-    out
+    search(s, q).0
 }
 
+/// How many chains one length of the search may try before it gives up.
+const BUDGET: usize = 2_000_000;
+
+/// The paths, and whether the search was cut short (so many chains to try
+/// that some length was not walked to its end: there may be more paths).
+///
+/// One length at a time, the shortest first: a search that walked every
+/// length at once and stopped when it had enough would keep the first
+/// chains it met, which are the earliest, not the shortest.
+pub fn search(s: &Store, q: &PathQuery) -> (Vec<Path>, bool) {
+    let mut out: Vec<Path> = Vec::new();
+    let mut cut = false;
+    if q.origin == q.dest || q.max_hops == 0 || q.max_paths == 0 {
+        return (out, cut);
+    }
+    // the same route with the same accounts (two rows of one logon, a
+    // retry a second later) is one path: the quickest stays
+    let mut seen: HashSet<Vec<(u32, u32, u32)>> = HashSet::new();
+    for hops in 1..=q.max_hops {
+        let mut found: Vec<Path> = Vec::new();
+        let mut visited: HashSet<u32> = HashSet::from([q.origin]);
+        let mut chain: Vec<u32> = Vec::new();
+        let mut budget = BUDGET;
+        let room = q.max_paths.saturating_mul(20).saturating_add(1000);
+        dfs(s, q, hops, room, q.origin, q.from.unwrap_or(i64::MIN), q.to.unwrap_or(i64::MAX), &mut visited, &mut chain, &mut found, &mut budget);
+        cut |= budget == 0;
+        found.sort_by(|a, b| a.span(s).cmp(&b.span(s)).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)).then_with(|| a.edges.cmp(&b.edges)));
+        for p in found {
+            if seen.insert(p.edges.iter().map(|&ei| { let e = &s.edges[ei as usize]; (e.src, e.dst, e.user) }).collect()) {
+                out.push(p);
+            }
+        }
+        if out.len() >= q.max_paths {
+            break;
+        }
+    }
+    out.truncate(q.max_paths);
+    (out, cut)
+}
+
+/// The chains of exactly `hops` logins from `host` to the destination.
 #[allow(clippy::too_many_arguments)]
-fn dfs(s: &Store, q: &PathQuery, host: u32, not_before: i64, not_after: i64, visited: &mut HashSet<u32>, chain: &mut Vec<u32>, out: &mut Vec<Path>, budget: &mut usize) {
-    if chain.len() >= q.max_hops || out.len() >= q.max_paths * 4 || *budget == 0 {
+fn dfs(s: &Store, q: &PathQuery, hops: usize, room: usize, host: u32, not_before: i64, not_after: i64, visited: &mut HashSet<u32>, chain: &mut Vec<u32>, out: &mut Vec<Path>, budget: &mut usize) {
+    if chain.len() >= hops || out.len() >= room || *budget == 0 {
         return;
     }
+    let last = chain.len() + 1 == hops;
     let edges = s.out_adj.of(host);
     // first edge at or after `not_before` (edges of a host are in time order)
     let start = edges.partition_point(|&ei| s.edges[ei as usize].t < not_before);
     for &ei in &edges[start..] {
         *budget = budget.saturating_sub(1);
-        if *budget == 0 {
+        if *budget == 0 || out.len() >= room {
             return;
         }
         let e = &s.edges[ei as usize];
         if e.t > not_after {
             break;
         }
-        if !hop_ok(s, ei, e, q) || visited.contains(&e.dst) {
+        // the last hop enters the destination and no other does
+        if last != (e.dst == q.dest) || visited.contains(&e.dst) || !hop_ok(s, ei, e, q) {
             continue;
         }
         chain.push(ei);
-        if e.dst == q.dest {
+        if last {
             out.push(Path { edges: chain.clone() });
         } else if let Some(w) = window(s, q, ei) {
             visited.insert(e.dst);
@@ -148,7 +175,7 @@ fn dfs(s: &Store, q: &PathQuery, host: u32, not_before: i64, not_after: i64, vis
             // the gap (or the session) runs from THIS hop; only the end of
             // the time window is carried along
             let window_end = e.t.saturating_add(w).min(q.to.unwrap_or(i64::MAX));
-            dfs(s, q, e.dst, next_after, window_end, visited, chain, out, budget);
+            dfs(s, q, hops, room, e.dst, next_after, window_end, visited, chain, out, budget);
             visited.remove(&e.dst);
         }
         chain.pop();
@@ -240,7 +267,32 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         heap.push(Reverse((etau(ei), seed)));
         hosts.get_mut(&seed).unwrap().queued = true;
     }
-    while let Some(Reverse((_, h))) = heap.pop() {
+    // the arrivals of the moment being walked: (host, time, hops, login).
+    // They wait until every login of that moment is done: one of them may
+    // replace an older arrival that a login of this very moment still needs
+    let mut arriving: Vec<(u32, i64, usize, u32)> = Vec::new();
+    loop {
+        if !arriving.is_empty() && heap.peek().map_or(true, |r| (r.0).0 > arriving[0].1) {
+            for (v, te, hops, ei) in arriving.drain(..) {
+                let first_next = first_at(v, te.saturating_add(1));
+                let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
+                let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
+                while hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
+                    hv.arrivals.pop_back();
+                }
+                hv.arrivals.push_back((te, hops, ei, expiry));
+                hv.until = hv.until.max(expiry);
+                if !hv.queued {
+                    hv.next = hv.next.max(first_next);
+                    if let Some(n) = nth(v, hv.next) {
+                        heap.push(Reverse((etau(n), v)));
+                        hv.queued = true;
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(Reverse((_, h))) = heap.pop() else { break };
         // this host's next login, and what it can continue
         let (ei, hops, enabling) = {
             let host = hosts.get_mut(&h).unwrap();
@@ -284,21 +336,7 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
                     }
                 }
             }
-            let first_next = first_at(v, te.saturating_add(1));
-            let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
-            let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
-            while hv.arrivals.back().map_or(false, |a| a.1 >= hops + 1 && a.3 <= expiry) {
-                hv.arrivals.pop_back();
-            }
-            hv.arrivals.push_back((te, hops + 1, ei, expiry));
-            hv.until = hv.until.max(expiry);
-            if !hv.queued {
-                hv.next = hv.next.max(first_next);
-                if let Some(n) = nth(v, hv.next) {
-                    heap.push(Reverse((etau(n), v)));
-                    hv.queued = true;
-                }
-            }
+            arriving.push((v, te, hops + 1, ei));
         }
         let host = hosts.get_mut(&h).unwrap();
         if !host.queued {
@@ -597,6 +635,244 @@ mod tests {
         assert_eq!(find_paths(&s, &PathQuery { gap_without_session: true, ..q.clone() }).len(), 1);
         assert_eq!(cone(&s, q.origin, 0, &q, true).0.len(), 2);
         assert_eq!(cone(&s, q.origin, 0, &PathQuery { gap_without_session: true, ..q.clone() }, true).0.len(), 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A small timeline made by chance: six hosts, three accounts (one a
+    /// machine's), every result, sessions with and without their logoff,
+    /// and few distinct moments so that many rows share one.
+    fn chance_store(seed: u64, tag: &str) -> (Store, std::path::PathBuf) {
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut next = |n: u64| -> u64 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        let hosts = ["HA", "HB", "HC", "HD", "HE", "HF"];
+        let users = ["ana", "bob", "HB$"];
+        let kinds = ["SUCCESSFUL_LOGON", "SUCCESSFUL_LOGON", "SUCCESSFUL_LOGON", "SUCCESSFUL_LOGON", "FAILED_LOGON", "CONNECT", "LOGOFF"];
+        let stamp = |slot: u64| chrono::DateTime::from_timestamp(1_767_225_600 + slot as i64 * 1800, 0).unwrap().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        let rows = 14 + next(22);
+        for i in 0..rows {
+            let (a, mut b) = (next(6) as usize, next(6) as usize);
+            if a == b {
+                b = (b + 1) % 6;
+            }
+            let slot = next(30);
+            let kind = kinds[next(7) as usize];
+            let user = users[next(3) as usize];
+            lines.push(format!("{},{},{},4624,3,{},CORP,,{},,,0x{:x},,Security.evtx,,,,,", stamp(slot), hosts[b], kind, user, hosts[a], 0x100 + i));
+            // its logoff (no origin, as Windows writes it), for some
+            if kind == "SUCCESSFUL_LOGON" && next(3) > 0 {
+                lines.push(format!("{},{},LOGOFF,4634,3,{},CORP,,,,,0x{:x},,Security.evtx,,,,,", stamp(slot + next(9)), hosts[b], user, 0x100 + i));
+            }
+        }
+        let path = std::env::temp_dir().join(format!("masstin-chance-{}-{}-{}.csv", tag, std::process::id(), seed));
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        (Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap(), path)
+    }
+
+    /// Whether a login may be a hop, written again here from what the
+    /// options mean (not from the code that is tested).
+    fn may_hop(s: &Store, q: &PathQuery, ei: usize) -> bool {
+        let e = &s.edges[ei];
+        q.results[e.result as usize]
+            && q.only.as_ref().map_or(true, |o| o[ei])
+            && !(q.skip_machine_accounts && s.users.name(e.user).split('@').next().unwrap().ends_with('$'))
+            && q.to.map_or(true, |t| e.t <= t)
+            && q.from.map_or(true, |f| e.t >= f)
+    }
+
+    /// Whether login `b` can follow login `a`: out of the host `a` entered,
+    /// later, and within the gap, or inside the session `a` opened.
+    fn follows(s: &Store, q: &PathQuery, a: usize, b: usize) -> bool {
+        let (ea, eb) = (&s.edges[a], &s.edges[b]);
+        if eb.src != ea.dst || eb.t <= ea.t {
+            return false;
+        }
+        let room = if !q.by_session {
+            Some(q.max_gap)
+        } else {
+            match s.session_of(a as u32) {
+                Some(d) => Some(d),
+                None => q.gap_without_session.then_some(q.max_gap),
+            }
+        };
+        room.map_or(false, |r| eb.t - ea.t <= r)
+    }
+
+    /// Every path there is, by trying every chain: the routes (origin,
+    /// destination and account of each hop) with their number of hops.
+    fn every_route(s: &Store, q: &PathQuery) -> HashMap<Vec<(u32, u32, u32)>, usize> {
+        fn walk(s: &Store, q: &PathQuery, chain: &mut Vec<usize>, seen: &mut Vec<u32>, out: &mut HashMap<Vec<(u32, u32, u32)>, usize>) {
+            let last = *chain.last().unwrap();
+            if s.edges[last].dst == q.dest {
+                out.insert(chain.iter().map(|&i| (s.edges[i].src, s.edges[i].dst, s.edges[i].user)).collect(), chain.len());
+                return;
+            }
+            if chain.len() >= q.max_hops {
+                return;
+            }
+            for b in 0..s.edges.len() {
+                if may_hop(s, q, b) && follows(s, q, last, b) && !seen.contains(&s.edges[b].dst) {
+                    chain.push(b);
+                    seen.push(s.edges[b].dst);
+                    walk(s, q, chain, seen, out);
+                    seen.pop();
+                    chain.pop();
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        if q.origin == q.dest || q.max_hops == 0 {
+            return out;
+        }
+        for a in 0..s.edges.len() {
+            if s.edges[a].src == q.origin && may_hop(s, q, a) {
+                walk(s, q, &mut vec![a], &mut vec![q.origin, s.edges[a].dst], &mut out);
+            }
+        }
+        out
+    }
+
+    /// Every host a chain of logins reaches from the seed (or that reaches
+    /// it), by trying every chain; a chain may pass a host twice.
+    fn every_reach(s: &Store, q: &PathQuery, seed: u32, forward: bool) -> HashSet<u32> {
+        let n = s.edges.len();
+        let far = |i: usize| if forward { s.edges[i].dst } else { s.edges[i].src };
+        let near = |i: usize| if forward { s.edges[i].src } else { s.edges[i].dst };
+        let usable = |i: usize| may_hop(s, q, i) && far(i) != seed;
+        let mut done = vec![false; n];
+        let mut level: Vec<usize> = (0..n).filter(|&i| near(i) == seed && usable(i)).collect();
+        let mut hosts: HashSet<u32> = HashSet::from([seed]);
+        for _ in 0..q.max_hops {
+            let mut after = Vec::new();
+            for &a in &level {
+                if std::mem::replace(&mut done[a], true) {
+                    continue;
+                }
+                hosts.insert(far(a));
+                for b in 0..n {
+                    let chained = if forward { follows(s, q, a, b) } else { follows(s, q, b, a) };
+                    if !done[b] && usable(b) && chained {
+                        after.push(b);
+                    }
+                }
+            }
+            level = after;
+        }
+        hosts
+    }
+
+    /// The search against every chain there is, on timelines made by
+    /// chance, with every option in every combination: the same paths, in
+    /// order of length, and the same cones forward and back.
+    #[test]
+    fn the_search_finds_what_trying_every_chain_finds() {
+        let mut checked = (0usize, 0usize, 0usize);
+        for seed in 0..60u64 {
+            let (s, path) = chance_store(seed, "all");
+            let h = |n: &str| s.hosts.get(n);
+            let (Some(o), Some(d)) = (h("HA"), h("HD")) else {
+                let _ = std::fs::remove_file(path);
+                continue;
+            };
+            let ana: std::rc::Rc<Vec<bool>> = std::rc::Rc::new(s.edges.iter().map(|e| s.users.name(e.user).to_lowercase().starts_with("ana")).collect());
+            let mid = (s.t_min + s.t_max) / 2;
+            for combo in 0..(2 * 3 * 3 * 2 * 2 * 3 * 3 * 2) {
+                let mut c = combo;
+                let mut pick = |n: usize| -> usize {
+                    let k = c % n;
+                    c /= n;
+                    k
+                };
+                let q = PathQuery {
+                    origin: o,
+                    dest: d,
+                    skip_machine_accounts: pick(2) == 0,
+                    results: [[true, false, false, false], [true, true, false, true], [true, true, true, true]][pick(3)],
+                    max_hops: [1, 2, 5][pick(3)],
+                    max_gap: [3600, 6 * 3600][pick(2)],
+                    only: [None, Some(ana.clone())][pick(2)].clone(),
+                    from: [None, Some(mid), Some(s.t_min + 3600)][pick(3)],
+                    to: [None, Some(mid), Some(s.t_max - 3600)][pick(3)],
+                    by_session: false,
+                    gap_without_session: false,
+                    max_paths: 100_000,
+                };
+                let chain = pick(2);
+                for mode in 0..3 {
+                    // the session modes on half the combinations (they share the rest)
+                    if mode > 0 && chain == 0 {
+                        continue;
+                    }
+                    let q = PathQuery { by_session: mode > 0, gap_without_session: mode == 2, ..q.clone() };
+                    let want = every_route(&s, &q);
+                    let (got, cut) = search(&s, &q);
+                    assert!(!cut);
+                    let got_routes: HashMap<Vec<(u32, u32, u32)>, usize> = got.iter().map(|p| (p.edges.iter().map(|&ei| { let e = &s.edges[ei as usize]; (e.src, e.dst, e.user) }).collect(), p.hops())).collect();
+                    assert_eq!(got_routes.len(), got.len(), "seed {} combo {} mode {}: a route twice", seed, combo, mode);
+                    assert_eq!(got_routes, want, "seed {} combo {} mode {}: {:?}", seed, combo, mode, q);
+                    assert!(got.windows(2).all(|w| w[0].hops() <= w[1].hops()), "seed {} combo {}: not shortest first", seed, combo);
+                    // every path found holds, hop by hop
+                    for p in &got {
+                        assert!(p.edges.iter().all(|&e| may_hop(&s, &q, e as usize)));
+                        assert!(p.edges.windows(2).all(|w| follows(&s, &q, w[0] as usize, w[1] as usize)));
+                    }
+                    // a few of them: the shortest ones
+                    if want.len() > 2 {
+                        let few = find_paths(&s, &PathQuery { max_paths: 2, ..q.clone() });
+                        let mut lens: Vec<usize> = want.values().copied().collect();
+                        lens.sort();
+                        assert_eq!(few.iter().map(|p| p.hops()).collect::<Vec<_>>(), lens[..2], "seed {} combo {} mode {}: the two shortest", seed, combo, mode);
+                    }
+                    checked.0 += 1;
+                    checked.1 += want.len();
+                    // the cones
+                    for forward in [true, false] {
+                        let seed_host = if forward { o } else { d };
+                        let t0 = if forward { q.from.unwrap_or(i64::MIN) } else { q.to.unwrap_or(i64::MAX) };
+                        let got: HashSet<u32> = cone(&s, seed_host, t0, &q, forward).0.keys().copied().collect();
+                        let want = every_reach(&s, &q, seed_host, forward);
+                        let names = |v: &HashSet<u32>| { let mut n: Vec<&str> = v.iter().map(|x| s.hosts.name(*x)).collect(); n.sort(); n.join(" ") };
+                        assert_eq!(names(&got), names(&want), "seed {} combo {} mode {} forward {}: {:?}", seed, combo, mode, forward, q);
+                        checked.2 += want.len() - 1;
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(path);
+        }
+        println!("{} searches checked: {} paths, {} hosts in cones", checked.0, checked.1, checked.2);
+        assert!(checked.1 > 5_000 && checked.2 > 20_000, "{:?}", checked);
+    }
+
+    /// So many chains that a length is not walked to its end: the search
+    /// says it was cut short; and a path that is there is still found
+    /// among thousands of rows of the same logins, once.
+    #[test]
+    fn a_search_too_wide_says_it_was_cut_short() {
+        let path = std::env::temp_dir().join(format!("masstin-wide-{}.csv", std::process::id()));
+        let mut lines = vec![crate::csv_out::HEADER.to_string()];
+        let stamp = |sec: u32| format!("2026-01-05T{:02}:{:02}:{:02}Z", sec / 3600, (sec / 60) % 60, sec % 60);
+        for i in 0..1800u32 {
+            lines.push(format!("{},B,SUCCESSFUL_LOGON,4624,3,ana,CORP,,10.0.0.1,,,0x{:x},,Security.evtx,,,,,", stamp(i), i + 1));
+            lines.push(format!("{},C,SUCCESSFUL_LOGON,4624,3,ana,CORP,,B,,,0x{:x},,Security.evtx,,,,,", stamp(3000 + i), 9000 + i));
+        }
+        // D is entered from C, and E from nowhere that is reached
+        lines.push(format!("{},D,SUCCESSFUL_LOGON,4624,3,ana,CORP,,C,,,0xfff1,,Security.evtx,,,,,", stamp(6000)));
+        lines.push(format!("{},E,SUCCESSFUL_LOGON,4624,3,ana,CORP,,Z,,,0xfff2,,Security.evtx,,,,,", stamp(6100)));
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        // 1,800 x 1,800 chains reach C before any could go on to E
+        let (found, cut) = search(&s, &PathQuery { origin: h("10.0.0.1"), dest: h("E"), ..Default::default() });
+        assert!(found.is_empty() && cut);
+        // to C in two hops: thousands of rows, one route, and nothing left unwalked
+        let (found, cut) = search(&s, &PathQuery { origin: h("10.0.0.1"), dest: h("C"), max_hops: 2, ..Default::default() });
+        assert_eq!((found.len(), found[0].hops(), cut), (1, 2, false));
+        // to D, three hops: found, as one path
+        let (found, _) = search(&s, &PathQuery { origin: h("10.0.0.1"), dest: h("D"), ..Default::default() });
+        assert_eq!((found.len(), found[0].hops()), (1, 3));
         let _ = std::fs::remove_file(path);
     }
 

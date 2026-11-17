@@ -588,6 +588,86 @@ pub(crate) struct Suggest {
     at: Option<usize>,
 }
 
+/// The rows a path search may use as hops, its time window, and how many
+/// rows that is: `(the rows, or None for all of them, from, to, how many)`.
+///
+/// Inside the filters (`whole` false) they are the rows the filters select,
+/// in the filters' time window unless the search has its own (`from`, `to`:
+/// a text that is no date counts as empty). Over the whole timeline the
+/// filters and their window are ignored. On top of either, `account` keeps
+/// the logins of the accounts it names (the patterns of the filters).
+fn path_rows(store: &Store, filter: &Filter, whole: bool, account: &str, from: &str, to: &str) -> (Option<std::rc::Rc<Vec<bool>>>, Option<i64>, Option<i64>, usize) {
+    let n = store.edges.len();
+    let users = Pattern::parse_list(account);
+    let own = |text: &str, bar: &str| -> Option<i64> { parse_time(text).or_else(|| if whole { None } else { parse_time(bar) }) };
+    let (t_from, t_to) = (own(from, &filter.from), own(to, &filter.to));
+    if whole && users.is_empty() {
+        let rows = store.in_window(t_from, t_to).len();
+        return (None, t_from, t_to, rows);
+    }
+    let mut ok = vec![whole; n];
+    if !whole {
+        let mut f = filter.clone();
+        if parse_time(from).is_some() {
+            f.from = from.to_string();
+        }
+        if parse_time(to).is_some() {
+            f.to = to.to_string();
+        }
+        for ei in f.select(store) {
+            ok[ei as usize] = true;
+        }
+    }
+    for (i, e) in store.edges.iter().enumerate() {
+        if ok[i] && ((!users.is_empty() && !Pattern::any_account(&users, store.users.name(e.user))) || t_from.map_or(false, |f| e.t < f) || t_to.map_or(false, |t| e.t > t)) {
+            ok[i] = false;
+        }
+    }
+    let rows = ok.iter().filter(|x| **x).count();
+    (Some(std::rc::Rc::new(ok)), t_from, t_to, rows)
+}
+
+/// Why a search found no path, when no wider search finds one either: the
+/// origin is the source of nothing that counts as a hop, nothing that
+/// counts enters the destination, or what the one reaches and what reaches
+/// the other never meet.
+fn why_no_path(store: &Store, q: &PathQuery) -> String {
+    let (o, d) = (store.hosts.name(q.origin), store.hosts.name(q.dest));
+    // the logins of a host by result, and how many of them may be a hop
+    let tally = |rows: &[u32]| -> ([usize; 4], usize) {
+        let mut by = [0usize; 4];
+        let mut usable = 0usize;
+        for &ei in rows {
+            let e = &store.edges[ei as usize];
+            by[e.result as usize] += 1;
+            if q.results[e.result as usize] && !(q.skip_machine_accounts && super::store::is_machine_account(store.users.name(e.user))) && q.only.as_ref().map_or(true, |only| only[ei as usize]) && q.from.map_or(true, |f| e.t >= f) && q.to.map_or(true, |t| e.t <= t) {
+                usable += 1;
+            }
+        }
+        (by, usable)
+    };
+    let has = |by: &[usize; 4]| -> String { RESULT_NAMES.iter().enumerate().filter(|(i, _)| by[*i] > 0).map(|(i, n)| format!("{} {}", group_digits(by[i]), n)).collect::<Vec<_>>().join(", ") };
+    let (out_by, out_ok) = tally(store.out_adj.of(q.origin));
+    let (in_by, in_ok) = tally(store.in_adj.of(q.dest));
+    let kinds = RESULT_NAMES.iter().enumerate().filter(|(i, _)| q.results[*i]).map(|(_, n)| *n).collect::<Vec<_>>().join(" / ");
+    let narrow = "the ones this search counts (see «Hops are», machine accounts, the account, the dates and «Search in»)";
+    if out_by.iter().sum::<usize>() == 0 {
+        return format!("Nothing in the timeline logs on FROM {}: it is only ever a destination, so no path can start at it.", o);
+    }
+    if out_ok == 0 {
+        return format!("No path can start at {}: none of its logins is among {}. As an origin it has {}; the search counts {}.", o, narrow, has(&out_by), kinds);
+    }
+    if in_by.iter().sum::<usize>() == 0 {
+        return format!("Nothing in the timeline logs on TO {}: it is only ever an origin, so no path can end at it.", d);
+    }
+    if in_ok == 0 {
+        return format!("No path can end at {}: none of the logins into it is among {}. As a destination it has {}; the search counts {}.", d, narrow, has(&in_by), kinds);
+    }
+    let reach = paths::cone(store, q.origin, q.from.unwrap_or(store.t_min), q, true).0.len().saturating_sub(1);
+    let ways = paths::cone(store, q.dest, q.to.unwrap_or(store.t_max), q, false).0.len().saturating_sub(1);
+    format!("From {} a chain of these logins reaches {} host(s), and {} host(s) could reach {}, but no chain joins the two within these limits («Reach from origin» and «Ways into destination» draw them). Try more hops, a longer gap, or letting failed logons and connections count as hops.", o, group_digits(reach), group_digits(ways), d)
+}
+
 /// `1234567` as `1,234,567`.
 fn group_digits(n: usize) -> String {
     let d = n.to_string();
@@ -3966,38 +4046,7 @@ impl Viewer {
 
     /// The search as the form has it: (the query, the rows it may use).
     fn path_query(&self, origin: u32, dest: u32) -> (PathQuery, usize) {
-        let n = self.store.edges.len();
-        let users = Pattern::parse_list(&self.path_user);
-        // the window: the search's own, else the bar's when it runs inside the filters
-        let own = |text: &str, bar: &str| -> Option<i64> { parse_time(text).or_else(|| if self.path_scope_all { None } else { parse_time(bar) }) };
-        let (from, to) = (own(&self.path_from, &self.filter.from), own(&self.path_to, &self.filter.to));
-        let mut rows = n;
-        let only = if self.path_scope_all && users.is_empty() {
-            None
-        } else {
-            let mut ok = vec![self.path_scope_all; n];
-            if !self.path_scope_all {
-                let mut f = self.filter.clone();
-                if parse_time(&self.path_from).is_some() {
-                    f.from = self.path_from.clone();
-                }
-                if parse_time(&self.path_to).is_some() {
-                    f.to = self.path_to.clone();
-                }
-                for ei in f.select(&self.store) {
-                    ok[ei as usize] = true;
-                }
-            }
-            if !users.is_empty() {
-                for (i, e) in self.store.edges.iter().enumerate() {
-                    if ok[i] && !Pattern::any_account(&users, self.store.users.name(e.user)) {
-                        ok[i] = false;
-                    }
-                }
-            }
-            rows = ok.iter().filter(|x| **x).count();
-            Some(std::rc::Rc::new(ok))
-        };
+        let (only, from, to, rows) = path_rows(&self.store, &self.filter, self.path_scope_all, &self.path_user, &self.path_from, &self.path_to);
         let q = PathQuery {
             origin,
             dest,
@@ -4033,8 +4082,16 @@ impl Viewer {
         }
         let (q, rows) = self.path_query(o, d);
         let scope = self.path_scope_text(&q, rows);
-        self.path_found = paths::find_paths(&self.store, &q);
+        let (found, cut) = paths::search(&self.store, &q);
+        self.path_found = found;
+        let cut = if cut { "\nThe search was cut short: there are so many chains to try that not all were walked, so there may be more paths (or shorter ones). Narrow it with an account, dates, fewer hops or a shorter gap." } else { "" };
         if self.path_found.is_empty() {
+            // the path of a search before this one is not this one's answer
+            if self.overlay.as_ref().map_or(false, |o| !o.exact) || self.trail.is_some() {
+                self.overlay = None;
+                self.trail = None;
+                self.requery(false);
+            }
             // why not, as far as a wider search can tell
             let mut hints: Vec<String> = Vec::new();
             let mut wider = q.clone();
@@ -4056,12 +4113,12 @@ impl Viewer {
                 }
             }
             if hints.is_empty() {
-                hints.push("Try more hops, a longer gap, or letting failed logons and connections count as hops.".to_string());
+                hints.push(why_no_path(&self.store, &q));
             }
-            self.path_msg = format!("No path from {} to {} within {} hops{}. Searched {}.\n{}", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, if q.by_session && !q.gap_without_session { String::new() } else { format!(" and {:.1} h per hop", self.path_gap_h) }, scope, hints.join("\n"));
+            self.path_msg = format!("No path from {} to {} within {} hops{}. Searched {}.\n{}", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, if q.by_session && !q.gap_without_session { String::new() } else { format!(" and {:.1} h per hop", self.path_gap_h) }, scope, hints.join("\n")) + cut;
             return;
         }
-        self.path_msg = format!("{} path(s), shortest first. Searched {}.", self.path_found.len(), scope);
+        self.path_msg = format!("{} path(s), shortest first{}. Searched {}.{}", self.path_found.len(), if self.path_found.len() >= q.max_paths { " (as many as «Max paths» allows: there may be more)" } else { "" }, scope, cut);
         let all: Vec<u32> = self.path_found.iter().flat_map(|p| p.edges.iter().copied()).collect();
         let hops = self.hops_along(&self.path_found);
         let labels = hops.iter().map(|(h, k)| (*h, if *k == 0 { "origin".to_string() } else { format!("hop {}", k) })).collect();
@@ -5525,6 +5582,60 @@ impl Viewer {
             "paths-alone" => self.path_in_map = false,
             "paths-reshow" => self.reshow_path(),
             "paths-open" => self.show_paths = true,
+            "paths-find" => {
+                let t = std::time::Instant::now();
+                self.run_paths();
+                println!("PATHS| ({} took {:.2} s)", "paths-find", t.elapsed().as_secs_f32());
+            }
+            "cone-fwd" => {
+                let t = std::time::Instant::now();
+                self.run_cone(true);
+                println!("PATHS| ({} took {:.2} s)", "cone-fwd", t.elapsed().as_secs_f32());
+            }
+            "cone-back" => {
+                let t = std::time::Instant::now();
+                self.run_cone(false);
+                println!("PATHS| ({} took {:.2} s)", "cone-back", t.elapsed().as_secs_f32());
+            }
+            "paths-back" => {
+                self.overlay = None;
+                self.trail = None;
+                self.path_found.clear();
+                self.path_msg.clear();
+                self.requery(false);
+            }
+            "paths-say" => {
+                // what the window says and what is drawn, for a test to read
+                println!("PATHS| {}", self.path_msg.replace('\n', " / "));
+                for p in &self.path_found {
+                    let mut t = self.store.hosts.name(self.store.edges[p.edges[0] as usize].src).to_string();
+                    for &ei in &p.edges {
+                        let e = &self.store.edges[ei as usize];
+                        t.push_str(&format!(" -({} {})-> {}", self.store.users.name(e.user), fmt_time(e.t), self.store.hosts.name(e.dst)));
+                    }
+                    println!("PATHS|   {}", t);
+                }
+                println!("PATHS|   drawn: {} hosts, {} connections; overlay {:?}; trail {:?} ({} marked)", self.graph.nodes.len(), self.graph.edges.len(), self.overlay.as_ref().map(|o| o.title.clone()), self.trail.as_ref().map(|t| t.title.clone()), self.trail_on.iter().filter(|x| **x).count());
+                let mut labels: Vec<String> = self.overlay.as_ref().map(|o| &o.labels).or(self.trail.as_ref().map(|t| &t.labels)).map(|l| l.iter().map(|(h, t)| format!("{}={}", self.store.hosts.name(*h), t)).collect()).unwrap_or_default();
+                labels.sort();
+                println!("PATHS|   labels: {}", labels.join("; "));
+            }
+            other if other.starts_with("paths-origin=") => self.path_origin = other["paths-origin=".len()..].to_string(),
+            other if other.starts_with("paths-dest=") => self.path_dest = other["paths-dest=".len()..].to_string(),
+            other if other.starts_with("paths-hops=") => self.path_hops = other["paths-hops=".len()..].parse().unwrap_or(6),
+            other if other.starts_with("paths-max=") => self.path_max = other["paths-max=".len()..].parse().unwrap_or(50),
+            other if other.starts_with("paths-gap=") => self.path_gap_h = other["paths-gap=".len()..].parse().unwrap_or(24.0),
+            other if other.starts_with("paths-results=") => {
+                for (i, ch) in other["paths-results=".len()..].chars().take(4).enumerate() {
+                    self.path_results[i] = ch == '1';
+                }
+            }
+            other if other.starts_with("paths-machine=") => self.path_skip_machine = &other["paths-machine=".len()..] != "1",
+            other if other.starts_with("paths-pick=") => self.show_one_path(other["paths-pick=".len()..].parse().unwrap_or(0)),
+            "paths-session-only" => {
+                self.path_by_session = true;
+                self.path_session_gap = false;
+            }
             "paths-session" => self.path_by_session = true,
             "paths-session-gap" => {
                 self.path_by_session = true;
@@ -5696,6 +5807,115 @@ impl Viewer {
 #[cfg(test)]
 mod rows_option_tests {
     use super::{host_answers, parse_event, parse_rows};
+
+    /// The rows a path search may use: what the filters select or the
+    /// whole timeline, the account, the search's own dates over the bar's.
+    #[test]
+    fn a_path_search_uses_the_rows_it_says() {
+        use super::super::query::{parse_time, Filter, View};
+        use super::super::store::Store;
+        let path = std::env::temp_dir().join(format!("masstin-pathrows-{}.csv", std::process::id()));
+        let row = |day: u32, src: &str, dst: &str, user: &str, et: &str, hunt: &str| format!("2026-01-{:02}T10:00:00Z,{},{},4624,3,{},CORP,,{},,,0x{}{},,Security.evtx,{},,,,", day, dst, et, user, src, day, src.len(), hunt);
+        let body = [
+            crate::csv_out::HEADER.to_string(),
+            row(1, "10.0.0.1", "B", "ana", "SUCCESSFUL_LOGON", "significant"),
+            row(2, "B", "C", "ana", "SUCCESSFUL_LOGON", "habitual"),
+            row(3, "C", "D", "bob", "SUCCESSFUL_LOGON", "candidate"),
+            row(4, "C", "D", "ana", "FAILED_LOGON", "baseline"),
+            row(5, "D", "E", "anabel", "SUCCESSFUL_LOGON", "not_evaluated"),
+            row(6, "D", "E", "bob", "LOGOFF", "baseline"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        assert_eq!(s.edges.len(), 6);
+        let days = |only: &Option<std::rc::Rc<Vec<bool>>>| -> Vec<i64> { s.edges.iter().enumerate().filter(|(i, _)| only.as_ref().map_or(true, |o| o[*i])).map(|(_, e)| (e.t - s.t_min) / 86_400 + 1).collect() };
+        let findings = Filter::default();
+        assert_eq!(findings.view, View::Findings);
+        let all = Filter { view: View::All, ..Filter::default() };
+        // inside the filters: the findings alone, or everything they let through (no logoff by default)
+        let (only, from, to, rows) = super::path_rows(&s, &findings, false, "", "", "");
+        assert_eq!((days(&only), from, to, rows), (vec![1, 3], None, None, 2));
+        let (only, _, _, rows) = super::path_rows(&s, &all, false, "", "", "");
+        assert_eq!((days(&only), rows), (vec![1, 2, 3, 4, 5], 5));
+        // the whole timeline: every row, whatever the filters and their window say
+        let barred = Filter { from: "2026-01-03".into(), to: "2026-01-04 23:00".into(), ..all.clone() };
+        let (only, from, to, rows) = super::path_rows(&s, &barred, true, "", "", "");
+        assert!(only.is_none());
+        assert_eq!((from, to, rows), (None, None, 6));
+        // inside the filters, the bar's window is the search's
+        let (only, from, to, rows) = super::path_rows(&s, &barred, false, "", "", "");
+        assert_eq!((days(&only), rows), (vec![3, 4], 2));
+        assert_eq!((from, to), (parse_time("2026-01-03"), parse_time("2026-01-04 23:00")));
+        // the search's own dates go over the bar's, one end or both
+        let (only, from, _, _) = super::path_rows(&s, &barred, false, "", "2026-01-02", "");
+        assert_eq!((days(&only), from), (vec![2, 3, 4], parse_time("2026-01-02")));
+        let (only, _, to, rows) = super::path_rows(&s, &barred, false, "", "2026-01-01", "2026-01-02 12:00");
+        assert_eq!((days(&only), to, rows), (vec![1, 2], parse_time("2026-01-02 12:00"), 2));
+        // and they bound the whole timeline too
+        let (only, from, to, rows) = super::path_rows(&s, &all, true, "", "2026-01-02", "2026-01-05 12:00");
+        assert!(only.is_none());
+        assert_eq!((from, to, rows), (parse_time("2026-01-02"), parse_time("2026-01-05 12:00"), 4));
+        // a text that is no date is as if empty
+        let (only, from, _, _) = super::path_rows(&s, &barred, false, "", "yesterday", "");
+        assert_eq!((days(&only), from), (vec![3, 4], parse_time("2026-01-03")));
+        // the account: part of a name, a wildcard, one left out, several
+        let acct = |a: &str, whole: bool| days(&super::path_rows(&s, &all, whole, a, "", "").0);
+        assert_eq!(acct("ana", true), vec![1, 2, 4, 5]);
+        assert_eq!(acct("ana", false), vec![1, 2, 4, 5]);
+        assert_eq!(acct("bob", true), vec![3, 6]);
+        assert_eq!(acct("bob", false), vec![3]);
+        assert_eq!(acct("anab*", true), vec![5]);
+        assert_eq!(acct("!bob", true), vec![1, 2, 4, 5]);
+        assert_eq!(acct("bob, anabel", true), vec![3, 5, 6]);
+        assert_eq!(acct("nobody", true), Vec::<i64>::new());
+        // account and dates and filters together
+        let (only, _, _, rows) = super::path_rows(&s, &findings, false, "bob", "2026-01-02", "");
+        assert_eq!((days(&only), rows), (vec![3], 1));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Why there is no path, said from what the origin and the destination
+    /// have: nothing out of the one, nothing into the other, or two cones
+    /// that never meet.
+    #[test]
+    fn no_path_says_why() {
+        use super::super::paths::PathQuery;
+        use super::super::store::Store;
+        let path = std::env::temp_dir().join(format!("masstin-why-{}.csv", std::process::id()));
+        let row = |hour: u32, src: &str, dst: &str, user: &str, et: &str| format!("2026-01-05T{:02}:00:00Z,{},{},4624,3,{},CORP,,{},,,0x{},,Security.evtx,,,,,", hour, dst, et, user, src, hour);
+        let body = [
+            crate::csv_out::HEADER.to_string(),
+            row(1, "10.0.0.9", "B", "ana", "FAILED_LOGON"),
+            row(2, "10.0.0.9", "B", "ana", "FAILED_LOGON"),
+            row(3, "B", "C", "ana", "SUCCESSFUL_LOGON"),
+            row(4, "C", "D", "D$", "SUCCESSFUL_LOGON"),
+            // E enters F before anything enters E
+            row(5, "E", "F", "ana", "SUCCESSFUL_LOGON"),
+            row(9, "C", "E", "ana", "SUCCESSFUL_LOGON"),
+        ]
+        .join("\n");
+        std::fs::write(&path, format!("{}\n", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        let q = |o: &str, d: &str| PathQuery { origin: h(o), dest: h(d), ..Default::default() };
+        // the address only fails: nothing of what counts leaves it
+        let why = super::why_no_path(&s, &q("10.0.0.9", "C"));
+        assert!(why.starts_with("No path can start at 10.0.0.9") && why.contains("2 logon FAILED") && why.contains("counts logon OK"), "{}", why);
+        // (and with failures counted there is one)
+        assert_eq!(super::paths::find_paths(&s, &PathQuery { results: [true, true, false, false], ..q("10.0.0.9", "C") }).len(), 1);
+        // F is never an origin, the address never a destination
+        assert!(super::why_no_path(&s, &q("F", "B")).starts_with("Nothing in the timeline logs on FROM F"));
+        assert!(super::why_no_path(&s, &q("B", "10.0.0.9")).starts_with("Nothing in the timeline logs on TO 10.0.0.9"));
+        // D is entered by a machine account alone
+        let why = super::why_no_path(&s, &q("B", "D"));
+        assert!(why.starts_with("No path can end at D") && why.contains("1 logon OK"), "{}", why);
+        // B reaches C and E; E could reach F; but E was left before it was entered
+        let why = super::why_no_path(&s, &q("B", "F"));
+        assert!(why.starts_with("From B a chain of these logins reaches 2 host(s), and 1 host(s) could reach F"), "{}", why);
+        assert!(super::paths::find_paths(&s, &q("B", "F")).is_empty());
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The names a box offers: the ones that start with what is typed
     /// first, then the ones that contain it, in any case; all when empty.

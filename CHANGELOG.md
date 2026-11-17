@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Paths: the shortest are found first, always.** The search walks one length at a time (one hop, then two…), so a search that stops at «Max paths» keeps the shortest paths there are, not the first chains it met. When there are so many chains that a length cannot be walked to its end, the window says the search was cut short.
+- **Paths: a search that finds nothing says why.** Nothing logs on from the origin, or none of its logins counts as a hop (and which it has: «2 logon FAILED»); the same for the destination; or how many hosts the origin reaches and how many could reach the destination, when the two never meet. A path from a search before is no longer left on the canvas.
+- **Fixed: a cone could miss a host** when a login left a host in the very second another login entered it. Found by a new test that checks every search against trying every chain, on timelines made by chance with every option in every combination (155,520 searches).
 - **Paths by session.** A path can now be asked for **by session (logon ID)**: the next hop must leave a host while the session the hop before opened there is still open, between its logon and its logoff, paired by logon ID. Where the timeline has no logoff for a logon it is not followed, or is followed for the gap if asked. Cones (*Reach from origin*, *Ways into destination*) follow the same rule.
 - **Paths: an account, dates, and where it searches.** The search runs inside what the filters select by default and says so, with the filters in a line; *the whole timeline* ignores them. An **Account** box keeps only the logins of the accounts named, and **From / To** give the search its own time window. A search that finds nothing says what it searched and which setting leaves a path out when a wider search finds one.
 - **Paths: hosts and accounts are offered as you type**, and the arrow next to each box lists all of them. Every setting of the window has its **?**.
