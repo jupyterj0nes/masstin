@@ -268,7 +268,28 @@ pub(super) fn write_rows(store: &Store, rows: &[(u16, u32)], path: &std::path::P
 
 impl Viewer {
     /// The programs a timeline opens in: found once, on first use.
-    fn viewer_list(&mut self) -> Vec<ViewerApp> {
+    /// A copy of these rows (the timeline's own columns), opened in a
+    /// program of the list, or in the system's CSV application.
+    pub(super) fn rows_in_program(&mut self, rows: &[(u16, u32)], label: &str, viewer: Option<usize>) {
+        let path = match self.write_rows_copy(rows, label) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = format!("Cannot write the copy of the rows: {}", e);
+                return;
+            }
+        };
+        let apps = self.viewer_list();
+        let (name, r) = match viewer.and_then(|i| apps.get(i)) {
+            Some(a) => (a.name.clone(), viewers::launch(a, &path, None)),
+            None => ("the system's application".to_string(), super::ingest::open_external(&path)),
+        };
+        self.status = match r {
+            Ok(()) => format!("Opened {} row(s) of {} in {} ({})", rows.len(), label, name, path),
+            Err(e) => format!("Cannot open {} in {}: {}", path, name, e),
+        };
+    }
+
+    pub(super) fn viewer_list(&mut self) -> Vec<ViewerApp> {
         if self.viewer_apps.is_none() {
             self.viewer_apps = Some(viewers::all());
         }

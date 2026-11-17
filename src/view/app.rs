@@ -1708,6 +1708,11 @@ impl Viewer {
         let name = self.store.hosts.name(host).to_string();
         let aliases: Vec<String> = self.store.aliases[host as usize].iter().filter(|a| a.as_str() != name).cloned().collect();
         ui.heading(&name);
+        // its rows, in sight (the right click on the host gives the same)
+        if ui.button(format!("{}  See its rows in the Timeline", super::icons::TABLE)).on_hover_text("Timeline mode, on the rows of the CSV behind every connection of this host that the graph shows").clicked() {
+            self.timeline_of_node(i);
+            return;
+        }
         if !aliases.is_empty() {
             ui.label(egui::RichText::new(format!("also seen as {}", aliases.join(", "))).color(MUTED));
             let mine = self.merged_into(&name);
@@ -1881,6 +1886,52 @@ impl Viewer {
             ui.label(egui::RichText::new(&self.mark_msg).color(MUTED).small());
         }
         ui.add_space(10.0);
+        // Where to read the rows of this connection, in sight: the same
+        // ways the right click on the connection gives, for whoever does
+        // not think of a right click.
+        {
+            let n = self.graph.edges[i].rows.len();
+            // 0 the timeline here, 1 agentc00pr, 2 the system's CSV program, 3.. a program of the list
+            let mut go: Option<usize> = None;
+            let apps = self.viewer_list();
+            ui.label(egui::RichText::new(format!("SEE ITS {} ROW{} IN", n, if n == 1 { "" } else { "S" })).small().color(MUTED));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                if ui.add(egui::Button::new(theme::semibold(format!("{}  Timeline", super::icons::TABLE), 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).on_hover_text("Timeline mode, on the rows of the CSV this connection is drawn from: every column, as the file has them").clicked() {
+                    go = Some(0);
+                }
+                if ui.button(format!("{}  agentc00pr", super::icons::APP_WINDOW)).on_hover_text("agentc00pr's viewer on the case this timeline is in, showing only the events of this connection. A timeline that is in no case yet is taken to one first").clicked() {
+                    go = Some(1);
+                }
+                ui.menu_button(format!("{}  Another program", super::icons::CARET_DOWN), |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(egui::RichText::new("A copy of these rows, with the timeline's own columns, opened in:").color(MUTED).small());
+                    if theme::icon_button(ui, super::icons::APP_WINDOW, "The system's CSV application").clicked() {
+                        ui.close();
+                        go = Some(2);
+                    }
+                    for (k, a) in apps.iter().enumerate() {
+                        if theme::icon_button(ui, super::icons::APP_WINDOW, &a.name).on_hover_text(a.args.last().unwrap_or(&a.program)).clicked() {
+                            ui.close();
+                            go = Some(3 + k);
+                        }
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("More programs are added in Timeline › Open in…").color(theme::DIM).small());
+                });
+            });
+            ui.add_space(8.0);
+            if let Some(g) = go {
+                let (label, rows) = (self.graph_edge_label(i), self.rows_of_graph_edge(i));
+                match g {
+                    0 => self.timeline_of_edge(i),
+                    1 => self.rows_to_agentc00pr(&rows, &label),
+                    2 => self.rows_in_program(&rows, &label, None),
+                    k => self.rows_in_program(&rows, &label, Some(k - 3)),
+                }
+                return;
+            }
+        }
         if let Some((_, rows, total)) = &self.rows {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("ROWS {}", if *total > rows.len() { format!("(first {} of {})", rows.len(), total) } else { total.to_string() })).small().color(MUTED));
