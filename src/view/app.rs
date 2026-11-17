@@ -442,6 +442,9 @@ pub struct Viewer {
     hunt_sweep: Option<std::time::Instant>,
     /// a hunt just ended: the findings appear one by one
     hunt_reveal: Option<std::time::Instant>,
+    /// what was selected at the last frame and when it became so: the ripple of a new selection
+    sel_seen: Option<Sel>,
+    sel_at: f32,
     /// the timeline a hunt just wrote, being read again away from the window
     hunt_loading: Option<std::sync::mpsc::Receiver<Result<Store, String>>>,
     reveal_rank: Vec<f32>,
@@ -566,6 +569,18 @@ struct Trail {
     labels: HashMap<u32, String>,
     /// how many of its connections the view does not draw
     missing: usize,
+}
+
+/// A length of time as it is said: "48 s", "2 min 05 s", "1 h 12 min".
+fn story_length(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{} s", s)
+    } else if s < 3600 {
+        format!("{} min {:02} s", s / 60, s % 60)
+    } else {
+        format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
+    }
 }
 
 struct Overlay {
@@ -952,6 +967,8 @@ impl Viewer {
             merge_form: MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() },
             hunt_sweep: None,
             hunt_reveal: None,
+            sel_seen: None,
+            sel_at: 0.0,
             hunt_loading: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
@@ -1509,10 +1526,10 @@ impl Viewer {
             if !d.whole {
                 if let Some((_, rows, _)) = &self.rows {
                     ui.horizontal(|ui| {
-                        if ui.small_button("all").clicked() {
+                        if ui.small_button("all").on_hover_text("Tick every one").clicked() {
                             d.picked.iter_mut().for_each(|p| *p = true);
                         }
-                        if ui.small_button("none").clicked() {
+                        if ui.small_button("none").on_hover_text("Untick every one").clicked() {
                             d.picked.iter_mut().for_each(|p| *p = false);
                         }
                         ui.label(egui::RichText::new(format!("{} ticked{}", d.picked.iter().filter(|p| **p).count(), if total > rows.len() { format!(" · first {} of {} shown", rows.len(), total) } else { String::new() })).color(theme::MUTED).small());
@@ -1543,7 +1560,7 @@ impl Viewer {
                 if ui.add_enabled(n > 0, egui::Button::new(theme::semibold(format!("Write {} on {} row(s)", VERDICT_NAMES[d.verdict as usize], n), 13.0).color(theme::ACCENT_INK)).fill(c).stroke(Stroke::NONE)).clicked() {
                     save = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Close this without doing anything").clicked() {
                     cancel = true;
                 }
             });
@@ -1641,7 +1658,7 @@ impl Viewer {
                 if ui.add_enabled(!text.trim().is_empty(), egui::Button::new(theme::semibold("Save note", 13.0).color(theme::ACCENT_INK)).fill(ACCENT).stroke(Stroke::NONE)).clicked() {
                     save = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Close this without doing anything").clicked() {
                     cancel = true;
                 }
             });
@@ -1800,24 +1817,24 @@ impl Viewer {
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("Expand around").clicked() {
+            if ui.button("Expand around").on_hover_text("Add to the canvas the hosts this one talks to, and their connections, keeping what is there").clicked() {
                 self.draft.view = View::Around;
                 self.draft.around = name.clone();
                 self.requery(false);
                 return;
             }
-            if ui.button("Only this host").clicked() {
+            if ui.button("Only this host").on_hover_text("Reduce the canvas to this host and what it talks to directly (its neighbourhood)").clicked() {
                 self.draft.view = View::All;
                 self.draft.host = name.clone();
                 self.requery(false);
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Paths from here").clicked() {
+            if ui.button("Paths from here").on_hover_text("Open Paths with this host as the origin: where could someone go from it?").clicked() {
                 self.path_origin = name.clone();
                 self.show_paths = true;
             }
-            if ui.button("Paths to here").clicked() {
+            if ui.button("Paths to here").on_hover_text("Open Paths with this host as the destination: how could someone have got here?").clicked() {
                 self.path_dest = name.clone();
                 self.show_paths = true;
             }
@@ -2002,10 +2019,10 @@ impl Viewer {
                 ui.label(egui::RichText::new(format!("ROWS {}", if *total > rows.len() { format!("(first {} of {})", rows.len(), total) } else { total.to_string() })).small().color(MUTED));
                 if rows.len() > 1 {
                     ui.label(egui::RichText::new("· tick the ones to mark:").small().color(theme::DIM));
-                    if ui.small_button("all").clicked() {
+                    if ui.small_button("all").on_hover_text("Tick every one").clicked() {
                         self.row_pick.iter_mut().for_each(|p| *p = true);
                     }
-                    if ui.small_button("none").clicked() {
+                    if ui.small_button("none").on_hover_text("Untick every one").clicked() {
                         self.row_pick.iter_mut().for_each(|p| *p = false);
                     }
                 }
@@ -2150,7 +2167,7 @@ impl Viewer {
                     self.persist();
                     done = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Close this without doing anything").clicked() {
                     done = true;
                 }
             });
@@ -2205,13 +2222,13 @@ impl Viewer {
                     changed |= ui.checkbox(&mut r.glow, "").changed();
                     changed |= ui.checkbox(&mut r.hide, "").changed();
                     ui.horizontal(|ui| {
-                        if i > 0 && ui.small_button("up").clicked() {
+                        if i > 0 && ui.small_button("up").on_hover_text("Apply this rule before the one above it: when two rules fit the same thing, the later one wins").clicked() {
                             swap = Some((i, i - 1));
                         }
-                        if i + 1 < n && ui.small_button("down").clicked() {
+                        if i + 1 < n && ui.small_button("down").on_hover_text("Apply this rule after the one below it").clicked() {
                             swap = Some((i, i + 1));
                         }
-                        if ui.small_button("x").clicked() {
+                        if ui.small_button("x").on_hover_text("Remove this rule").clicked() {
                             remove = Some(i);
                         }
                     });
@@ -2227,7 +2244,7 @@ impl Viewer {
                 changed = true;
             }
             ui.horizontal(|ui| {
-                if ui.button("+ rule").clicked() {
+                if ui.button("+ rule").on_hover_text("A new empty rule: say what it matches (a name, an account, a state) and how that is drawn").clicked() {
                     self.style.rules.push(Rule::default());
                     changed = true;
                 }
@@ -2235,15 +2252,15 @@ impl Viewer {
                     self.style.rules.push(Rule { field: Field::User, pattern: "jdoe".into(), color: Some([255, 196, 84]), width: 1.6, ..Default::default() });
                     changed = true;
                 }
-                if ui.button("+ hide machine accounts").clicked() {
+                if ui.button("+ hide machine accounts").on_hover_text("A ready-made rule: connections of machine accounts (names ending in $) are not drawn").clicked() {
                     self.style.rules.push(Rule { field: Field::User, pattern: "*$".into(), color: None, hide: true, ..Default::default() });
                     changed = true;
                 }
-                if ui.button("+ fade benign").clicked() {
+                if ui.button("+ fade benign").on_hover_text("A ready-made rule: what the hunt found habitual or baseline is drawn faint, so the findings stand out").clicked() {
                     self.style.rules.push(Rule { field: Field::Verdict, pattern: "benign".into(), color: Some([90, 96, 110]), width: 0.6, ..Default::default() });
                     changed = true;
                 }
-                if ui.button("+ domain controllers as hexagons").clicked() {
+                if ui.button("+ domain controllers as hexagons").on_hover_text("A ready-made rule: hosts whose name looks like a domain controller are drawn as hexagons").clicked() {
                     self.style.rules.push(Rule { field: Field::Host, pattern: "*DC*".into(), color: Some([201, 144, 192]), shape: Some(Shape::Hexagon), size: 1.3, ..Default::default() });
                     changed = true;
                 }
@@ -2874,6 +2891,15 @@ impl Viewer {
         self.layout.aspect = (canvas.width() / canvas.height().max(1.0)).clamp(0.5, 2.5);
         self.draw_subnets(&painter, canvas, false);
 
+        // a new selection sends a ripple out from what was picked
+        if self.sel_seen != self.selected {
+            self.sel_seen = self.selected;
+            self.sel_at = now;
+        }
+        let ripple = if motion && self.selected.is_some() { ((now - self.sel_at) / 0.55).clamp(0.0, 1.0) } else { 1.0 };
+        if ripple < 1.0 {
+            keep_moving = true;
+        }
         // ── edges ──
         let mut animated: Vec<usize> = Vec::new();
         let mut edges_drawn = 0usize;
@@ -2947,6 +2973,10 @@ impl Viewer {
             if on_trail {
                 width = width * 1.8 + 2.6 * z.sqrt();
                 color = theme::MAGENTA;
+            }
+            if selected && ripple < 1.0 {
+                // the line swells with light as it is picked
+                painter.add(egui::epaint::QuadraticBezierShape { points: [pa, pc, pb], closed: false, fill: Color32::TRANSPARENT, stroke: egui::epaint::PathStroke::new(width + 22.0 * (1.0 - ripple) * z.sqrt(), draw::fade(theme::CYAN, 0.30 * (1.0 - ripple))) });
             }
             let stroke_color = if selected { ACCENT } else { color };
             let short = (pa - pb).length() < 14.0;
@@ -3090,6 +3120,12 @@ impl Viewer {
             let selected = self.selected == Some(Sel::Node(i));
             let hovered = self.hovered == Some(Sel::Node(i));
             // a path marked on the map: its hosts keep their light and carry its ring, the others step back
+            if selected && ripple < 1.0 && r > 2.0 {
+                // two rings leave the host, in the logo's two colours
+                let e = draw::ease_out_cubic(ripple);
+                painter.circle_stroke(p, r + 6.0 + 46.0 * e, Stroke::new(2.0 * (1.0 - ripple) + 0.5, draw::fade(theme::CYAN, 0.75 * (1.0 - ripple))));
+                painter.circle_stroke(p, r + 4.0 + 26.0 * e, Stroke::new(1.5 * (1.0 - ripple) + 0.5, draw::fade(theme::MAGENTA, 0.55 * (1.0 - ripple))));
+            }
             let on_trail = !self.trail_on.is_empty() && look.edges.iter().any(|&k| self.trail_on.get(k as usize).copied().unwrap_or(false));
             let alpha = if !self.trail_on.is_empty() && !on_trail && !selected && !hovered { alpha * 0.3 } else { alpha };
             if on_trail && r > 2.0 {
@@ -3932,7 +3968,7 @@ impl Viewer {
                 if ui.button("Ways into destination").on_hover_text("cone backward in time").clicked() {
                     cone = Some(false);
                 }
-                if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").clicked() {
+                if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").on_hover_text("Leave the path or the cone and draw again what the filters select").clicked() {
                     self.overlay = None;
                     self.trail = None;
                     self.path_found.clear();
@@ -4044,6 +4080,31 @@ impl Viewer {
 
     // ───────────────────────── story editor & export ─────────────────────────
 
+    /// Set the pace so the animation lasts about `target` seconds: rows
+    /// close in time are grouped until the steps are few enough to be seen
+    /// (a quarter of a second each at least), then every step takes the same
+    /// time. Nothing leaves the picture.
+    fn fit_story(&mut self, target: f32) {
+        self.story.timing = Timing::Fixed;
+        self.story.stretches.clear();
+        self.story.hold_end = if target <= 30.0 { 2.0 } else { 3.0 };
+        self.story.pause_significant = if target <= 60.0 { 0.4 } else { 1.0 };
+        let most = ((target - self.story.hold_end) / 0.25).max(1.0) as usize;
+        for group in [0.0f32, 2.0, 10.0, 60.0, 300.0, 1800.0, 7200.0, 43200.0, 172800.0, 604800.0] {
+            self.story.group_secs = group;
+            self.rebuild_steps();
+            if self.steps.len() <= most {
+                break;
+            }
+        }
+        let n = self.steps.len().max(1) as f32;
+        let findings = self.steps.iter().filter(|s| s.significant).count() as f32;
+        let room = (target - self.story.hold_end - findings * self.story.pause_significant).max(target * 0.4);
+        self.story.step_secs = (room / n).clamp(0.02, 20.0);
+        self.rebuild_steps();
+        self.status = format!("Animation fitted to about {}: {} steps, {:.2} s each, rows within {:.0} s together", story_length(present::total_secs(&self.steps, &self.story)), self.steps.len(), self.story.step_secs, self.story.group_secs);
+    }
+
     fn story_window(&mut self, ctx: &egui::Context) {
         if !self.show_story {
             return;
@@ -4055,47 +4116,90 @@ impl Viewer {
         let mut changed = false;
         let mut start = false;
         let mut preview: Option<usize> = None;
-        egui::Window::new("Story").open(&mut open).default_width(820.0).default_height(560.0).resizable(true).show(ctx, |ui| {
-            ui.label(egui::RichText::new("The view replayed in time order, one step per row (or per burst of rows close in time). Every setting here is saved next to the timeline; Present plays it full screen, Record writes it as a video.").color(MUTED));
-            egui::Grid::new("story-globals").num_columns(6).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Title");
-                changed |= ui.add_sized([260.0, 20.0], egui::TextEdit::singleline(&mut self.story.title).hint_text("shown at the top")).changed();
-                ui.label("Timing");
-                egui::ComboBox::from_id_salt("timing").selected_text(match self.story.timing { Timing::Fixed => "same time per step", Timing::Compressed => "real gaps, compressed" }).show_ui(ui, |ui| {
-                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Fixed, "same time per step").changed();
-                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Compressed, "real gaps, compressed").changed();
+        let mut fit: Option<f32> = None;
+        egui::Window::new(format!("{}  Animation · the story of this view", super::icons::FILM_STRIP)).id(egui::Id::new("story-window")).open(&mut open).default_width(820.0).default_height(560.0).resizable(true).show(ctx, |ui| {
+            let total = present::total_secs(&self.steps, &self.story);
+            let (n_now, n_rows) = (self.steps.len(), self.graph.events.len());
+            // what an animation is and how long this one is, before any knob
+            egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::BORDER_2)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::semibold(format!("{}  How an animation is made", super::icons::FILM_STRIP), 13.0).color(theme::CYAN));
+                ui.add(egui::Label::new(egui::RichText::new("1 · The graph on the canvas is what is animated, connection by connection in time order: narrow it first with the filters (a time window, the findings, one host's neighbourhood).\n2 · Here you set its pace and what is written on the picture.\n3 · Present plays it full screen (Esc ends it). Record… writes it as a GIF or a video.\nEverything is saved with the timeline as you change it.").color(TEXT).size(12.5)).wrap());
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    let (verdict, colour) = if n_now == 0 {
+                        ("nothing to animate: the view is empty", CANDIDATE)
+                    } else if total > 300.0 {
+                        ("long for a video: fit it to a length here, or narrow the view", CANDIDATE)
+                    } else if total < 8.0 {
+                        ("very short: slow it down, or widen the view", CANDIDATE)
+                    } else {
+                        ("a good length", theme::CYAN)
+                    };
+                    ui.label(egui::RichText::new(format!("Now: {} steps from {} rows, {}", n_now, n_rows, story_length(total))).color(TEXT));
+                    ui.label(egui::RichText::new(verdict).color(colour));
                 });
-                ui.label("Seconds per step");
-                changed |= ui.add(egui::DragValue::new(&mut self.story.step_secs).range(0.1..=20.0).speed(0.05).fixed_decimals(2)).changed();
-                ui.end_row();
-                ui.label("Compress by");
-                changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.compress).range(1.0..=100000.0).speed(10.0)).on_hover_text("real seconds between rows divided by this").changed();
-                ui.label("Gap min / max (s)");
                 ui.horizontal(|ui| {
-                    changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.min_gap).range(0.05..=10.0).speed(0.05).fixed_decimals(2)).changed();
-                    changed |= ui.add_enabled(self.story.timing == Timing::Compressed, egui::DragValue::new(&mut self.story.max_gap).range(0.1..=60.0).speed(0.1).fixed_decimals(1)).changed();
+                    ui.label(egui::RichText::new("Fit it to").color(MUTED));
+                    for (label, secs) in [("30 s", 30.0f32), ("1 min", 60.0), ("2 min", 120.0), ("5 min", 300.0)] {
+                        if ui.add_enabled(n_now > 0, egui::Button::new(label)).on_hover_text(format!("Set the pace so the whole animation lasts about {}: rows close in time are shown together and every step takes the same time. The knobs below show what it set, and can be changed after", label)).clicked() {
+                            fit = Some(secs);
+                        }
+                    }
+                    theme::help(ui, "The quick way: say how long the animation should be and masstin sets the pace for you. It groups rows that are close in time into one step until there are few enough, then gives every step the same time. Nothing is removed from the picture: only how fast it is drawn. For a talk, 1 to 2 minutes is usually right; for a GIF in a report, 30 seconds.");
                 });
-                ui.label("Group rows within (s)");
-                changed |= ui.add(egui::DragValue::new(&mut self.story.group_secs).range(0.0..=3600.0).speed(0.5).fixed_decimals(1)).on_hover_text("rows this close in time appear together as one step").changed();
-                ui.end_row();
-                ui.label("Pause on significant (s)");
-                changed |= ui.add(egui::DragValue::new(&mut self.story.pause_significant).range(0.0..=30.0).speed(0.1).fixed_decimals(1)).changed();
-                ui.label("Hold the end (s)");
-                changed |= ui.add(egui::DragValue::new(&mut self.story.hold_end).range(0.0..=60.0).speed(0.1).fixed_decimals(1)).changed();
-                ui.label("");
+            });
+            ui.add_space(4.0);
+            theme::section(ui, "Pace");
+            egui::Grid::new("story-pace").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+                theme::label_help(ui, "Timing", "How long each step stays. «same time per step»: every step lasts the same, whatever the real time between them: the simplest, and right for most videos. «real gaps, compressed»: a step waits in proportion to the real time that passed before it, so a burst plays fast and a quiet night is felt as a pause: right when the rhythm of the attack is the point.");
                 ui.horizontal(|ui| {
-                    changed |= ui.checkbox(&mut self.story.fade_old, "fade older").changed();
-                    changed |= ui.checkbox(&mut self.story.show_clock, "clock").changed();
-                    changed |= ui.checkbox(&mut self.story.show_caption, "caption").changed();
-                    changed |= ui.checkbox(&mut self.story.show_counter, "counter").changed();
-                    changed |= ui.checkbox(&mut self.story.anonymise, "anonymise").on_hover_text("HOST-01, user-02, 10.x.x.3: consistent stand-ins for a talk").changed();
+                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Fixed, "same time per step").on_hover_text("Every step lasts «Seconds per step»").changed();
+                    changed |= ui.selectable_value(&mut self.story.timing, Timing::Compressed, "real gaps, compressed").on_hover_text("A step waits the real time before it, divided by «Compress by», kept between the two gaps").changed();
+                });
+                theme::label_help(ui, "Group rows within", "Rows of the timeline this close in time (in seconds) are drawn together as one step. 0: one step per row, which is slow when there are thousands. Raise it to shorten the animation without losing anything from the picture: a logon and its ten repeats in the same minute become one step.");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.group_secs).range(0.0..=604800.0).speed(0.5).fixed_decimals(1).suffix(" s")).on_hover_text("rows this close in time appear together as one step").changed();
+                ui.end_row();
+                if self.story.timing == Timing::Fixed {
+                    theme::label_help(ui, "Seconds per step", "How long each step takes to draw and stay before the next. 0.8 reads well when someone is explaining; 0.2 to 0.4 for an overview. The length above is the number of steps times this, plus the pauses.");
+                    changed |= ui.add(egui::DragValue::new(&mut self.story.step_secs).range(0.02..=20.0).speed(0.05).fixed_decimals(2).suffix(" s")).changed();
+                } else {
+                    theme::label_help(ui, "Compress by", "Real seconds between two steps are divided by this to get the wait on screen. 600 means ten minutes of the incident pass in one second. The wait is never shorter than the first gap nor longer than the second, so a week of silence does not freeze the picture.");
+                    ui.horizontal(|ui| {
+                        changed |= ui.add(egui::DragValue::new(&mut self.story.compress).range(1.0..=100000.0).speed(10.0)).on_hover_text("real seconds between rows divided by this").changed();
+                        ui.label(egui::RichText::new("wait between").color(MUTED));
+                        changed |= ui.add(egui::DragValue::new(&mut self.story.min_gap).range(0.05..=10.0).speed(0.05).fixed_decimals(2).suffix(" s")).on_hover_text("the shortest a step waits").changed();
+                        ui.label(egui::RichText::new("and").color(MUTED));
+                        changed |= ui.add(egui::DragValue::new(&mut self.story.max_gap).range(0.1..=60.0).speed(0.1).fixed_decimals(1).suffix(" s")).on_hover_text("the longest a step waits").changed();
+                    });
+                }
+                theme::label_help(ui, "Pause on a finding", "Extra seconds the picture holds after a step the hunt marked significant, so the eye has time to land on it. 0: no pause.");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.pause_significant).range(0.0..=30.0).speed(0.1).fixed_decimals(1).suffix(" s")).changed();
+                ui.end_row();
+                theme::label_help(ui, "Hold the end", "Seconds the finished picture stays before the animation ends (and before a GIF loops): time to read the whole graph.");
+                changed |= ui.add(egui::DragValue::new(&mut self.story.hold_end).range(0.0..=60.0).speed(0.1).fixed_decimals(1).suffix(" s")).changed();
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            theme::section(ui, "On the picture");
+            egui::Grid::new("story-screen").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                theme::label_help(ui, "Title", "A line at the top of the picture for the whole animation: the case, the client, the date. Empty: none.");
+                changed |= ui.add_sized([360.0, 20.0], egui::TextEdit::singleline(&mut self.story.title).hint_text("shown at the top, for instance: Incident 2026-11 · lateral movement")).changed();
+                ui.end_row();
+                theme::label_help(ui, "Show", "What is written over the graph while it plays. Hover each one for what it is.");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut self.story.show_clock, "clock").on_hover_text("The date and time of the step being drawn, in a corner: when it happened").changed();
+                    changed |= ui.checkbox(&mut self.story.show_caption, "caption").on_hover_text("A line at the bottom saying what the step is: origin, destination and account. A step's own caption (in the list below) replaces it").changed();
+                    changed |= ui.checkbox(&mut self.story.show_counter, "counter").on_hover_text("«12 / 80»: which step this is, of how many").changed();
+                    changed |= ui.checkbox(&mut self.story.fade_old, "fade older").on_hover_text("Connections drawn several steps ago dim, so the newest stand out and the picture does not fill up").changed();
+                    changed |= ui.checkbox(&mut self.story.anonymise, "anonymise").on_hover_text("Real names never appear: HOST-01, user-02, 10.x.x.3 stand in for them, the same stand-in every time. For a talk or anything that leaves the case").changed();
                     changed |= ui.checkbox(&mut self.story.cinematic, "cinematic").on_hover_text("The look for a client: the hop under way lit, a clock at the story's pace, a lower third, the incident's bar, a title card and a summary. Its pieces and the colour are in Record…").changed();
                 });
                 ui.end_row();
-                ui.label("Logo").on_hover_text("Your company's logo on the presentation and the recording: PNG (with transparency), JPEG, WebP, BMP or GIF. The path is saved with the story.");
+                theme::label_help(ui, "Logo", "Your company's logo on the presentation and the recording: PNG (with transparency), JPEG, WebP, BMP or GIF. Where it goes, how wide it is (a share of the window's width) and how opaque (1 as it is, lower for a watermark). The path is saved with the story.");
                 ui.horizontal(|ui| {
                     changed |= ui.add_sized([188.0, 20.0], egui::TextEdit::singleline(&mut self.story.logo).hint_text("none: pick an image file…")).changed();
-                    if ui.button("Choose…").clicked() {
+                    if ui.button("Choose…").on_hover_text("Pick the image file").clicked() {
                         if let Some(p) = rfd::FileDialog::new().set_title("Logo for the recording").add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]).pick_file() {
                             self.story.logo = p.to_string_lossy().to_string();
                             changed = true;
@@ -4105,21 +4209,17 @@ impl Viewer {
                         self.story.logo.clear();
                         changed = true;
                     }
-                });
-                ui.label("Place it");
-                egui::ComboBox::from_id_salt("logo-pos").selected_text(self.story.logo_pos.label()).show_ui(ui, |ui| {
-                    for p in LogoPos::ALL {
-                        changed |= ui.selectable_value(&mut self.story.logo_pos, p, p.label()).changed();
-                    }
-                });
-                ui.label("Width % / opacity");
-                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("logo-pos").selected_text(self.story.logo_pos.label()).show_ui(ui, |ui| {
+                        for p in LogoPos::ALL {
+                            changed |= ui.selectable_value(&mut self.story.logo_pos, p, p.label()).changed();
+                        }
+                    }).response.on_hover_text("The corner it sits in");
                     let mut pct = self.story.logo_width * 100.0;
-                    if ui.add(egui::DragValue::new(&mut pct).range(3.0..=60.0).speed(0.5).fixed_decimals(0).suffix(" %")).on_hover_text("of the window's width; the height follows the image").changed() {
+                    if ui.add(egui::DragValue::new(&mut pct).range(3.0..=60.0).speed(0.5).fixed_decimals(0).suffix(" % wide")).on_hover_text("of the window's width; the height follows the image").changed() {
                         self.story.logo_width = pct / 100.0;
                         changed = true;
                     }
-                    changed |= ui.add(egui::DragValue::new(&mut self.story.logo_opacity).range(0.05..=1.0).speed(0.02).fixed_decimals(2)).on_hover_text("1: as it is; lower for a watermark").changed();
+                    changed |= ui.add(egui::DragValue::new(&mut self.story.logo_opacity).range(0.05..=1.0).speed(0.02).fixed_decimals(2).prefix("opacity ")).on_hover_text("1: as it is; lower for a watermark").changed();
                     changed |= ui.checkbox(&mut self.story.logo_always, "also on the window").on_hover_text("Show it outside the presentation too").changed();
                 });
                 ui.end_row();
@@ -4132,7 +4232,10 @@ impl Viewer {
                 }
             });
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("STRETCHES   (a part of the timeline at a speed of its own: the first stretch a step falls in sets its timing; the rest take the global one)").small().color(MUTED));
+            ui.horizontal(|ui| {
+                theme::section(ui, "Stretches");
+                theme::help(ui, "Optional. A stretch is a part of the timeline (from a time to a time) played at a speed of its own: slow down the hour the attacker moved, race through the quiet days around it. A step takes the timing of the first stretch it falls in; steps outside every stretch take the pace above. «Add a stretch» starts one over the time window the filters select.");
+            });
             let mut remove_stretch: Option<usize> = None;
             egui::Grid::new("stretches").num_columns(7).spacing([8.0, 4.0]).show(ui, |ui| {
                 for h in ["from", "to", "timing", "speed", "", "", ""] {
@@ -4195,22 +4298,26 @@ impl Viewer {
             }
             let total = present::total_secs(&self.steps, &self.story);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Present").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Present", super::icons::PRESENTATION)).strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).on_hover_text("Play the animation now, full screen, as it is set here. Esc ends it; the space bar pauses; the arrows go a step back or forward").clicked() {
                     start = true;
                 }
-                if ui.button("Record…").clicked() {
+                if ui.button(format!("{}  Record…", super::icons::VIDEO_CAMERA)).on_hover_text("Write the animation to a file: a GIF, an MP4 (needs ffmpeg) or PNG frames. Opens the choices of format, size and quality").clicked() {
                     self.show_export = true;
                 }
                 ui.label(egui::RichText::new(format!("{} steps · {} rows · {:.0} s", self.steps.len(), self.graph.events.len(), total)).color(MUTED));
                 ui.label(egui::RichText::new(self.case.as_ref().unwrap_or(&self.story_path).to_string_lossy()).small().color(MUTED));
             });
             ui.separator();
-            ui.label(egui::RichText::new("STEPS   (click a row to see the graph at that moment; a blank duration means the global one)").small().color(MUTED));
+            ui.horizontal(|ui| {
+                theme::section(ui, "Steps");
+                theme::help(ui, "Every step of the animation, in order. Click its number to see the graph as it is at that moment. Each step can have its own time (s: 0 means the pace above), a pause after it, a caption of your own instead of the automatic one, be skipped (it is drawn with the next, without a stop) or be emphasised (drawn brighter and thicker). A step in red is one the hunt marked significant.");
+                ui.label(egui::RichText::new("click a number to see the graph at that moment").small().color(MUTED));
+            });
             let n_steps = self.steps.len();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("steps").striped(true).num_columns(9).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for h in ["#", "time", "what", "s", "pause", "caption", "skip", "emph", ""] {
-                        ui.label(egui::RichText::new(h).small().color(MUTED));
+                    for (h, tip) in [("#", "The step. Click it to see the graph at that moment"), ("time", "When its first row happened"), ("what", "Origin, destination and account of its first row; (+N) more rows drawn with it"), ("s", "Its own duration in seconds. 0: the pace set above"), ("pause", "Extra seconds the picture holds after it"), ("caption", "Your own line for this step, instead of the automatic one"), ("skip", "Do not stop on it: it is drawn together with the next step"), ("emph", "Emphasise it: brighter and thicker while it is drawn"), ("", "")] {
+                        ui.label(egui::RichText::new(h).small().color(MUTED)).on_hover_text(tip);
                     }
                     ui.end_row();
                     for k in 0..n_steps {
@@ -4260,6 +4367,10 @@ impl Viewer {
                 self.cursor = self.steps[k].to;
             }
         }
+        if let Some(secs) = fit {
+            self.fit_story(secs);
+            self.save_story();
+        }
         if start {
             self.start_presentation();
         }
@@ -4288,7 +4399,7 @@ impl Viewer {
             ui.add_space(8.0);
             theme::section(ui, "On the picture");
             egui::Grid::new("rec-picture").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Title");
+                theme::label_help(ui, "Title", "A line at the top of every frame: the case, the client, the date. The same as in the story's settings.");
                 changed |= ui.add_sized([460.0, 20.0], egui::TextEdit::singleline(&mut self.story.title).hint_text("a line at the top: the case, the date… (none)")).changed();
                 ui.end_row();
                 ui.label("Logo").on_hover_text("Your logo on the frames and on the presentation: PNG with transparency, JPEG, WebP, BMP or GIF");
@@ -4300,13 +4411,13 @@ impl Viewer {
                         let name = std::path::Path::new(&logo).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| logo.clone());
                         ui.label(egui::RichText::new(name).color(TEXT)).on_hover_text(&logo);
                     }
-                    if ui.button("Choose…").clicked() {
+                    if ui.button("Choose…").on_hover_text("Pick the image file").clicked() {
                         if let Some(p) = rfd::FileDialog::new().set_title("Logo for the recording").add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]).pick_file() {
                             self.story.logo = p.to_string_lossy().to_string();
                             changed = true;
                         }
                     }
-                    if !logo.is_empty() && ui.button("None").clicked() {
+                    if !logo.is_empty() && ui.button("None").on_hover_text("No logo").clicked() {
                         self.story.logo.clear();
                         changed = true;
                     }
@@ -4339,7 +4450,7 @@ impl Viewer {
             ui.add_space(8.0);
             theme::section(ui, "The look");
             egui::Grid::new("rec-look").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Cinematic");
+                theme::label_help(ui, "Cinematic", "The look made for a client or a talk: the hop being drawn is lit and the rest steps back, a clock runs at the story's pace, a lower third names each step, and a title card opens and a summary closes the video. Each piece can be turned off below, and its colour set to the client's.");
                 ui.horizontal(|ui| {
                     changed |= ui.checkbox(&mut self.story.cinematic, "on").on_hover_text("The hop under way lit and the rest dimmed, a clock that rolls at the story's pace and says when it changes, a lower third with the hunt's word, the incident's bar, a title card and a summary. Present shows the same.").changed();
                     if self.story.cinematic {
@@ -4358,7 +4469,7 @@ impl Viewer {
                 });
                 ui.end_row();
                 if self.story.cinematic {
-                    ui.label("Colour");
+                    theme::label_help(ui, "Colour", "The colour of the cinematic pieces (the lit hop, the bar, the cards). masstin's own, or the client's brand colour.");
                     ui.horizontal(|ui| {
                         let mut own = self.story.look.accent.is_some();
                         if ui.checkbox(&mut own, "the client's").on_hover_text("The overlays, the focus and the cards in this colour instead of masstin's amber").changed() {
@@ -4386,7 +4497,7 @@ impl Viewer {
             theme::section(ui, "The file");
             let rec = &mut self.story.recording;
             egui::Grid::new("rec-file").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Format");
+                theme::label_help(ui, "Format", "GIF: plays anywhere (a report, a chat, a slide) with no player, but large and limited to 256 colours. MP4: small and sharp, for video; it needs ffmpeg installed on this computer. PNG frames: one image per frame, for editing in a video editor.");
                 ui.horizontal(|ui| {
                     for (f, hint) in [
                         (Format::Gif, "Plays wherever a picture does. 256 colours a frame; only what changes is stored, still big for a long story."),
@@ -4403,7 +4514,7 @@ impl Viewer {
                     }
                 });
                 ui.end_row();
-                ui.label("Quality");
+                theme::label_help(ui, "Quality", "How much the file is squeezed. Small file: fewer colours or stronger compression, for sending. Balanced: the usual. Best: the largest file and the cleanest picture.");
                 ui.horizontal(|ui| {
                     for q in Quality::ALL {
                         if ui.add(egui::Button::selectable(rec.quality == q, q.label())).on_hover_text(q.hint()).clicked() {
@@ -4413,7 +4524,7 @@ impl Viewer {
                     }
                 });
                 ui.end_row();
-                ui.label("Size");
+                theme::label_help(ui, "Size", "The size of the picture in pixels. «this window» records exactly what you see. The fixed sizes resize the window while it records and put it back after: 1280 x 720 for a report or a chat, 1920 x 1080 for a screen or a talk.");
                 ui.horizontal(|ui| {
                     for (i, name) in [(0usize, "this window"), (1, "1280 x 720"), (3, "1600 x 900"), (2, "1920 x 1080")] {
                         if ui.add(egui::Button::selectable(rec.size == i, name)).on_hover_text("The window is resized for the recording and put back after").clicked() {
@@ -4423,7 +4534,7 @@ impl Viewer {
                     }
                 });
                 ui.end_row();
-                ui.label("Frames a second");
+                theme::label_help(ui, "Frames a second", "How smooth the motion is. 20 to 25 is enough for a graph; more makes a bigger file. A GIF can only keep time at the values offered here.");
                 ui.horizontal(|ui| {
                     for f in present::fps_choices(rec.format) {
                         if ui.add(egui::Button::selectable(rec.fps == *f, f.to_string())).clicked() {
@@ -4436,13 +4547,13 @@ impl Viewer {
                     }
                 });
                 ui.end_row();
-                ui.label("Save as");
+                theme::label_help(ui, "Save as", "Where the recording is written. The name proposed is the timeline's with -story.");
                 ui.horizontal(|ui| {
                     let shown = out.to_string_lossy().to_string();
                     let n = shown.chars().count();
                     let short = if n > 60 { format!("…{}", shown.chars().skip(n - 59).collect::<String>()) } else { shown.clone() };
                     ui.label(egui::RichText::new(short).color(TEXT)).on_hover_text(&shown);
-                    if ui.button("Change…").clicked() {
+                    if ui.button("Change…").on_hover_text("Choose where the file is written and its name").clicked() {
                         let picked = match rec.format {
                             Format::Png => rfd::FileDialog::new().set_title("Folder for the frames").pick_folder(),
                             f => {
@@ -4484,7 +4595,7 @@ impl Viewer {
                 if ui.add_enabled(!self.steps.is_empty(), egui::Button::new(egui::RichText::new("Record").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).clicked() {
                     start = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Close this without doing anything").clicked() {
                     self.show_export = false;
                 }
             });
@@ -5072,6 +5183,16 @@ impl Viewer {
                     self.layout.reheat(0.1);
                 }
             }
+            other if other.starts_with("story-fit=") => {
+                if let Ok(secs) = other["story-fit=".len()..].parse::<f32>() {
+                    self.fit_story(secs);
+                }
+            }
+            other if other.starts_with("studio=") => {
+                self.studio.open = true;
+                self.studio.load(&other["studio=".len()..]);
+            }
+            other if other.starts_with("studio-do=") => self.studio.auto(&other["studio-do=".len()..]),
             "paths-map" => self.path_in_map = true,
             "paths-alone" => self.path_in_map = false,
             "paths-reshow" => self.reshow_path(),

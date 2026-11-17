@@ -361,7 +361,7 @@ impl Viewer {
             theme::section(ui, "Timeline to write");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.output).desired_width(470.0));
-                if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).clicked() {
+                if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).on_hover_text("Choose where the file is written and its name").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("cortex.csv").save_file() {
                         f.output = p.to_string_lossy().to_string();
                     }

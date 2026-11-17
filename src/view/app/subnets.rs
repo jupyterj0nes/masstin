@@ -164,7 +164,7 @@ impl Viewer {
                 self.subnet_defs.remove(i);
                 changed = true;
             }
-            if ui.button(format!("{}  Add a subnet", ic::PLUS)).clicked() {
+            if ui.button(format!("{}  Add a subnet", ic::PLUS)).on_hover_text("A new line to name a subnet: its range as CIDR (10.10.0.0/24) and the name drawn around its hosts").clicked() {
                 self.subnet_defs.push((String::new(), String::new()));
             }
             if !self.subnets.is_empty() {

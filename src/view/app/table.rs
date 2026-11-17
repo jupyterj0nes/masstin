@@ -805,7 +805,7 @@ impl Viewer {
                             }
                         }
                         ui.separator();
-                        if ui.button("Show every column").clicked() {
+                        if ui.button("Show every column").on_hover_text("Bring back every column that was hidden").clicked() {
                             self.table_look.hidden = [false; 19];
                             self.table_look_dirty = true;
                         }
@@ -1063,6 +1063,7 @@ impl Viewer {
                             refit = Some(ci);
                             ui.close();
                         }
+                        theme::menu_help(ui, "A column of the timeline. Type a text and press Enter to keep only the rows whose column contains it; tick «does not contain» to leave them out instead. Filters add up, and each is a chip above the table that a click removes.");
                     };
                     // one menu, opened by either button of the mouse; a click inside it
                     // (in its box, to type) does not close it

@@ -751,12 +751,12 @@ impl Viewer {
         ui.label(egui::RichText::new("A VPN, a firewall, a proxy: YAML rules say how to read them, and their rows join the same timeline (--rules). masstin's rules folder has rules for several products.").color(theme::MUTED).size(12.0));
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ingest.rules).desired_width(400.0).hint_text("a rule file (.yaml) or a folder of rules"));
-            if ui.button(format!("{}  Rule file…", ic::ARCHIVE)).clicked() {
+            if ui.button(format!("{}  Rule file…", ic::ARCHIVE)).on_hover_text("A YAML rule (made in the rule studio, or from masstin's library) that reads the logs masstin does not know").clicked() {
                 if let Some(p) = rfd::FileDialog::new().set_title("Rule file").add_filter("YAML rules", &["yaml", "yml"]).pick_file() {
                     self.ingest.rules = p.to_string_lossy().to_string();
                 }
             }
-            if ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).clicked() {
+            if ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).on_hover_text("Pick a folder: everything in it is used").clicked() {
                 if let Some(p) = rfd::FileDialog::new().set_title("Folder of rules").pick_folder() {
                     self.ingest.rules = p.to_string_lossy().to_string();
                 }
@@ -775,7 +775,7 @@ impl Viewer {
         theme::section(ui, "Timeline to write");
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ingest.output).desired_width(520.0).hint_text("…\\case.csv"));
-            if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).clicked() {
+            if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).on_hover_text("Choose where the file is written and its name").clicked() {
                 let name = Path::new(&self.ingest.output).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "timeline.csv".into());
                 if let Some(p) = rfd::FileDialog::new().set_title("Timeline CSV to write").add_filter("CSV", &["csv"]).set_file_name(name).save_file() {
                     self.ingest.output = p.to_string_lossy().to_string();
@@ -906,16 +906,16 @@ impl Viewer {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if ui.button(format!("{}  Open here", ic::GRAPH)).clicked() {
+                    if ui.button(format!("{}  Open here", ic::GRAPH)).on_hover_text("Open the timeline just written in this window, as a graph").clicked() {
                         *action = Some("open-here");
                     }
-                    if ui.button(format!("{}  As a table", ic::TABLE)).clicked() {
+                    if ui.button(format!("{}  As a table", ic::TABLE)).on_hover_text("Open the timeline just written in the Timeline: its rows as a table").clicked() {
                         *action = Some("open-table");
                     }
-                    if ui.button(format!("{}  System's CSV app", ic::APP_WINDOW)).clicked() {
+                    if ui.button(format!("{}  System's CSV app", ic::APP_WINDOW)).on_hover_text("Open the CSV with the program this computer uses for CSV files").clicked() {
                         *action = Some("open-external");
                     }
-                    if ui.button(format!("{}  Show in folder", ic::FOLDER_OPEN)).clicked() {
+                    if ui.button(format!("{}  Show in folder", ic::FOLDER_OPEN)).on_hover_text("Open the folder the timeline is in, with the file selected").clicked() {
                         *action = Some("reveal");
                     }
                 });

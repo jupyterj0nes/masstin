@@ -48,15 +48,15 @@ impl Viewer {
             ui.add_space(10.0);
             ui.menu_button("Evidence", |ui| {
                 ui.set_min_width(260.0);
-                if icon_button(ui, ic::FOLDER_OPEN, "Open timeline…").clicked() {
+                if icon_button(ui, ic::FOLDER_OPEN, "Open timeline…").on_hover_text("Open a timeline CSV masstin wrote (or several) in this window, instead of what is open").clicked() {
                     ui.close();
                     self.open_timelines(false);
                 }
-                if icon_button(ui, ic::PLUS, "Add a timeline to this view…").clicked() {
+                if icon_button(ui, ic::PLUS, "Add a timeline to this view…").on_hover_text("Open another timeline CSV together with the ones already open: one picture of all of them").clicked() {
                     ui.close();
                     self.open_timelines(true);
                 }
-                if icon_button(ui, ic::ARROW_CLOCKWISE, "Reload from disk").clicked() {
+                if icon_button(ui, ic::ARROW_CLOCKWISE, "Reload from disk").on_hover_text("Read the timeline files again: for when another program or another masstin changed them").clicked() {
                     ui.close();
                     self.reload();
                 }
@@ -79,7 +79,7 @@ impl Viewer {
                     ui.close();
                     self.show_table = true;
                 }
-                if icon_button(ui, ic::STACK, "Merge timelines…").clicked() {
+                if icon_button(ui, ic::STACK, "Merge timelines…").on_hover_text("Join several timeline CSVs into one file, in time order, without duplicates").clicked() {
                     ui.close();
                     self.show_merge = true;
                 }
@@ -133,13 +133,13 @@ impl Viewer {
                     }
                 }
                 ui.separator();
-                if icon_button(ui, ic::X, "Quit").clicked() {
+                if icon_button(ui, ic::X, "Quit").on_hover_text("Close masstin. Everything is already saved").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
             ui.menu_button("Hunt", |ui| {
                 ui.set_min_width(260.0);
-                if icon_button(ui, ic::DETECTIVE, "Run the hunt on this timeline…").clicked() {
+                if icon_button(ui, ic::DETECTIVE, "Run the hunt on this timeline…").on_hover_text("Open the hunt's assistant: it scores every connection by how unusual it is and marks the findings").clicked() {
                     ui.close();
                     self.show_hunt = true;
                 }
@@ -156,7 +156,7 @@ impl Viewer {
                     }
                 }
                 ui.separator();
-                if icon_button(ui, ic::FIRE, "Findings only").clicked() {
+                if icon_button(ui, ic::FIRE, "Findings only").on_hover_text("Draw only the connections the hunt marked significant or candidate").clicked() {
                     ui.close();
                     self.draft.view = View::Findings;
                     self.requery(false);
@@ -186,12 +186,12 @@ impl Viewer {
                     }
                 }
                 ui.separator();
-                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").clicked() {
+                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").on_hover_text("Zoom and centre so every host on the canvas is in sight").clicked() {
                     ui.close();
                     self.layout.stop();
                     self.fill_pending = true;
                 }
-                if icon_button(ui, ic::SHUFFLE, "Lay out again").clicked() {
+                if icon_button(ui, ic::SHUFFLE, "Lay out again").on_hover_text("Place the hosts again from scratch (pinned ones stay where they are): for when the picture got tangled").clicked() {
                     ui.close();
                     let f = self.draft.clone();
                     self.draft = f;
@@ -244,7 +244,7 @@ impl Viewer {
                     self.persist();
                 }
                 ui.separator();
-                if icon_button(ui, ic::TAG, "Style: mode, sizes, names, connections, canvas…").clicked() {
+                if icon_button(ui, ic::TAG, "Style: mode, sizes, names, connections, canvas…").on_hover_text("How everything is drawn: the look of hosts, sizes, names, lines, captions, effects").clicked() {
                     ui.close();
                     self.show_labels = true;
                 }
@@ -260,20 +260,20 @@ impl Viewer {
                     self.studio.open = true;
                 }
                 ui.separator();
-                if icon_button(ui, ic::PATH, "Paths and reach…").clicked() {
+                if icon_button(ui, ic::PATH, "Paths and reach…").on_hover_text("Find how one host could have reached another, hop by hop in time order; or everything a host could reach").clicked() {
                     ui.close();
                     self.show_paths = true;
                 }
-                if icon_button(ui, ic::QUESTION, "Questions…").clicked() {
+                if icon_button(ui, ic::QUESTION, "Questions…").on_hover_text("Ready-made questions about the view (who reached the most hosts, the first logon to each server…) answered on the canvas").clicked() {
                     ui.close();
                     self.show_questions = true;
                 }
                 ui.separator();
-                if icon_button(ui, ic::PRESENTATION, "Present the story").clicked() {
+                if icon_button(ui, ic::PRESENTATION, "Present the story").on_hover_text("Play the animation of this view full screen, as it is set in Story and recording. Esc ends it").clicked() {
                     ui.close();
                     self.start_presentation();
                 }
-                if icon_button(ui, ic::FILM_STRIP, "Story and recording…").clicked() {
+                if icon_button(ui, ic::FILM_STRIP, "Story and recording…").on_hover_text("Set the pace of the animation, what is written on it, and record it as a GIF or a video").clicked() {
                     ui.close();
                     self.show_story = true;
                 }
@@ -283,7 +283,7 @@ impl Viewer {
                         let ctx = ui.ctx().clone();
                         self.start_film(&ctx, Format::Mp4, 20, 0, None, false);
                     }
-                } else if icon_button(ui, ic::VIDEO_CAMERA, "Stop filming").clicked() {
+                } else if icon_button(ui, ic::VIDEO_CAMERA, "Stop filming").on_hover_text("End the recording now and keep what was recorded").clicked() {
                     ui.close();
                     self.stop_film(false);
                 }
@@ -305,18 +305,18 @@ impl Viewer {
                     ui.close();
                     self.show_subnets_window = true;
                 }
-                if icon_button(ui, ic::TERMINAL_WINDOW, "Log of the last run…").clicked() {
+                if icon_button(ui, ic::TERMINAL_WINDOW, "Log of the last run…").on_hover_text("What the last ingest or hunt wrote while it ran: its steps, counts and any error").clicked() {
                     ui.close();
                     self.show_last_log = true;
                 }
             });
             ui.menu_button("Help", |ui| {
                 ui.set_min_width(260.0);
-                if icon_button(ui, ic::KEYBOARD, "Mouse and keys").clicked() {
+                if icon_button(ui, ic::KEYBOARD, "Mouse and keys").on_hover_text("Every mouse gesture and keyboard shortcut of the window").clicked() {
                     ui.close();
                     self.show_help = true;
                 }
-                if icon_button(ui, ic::BOOK_OPEN, "docs/viewer.md").clicked() {
+                if icon_button(ui, ic::BOOK_OPEN, "docs/viewer.md").on_hover_text("The viewer's manual, in the browser").clicked() {
                     ui.close();
                     ui.ctx().open_url(egui::OpenUrl::new_tab("https://github.com/c00pr/masstin/blob/main/docs/viewer.md"));
                 }
@@ -598,7 +598,7 @@ impl Viewer {
                 });
             });
 
-            section(ui, "View");
+            theme::section_help(ui, "View", "What the canvas draws. Findings: only the connections the hunt marked significant or candidate (run Hunt first). Everything: every connection the filters below let through. Neighbourhood: one host and what it talks to, as far as the hops say.");
             ui.horizontal_wrapped(|ui| {
                 for (v, label) in [(View::Findings, "Findings"), (View::All, "Everything"), (View::Around, "Neighbourhood")] {
                     if pill(ui, self.draft.view == v, label, theme::ACCENT).clicked() {
@@ -624,7 +624,7 @@ impl Viewer {
                 });
             }
 
-            section(ui, "Search");
+            theme::section_help(ui, "Search", "Narrow the picture by name. Hosts and accounts: a text is «contains»; * is a wildcard, ! in front leaves it out, a comma separates several (srv*, !dc01). Logon type: 3 network, 10 RDP, SSH… as the timeline writes them.");
             for (field, hint, icon) in [(0, "hosts: contains, * wildcards, !not, commas", ic::DESKTOP), (1, "accounts: adm*, !*$", ic::USER), (2, "logon type: 10, 3, SSH", ic::TAG)] {
                 let text = match field {
                     0 => &mut self.draft.host,
@@ -638,13 +638,13 @@ impl Viewer {
                 edited |= r.changed();
             }
 
-            section(ui, "Time window");
+            theme::section_help(ui, "Time window", "Only the rows between these two moments, in the timeline's time (UTC). Type a date (2026-11-03 or 2026-11-03 14:30), use the calendars, or drag the handles of the strip at the bottom: they are the same window.");
             let w = self.time_window_fields(ui, "pane");
             changed |= w.changed;
             apply |= w.commit;
             ui.label(egui::RichText::new("To the second, the timeline's time (UTC). The strip's handles follow.").small().color(theme::DIM));
 
-            section(ui, "Hunt");
+            theme::section_help(ui, "Hunt", "What the hunt said of each connection. The score (0 to 100) is how unusual it is; the slider keeps the ones at or above it. The pills keep or leave out each state: significant (the hunt would bet on it), candidate (worth a look), habitual and baseline (what this network normally does), not hunted (before the hunt's start or never judged).");
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("score ≥").color(theme::MUTED));
                 ui.spacing_mut().slider_width = (ui.available_width() - 48.0).max(80.0);
@@ -670,7 +670,7 @@ impl Viewer {
                 ui.label(egui::RichText::new("Findings shows significant and candidate; switch to Everything to pick states.").small().color(theme::DIM));
             }
 
-            section(ui, "Result");
+            theme::section_help(ui, "Result", "What happened in the event: a logon that succeeded, one that failed, a logoff, or a connection with no logon in it. Each is a colour in the graph.");
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                 for (i, name) in RESULT_NAMES.iter().enumerate() {
@@ -681,7 +681,7 @@ impl Viewer {
                 }
             });
 
-            section(ui, "Verdict");
+            theme::section_help(ui, "Verdict", "Your own marks: the connections you marked as malicious, suspicious or legitimate (right click on a connection, Mark…). Keep only the ones with the marks ticked.");
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
                 for (i, name) in VERDICT_NAMES.iter().enumerate() {
@@ -693,7 +693,7 @@ impl Viewer {
                 }
             });
 
-            section(ui, "Grouping");
+            theme::section_help(ui, "Grouping", "How rows become lines. Grouped by hosts: one line between two hosts, whoever logged on. By connection: one line per account between two hosts, which is what the hunt judges. Ungrouped: one line per row, for a short window or an exact selection.");
             for (g, label, tip) in [
                 (Grouping::PerPair, "Grouped by hosts", "one edge per origin, destination and result: every account between two hosts in it. Its rows are all the events of all of them"),
                 (Grouping::PerAccount, "By connection", "one edge per origin, destination, account and result: the connection the hunt judges. Every pair alike, however many accounts it has"),
@@ -705,13 +705,13 @@ impl Viewer {
                 }
             }
 
-            section(ui, "Limit");
+            theme::section_help(ui, "Limit", "The most connections drawn at once. Above it the most pressing are kept (findings first) and a banner says so: narrow the filters or raise it. A very large number makes the canvas slow.");
             ui.horizontal(|ui| {
                 changed |= ui.add(egui::DragValue::new(&mut self.draft.limit).range(10..=200_000).speed(10)).changed();
                 ui.label(egui::RichText::new("connections drawn, the most pressing first").small().color(theme::DIM));
             });
 
-            section(ui, "Saved filters");
+            theme::section_help(ui, "Saved filters", "The filters as they are now, kept under a name to come back to with one click (for instance «RDP at night»). They are saved with the timeline.");
             let mut pick: Option<SavedView> = None;
             let mut delete: Option<String> = None;
             if self.saved.is_empty() {
@@ -838,7 +838,7 @@ impl Viewer {
 
     /// What is in the view now: counts by state and verdict.
     fn view_summary(&self, ui: &mut egui::Ui) {
-        section(ui, "In this view");
+        theme::section_help(ui, "In this view", "What is on the canvas now: how many hosts, connections and rows, and how many of each state of the hunt. Click a host or a connection to see it here instead.");
         let g = &self.graph;
         ui.label(format!("{} hosts · {} connections · {} rows", g.nodes.len(), g.edges.len(), g.events.len()));
         let mut per_hunt = [0usize; 6];
@@ -1221,24 +1221,24 @@ impl Viewer {
                     ui.close();
                     self.timeline_of_node(i);
                 }
-                if icon_button(ui, ic::CIRCLES_THREE_PLUS, "Expand around").clicked() {
+                if icon_button(ui, ic::CIRCLES_THREE_PLUS, "Expand around").on_hover_text("Add to the canvas the hosts this one talks to, and their connections, keeping what is there").clicked() {
                     ui.close();
                     self.draft.view = View::Around;
                     self.draft.around = name.clone();
                     self.requery(false);
                 }
-                if icon_button(ui, ic::TARGET, "Only this host").clicked() {
+                if icon_button(ui, ic::TARGET, "Only this host").on_hover_text("Reduce the canvas to this host and what it talks to directly (its neighbourhood)").clicked() {
                     ui.close();
                     self.draft.view = View::All;
                     self.draft.host = name.clone();
                     self.requery(false);
                 }
-                if icon_button(ui, ic::ARROW_RIGHT, "Paths from here").clicked() {
+                if icon_button(ui, ic::ARROW_RIGHT, "Paths from here").on_hover_text("Open Paths with this host as the origin: where could someone go from it?").clicked() {
                     ui.close();
                     self.path_origin = name.clone();
                     self.show_paths = true;
                 }
-                if icon_button(ui, ic::ARROW_LEFT, "Paths to here").clicked() {
+                if icon_button(ui, ic::ARROW_LEFT, "Paths to here").on_hover_text("Open Paths with this host as the destination: how could someone have got here?").clicked() {
                     ui.close();
                     self.path_dest = name.clone();
                     self.show_paths = true;
@@ -1271,20 +1271,21 @@ impl Viewer {
                     ui.close();
                     self.host_edit = Some(HostEdit { name: name.clone() });
                 }
-                if icon_button(ui, ic::EYE_SLASH, "Hide this host").clicked() {
+                if icon_button(ui, ic::EYE_SLASH, "Hide this host").on_hover_text("Take this host and its connections off the canvas. View › Style › hidden hosts brings it back").clicked() {
                     ui.close();
                     self.style.rules.push(Rule { enabled: true, field: Field::Host, pattern: format!("={}", name), color: None, hide: true, ..Rule::default() });
                     self.persist();
                 }
                 ui.separator();
-                if icon_button(ui, ic::NOTE_PENCIL, "Add a note…").clicked() {
+                if icon_button(ui, ic::NOTE_PENCIL, "Add a note…").on_hover_text("Write a note about this: it stays with the timeline, shows in the Notes tab and marks the thing on the canvas").clicked() {
                     ui.close();
                     self.note_draft = Some((NoteTarget::Host(name.clone()), String::new()));
                 }
-                if icon_button(ui, ic::LINK, "Copy the name").clicked() {
+                if icon_button(ui, ic::LINK, "Copy the name").on_hover_text("The host's name to the clipboard").clicked() {
                     ui.close();
                     ui.ctx().copy_text(name.clone());
                 }
+                theme::menu_help(ui, "A host: a machine by its name, or an address when no name is known. Its size is how much goes through it; a red ring is a host the hunt found significant. Double click opens its neighbourhood; drag moves and pins it.");
             }
             Some(Sel::Edge(k)) => {
                 let e = &self.graph.edges[k];
@@ -1298,7 +1299,7 @@ impl Viewer {
                     None => format!("{} accounts · {} event(s)", e.users.len(), e.count),
                 }).color(theme::MUTED).small());
                 ui.separator();
-                if icon_button(ui, ic::TARGET, "Open in the inspector").clicked() {
+                if icon_button(ui, ic::TARGET, "Open in the inspector").on_hover_text("Select it: the panel on the right shows its details and its rows").clicked() {
                     ui.close();
                     self.selected = Some(Sel::Edge(k));
                     self.tab = Tab::Selection;
@@ -1322,7 +1323,7 @@ impl Viewer {
                         self.begin_mark(k, v);
                     }
                 }
-                if icon_button(ui, ic::NOTE_PENCIL, "Add a note…").clicked() {
+                if icon_button(ui, ic::NOTE_PENCIL, "Add a note…").on_hover_text("Write a note about this: it stays with the timeline, shows in the Notes tab and marks the thing on the canvas").clicked() {
                     ui.close();
                     self.note_draft = Some((NoteTarget::Edge { src: self.store.hosts.name(src).to_string(), dst: self.store.hosts.name(dst).to_string(), user: users.first().map(|&u| self.store.users.name(u).to_string()).unwrap_or_default() }, String::new()));
                 }
@@ -1345,14 +1346,15 @@ impl Viewer {
                         self.requery(false);
                     }
                 }
+                theme::menu_help(ui, "A connection: logons from the host it leaves to the host its arrow points at. Its colour is the result (or the hunt's state), its width how many times. The inspector on the right shows its rows; from there or from here they open in the Timeline or agentc00pr.");
             }
             None => {
-                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").clicked() {
+                if icon_button(ui, ic::CORNERS_OUT, "Fill the window").on_hover_text("Zoom and centre so every host on the canvas is in sight").clicked() {
                     ui.close();
                     self.layout.stop();
                     self.fill_pending = true;
                 }
-                if icon_button(ui, ic::SHUFFLE, "Lay out again").clicked() {
+                if icon_button(ui, ic::SHUFFLE, "Lay out again").on_hover_text("Place the hosts again from scratch (pinned ones stay where they are): for when the picture got tangled").clicked() {
                     ui.close();
                     let f = self.draft.clone();
                     self.draft = f;
@@ -1365,31 +1367,32 @@ impl Viewer {
                     self.layout.reheat(0.3);
                 }
                 ui.separator();
-                if icon_button(ui, ic::FIRE, "Findings").clicked() {
+                if icon_button(ui, ic::FIRE, "Findings").on_hover_text("Draw only the connections the hunt marked significant or candidate").clicked() {
                     ui.close();
                     self.draft.view = View::Findings;
                     self.requery(false);
                 }
-                if icon_button(ui, ic::GRAPH, "Everything").clicked() {
+                if icon_button(ui, ic::GRAPH, "Everything").on_hover_text("Draw every connection the filters let through, not only the hunt's findings").clicked() {
                     ui.close();
                     self.draft.view = View::All;
                     self.requery(false);
                 }
-                if (self.overlay.is_some() || self.trail.is_some()) && icon_button(ui, ic::ARROW_LEFT, "Back to the view").clicked() {
+                if (self.overlay.is_some() || self.trail.is_some()) && icon_button(ui, ic::ARROW_LEFT, "Back to the view").on_hover_text("Leave the path, the cone or the selection and draw again what the filters select").clicked() {
                     ui.close();
                     self.trail = None;
                     self.overlay = None;
                     self.requery(false);
                 }
                 ui.separator();
-                if icon_button(ui, ic::X, "Clear the selection").clicked() {
+                if icon_button(ui, ic::X, "Clear the selection").on_hover_text("Nothing selected: the inspector goes back to the summary of the view").clicked() {
                     ui.close();
                     self.selected = None;
                 }
-                if icon_button(ui, ic::NOTE_PENCIL, "Add a note to the case…").clicked() {
+                if icon_button(ui, ic::NOTE_PENCIL, "Add a note to the case…").on_hover_text("A note about the case as a whole, kept with the timeline and shown in the Notes tab").clicked() {
                     ui.close();
                     self.note_draft = Some((NoteTarget::Free, String::new()));
                 }
+                theme::menu_help(ui, "The canvas: every host of the view and the connections between them. Scroll to zoom, drag the background to move, right click a host or a line for its own actions. The filters on the left decide what is drawn.");
             }
         }
     }
@@ -1414,7 +1417,7 @@ impl Viewer {
                                 self.draft.limit = total.max(10);
                                 self.requery(false);
                             }
-                            if ui.button("Filters").clicked() {
+                            if ui.button("Filters").on_hover_text("Show or hide the filters pane on the left").clicked() {
                                 self.show_filters = true;
                             }
                         });
@@ -1488,7 +1491,7 @@ impl Viewer {
                 if ui.add(egui::Button::new(theme::semibold("Use this colour", 13.0).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE)).clicked() {
                     done = true;
                 }
-                if ui.button("Back to the palette colour").clicked() {
+                if ui.button("Back to the palette colour").on_hover_text("Forget the colour chosen here: it takes the one of the palette again").clicked() {
                     clear = true;
                 }
             });

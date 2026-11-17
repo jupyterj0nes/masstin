@@ -38,6 +38,8 @@ The layout is d3's: repulsion through a Barnes-Hut quadtree (a far cell counts a
 
 ## The window
 
+**Help is where the question is.** A small **?** follows the title of a section and the name of a control whose meaning is not in its name: hover it and it says what the thing is, what its values mean and when to use it. Every button and every action of a menu says what it does on hover, and the menu a right click opens ends with a few lines on what the thing clicked is (a host, a connection, the canvas, a column of the timeline). A new selection sends a ripple out from the host or along the connection picked.
+
 The logo's dog and the wordmark in its cyan-to-magenta gradient at the top left (click the dog for About); the accent of the window is the logo's cyan. A menu bar (**Evidence**, **Hunt**, **View**, **Tools**, **Help**), a toolbar, the row of applied filters, the filter pane on the left, the canvas, the inspector on the right, the time strip and a status line.
 
 - **Evidence**: open or add timeline CSVs, reload, **Ingest evidence…** (below), **Timeline: the rows of the CSV** (the Timeline mode, below), **Merge timelines…**, the timelines open now and the recent ones.
@@ -93,6 +95,8 @@ In the View menu and on the toolbar:
 
 ## Paths, cones and questions
 
+A path (and a cone) is shown one of two ways, chosen with **Show it** in the Paths window and changed at any time. **Alone**: the canvas is reduced to the path's hosts, in columns by hop, so it reads left to right. **Marked on the map**: nothing is taken away or moved; the path's connections are drawn thick over the map in the logo's run from cyan to magenta, its hosts are ringed and labelled *origin*, *hop 1*, *hop 2*…, and everything else is dimmed. Connections of the path that the filters had left out are drawn with it, and the chip above the canvas says how many. The chip takes the mark away.
+
 **Paths…** finds the time-respecting paths between two hosts: a chain of logins where every hop happens after the previous one and no later than the gap allowed (hours; 24 by default), no host entered twice, up to a number of hops, inside the bar's time window. Hops are successful logons by default; failures, touches and logoffs can count too, and machine accounts are left out unless asked. The paths come shortest first, each as `A -(account HH:MM)-> B -(…)-> C`; clicking one draws it alone, the hosts in columns by hop with the time of each arrival. *Reach from origin* draws the earliest-arrival cone (every host a chain of logins could have reached from the origin, with the hop and the time it was first reached); *Ways into destination* the same backwards. *Paths from here* / *Paths to here* on a host fill the form. *Back to the view* returns to the filter's graph.
 
 **Questions…** answers, over the rows of the current view: the origins reaching the most destinations, the destinations reached from the most origins, the accounts used from several origins, the connections where failures were followed by a logon, the hosts and accounts seen latest for the first time, and the centrality of every host (PageRank, betweenness, distinct in / out). Click a host to open its neighbourhood.
@@ -133,6 +137,8 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 ## The hunt, from the window
 
+While the hunt runs, the mastiff and a sweep cross the canvas; they go on until the timeline it wrote has been read again (which happens away from the window, so nothing freezes), and the findings then light up one after another in time order.
+
 The last step has a tick box, **Read each address as the host it is**, with the level (Strict, Standard, Broad): the hunt then runs with `--merge-hosts`, one machine where the timeline has a name in some rows and an address in others. It is off unless you tick it.
 
 When a timeline that is open **already carries a hunt**, Run does not write over it unasked. A dialog names the timeline, what the hunt it has was run with (the start of the investigation, alpha, the masstin and the date, from the record in the timeline's masstin file; or the days between which it started, read off its rows, when there is no record) and what this hunt is run with, and offers **Save as a new timeline** (the timeline with this hunt goes to `<name>.hunt-<date>.csv` next to it and the window goes on with that one; the file it had keeps its hunt), **Overwrite** (this hunt replaces the one it has, in the same file), **Keep the hunt it has** (the hunt runs, its findings and report are written, the timeline is not) or Cancel. It is `--if-hunted` of the command line.
@@ -140,6 +146,8 @@ When a timeline that is open **already carries a hunt**, Run does not write over
 **Hunt** on the toolbar (or the Hunt menu) runs `graph-hunt-csv` on the timeline(s) open: the start of the investigation (prefilled with the window's From, or the last third of the timeline), an optional end, alpha. It runs as a child masstin with the same command line you would type, its output in a log window, and while it runs the mastiff of the logo is on the scent in the middle of the canvas and a sweep crosses it. When it ends the timeline is read again, the view switches to Findings and **the findings appear one after another in time order, each with a flash**; then **the summary** opens: rows by state, the rarest connections with their scores, the spread of scores, and the score threshold with one-click bars (one in twenty, one in a hundred, one in a thousand) that apply at once. The slider in the filter pane does the same at any time. The verdicts and notes already written are kept. *Tools › Log of the last run…* brings the log back.
 
 ## Presentation and recording
+
+The **Animation** window (Story and recording…) opens with what an animation is and how long this one would be, and says when that is too long for a video. **Fit it to** 30 s, 1 min, 2 min or 5 min sets the pace for that length: rows close in time are grouped into one step until every step can be seen, and each step takes the same time; nothing leaves the picture. Below it, **Pace** (timing, grouping, seconds per step, pauses), **On the picture** (title, clock, caption, counter, fading, anonymising, the cinematic look, the logo), **Stretches** and **Steps** each carry a **?** that explains them, as do the format, quality, size and frame rate of **Record…**.
 
 **Present** plays the view as a story, full window: each connection draws itself from origin to destination in its turn, the host it reaches pops in, a clock shows the moment, a caption at the bottom says what happened (`14:54:24 · admin-hacker · 10.23.123.11 -> ROOTDC1 (+9 more)`), a counter says where you are. Space pauses, Left / Right step, Home restarts, Esc leaves.
 

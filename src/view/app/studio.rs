@@ -87,6 +87,8 @@ pub(super) struct Studio {
     checks: Vec<Check>,
     /// the YAML last written, to tell an unsaved change
     saved_yaml: Option<String>,
+    /// the step's explanation is shown (its name always is)
+    guide_open: bool,
 }
 
 impl Default for Studio {
@@ -112,6 +114,7 @@ impl Default for Studio {
             status: String::new(),
             checks: Vec::new(),
             saved_yaml: None,
+            guide_open: true,
         }
     }
 }
@@ -234,6 +237,32 @@ impl Studio {
         self.tab = Tab::Start;
     }
 
+    /// For the autopilot: `library` starts from the best library rule,
+    /// `empty` from nothing, a tab's name goes to it, `line=N` selects a line.
+    pub(super) fn auto(&mut self, what: &str) {
+        match what {
+            "library" => {
+                if let Some((name, _)) = self.ranked.first().copied() {
+                    self.start_from_library(name);
+                }
+            }
+            "empty" => self.start_empty(),
+            "all" => self.add_line_type_for_all(),
+            "start" => self.tab = Tab::Start,
+            "lines" => self.tab = Tab::Lines,
+            "fields" => self.tab = Tab::Fields,
+            "columns" => self.tab = Tab::Columns,
+            "rejected" => self.tab = Tab::Rejected,
+            "yaml" => self.tab = Tab::Yaml,
+            other => {
+                if let Some(n) = other.strip_prefix("line=").and_then(|n| n.parse::<usize>().ok()) {
+                    self.sel_line = n.min(self.lines.len().saturating_sub(1));
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     fn line(&self, i: usize) -> &str {
         self.lines.get(i).map(|s| s.as_str()).unwrap_or("")
     }
@@ -276,6 +305,20 @@ impl Studio {
         let needle = self.selection.trim().to_string();
         let et = EVENT_TYPES[self.new_type].0;
         let p = new_parser(et, &needle, self.base_extract(), &sample, self.rule.parsers.len() + 1);
+        self.rule.parsers.push(p);
+        self.sel_parser = self.rule.parsers.len() - 1;
+        self.dirty = true;
+    }
+
+    /// One line type that reads every line: for logs whose lines all have
+    /// the same shape (JSON, CSV, key=value).
+    fn add_line_type_for_all(&mut self) {
+        let sample = self.line(self.sel_line).to_string();
+        let et = EVENT_TYPES[self.new_type].0;
+        let mut p = new_parser(et, "", self.base_extract(), &sample, self.rule.parsers.len() + 1);
+        p.name = format!("{}-every-line", et.to_ascii_lowercase().replace('_', "-"));
+        // (a type with no condition reads nothing: this one is "any line")
+        p.match_rule.regex = Some(".".to_string());
         self.rule.parsers.push(p);
         self.sel_parser = self.rule.parsers.len() - 1;
         self.dirty = true;
@@ -519,7 +562,7 @@ impl Viewer {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Log").color(theme::MUTED));
                     ui.add(egui::Label::new(egui::RichText::new(if st.log_path.is_empty() { "none yet".to_string() } else { st.log_path.clone() }).monospace().size(11.5)).truncate());
-                    if ui.button(format!("{}  Open a log…", ic::FOLDER_OPEN)).clicked() {
+                    if ui.button(format!("{}  Open a log…", ic::FOLDER_OPEN)).on_hover_text("Pick the log to build a rule for: a text file with one event per line (a VPN, a firewall, a proxy, a JSON export…)").clicked() {
                         if let Some(p) = rfd::FileDialog::new().set_title("A log masstin does not know").pick_file() {
                             st.load(&p.to_string_lossy());
                         }
@@ -690,7 +733,8 @@ fn studio_rule(ui: &mut egui::Ui, st: &mut Studio, h: f32) {
         }
     });
     ui.add_space(4.0);
-    egui::ScrollArea::vertical().id_salt("studio-rule").max_height(h - 36.0).auto_shrink([false, false]).show(ui, |ui| match st.tab {
+    let guide_h = guide(ui, st);
+    egui::ScrollArea::vertical().id_salt("studio-rule").max_height(h - 36.0 - guide_h).auto_shrink([false, false]).show(ui, |ui| match st.tab {
         Tab::Start => tab_start(ui, st),
         Tab::Lines => tab_lines(ui, st),
         Tab::Fields => tab_fields(ui, st),
@@ -704,6 +748,53 @@ fn studio_rule(ui: &mut egui::Ui, st: &mut Studio, h: f32) {
     });
 }
 
+/// What each step is for, in the order the rule is made: (tab, title,
+/// what to do, what "done" looks like).
+const STEPS: [(Tab, &str, &str, &str); 6] = [
+    (Tab::Start, "Where to start", "A rule teaches masstin to read a log it does not know: which lines matter, how each is cut into fields, and which field goes in which column of the timeline. Open a log (above), then start from a rule of the library that already reads part of it, or from an empty one.", "Done when a rule is started: the next step lists its line types."),
+    (Tab::Lines, "Which lines matter", "A log holds several kinds of line (a login, a failure, a logout…). Each kind is a line type. Click a line on the left, select in the box below the words only that kind of line has (for instance «authenticated»), say what it is (a logon, a failed logon…) and add it. When every line has the same shape (JSON, CSV), one line type for all of them is enough: the button below.", "Done when the bar above is coloured: every colour is a line type, the dashed part is lines no type reads."),
+    (Tab::Fields, "How a line is cut into fields", "Pick the line type on the left of this pane (step 2) and say what its lines look like: key=value pairs, columns split by a character, JSON, or free text read with a pattern. The table shows the fields masstin gets from the selected line: each is a name you use in the next step as ${name}.", "Done when the fields you need (the time, the user, where it came from, where it went) are in the table with the right values."),
+    (Tab::Columns, "Which field goes in which column", "The timeline has fixed columns. For each one, write the field that fills it as ${name}, plain text, or both. A connection needs at least its time, an origin (src_ip or src_computer) and a destination (dst_computer): without them the line is read but no row is written.", "Done when the rows at the bottom show the values in the right columns and nothing is marked to fix."),
+    (Tab::Rejected, "What is left unread", "The lines no line type reads. They may be noise (leave them) or a kind of line you still want: click one, go back to step 2 and make a line type for it.", "Done when only the lines you do not need are left here."),
+    (Tab::Yaml, "The rule, written", "The rule as a file. Save as… (above) writes it; Use it in the ingest then reads the whole log with it. The same file works from the command line: masstin -a parse --rules FILE.", "Done: save it and use it in the ingest."),
+];
+
+/// The step's card: what it is for, what to do, and the way to the next.
+/// Gives the height it took.
+fn guide(ui: &mut egui::Ui, st: &mut Studio) -> f32 {
+    let k = STEPS.iter().position(|s| s.0 == st.tab).unwrap_or(0);
+    let (_, title, what, done) = STEPS[k];
+    let top = ui.cursor().top();
+    egui::Frame::new().fill(theme::FIELD).stroke(Stroke::new(1.0, theme::BORDER_2)).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::semibold(format!("{}  Step {} of {} · {}", ic::FLAG, k + 1, STEPS.len(), title), 13.0).color(theme::CYAN));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let last = k + 1 == STEPS.len();
+                if ui.add_enabled(!last, egui::Button::new(theme::semibold(format!("Next  {}", ic::ARROW_RIGHT), 12.5).color(if last { theme::DIM } else { theme::ACCENT_INK })).fill(if last { theme::FIELD } else { theme::ACCENT })).on_hover_text("The next step of the rule").clicked() {
+                    st.tab = STEPS[k + 1].0;
+                }
+                if ui.add_enabled(k > 0, egui::Button::new(format!("{}  Back", ic::ARROW_LEFT))).on_hover_text("The step before").clicked() {
+                    st.tab = STEPS[k - 1].0;
+                }
+                if st.guide_open {
+                    if ui.small_button("hide the guide").on_hover_text("Keep only the step's name; show it again from here").clicked() {
+                        st.guide_open = false;
+                    }
+                } else if ui.small_button("show the guide").clicked() {
+                    st.guide_open = true;
+                }
+            });
+        });
+        if st.guide_open {
+            ui.add(egui::Label::new(egui::RichText::new(what).color(TEXT).size(12.5)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(format!("{}  {}", ic::CHECK_CIRCLE, done)).color(theme::MUTED).size(12.0)).wrap());
+        }
+    });
+    ui.add_space(6.0);
+    ui.cursor().top() - top
+}
+
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).color(theme::MUTED).size(12.0));
 }
@@ -714,7 +805,10 @@ fn tab_start(ui: &mut egui::Ui, st: &mut Studio) {
         return;
     }
     hint(ui, "masstin's library tried on this log: start from the one that reads most, or from an empty rule.");
-    theme::section(ui, "The library");
+    ui.horizontal(|ui| {
+        theme::section(ui, "The library");
+        theme::help(ui, "Rules that come with masstin for known products (VPNs, firewalls, proxies, JSON exports). Each was tried on this log: the count is how many of its lines it reads as it is. Starting from one keeps its line types, fields and columns; you only add what your log has and it lacks.");
+    });
     if st.ranked.is_empty() {
         ui.label(egui::RichText::new("None of the library's rules reads a line of it.").color(theme::DIM));
     }
@@ -726,7 +820,10 @@ fn tab_start(ui: &mut egui::Ui, st: &mut Studio) {
             st.start_from_library(name);
         }
     }
-    theme::section(ui, "Or from nothing");
+    ui.horizontal(|ui| {
+        theme::section(ui, "Or from nothing");
+        theme::help(ui, "A rule with no line types: you make them in the next step. masstin looked at the lines and guessed their shape (JSON, key=value, delimited or free text), which is what a new line type starts with; it can be changed in 3 Fields.");
+    });
     let guessed = pc::guess_extract(&st.lines);
     if ui.button(format!("{}  An empty rule: the lines look {}", ic::PLUS, extract_kind(&guessed))).clicked() {
         st.start_empty();
@@ -771,10 +868,23 @@ fn tab_lines(ui: &mut egui::Ui, st: &mut Studio) {
                 ui.selectable_value(&mut st.new_type, i, format!("{}  ({})", t, what));
             }
         });
+        theme::help(ui, "What this kind of line is in the timeline. SUCCESSFUL_LOGON: someone got in. FAILED_LOGON: someone tried and was refused. LOGOFF: a session ended. CONNECT: a connection with no login in it (a firewall's allow, a proxy's request). It is the event_type column, and the colour of the connection in the graph.");
         let ok = !st.selection.trim().is_empty() && !st.lines.is_empty();
-        if ui.add_enabled(ok, egui::Button::new(format!("{}  A line type for lines with this", ic::PLUS))).clicked() {
+        if ui.add_enabled(ok, egui::Button::new(format!("{}  A line type for lines with this", ic::PLUS))).on_hover_text("Lines that hold the selected text are read by this new line type. Select the text first, in the box above").on_disabled_hover_text("Select in the box above the words that only this kind of line has").clicked() {
             st.add_line_type();
         }
+    });
+    ui.horizontal(|ui| {
+        let structured = !matches!(st.base_extract(), Extract::Regex { .. });
+        let label = format!("{}  One line type for every line", ic::STACK);
+        let b = if structured && st.rule.parsers.is_empty() { egui::Button::new(theme::semibold(label, 13.0).color(theme::ACCENT_INK)).fill(theme::ACCENT) } else { egui::Button::new(label) };
+        if ui.add_enabled(!st.lines.is_empty(), b).on_hover_text("Every line is read the same way, as the event chosen on the left. Right when the log is JSON, CSV or key=value and each line is one event").clicked() {
+            st.add_line_type_for_all();
+        }
+        if structured {
+            ui.label(egui::RichText::new(format!("the lines look {}: one type usually reads them all", extract_kind(&st.base_extract()))).color(theme::MUTED).size(12.0));
+        }
+        theme::help(ui, "A line type that reads every line. Use it when all the lines have the same fields (JSON objects, CSV rows, key=value pairs). If the log mixes logons and failures in the same shape, make it once, then in 4 Columns fill event_type from the field that says which it is, or add more specific line types above it (a line is read by the first type it fits; «up» moves a type earlier).");
     });
     theme::section(ui, "Line types");
     if st.rule.parsers.is_empty() {
@@ -803,10 +913,10 @@ fn tab_lines(ui: &mut egui::Ui, st: &mut Studio) {
                     st.dirty = true;
                 }
                 ui.label(egui::RichText::new(format!("{} lines", hits[i])).color(colour(i)));
-                if i > 0 && ui.small_button("up").on_hover_text("Tried earlier").clicked() {
+                if i > 0 && ui.small_button("up").on_hover_text("Try this line type before the one above it: a line is read by the first type it fits, so the most specific go first").clicked() {
                     up = Some(i);
                 }
-                if ui.small_button(ic::X).on_hover_text("Remove").clicked() {
+                if ui.small_button(ic::X).on_hover_text("Remove this line type: its lines go back to «read by none»").clicked() {
                     remove = Some(i);
                 }
             });
@@ -827,7 +937,11 @@ fn tab_lines(ui: &mut egui::Ui, st: &mut Studio) {
                     st.dirty = true;
                 }
                 if let Some(re) = &p.match_rule.regex {
-                    ui.label(egui::RichText::new(format!("regex {}", re)).monospace().size(11.0).color(theme::DIM));
+                    if re == "." {
+                        ui.label(egui::RichText::new("every line").size(11.5).color(theme::CYAN)).on_hover_text("This line type reads any line (its condition is the pattern «.»). More specific types above it are tried first");
+                    } else {
+                        ui.label(egui::RichText::new(format!("regex {}", re)).monospace().size(11.0).color(theme::DIM));
+                    }
                 }
             });
         });
@@ -859,6 +973,7 @@ fn tab_fields(ui: &mut egui::Ui, st: &mut Studio) {
     let kind = extract_kind(&p.extract);
     let mut changed = false;
     ui.horizontal(|ui| {
+        theme::help(ui, "The shape of this kind of line. key=value: user=ana src=10.0.0.5 … (say what splits the pairs and what splits key from value). delimited: columns split by a comma, a tab, a bar; you name the ones you use. JSON: one object per line; its values are the fields. free text: anything else, read with a pattern where each field is a named group, (?P<user>\\S+).");
         ui.label(egui::RichText::new("The lines are").color(theme::MUTED));
         egui::ComboBox::from_id_salt("studio-extract").selected_text(kind).show_ui(ui, |ui| {
             let opts: [(&str, Extract); 4] = [
@@ -970,7 +1085,7 @@ fn tab_columns(ui: &mut egui::Ui, st: &mut Studio) {
     let vars = variables(p, &line);
     let mut changed = false;
     ui.horizontal(|ui| {
-        if ui.button(format!("{}  Guess them from the field names", ic::ARROWS_CLOCKWISE)).clicked() {
+        if ui.button(format!("{}  Guess them from the field names", ic::ARROWS_CLOCKWISE)).on_hover_text("Fill the columns from fields with telling names (user, src, srcip, dst, time…). What is already filled is kept; check the guess in the rows below").clicked() {
             let fields = pc::fields_of(&p.extract, &line).unwrap_or_default();
             for (k, v) in guess_columns(&fields, &p.extract) {
                 p.map.entry(k).or_insert(v);
@@ -1175,6 +1290,30 @@ date=2026-11-10 time=08:02:11 devname="FGT-LEO" type="event" subtype="vpn" actio
         st.evaluate();
         assert_eq!(st.counts().0, 2);
         assert!(st.yaml().contains("fortinet-sslvpn-tunnel-up"));
+    }
+
+    #[test]
+    fn one_line_type_reads_every_line_of_a_json_log() {
+        let mut st = Studio::default();
+        st.lines = vec![
+            r#"{"ts":"2026-11-10T08:00:00Z","user":"bob","src":"10.0.0.9","host":"VPN1"}"#.to_string(),
+            r#"{"ts":"2026-11-10T08:05:00Z","user":"ana","src":"10.0.0.7","host":"VPN1"}"#.to_string(),
+        ];
+        st.rule = RuleFile { meta: None, prefilter: None, parsers: Vec::new() };
+        st.add_line_type_for_all();
+        // one type, with no text to tell lines apart, and the fields named
+        assert_eq!(st.rule.parsers.len(), 1);
+        assert!(st.rule.parsers[0].match_rule.contains.is_empty());
+        assert_eq!(st.rule.parsers[0].match_rule.regex.as_deref(), Some("."));
+        assert_eq!(st.rule.parsers[0].name, "successful-logon-every-line");
+        st.dirty = true;
+        st.evaluate();
+        assert_eq!(st.counts(), (2, 0, 0));
+        // every step of the guide is a tab, in the order the rule is made
+        assert_eq!(STEPS.len(), 6);
+        assert!(STEPS[0].0 == Tab::Start && STEPS[5].0 == Tab::Yaml);
+        st.auto("columns");
+        assert!(st.tab == Tab::Columns);
     }
 
     #[test]

@@ -201,10 +201,10 @@ impl Viewer {
                 set = Some(Some(day + h * 3600 + m * 60 + s));
             }
             ui.horizontal_wrapped(|ui| {
-                if ui.small_button("00:00:00").clicked() {
+                if ui.small_button("00:00:00").on_hover_text("The start of that day").clicked() {
                     set = Some(Some(day));
                 }
-                if ui.small_button("23:59:59").clicked() {
+                if ui.small_button("23:59:59").on_hover_text("The end of that day").clicked() {
                     set = Some(Some(day + 86_399));
                 }
                 let of_day = self.store.in_window(Some(day), Some(day + 86_399));

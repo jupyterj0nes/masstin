@@ -42,6 +42,15 @@ pub fn help(ui: &mut egui::Ui, text: &str) -> egui::Response {
     })
 }
 
+/// A control's name with its "?" after it, as one cell.
+pub fn label_help(ui: &mut egui::Ui, label: &str, text: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(label);
+        help(ui, text);
+    });
+}
+
 /// The explanation at the foot of a menu: what the thing clicked is and
 /// what its actions do, for whoever opens the menu to find out.
 pub fn menu_help(ui: &mut egui::Ui, text: &str) {
@@ -192,6 +201,20 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
         let y = r.rect.center().y;
         p.line_segment([Pos2::new(r.rect.left(), y), Pos2::new(r.rect.right(), y)], Stroke::new(2.0, super::draw::fade(CYAN, 0.8)));
         ui.label(medium(title.to_ascii_uppercase(), 10.5).color(MUTED));
+    });
+    ui.add_space(1.0);
+}
+
+/// A section title with a "?" that explains the section on hover.
+pub fn section_help(ui: &mut egui::Ui, title: &str, text: &str) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (r, p) = ui.allocate_painter(Vec2::new(10.0, 10.0), egui::Sense::hover());
+        let y = r.rect.center().y;
+        p.line_segment([Pos2::new(r.rect.left(), y), Pos2::new(r.rect.right(), y)], Stroke::new(2.0, super::draw::fade(CYAN, 0.8)));
+        ui.label(medium(title.to_ascii_uppercase(), 10.5).color(MUTED));
+        help(ui, text);
     });
     ui.add_space(1.0);
 }

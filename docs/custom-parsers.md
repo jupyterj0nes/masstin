@@ -19,6 +19,8 @@ Lines that nothing matches are counted and reported as *rejected* so you can see
 
 ## The rule studio (in masstin's window)
 
+The studio walks through the rule in six steps, each with a card that says what the step is for, what to do in it and what it looks like when it is done, with **Back** and **Next** (the card folds to its title with *hide the guide*): where to start, which lines matter, how a line is cut into fields, which field goes in which column, what is left unread, and the rule as written. For a log whose lines all have the same shape (JSON, CSV, key=value), **One line type for every line** makes the single line type that reads them all, with the fields of the line already named. A **?** next to the event type, the shape of the lines and the library explains each.
+
 A rule can be built without writing YAML by hand: Tools › *Rule studio (custom logs)…* opens a log next to the rule. It ranks the library's rules on that log (or starts from an empty rule in the format it guesses), makes a line type from text selected in a line, shows each line's fields, fills the timeline's columns with `${field}` templates, lists the lines no line type reads, and previews the rows with the same engine `parse-custom` runs. *Save as…* writes the YAML described below; *Use it in the ingest* runs it with `masstin -a parse --rules`.
 
 ## Command-line usage

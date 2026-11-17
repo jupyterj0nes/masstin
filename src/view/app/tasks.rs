@@ -500,7 +500,7 @@ impl Viewer {
             if let Some(i) = remove {
                 self.merge_form.inputs.remove(i);
             }
-            if ui.button(format!("{}  Add timelines…", ic::PLUS)).clicked() {
+            if ui.button(format!("{}  Add timelines…", ic::PLUS)).on_hover_text("Pick the timeline CSVs to join into one").clicked() {
                 if let Some(ps) = rfd::FileDialog::new().set_title("Timelines to merge").add_filter("CSV", &["csv"]).pick_files() {
                     for p in ps {
                         let s = p.to_string_lossy().to_string();
@@ -513,7 +513,7 @@ impl Viewer {
             theme::section(ui, "Result");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.merge_form.output).desired_width(380.0).hint_text("…\\case.csv"));
-                if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).clicked() {
+                if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).on_hover_text("Choose where the file is written and its name").clicked() {
                     if let Some(p) = rfd::FileDialog::new().set_title("Merged timeline to write").add_filter("CSV", &["csv"]).set_file_name("merged.csv").save_file() {
                         self.merge_form.output = p.to_string_lossy().to_string();
                     }
@@ -538,7 +538,7 @@ impl Viewer {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Marks from").color(theme::MUTED));
                     ui.add(egui::TextEdit::singleline(&mut self.merge_form.carry).desired_width(380.0).hint_text("an earlier timeline of the same evidence"));
-                    if ui.button(format!("{}  File…", ic::ARCHIVE)).clicked() {
+                    if ui.button(format!("{}  File…", ic::ARCHIVE)).on_hover_text("Pick a file").clicked() {
                         if let Some(p) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).pick_file() {
                             self.merge_form.carry = p.to_string_lossy().to_string();
                         }
@@ -619,7 +619,7 @@ impl Viewer {
             });
             if job.done.is_some() {
                 ui.add_space(4.0);
-                if ui.button("Close").clicked() {
+                if ui.button("Close").on_hover_text("Close this window").clicked() {
                     close = true;
                 }
             }

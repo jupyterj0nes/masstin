@@ -79,7 +79,7 @@ impl Viewer {
             changed |= ui.checkbox(&mut glow, "a glow along it (and dots travelling, with motion on)").changed();
             changed |= ui.checkbox(&mut hide, "hidden").changed();
             ui.add_space(6.0);
-            if ui.button(format!("{}  Back to the default look", ic::ARROW_CLOCKWISE)).clicked() {
+            if ui.button(format!("{}  Back to the default look", ic::ARROW_CLOCKWISE)).on_hover_text("Forget everything set here for these connections: they are drawn like the rest").clicked() {
                 reset = true;
             }
         });

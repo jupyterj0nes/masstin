@@ -438,7 +438,7 @@ impl Viewer {
                     ui.label(egui::RichText::new("github.com/jupyterj0nes/agentc00pr has it. With it in place, this takes the timelines open here into a case of it, with the evidence they were read from.").color(theme::MUTED));
                 }
                 ui.add_space(8.0);
-                if ui.button("Close").clicked() {
+                if ui.button("Close").on_hover_text("Close this window").clicked() {
                     close = true;
                 }
                 return;
@@ -491,7 +491,7 @@ impl Viewer {
                     ui.label(egui::RichText::new("made in").color(theme::MUTED));
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut d.parent).desired_width(380.0).hint_text("the folder that holds your cases"));
-                        if ui.button("Browse…").clicked() {
+                        if ui.button("Browse…").on_hover_text("Pick the folder").clicked() {
                             if let Some(p) = rfd::FileDialog::new().set_title("The folder the case is made in").pick_folder() {
                                 d.parent = p.to_string_lossy().to_string();
                             }

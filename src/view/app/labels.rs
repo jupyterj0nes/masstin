@@ -452,7 +452,7 @@ impl Viewer {
                 }
             });
             ui.add_space(6.0);
-            if ui.button(format!("{}  Back to the global settings", ic::ARROW_CLOCKWISE)).clicked() {
+            if ui.button(format!("{}  Back to the global settings", ic::ARROW_CLOCKWISE)).on_hover_text("Forget what was set for this host alone: it is drawn as the global style says").clicked() {
                 reset = true;
             }
         });

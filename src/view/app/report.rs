@@ -227,7 +227,7 @@ impl Viewer {
                 if ui.add(egui::Button::new(theme::semibold(format!("{}  Show the findings with this score", ic::FIRE), 13.0).color(theme::ACCENT_INK)).fill(theme::ACCENT).stroke(Stroke::NONE).min_size(Vec2::new(0.0, 30.0))).clicked() {
                     apply = Some(self.draft.min_score);
                 }
-                if ui.button("Close").clicked() {
+                if ui.button("Close").on_hover_text("Close this window").clicked() {
                     close = true;
                 }
                 ui.label(egui::RichText::new("13 is one in twenty (alpha 0.05), 30 one in a thousand, 60 one in a million. The slider in the filter pane does the same at any time.").color(theme::DIM).size(11.0));

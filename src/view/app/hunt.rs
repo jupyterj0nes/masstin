@@ -237,7 +237,7 @@ fn hint(ui: &mut egui::Ui, text: &str) {
 fn path_row(ui: &mut egui::Ui, value: &mut String, hint_text: &str, file_filter: Option<(&str, &[&str])>, folder: bool) {
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(400.0).hint_text(hint_text));
-        if ui.button(format!("{}  File…", ic::ARCHIVE)).clicked() {
+        if ui.button(format!("{}  File…", ic::ARCHIVE)).on_hover_text("Pick a file").clicked() {
             let mut d = rfd::FileDialog::new();
             if let Some((name, ext)) = file_filter {
                 d = d.add_filter(name, ext);
@@ -246,7 +246,7 @@ fn path_row(ui: &mut egui::Ui, value: &mut String, hint_text: &str, file_filter:
                 *value = p.to_string_lossy().to_string();
             }
         }
-        if folder && ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).clicked() {
+        if folder && ui.button(format!("{}  Folder…", ic::FOLDER_OPEN)).on_hover_text("Pick a folder: everything in it is used").clicked() {
             if let Some(p) = rfd::FileDialog::new().pick_folder() {
                 *value = p.to_string_lossy().to_string();
             }
@@ -261,7 +261,7 @@ fn path_row(ui: &mut egui::Ui, value: &mut String, hint_text: &str, file_filter:
 fn save_row(ui: &mut egui::Ui, value: &mut String, title: &str, filter: (&str, &[&str])) {
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(470.0));
-        if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).clicked() {
+        if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).on_hover_text("Choose where the file is written and its name").clicked() {
             let name = Path::new(value.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if let Some(p) = rfd::FileDialog::new().set_title(title).add_filter(filter.0, filter.1).set_file_name(name).save_file() {
                 *value = p.to_string_lossy().to_string();
@@ -501,7 +501,7 @@ impl Viewer {
         theme::section(ui, "What it looks for");
         ui.horizontal(|ui| {
             hint(ui, "Every detector runs by default; untick one to leave it out.");
-            if ui.small_button("all").clicked() {
+            if ui.small_button("all").on_hover_text("Tick every one").clicked() {
                 self.hunt_form.detectors = [true; 13];
             }
         });
