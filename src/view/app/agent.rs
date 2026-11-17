@@ -15,7 +15,80 @@ use std::sync::mpsc::Receiver;
 /// The day agentc00pr is published.
 const RELEASE: (i32, u32, u32) = (2026, 12, 1);
 
+/// The case of agentc00pr a timeline is tied to, and how that is known.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Link {
+    /// agentc00pr opened this window, on this case
+    OpenedFrom(String),
+    /// the timeline's masstin file says it was taken to this case, and the
+    /// case is there
+    TakenTo(String),
+    /// it says so, and the case is not there any more
+    Gone(String),
+}
+
+/// The key of the timeline's file the case is kept under.
+const LINK_KEY: &str = "agentc00pr";
+
+fn is_case_folder(folder: &str) -> bool {
+    std::path::Path::new(folder).join("case.json").is_file()
+}
+
+/// What ties these timelines to a case: the case agentc00pr said it opened
+/// this window from (`opened_from`: `AGENTC00PR_CASE`), else the one the
+/// first timeline's masstin file names.
+pub(super) fn link_of(files: &[String], opened_from: Option<String>) -> Option<Link> {
+    if let Some(c) = opened_from.filter(|c| is_case_folder(c)) {
+        return Some(Link::OpenedFrom(c));
+    }
+    let folder = crate::timeline_file::get(files.first()?, LINK_KEY)?.get("case")?.as_str()?.to_string();
+    Some(if is_case_folder(&folder) { Link::TakenTo(folder) } else { Link::Gone(folder) })
+}
+
+/// Note in the timelines' masstin files the case they are in.
+fn remember_link(files: &[String], folder: &str) {
+    for f in files {
+        let _ = crate::timeline_file::set(f, LINK_KEY, serde_json::json!({ "case": folder }));
+    }
+}
+
+/// Whether the case in this folder names this timeline among its evidence
+/// (as it was added, or as the copy a hunt made of it). None when the case
+/// cannot be read that way: then nothing is concluded.
+pub(super) fn in_case(folder: &str, timeline: &str) -> Option<bool> {
+    let text = std::fs::read_to_string(std::path::Path::new(folder).join("case.json")).ok()?;
+    let case: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let evidence = case.get("evidence")?.as_array()?;
+    let norm = |s: &str| crate::timeline_file::absolute(s).replace(BACKSLASH, "/").to_lowercase();
+    let want = norm(timeline);
+    let mut any_path = false;
+    for e in evidence {
+        for key in ["original_path", "hunted_copy"] {
+            if let Some(p) = e.get(key).and_then(|p| p.as_str()).filter(|p| !p.is_empty()) {
+                any_path = true;
+                if norm(p) == want {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    // a case with evidence and no path under those names is written another way
+    if !evidence.is_empty() && !any_path {
+        return None;
+    }
+    Some(false)
+}
+
+const BACKSLASH: char = 92 as char;
+
+fn same_folder(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    norm(a) == norm(b)
+}
+
 pub(super) struct AgentDialog {
+    /// the case these timelines are tied to, when they are
+    pub link: Option<Link>,
     pub exe: Option<PathBuf>,
     /// the cases agentc00pr knows: (name, folder)
     pub cases: Vec<(String, String)>,
@@ -28,8 +101,12 @@ pub(super) struct AgentDialog {
     rx: Option<Receiver<Result<String, String>>>,
 }
 
-/// agentc00pr next to masstin, else on the PATH.
+/// The agentc00pr that opened this window (it says so: `AGENTC00PR_EXE`),
+/// else the one next to masstin, else on the PATH.
 pub(super) fn find_agentc00pr() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("AGENTC00PR_EXE").map(PathBuf::from).filter(|p| p.is_file()) {
+        return Some(p);
+    }
     let names: &[&str] = if cfg!(windows) { &["agentc00pr.exe"] } else { &["agentc00pr"] };
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
         for n in names {
@@ -128,9 +205,23 @@ impl Viewer {
     /// The dialog: agentc00pr found or not, its cases, a name for a new one.
     pub(super) fn open_agentc00pr(&mut self) {
         let exe = find_agentc00pr();
-        let cases = exe.as_ref().map(known_cases).unwrap_or_default();
+        let mut cases = exe.as_ref().map(known_cases).unwrap_or_default();
         let name = self.files.first().and_then(|f| std::path::Path::new(f).file_stem().map(|s| s.to_string_lossy().to_string())).unwrap_or_else(|| "case".to_string());
-        self.agent = Some(AgentDialog { exe, cases, new_case: true, name, parent: last_parent(), pick: 0, msg: String::new(), rx: None });
+        // already tied to a case: that case is the one offered
+        let link = link_of(&self.files, std::env::var("AGENTC00PR_CASE").ok());
+        let (mut new_case, mut pick) = (true, 0);
+        if let Some(Link::OpenedFrom(folder)) | Some(Link::TakenTo(folder)) = &link {
+            pick = match cases.iter().position(|(_, f)| same_folder(f, folder)) {
+                Some(i) => i,
+                None => {
+                    let n = std::path::Path::new(folder).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| folder.clone());
+                    cases.insert(0, (n, folder.clone()));
+                    0
+                }
+            };
+            new_case = false;
+        }
+        self.agent = Some(AgentDialog { link, exe, cases, new_case, name, parent: last_parent(), pick, msg: String::new(), rx: None });
     }
 
     /// Put the open timelines into the case and open agentc00pr on it.
@@ -161,6 +252,7 @@ impl Viewer {
             remember_parent(d.parent.trim());
         }
         let args = add_arguments(&folder, new_name.as_deref(), &self.files);
+        let files = self.files.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         d.rx = Some(rx);
         d.msg = format!("Putting {} timeline(s) into {}…", self.files.len(), folder);
@@ -177,6 +269,20 @@ impl Viewer {
                         let _ = tx.send(Err(text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("agentc00pr refused the case").to_string()));
                         return;
                     }
+                    // every timeline must be in the case now: one that is not (the case
+                    // is open in a window of agentc00pr, which is the one that saves it)
+                    // is said, not opened on as if it were
+                    let left: Vec<&String> = files.iter().filter(|f| in_case(&folder, f) == Some(false)).collect();
+                    if !left.is_empty() {
+                        let names: Vec<String> = left.iter().map(|f| std::path::Path::new(f.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.to_string())).collect();
+                        let why = if text.contains("being processed by the window") {
+                            "the case is open in a window of agentc00pr, which is the one that saves it: add the timeline there (drop it on Ingest), or close that window and try again".to_string()
+                        } else {
+                            text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("agentc00pr did not say why").trim().to_string()
+                        };
+                        let _ = tx.send(Err(format!("{} did not get into the case {}: {}", names.join(", "), folder, why)));
+                        return;
+                    }
                     text.lines().filter(|l| l.contains("added from the timeline's ingest record")).count()
                 }
                 Err(e) => {
@@ -184,6 +290,8 @@ impl Viewer {
                     return;
                 }
             };
+            // the timelines say from now on which case they are in
+            remember_link(&files, &folder);
             let mut win = std::process::Command::new(&exe);
             win.args(["--case", &folder, "--panel", "investigate", "--load-all"]);
             win.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -252,6 +360,21 @@ impl Viewer {
                 ui.label(egui::RichText::new("No timeline is open.").color(theme::MUTED));
             }
             ui.add_space(4.0);
+            match &d.link {
+                Some(Link::OpenedFrom(folder)) => {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("{}  agentc00pr opened this window from its case {}: that is the one offered.", ic::LINK, folder)).color(theme::ACCENT));
+                }
+                Some(Link::TakenTo(folder)) => {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("{}  This timeline is already in the case {}: that is the one offered.", ic::LINK, folder)).color(theme::ACCENT));
+                }
+                Some(Link::Gone(folder)) => {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("{}  This timeline was taken to the case {}, which is not there any more (moved, renamed or deleted). Pick the case where it is now, or make a new one.", ic::WARNING, folder)).color(CANDIDATE));
+                }
+                None => {}
+            }
             theme::section(ui, "Into which case");
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut d.new_case, true, "A new case");
@@ -321,6 +444,48 @@ mod tests {
         assert_eq!(parse_case_line("share                        \\\\nas\\cases\\x  ·  1 evidence"), Some(("share".to_string(), "\\\\nas\\cases\\x".to_string())));
         assert_eq!(parse_case_line("?                            D:\\gone  ·  unreadable: no case.json"), None);
         assert_eq!(parse_case_line(""), None);
+    }
+
+    /// A timeline knows the case it is in: the one agentc00pr opened the
+    /// window from, else the one its masstin file names, there or gone.
+    #[test]
+    fn a_timeline_is_tied_to_its_case() {
+        let dir = std::env::temp_dir().join(format!("masstin_agent_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("case-a")).unwrap();
+        std::fs::create_dir_all(dir.join("case-b")).unwrap();
+        std::fs::write(dir.join("case-a").join("case.json"), "{}").unwrap();
+        std::fs::write(dir.join("case-b").join("case.json"), "{}").unwrap();
+        let tl = dir.join("t.csv").to_string_lossy().to_string();
+        std::fs::write(&tl, "x\n").unwrap();
+        let (a, b) = (dir.join("case-a").to_string_lossy().to_string(), dir.join("case-b").to_string_lossy().to_string());
+        // nothing says
+        assert_eq!(link_of(&[tl.clone()], None), None);
+        assert_eq!(link_of(&[], None), None);
+        // taken to a case: its masstin file says so, next to what else it holds
+        crate::timeline_file::set(&tl, "hunt", serde_json::json!({"alpha": 0.05})).unwrap();
+        remember_link(&[tl.clone()], &a);
+        assert_eq!(link_of(&[tl.clone()], None), Some(Link::TakenTo(a.clone())));
+        assert_eq!(crate::timeline_file::get(&tl, "hunt").unwrap()["alpha"].as_f64(), Some(0.05));
+        // opened from another case by agentc00pr: that one, when it is a case
+        assert_eq!(link_of(&[tl.clone()], Some(b.clone())), Some(Link::OpenedFrom(b.clone())));
+        assert_eq!(link_of(&[tl.clone()], Some(dir.join("nowhere").to_string_lossy().to_string())), Some(Link::TakenTo(a.clone())));
+        // the case went away
+        std::fs::remove_dir_all(dir.join("case-a")).unwrap();
+        assert_eq!(link_of(&[tl.clone()], None), Some(Link::Gone(a.clone())));
+        assert!(same_folder("D:\\Cases\\X\\", "d:/cases/x") && !same_folder("D:/cases/x", "D:/cases/y"));
+        // whether a case names a timeline among its evidence, however the path is written
+        let other = dir.join("other.csv").to_string_lossy().to_string();
+        std::fs::write(dir.join("case-b").join("case.json"), serde_json::json!({"evidence": [{"original_path": tl.replace(BACKSLASH, "/").to_uppercase(), "hunted_copy": ""}, {"original_path": "D:/other/x.zip"}]}).to_string()).unwrap();
+        assert_eq!(in_case(&b, &tl), Some(true));
+        assert_eq!(in_case(&b, &other), Some(false));
+        // a case that cannot be read that way concludes nothing
+        assert_eq!(in_case(&dir.join("nowhere").to_string_lossy(), &tl), None);
+        std::fs::write(dir.join("case-b").join("case.json"), serde_json::json!({"evidence": [{"where": "x"}]}).to_string()).unwrap();
+        assert_eq!(in_case(&b, &tl), None);
+        std::fs::write(dir.join("case-b").join("case.json"), serde_json::json!({"evidence": []}).to_string()).unwrap();
+        assert_eq!(in_case(&b, &tl), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

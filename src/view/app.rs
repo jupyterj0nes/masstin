@@ -4587,6 +4587,15 @@ impl Viewer {
                 }
             }
             // on to agentc00pr: the dialog, a new case of that name in that folder, go
+            // how rows become edges: `grouping=hosts|connection|event`
+            other if other.starts_with("grouping=") => {
+                self.draft.grouping = match &other["grouping=".len()..] {
+                    "hosts" => super::query::Grouping::PerPair,
+                    "event" => super::query::Grouping::PerEvent,
+                    _ => super::query::Grouping::PerAccount,
+                };
+                self.requery(false);
+            }
             // exactly the events named, as `--event`; several with `;` between
             other if other.starts_with("events=") => {
                 let conds: Vec<String> = other["events=".len()..].split(';').map(|c| c.replace('|', ",")).collect();
@@ -4629,6 +4638,20 @@ impl Viewer {
                     d.new_case = true;
                     d.name = name.to_string();
                     d.parent = parent.to_string();
+                }
+            }
+            // one of agentc00pr's cases, by its folder
+            other if other.starts_with("agent-case=") => {
+                if let Some(d) = self.agent.as_mut() {
+                    let folder = other["agent-case=".len()..].to_string();
+                    d.pick = match d.cases.iter().position(|(_, f)| f.replace(92 as char, "/").eq_ignore_ascii_case(&folder.replace(92 as char, "/"))) {
+                        Some(i) => i,
+                        None => {
+                            d.cases.insert(0, (folder.clone(), folder));
+                            0
+                        }
+                    };
+                    d.new_case = false;
                 }
             }
             "agent-go" => self.agent_go(),

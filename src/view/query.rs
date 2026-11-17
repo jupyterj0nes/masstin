@@ -438,6 +438,26 @@ mod tests {
         format!("2026-01-{:02}T{:02}:00:00Z,{},{},4624,3,{},CORP,,{},,,0x{},,Security.evtx{}", day, hour, dst, et, user, src, hour, tail)
     }
 
+    /// A host is keyed by its short name; it answers to the name the file
+    /// writes too, so a neighbourhood asked for by the fully qualified name
+    /// (what a case tool shows) is its neighbourhood.
+    #[test]
+    fn a_host_answers_to_its_fully_qualified_name() {
+        let path = std::env::temp_dir().join(format!("masstin-query-fqdn-{}.csv", std::process::id()));
+        let lines = vec![csv_out::HEADER.to_string(), row(1, 9, "10.0.0.5", "SRV09.corp.test", "alice", "SUCCESSFUL_LOGON", ",,,,,")];
+        std::fs::write(&path, format!("{}
+", lines.join("
+"))).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        for asked in ["SRV09.corp.test", "srv09", "=SRV09.CORP.TEST"] {
+            let f = Filter { view: View::Around, around: asked.to_string(), ..Filter::default() };
+            assert_eq!(GraphView::build(&s, &f).edges.len(), 1, "{asked}");
+        }
+        let f = Filter { view: View::Around, around: "SRV09.other.test".into(), ..Filter::default() };
+        assert_eq!(GraphView::build(&s, &f).edges.len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn store() -> (Store, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("masstin-query-{}.csv", std::process::id()));
         let mut lines = vec![csv_out::HEADER.to_string()];

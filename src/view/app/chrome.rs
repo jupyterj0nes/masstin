@@ -1385,7 +1385,9 @@ impl Viewer {
     /// category, and when coloured by account a click picks its colour.
     pub(super) fn legend_overlay(&mut self, ctx: &egui::Context, canvas: Rect) {
         let n_ip = self.scene.n_ip;
-        let n_host = self.graph.nodes.len() - n_ip;
+        // (the scene's count is of the frame before: after a query that leaves
+        // fewer hosts than it had addresses, it is the larger of the two)
+        let n_host = self.graph.nodes.len().saturating_sub(n_ip);
         let chips: Vec<(String, Color32, usize)> = self.scene.chips.clone();
         let by_user = self.style.color_by == ColorBy::User;
         let area = egui::Area::new(egui::Id::unique("legend-overlay")).fixed_pos(canvas.min + Vec2::new(10.0, 10.0)).order(egui::Order::Middle).show(ctx, |ui| {

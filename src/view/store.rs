@@ -19,7 +19,7 @@ use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::csv_out::{self, Layout};
-use crate::graph_hunt_common::engine::{ambiguous_short_names, base_prefix_len, ip_names_for_csv, replace_file, row_key, split_csv_into};
+use crate::graph_hunt_common::engine::{ambiguous_short_names, base_prefix_len, clean_host, ip_names_for_csv, replace_file, row_key, short_name, split_csv_into};
 use crate::graph_hunt_common::parse_ts;
 
 pub const R_OK: u8 = 0;
@@ -197,7 +197,10 @@ impl Store {
         }
         let mut hosts = Interner::default();
         let mut aliases: Vec<Vec<String>> = Vec::new();
-        let mut host_of = |raw: &str, hosts: &mut Interner| -> u32 {
+        // `full`: the name as the file writes it (`SRV01.corp.example`), so the
+        // host answers to it too wherever a host is named (a search, a
+        // neighbourhood, `--focus`); empty when the row gives none
+        let mut host_of = |raw: &str, full: &str, hosts: &mut Interner| -> u32 {
             let label = resolved.get(raw).map(|r| r.0.as_str()).unwrap_or(raw);
             // a machine account named as a computer (`PTR-SRV01$`) is that computer
             let label = label.strip_suffix('$').filter(|l| !l.is_empty()).unwrap_or(label);
@@ -208,6 +211,9 @@ impl Store {
             }
             if !aliases[id as usize].iter().any(|a| a == raw) {
                 aliases[id as usize].push(raw.to_string());
+            }
+            if !full.is_empty() && !aliases[id as usize].iter().any(|a| a.eq_ignore_ascii_case(full)) {
+                aliases[id as usize].push(full.to_string());
             }
             id
         };
@@ -271,8 +277,14 @@ impl Store {
                 };
                 let sc = b[7].trim();
                 let src_is_ip = sc.is_empty() || sc == "-" || crate::load_neo4j::looks_like_ip(sc);
-                let src = host_of(&origin, &mut hosts);
-                let dst = host_of(&dest, &mut hosts);
+                // the fully qualified name of each end, when the row has one
+                // and it is the name the end was keyed by
+                let full_of = |cell: &str, keyed: &str| -> String {
+                    let c = clean_host(cell).to_uppercase();
+                    if c.contains('.') && c.parse::<std::net::IpAddr>().is_err() && short_name(&c, &ambiguous) == keyed { c } else { String::new() }
+                };
+                let src = host_of(&origin, &full_of(&b[7], &origin), &mut hosts);
+                let dst = host_of(&dest, &full_of(&b[1], &dest), &mut hosts);
                 let (hunt, score, why, verdict) = if layout == Layout::V19 && p.len() >= 19 {
                     let h = hunt_code(p[14].trim());
                     let q: f32 = csv_out::score_of_text(&p[15], header_has_q).map(|s| s as f32).unwrap_or(f32::NAN);

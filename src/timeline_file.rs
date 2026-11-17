@@ -6,6 +6,8 @@
 //!
 //! - `ingests`: what the timeline was read from (see `ingest_record`)
 //! - `hunt`: what its hunt was run with (see `graph_hunt_common::record`)
+//! - `hosts`: whose an address is (see `graph_hunt_common::hostmap`)
+//! - `agentc00pr`: the case of agentc00pr the timeline was taken to
 //!
 //! One file, not one per record. Whoever writes a key leaves every other
 //! key of the file as it was. The 19 columns are not touched by any of it.
@@ -68,7 +70,7 @@ pub fn set(timeline: &str, key: &str, value: Value) -> std::io::Result<PathBuf> 
 
 /// The keys masstin itself writes: the viewer, saving a case over the file,
 /// keeps them as they are on disk.
-pub const RECORD_KEYS: [&str; 3] = ["ingests", "hunt", "hosts"];
+pub const RECORD_KEYS: [&str; 4] = ["ingests", "hunt", "hosts", "agentc00pr"];
 
 /// The whole text, or the file as it was: never half of it.
 pub fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
