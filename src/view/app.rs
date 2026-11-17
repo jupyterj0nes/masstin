@@ -2144,7 +2144,7 @@ impl Viewer {
         let s = &self.store;
         match rule.field {
             Field::Host => [e.src, e.dst].iter().any(|&h| s.aliases[h as usize].iter().any(|a| Pattern::any(pats, a))),
-            Field::User => e.users.iter().any(|&u| Pattern::any(pats, s.users.name(u))),
+            Field::User => e.users.iter().any(|&u| Pattern::any_account(pats, s.users.name(u))),
             Field::LogonType => e.logon_types.iter().any(|&k| Pattern::any(pats, s.logon_types.name(k))),
             Field::EventId => e.event_ids.iter().any(|&k| Pattern::any(pats, s.event_ids.name(k))),
             Field::Result => Pattern::any(pats, RESULT_NAMES[e.result as usize]),

@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::store::{Edge, Store, R_OK};
+use super::store::{is_machine_account, Edge, Store, R_OK};
 
 #[derive(Clone, Debug)]
 pub struct PathQuery {
@@ -61,7 +61,7 @@ fn hop_ok(s: &Store, e: &Edge, q: &PathQuery) -> bool {
     if !q.results[e.result as usize] {
         return false;
     }
-    if q.skip_machine_accounts && s.users.name(e.user).ends_with('$') {
+    if q.skip_machine_accounts && is_machine_account(s.users.name(e.user)) {
         return false;
     }
     true
@@ -301,7 +301,7 @@ pub fn questions(s: &Store, edges: &[u32], top: usize) -> Vec<Question> {
         if e.result == R_OK {
             fanout.entry(e.src).or_default().insert(e.dst);
             fanin.entry(e.dst).or_default().insert(e.src);
-            if !s.users.name(e.user).is_empty() && !s.users.name(e.user).ends_with('$') {
+            if !s.users.name(e.user).is_empty() && !is_machine_account(s.users.name(e.user)) {
                 acct_origins.entry(e.user).or_default().insert(e.src);
             }
         }

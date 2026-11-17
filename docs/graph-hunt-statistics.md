@@ -59,6 +59,9 @@ The only number the analyst chooses is `--alpha`, the false discovery rate (defa
 
 ## Unit of the test: the connection
 
+**What an account is.** The account of a connection is its name *and its domain*, written `NAME@DOMAIN`: `Administrator` is not one account but the Administrator of each domain and the local one of each machine, different credentials that share a name. Taken for one, a credential nobody had used on a host looked habitual because another Administrator had been there. The domain is read from the name when it carries one (`administrator@EXAMPLE.TEST`, a Kerberos ticket; `DEV\alice`), else from the event's `target_domain_name`. One domain is written several ways by the same network (`DEV`, `DEV.EXAMPLE.TEST`, `dev.example.test`): its key is the first label, upper case; where a NetBIOS name is not the first label of the DNS one, an account written both ways is two accounts, never merged with another. A local account has its machine's name as domain, so the local Administrator of two servers is two accounts (NetBIOS cuts that name at 15 characters: a domain that is the first 15 characters of the destination's longer name is that destination). An event that gives no domain (4776, an SSH login) names the account by its name alone, an account of its own. On a loaded graph the relationship type is still the name; the hunt reads the domain off the edge's `target_domain_name`, and the Cypher it prints filters by both. On LANL this made 895 names into several accounts (10,073 to 10,968) and left every published figure as it was (256 significant, 230 red team, first other row at rank 108, 0 on the incident-free period, the same calibration); on a lab with three domains and local accounts of the same name, 14 accounts became 34.
+
+
 The anomaly is a connection, not a machine: (origin, destination, account,
 result) on one day, where result is login OK, login failed or
 unauthenticated contact. A connection that already happened on another

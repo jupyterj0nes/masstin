@@ -240,7 +240,8 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
     );
     let qa = format!(
         "MATCH (a:host)-[r]->(b:host) WHERE NOT {agg}
-         RETURN a.name AS o, b.name AS d, type(r) AS acct, coalesce(r.event_type, '') AS et,
+         RETURN a.name AS o, b.name AS d, type(r) AS acct, coalesce(r.target_domain_name, '') AS dom,
+                coalesce(r.target_user_name, '') AS usr, coalesce(r.event_type, '') AS et,
                 coalesce(r.event_id, '') AS eid, coalesce(toString(r.logon_type), '') AS lt,
                 coalesce(r.log_source, '') AS src, toString(r.time) AS t,
                 toInteger(coalesce(r.count, 1)) AS c, coalesce(r.logon_id, '') AS lid",
@@ -263,7 +264,12 @@ async fn pull(graph: &Graph) -> neo4rs::Result<Corpus> {
             if o.is_empty() || d.is_empty() {
                 continue;
             }
+            // the relationship type is the account's name; its domain is on
+            // the edge (the aggregated query returns none: rows without an account)
             let acct: String = row.get("acct").unwrap_or_default();
+            let dom: String = row.get("dom").unwrap_or_default();
+            let usr: String = row.get("usr").unwrap_or_default();
+            let acct = super::account::with_domain(&acct, &super::account::domain_key(&usr, &dom, &d));
             let et: String = row.get("et").unwrap_or_default();
             let eid: String = row.get("eid").unwrap_or_default();
             let lt: String = row.get("lt").unwrap_or_default();
@@ -395,7 +401,7 @@ pub(crate) fn split_csv(line: &str) -> Vec<String> {
     v.into_iter().map(|c| c.into_owned()).collect()
 }
 
-fn account_type(user: &str) -> String {
+pub(crate) fn account_type(user: &str) -> String {
     let stripped = user.split('@').next().unwrap_or(user);
     // Letters and digits of any alphabet are kept: with ASCII only, two
     // accounts written in another script and of the same length became
@@ -492,7 +498,9 @@ pub(crate) fn row_key(p: &[std::borrow::Cow<str>], ambiguous: &HashSet<String>) 
     } else {
         return None;
     };
-    let acct = account_type(p[5].trim());
+    // the account is its name and its domain (see account.rs): the
+    // Administrator of a domain is not the local one of this machine
+    let acct = super::account::account_id(&p[5], &p[6], &dest);
     let cls = class_of(p[2].trim(), p[3].trim(), &acct);
     Some((origin, dest, acct, cls))
 }
@@ -3078,12 +3086,14 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
             (0..ents.names.names.len() as u32).filter(|&e| is(ents.names.name(e)) || ents.aliases[e as usize].iter().any(|a| is(a))).collect()
         };
         let find_a = |s: &str| -> HashSet<u32> {
-            let bare = s.rsplit('\\').next().unwrap_or(s);
-            let key = account_type(bare).to_lowercase();
+            // `alice@DEV` or `DEV\alice` is that account; `alice` alone is
+            // every account of that name, whatever its domain
+            let full = super::account::account_id(s, "", "").to_lowercase();
+            let named_domain = full.contains('@');
             (0..c.accts.names.len() as u32)
                 .filter(|&a| {
                     let n = c.accts.name(a).to_lowercase();
-                    n == s || n == key
+                    n == s || n == full || (!named_domain && super::account::split(&n).0 == full)
                 })
                 .collect()
         };
@@ -3380,10 +3390,10 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
                 .iter()
                 .map(|g| {
                     format!(
-                        "(a.name IN [{}] AND b.name IN [{}] AND type(r) = '{}' AND r.time >= {} AND r.time < {})",
+                        "(a.name IN [{}] AND b.name IN [{}] AND {} AND r.time >= {} AND r.time < {})",
                         alias_list(g.o).iter().map(|x| format!("'{}'", qs(x))).collect::<Vec<_>>().join(", "),
                         alias_list(g.d).iter().map(|x| format!("'{}'", qs(x))).collect::<Vec<_>>().join(", "),
-                        qs(c.accts.name(g.a)),
+                        super::account::cypher_condition(c.accts.name(g.a), &|s| qs(s)),
                         dialect.t(ts_str(g.first - 1).trim_end_matches('Z')),
                         dialect.t(ts_str(g.last + 1).trim_end_matches('Z'))
                     )
@@ -3874,24 +3884,24 @@ mod tests {
             row_key(&p, &none).map(|(o, d, a, _)| (o, d, a))
         };
         let k = |o: &str, d: &str, a: &str| Some((o.to_string(), d.to_string(), a.to_string()));
-        assert_eq!(key("SRV01.corp.local", "WS07", "10.0.0.7", "ana"), k("WS07", "SRV01", "ANA"));
-        assert_eq!(key("SRV01.corp.local", "", "10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA"));
+        assert_eq!(key("SRV01.corp.local", "WS07", "10.0.0.7", "ana"), k("WS07", "SRV01", "ANA@CORP"));
+        assert_eq!(key("SRV01.corp.local", "", "10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA@CORP"));
         // a port, an IPv4 address written as IPv6, a dot ending the name
-        assert_eq!(key("SRV01", "", "10.0.0.7:50211", "ana"), k("10.0.0.7", "SRV01", "ANA"));
-        assert_eq!(key("SRV01", "", "::ffff:10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA"));
-        assert_eq!(key("SRV01.corp.local.", "WS07.corp.local.", "", "ana"), k("WS07", "SRV01", "ANA"));
+        assert_eq!(key("SRV01", "", "10.0.0.7:50211", "ana"), k("10.0.0.7", "SRV01", "ANA@CORP"));
+        assert_eq!(key("SRV01", "", "::ffff:10.0.0.7", "ana"), k("10.0.0.7", "SRV01", "ANA@CORP"));
+        assert_eq!(key("SRV01.corp.local.", "WS07.corp.local.", "", "ana"), k("WS07", "SRV01", "ANA@CORP"));
         // the machine itself, by any name: no origin
         for (sc, si) in [("", ""), ("-", "-"), ("localhost", ""), ("", "127.0.0.1"), ("LOCAL", "::1"), ("SRV01", ""), ("srv01.corp.local", "-"), ("", "::ffff:127.0.0.1")] {
             assert_eq!(key("SRV01.corp.local", sc, si, "ana"), None, "{:?} {:?}", sc, si);
         }
         // RDP as Windows logs it (lab, DEV-SRV01): the workstation is the
         // server itself and the address is the client's
-        assert_eq!(key("DEV-SRV01.dev.leoncorp.test", "DEV-SRV01", "10.10.0.37", "ryan.devlead"), k("10.10.0.37", "DEV-SRV01", "RYAN_DEVLEAD"));
+        assert_eq!(key("DEV-SRV01.dev.example.test", "DEV-SRV01", "10.10.0.37", "ryan.devlead"), k("10.10.0.37", "DEV-SRV01", "RYAN_DEVLEAD@CORP"));
         // accounts of another alphabet stay themselves
         let a = key("SRV01", "WS07", "", "\u{43c}\u{430}\u{440}\u{438}\u{44f}").unwrap().2;
         let b = key("SRV01", "WS07", "", "\u{438}\u{432}\u{430}\u{43d}\u{430}").unwrap().2;
         assert!(a != b && !a.contains('_'), "{} {}", a, b);
-        assert_eq!(key("SRV01", "WS07", "", "jos\u{e9}").unwrap().2, "JOS\u{c9}");
+        assert_eq!(key("SRV01", "WS07", "", "jos\u{e9}").unwrap().2, "JOS\u{c9}@CORP");
     }
 
     /// A logon ID that comes back on a destination (RDP session ids, a

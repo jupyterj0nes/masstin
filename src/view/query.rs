@@ -138,7 +138,7 @@ impl Filter {
         if self.min_score > 0 && !(e.score >= self.min_score as f32) {
             return false;
         }
-        if !c.users.is_empty() && !Pattern::any(&c.users, s.users.name(e.user)) {
+        if !c.users.is_empty() && !Pattern::any_account(&c.users, s.users.name(e.user)) {
             return false;
         }
         if !c.logon_types.is_empty() && !Pattern::any(&c.logon_types, s.logon_types.name(e.logon_type)) {
@@ -476,7 +476,7 @@ mod tests {
         // one connection of the administrator with its three logins, shown as first written
         assert_eq!(g.edges.len(), 2);
         let admin = g.edges.iter().find(|e| e.count == 3).expect("the three logins in one connection");
-        assert_eq!(s.users.name(admin.user.unwrap()), "Administrator");
+        assert_eq!(s.users.name(admin.user.unwrap()), "Administrator@CORP");
         let _ = std::fs::remove_file(&path);
     }
 

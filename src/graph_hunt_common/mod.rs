@@ -18,6 +18,7 @@
 
 use chrono::NaiveDateTime;
 
+pub mod account;
 pub mod algos;
 pub mod engine;
 pub mod hostmap;
@@ -262,7 +263,7 @@ pub fn browser_snippet_multi(
         w.push(format!("b.name IN [{}]", list(dests)));
     }
     if let Some(a) = account {
-        w.push(format!("type(r) = '{}'", q(a)));
+        w.push(account::cypher_condition(a, &|s| q(s)));
     }
     let wh = w.join(" AND ");
     if d.apoc {

@@ -56,6 +56,12 @@ fn result_code(event_type: &str) -> u8 {
     }
 }
 
+/// A computer account, by its name: `WS01$`, with its domain or not
+/// (`WS01$@CORP`).
+pub fn is_machine_account(account: &str) -> bool {
+    account.split('@').next().unwrap_or(account).ends_with('$')
+}
+
 #[derive(Default)]
 pub struct Interner {
     map: HashMap<String, u32>,
@@ -218,8 +224,10 @@ impl Store {
             id
         };
         let mut users = Interner::default();
-        // An account is one account however its name is cased: `Administrator`
-        // and `administrator` are the same one, shown as it was first written.
+        // An account is its name and its domain (graph_hunt_common::account):
+        // the Administrator of a domain is not the local one of a machine,
+        // and `Administrator@PARTNER.TEST` is the one of PARTNER. In any
+        // case; shown as first written, `Administrator@PARTNER`.
         let mut user_of: HashMap<String, u32> = HashMap::new();
         let mut logon_types = Interner::default();
         let mut event_ids = Interner::default();
@@ -306,12 +314,12 @@ impl Store {
                     src,
                     dst,
                     user: {
-                        let raw = b[5].trim();
-                        match user_of.get(&raw.to_lowercase()) {
+                        let shown = crate::graph_hunt_common::account::account_shown(&b[5], &b[6], &dest);
+                        match user_of.get(&shown.to_lowercase()) {
                             Some(&u) => u,
                             None => {
-                                let u = users.id(raw);
-                                user_of.insert(raw.to_lowercase(), u);
+                                let u = users.id(&shown);
+                                user_of.insert(shown.to_lowercase(), u);
                                 u
                             }
                         }
@@ -710,6 +718,28 @@ impl Pattern {
             }
         }
         true
+    }
+
+    /// `any` for an account (`name@DOMAIN`): a pattern that names no
+    /// domain is about the name alone, so `adm*`, `!*$` and `=alice` mean
+    /// what they always did; one with an `@` is about the whole.
+    pub fn any_account(pats: &[Pattern], account: &str) -> bool {
+        if pats.is_empty() {
+            return true;
+        }
+        let name = account.split('@').next().unwrap_or(account);
+        let positives = pats.iter().filter(|p| !p.negate).count();
+        let mut hit = positives == 0;
+        for p in pats {
+            let m = p.matches(if p.parts.iter().any(|x| x.contains('@')) { account } else { name });
+            if p.negate && m {
+                return false;
+            }
+            if !p.negate && m {
+                hit = true;
+            }
+        }
+        hit
     }
 
     pub fn any(pats: &[Pattern], s: &str) -> bool {

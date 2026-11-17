@@ -342,8 +342,15 @@ impl Viewer {
                 if c.t.is_some_and(|t| t != e.t) {
                     continue;
                 }
-                if !c.user.is_empty() && !self.store.users.name(e.user).eq_ignore_ascii_case(&c.user) {
-                    continue;
+                // the account asked for, by its name (the row's domain is not asked
+                // about unless the name carries one: `alice@DEV`)
+                if !c.user.is_empty() {
+                    let have = self.store.users.name(e.user);
+                    let asked = crate::graph_hunt_common::account::account_shown(&c.user, "", "");
+                    let same = if asked.contains('@') { have.eq_ignore_ascii_case(&asked) } else { have.split('@').next().unwrap_or(have).eq_ignore_ascii_case(&asked) };
+                    if !same {
+                        continue;
+                    }
                 }
                 if !c.origin.is_empty() && !host_answers(&self.store.aliases[e.src as usize], &c.origin) {
                     continue;
