@@ -369,6 +369,10 @@ pub struct Viewer {
     table_filter_draft: (usize, String),
     /// the cell a right click fell on: (column, its text)
     table_ctx_cell: Option<(usize, String)>,
+    /// Timeline mode: the size of its text, the width of each column and
+    /// the ones hidden, as the analyst left them (kept between sessions)
+    table_look: table::TableLook,
+    table_look_dirty: bool,
     /// the rows of a connection or a host, when the timeline is narrowed
     /// to them (and a counter that changes with it, for the cache)
     table_scope: Option<table::TableScope>,
@@ -874,6 +878,8 @@ impl Viewer {
             table_filters: Vec::new(),
             table_filter_draft: (usize::MAX, String::new()),
             table_ctx_cell: None,
+            table_look: table::TableLook::load(),
+            table_look_dirty: false,
             table_scope: None,
             table_scope_gen: 0,
             table_sel: None,
@@ -4691,6 +4697,21 @@ impl Viewer {
                 self.timeline_of_node(i);
             }
             other if other.starts_with("timeline-find=") => self.table_find = other["timeline-find=".len()..].to_string(),
+            // the look of the timeline: `timeline-font=14`, `timeline-hide=COLUMN`
+            // (again shows it), `timeline-width=COLUMN:PIXELS`
+            other if other.starts_with("timeline-font=") => self.table_look.set_font(other["timeline-font=".len()..].parse().unwrap_or(12.0)),
+            other if other.starts_with("timeline-hide=") => {
+                if let Some(ci) = table::column_named(&other["timeline-hide=".len()..]) {
+                    self.table_look.hidden[ci] = !self.table_look.hidden[ci];
+                }
+            }
+            other if other.starts_with("timeline-width=") => {
+                if let Some((c, w)) = other["timeline-width=".len()..].split_once(':') {
+                    if let (Some(ci), Ok(w)) = (table::column_named(c), w.parse::<f32>()) {
+                        self.table_look.set_width(ci, w);
+                    }
+                }
+            }
             // a filter of the timeline, added to the ones there: `+user:alice`,
             // `-event_type:logoff`, `+10.0.0.5` (any column); `timeline-filter=` clears them
             other if other.starts_with("timeline-filter=") => match table::RowFilter::parse(&other["timeline-filter=".len()..]) {

@@ -19,6 +19,100 @@ fn raw_columns() -> Vec<&'static str> {
     crate::csv_out::HEADER.split(',').collect()
 }
 
+/// A column of the file by its name, in any case.
+pub(super) fn column_named(name: &str) -> Option<usize> {
+    raw_columns().iter().position(|c| c.eq_ignore_ascii_case(name.trim()))
+}
+
+/// How the analyst left the timeline: the size of its text, the width of
+/// each column, the columns hidden. The analyst's, not the case's: kept in
+/// the viewer's own settings, for every timeline.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(super) struct TableLook {
+    pub font: f32,
+    pub widths: [f32; 19],
+    pub hidden: [bool; 19],
+}
+
+impl Default for TableLook {
+    fn default() -> Self {
+        TableLook { font: 12.0, widths: RAW_WIDTHS, hidden: [false; 19] }
+    }
+}
+
+impl TableLook {
+    pub const FONT: (f32, f32) = (8.0, 24.0);
+    pub const WIDTH: (f32, f32) = (36.0, 1200.0);
+
+    fn path() -> Option<std::path::PathBuf> {
+        super::ingest::config_file("timeline.json")
+    }
+
+    pub fn load() -> TableLook {
+        let mut l: TableLook = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        l.font = l.font.clamp(Self::FONT.0, Self::FONT.1);
+        for w in l.widths.iter_mut() {
+            *w = w.clamp(Self::WIDTH.0, Self::WIDTH.1);
+        }
+        // a timeline with every column hidden shows nothing to bring one back from
+        if l.hidden.iter().all(|h| *h) {
+            l.hidden = [false; 19];
+        }
+        l
+    }
+
+    pub fn save(&self) {
+        if let Some(p) = Self::path() {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(s) = serde_json::to_string_pretty(self) {
+                let _ = std::fs::write(p, s);
+            }
+        }
+    }
+
+    pub fn set_font(&mut self, size: f32) {
+        self.font = (size * 2.0).round() / 2.0;
+        self.font = self.font.clamp(Self::FONT.0, Self::FONT.1);
+    }
+
+    pub fn set_width(&mut self, col: usize, width: f32) {
+        if let Some(w) = self.widths.get_mut(col) {
+            *w = width.clamp(Self::WIDTH.0, Self::WIDTH.1);
+        }
+    }
+
+    /// The height of a row at this size of text.
+    pub fn row_height(&self) -> f32 {
+        (self.font + 8.0).round()
+    }
+
+    /// The columns shown, in the file's order.
+    pub fn shown(&self) -> Vec<usize> {
+        (0..19).filter(|c| !self.hidden[*c]).collect()
+    }
+
+    /// The column at a horizontal position, `x` measured from where the
+    /// first column starts (each column is its width and the gap after it).
+    pub fn column_at(&self, x: f32) -> Option<usize> {
+        let mut left = 0.0;
+        for c in self.shown() {
+            let right = left + self.widths[c] + COL_GAP;
+            if x >= left && x < right {
+                return Some(c);
+            }
+            left = right;
+        }
+        None
+    }
+}
+
+/// The gap between two columns: in the header it is the handle that
+/// drags the width of the column before it.
+const COL_GAP: f32 = 8.0;
+
 /// One filter of the timeline: the rows whose column (or any column) holds
 /// the text, or the ones that do not. Any case; an empty text is "the
 /// column is empty". Filters add up: a row is shown when it passes all.
@@ -532,6 +626,41 @@ impl Viewer {
                     if ui.add(egui::Button::new(egui::RichText::new(ic::FOLDER_OPEN).size(14.0)).min_size(Vec2::new(30.0, 26.0))).on_hover_text("Show the timeline's file in its folder").clicked() {
                         reveal = true;
                     }
+                    // the columns shown, and their widths as they came
+                    let n_hidden = self.table_look.hidden.iter().filter(|h| **h).count();
+                    ui.menu_button(if n_hidden > 0 { format!("{}  Columns ({} hidden)", ic::TABLE, n_hidden) } else { format!("{}  Columns", ic::TABLE) }, |ui| {
+                        ui.set_min_width(230.0);
+                        ui.label(egui::RichText::new("The columns of the file to show. Nothing changes in the file").color(theme::MUTED).small());
+                        for (ci, name) in raw_columns().iter().enumerate() {
+                            let mut on = !self.table_look.hidden[ci];
+                            if ui.checkbox(&mut on, *name).changed() {
+                                // the last one shown stays
+                                if on || self.table_look.hidden.iter().filter(|h| !**h).count() > 1 {
+                                    self.table_look.hidden[ci] = !on;
+                                    self.table_look_dirty = true;
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Show every column").clicked() {
+                            self.table_look.hidden = [false; 19];
+                            self.table_look_dirty = true;
+                        }
+                        if ui.button("Widths as they came").clicked() {
+                            self.table_look.widths = RAW_WIDTHS;
+                            self.table_look_dirty = true;
+                        }
+                    });
+                    // the size of the text
+                    if ui.add(egui::Button::new("A+").min_size(Vec2::new(30.0, 26.0))).on_hover_text("Larger text").clicked() {
+                        self.table_look.set_font(self.table_look.font + 1.0);
+                        self.table_look_dirty = true;
+                    }
+                    ui.label(egui::RichText::new(format!("{} pt", self.table_look.font)).color(theme::MUTED).size(12.0)).on_hover_text("The size of the timeline's text");
+                    if ui.add(egui::Button::new("A-").min_size(Vec2::new(30.0, 26.0))).on_hover_text("Smaller text").clicked() {
+                        self.table_look.set_font(self.table_look.font - 1.0);
+                        self.table_look_dirty = true;
+                    }
                     ui.menu_button(format!("{}  Open in…", ic::APP_WINDOW), |ui| {
                         ui.set_min_width(300.0);
                         if narrowed {
@@ -589,6 +718,11 @@ impl Viewer {
         }
         theme::hairline(ui);
         let (act, from_rows) = self.timeline_rows(ui);
+        // the look is kept once it is settled (not at every step of a drag)
+        if self.table_look_dirty && !ui.input(|i| i.pointer.any_down()) {
+            self.table_look.save();
+            self.table_look_dirty = false;
+        }
         if from_rows.is_some() {
             new_filter = from_rows;
         }
@@ -701,9 +835,13 @@ impl Viewer {
     /// scroll into view. The margin on the left is the row's line in its
     /// file (1 is the header), the number an editor shows.
     fn timeline_rows(&mut self, ui: &mut egui::Ui) -> (Option<RowAct>, Option<RowFilter>) {
-        let row_h = 20.0;
+        let look = self.table_look.clone();
+        let row_h = look.row_height();
         let cols = raw_columns();
-        let width: f32 = GUTTER + 8.0 + RAW_WIDTHS.iter().map(|w| w + 8.0).sum::<f32>();
+        let shown = look.shown();
+        let width: f32 = GUTTER + COL_GAP + shown.iter().map(|c| look.widths[*c] + COL_GAP).sum::<f32>();
+        let mut resize: Option<(usize, f32)> = None;
+        let mut hide: Option<usize> = None;
         let rows: Vec<(u16, u32)> = self.table_raw_rows().to_vec();
         if self.table_raw_cache.len() > 4000 {
             self.table_raw_cache.clear();
@@ -714,34 +852,61 @@ impl Viewer {
         egui::ScrollArea::both().id_salt("table-raw").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_min_width(width);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new("line").size(10.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
-                // a column's name opens its filter: what it must hold, or must not
-                for (ci, (name, w)) in cols.iter().zip(RAW_WIDTHS.iter()).enumerate() {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new("line").size(look.font - 1.5).color(theme::DIM))).on_hover_text("The row's line in its file (1 is the header). It is not a column of the timeline");
+                ui.add_space(COL_GAP);
+                // A column's name: a right click (or a click) opens what can be
+                // done with the column: filter by a text it contains or does
+                // not, hide it. The gap after it drags its width.
+                for &ci in &shown {
+                    let (name, w) = (cols[ci], look.widths[ci]);
                     let on = self.table_filters.iter().any(|f| f.col == Some(ci));
-                    let head = egui::Button::new(egui::RichText::new(*name).size(10.5).monospace().color(if on { theme::ACCENT } else { theme::MUTED })).frame(false).min_size(Vec2::new(*w, row_h));
-                    let resp = ui.add(head).on_hover_text("Click: filter by this column (contains, or does not)");
-                    egui::Popup::menu(&resp).show(|ui| {
-                        ui.set_min_width(250.0);
+                    let head = egui::Button::new(egui::RichText::new(name).size(look.font - 1.5).monospace().color(if on { theme::ACCENT } else { theme::MUTED })).frame(false).truncate().min_size(Vec2::new(w, row_h));
+                    let resp = ui.add_sized([w, row_h], head).on_hover_text(format!("{}: right click (or click) to filter by a text it contains or does not, or to hide the column. Drag its right edge for its width", name));
+                    let mut menu = |ui: &mut egui::Ui| {
+                        ui.set_min_width(260.0);
                         if self.table_filter_draft.0 != ci {
                             self.table_filter_draft = (ci, String::new());
                         }
-                        ui.label(egui::RichText::new(format!("{} contains…", name)).color(theme::MUTED).small());
-                        let edit = ui.add(egui::TextEdit::singleline(&mut self.table_filter_draft.1).desired_width(230.0).hint_text("text (empty: the column is empty)"));
+                        ui.label(theme::semibold(name, 12.5).color(TEXT));
+                        ui.label(egui::RichText::new("the rows whose column…").color(theme::MUTED).small());
+                        let edit = ui.add(egui::TextEdit::singleline(&mut self.table_filter_draft.1).desired_width(240.0).hint_text("text, in any case (empty: the column is empty)"));
                         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new("+ keep only").color(theme::ACCENT)).on_hover_text("Only the rows whose column holds the text (Enter does this)").clicked() || enter {
+                            if ui.button(egui::RichText::new("+ contains").color(theme::ACCENT)).on_hover_text("Include: only the rows whose column contains the text (Enter does this). It adds to the filters there").clicked() || enter {
                                 filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, false));
                                 self.table_filter_draft.1.clear();
                                 ui.close();
                             }
-                            if ui.button(egui::RichText::new("− exclude").color(EDGE_FAIL)).on_hover_text("Leave out the rows whose column holds the text").clicked() {
+                            if ui.button(egui::RichText::new("− does not contain").color(EDGE_FAIL)).on_hover_text("Exclude: leave out the rows whose column contains the text. It adds to the filters there").clicked() {
                                 filter = Some(RowFilter::new(Some(ci), &self.table_filter_draft.1, true));
                                 self.table_filter_draft.1.clear();
                                 ui.close();
                             }
                         });
-                    });
+                        ui.separator();
+                        if icon_button(ui, ic::EYE_SLASH, "Hide this column").on_hover_text("Columns, on the bar above, brings it back").clicked() {
+                            hide = Some(ci);
+                            ui.close();
+                        }
+                        if icon_button(ui, ic::CORNERS_OUT, "Its width as it came").clicked() {
+                            resize = Some((ci, RAW_WIDTHS[ci]));
+                            ui.close();
+                        }
+                    };
+                    // one menu, opened by either button of the mouse
+                    let open = (resp.clicked() || resp.secondary_clicked()).then_some(egui::SetOpenCommand::Toggle);
+                    egui::Popup::menu(&resp).open_memory(open).show(&mut menu);
+                    // the handle of its width
+                    let (grip, grip_resp) = ui.allocate_exact_size(Vec2::new(COL_GAP, row_h), Sense::drag());
+                    let hot = grip_resp.hovered() || grip_resp.dragged();
+                    if hot {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    ui.painter().vline(grip.center().x, grip.y_range().shrink(3.0), Stroke::new(if hot { 2.0 } else { 1.0 }, if hot { theme::ACCENT } else { theme::BORDER }));
+                    if grip_resp.dragged() {
+                        resize = Some((ci, w + grip_resp.drag_delta().x));
+                    }
                 }
             });
             theme::hairline(ui);
@@ -755,10 +920,11 @@ impl Viewer {
                     }
                     let fields = &self.table_raw_cache[&key];
                     let r = ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.spacing_mut().item_spacing.x = COL_GAP;
                         let num = if several { format!("{}:{}", key.0 + 1, key.1 + 2) } else { (key.1 + 2).to_string() };
-                        ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new(num).size(11.0).monospace().color(theme::DIM)).selectable(false));
-                        for (k, w) in RAW_WIDTHS.iter().enumerate() {
+                        ui.add_sized([GUTTER, row_h], egui::Label::new(egui::RichText::new(num).size(look.font - 1.0).monospace().color(theme::DIM)).selectable(false));
+                        for &k in &shown {
+                            let w = &look.widths[k];
                             let text = fields.get(k).map(|s| s.as_str()).unwrap_or("");
                             let color = match k {
                                 0 | 3 | 4 | 11 => theme::MUTED,
@@ -771,7 +937,7 @@ impl Viewer {
                                 2 if text == "FAILED_LOGON" => EDGE_FAIL,
                                 _ => TEXT,
                             };
-                            ui.add_sized([*w, row_h], egui::Label::new(egui::RichText::new(text).size(12.0).color(color)).truncate().selectable(false));
+                            ui.add_sized([*w, row_h], egui::Label::new(egui::RichText::new(text).size(look.font).color(color)).truncate().selectable(false));
                         }
                     });
                     let rect = r.response.rect.expand2(Vec2::new(4.0, 0.0));
@@ -793,14 +959,7 @@ impl Viewer {
                     }
                     if resp.secondary_clicked() {
                         // the cell under the click: its column by where the pointer is
-                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| {
-                            let mut x = r.response.rect.left() + GUTTER + 8.0;
-                            RAW_WIDTHS.iter().position(|w| {
-                                let inside = p.x >= x && p.x < x + w + 8.0;
-                                x += w + 8.0;
-                                inside
-                            })
-                        }).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
+                        self.table_ctx_cell = resp.interact_pointer_pos().and_then(|p| look.column_at(p.x - (r.response.rect.left() + GUTTER + COL_GAP))).map(|ci| (ci, fields.get(ci).cloned().unwrap_or_default()));
                     }
                     resp.context_menu(|ui| {
                         ui.set_min_width(250.0);
@@ -849,6 +1008,17 @@ impl Viewer {
                 }
             });
         });
+        if let Some((ci, w)) = resize {
+            self.table_look.set_width(ci, w);
+            self.table_look_dirty = true;
+        }
+        if let Some(ci) = hide {
+            // the last column shown stays
+            if self.table_look.hidden.iter().filter(|h| !**h).count() > 1 {
+                self.table_look.hidden[ci] = true;
+                self.table_look_dirty = true;
+            }
+        }
         (act, filter)
     }
 }
@@ -856,6 +1026,42 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The look of the timeline: text size, widths and hidden columns, within
+    /// bounds, and which column a click falls on.
+    #[test]
+    fn the_look_of_the_timeline_stays_usable() {
+        let mut l = TableLook::default();
+        assert_eq!((l.font, l.shown().len(), l.row_height()), (12.0, 19, 20.0));
+        l.set_font(14.3);
+        assert_eq!(l.font, 14.5);
+        l.set_font(100.0);
+        assert_eq!(l.font, TableLook::FONT.1);
+        l.set_font(1.0);
+        assert_eq!(l.font, TableLook::FONT.0);
+        l.set_width(0, 5.0);
+        assert_eq!(l.widths[0], TableLook::WIDTH.0);
+        l.set_width(0, 300.0);
+        l.set_width(99, 300.0);
+        assert_eq!(l.widths[0], 300.0);
+        // a click by where it falls: column 0 is 300 wide and the gap after it
+        assert_eq!(l.column_at(0.0), Some(0));
+        assert_eq!(l.column_at(307.0), Some(0));
+        assert_eq!(l.column_at(308.0), Some(1));
+        assert_eq!(l.column_at(-1.0), None);
+        // hidden columns take no room
+        l.hidden[0] = true;
+        l.hidden[1] = true;
+        assert_eq!(l.shown()[0], 2);
+        assert_eq!(l.column_at(0.0), Some(2));
+        assert_eq!(l.column_at(1.0e6), None);
+        // by its name in the file
+        assert_eq!((column_named("TARGET_USER_NAME"), column_named(" hunt_score "), column_named("line")), (Some(5), Some(15), None));
+        // what was kept reads back; what does not read is the defaults
+        let back: TableLook = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back, l);
+        assert_eq!(serde_json::from_str::<TableLook>("{\"font\": 15.0}").unwrap().widths, RAW_WIDTHS);
+    }
 
     /// Filters of the timeline: contains by default, one way or the other,
     /// by a column or by any, and they add up.
