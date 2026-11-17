@@ -5582,6 +5582,12 @@ impl Viewer {
             "paths-alone" => self.path_in_map = false,
             "paths-reshow" => self.reshow_path(),
             "paths-open" => self.show_paths = true,
+            other if other.starts_with("merge=") => {
+                // merge=FROM>INTO: the analyst's merge of two hosts that are one
+                if let Some((from, into)) = other["merge=".len()..].split_once('>') {
+                    self.merge_hosts(from, into);
+                }
+            }
             "paths-find" => {
                 let t = std::time::Instant::now();
                 self.run_paths();
