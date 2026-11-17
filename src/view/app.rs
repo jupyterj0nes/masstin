@@ -368,6 +368,8 @@ pub struct Viewer {
     table_scope_gen: u64,
     /// the row picked in the timeline (file, row)
     table_sel: Option<(u16, u32)>,
+    /// Timeline mode: the rows picked with Ctrl or Shift, when several are
+    table_multi: std::collections::BTreeSet<(u16, u32)>,
     /// "Open in…" opens the whole file, not a copy of the rows shown
     table_open_whole: bool,
     /// the programs a timeline opens in, found on first use
@@ -460,6 +462,26 @@ struct MarkDialog {
     picked: Vec<bool>,
 }
 
+/// `12,57,2:301`: rows by their line in the file (1 is the header, so the
+/// first row is 2), of the first timeline or, with `N:`, of the N-th.
+pub(crate) fn parse_rows(text: &str) -> Result<Vec<(u16, u32)>, String> {
+    let mut out = Vec::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (file, line) = match part.split_once(':') {
+            Some((f, l)) => (f.trim().parse::<u16>().ok().filter(|f| *f >= 1), l.trim()),
+            None => (Some(1), part),
+        };
+        match (file, line.parse::<u32>().ok().filter(|l| *l >= 2)) {
+            (Some(f), Some(l)) => out.push((f - 1, l - 2)),
+            _ => return Err(format!("--rows {}: `{}` is not a line of a timeline (LINE, or FILE:LINE; the header is line 1, the first row 2)", text, part)),
+        }
+    }
+    if out.is_empty() {
+        return Err("--rows: no line given".to_string());
+    }
+    Ok(out)
+}
+
 /// What the canvas shows instead of the filter's selection: the edges of
 /// a path or a cone, with a word under each host.
 struct Overlay {
@@ -467,6 +489,9 @@ struct Overlay {
     edges: Vec<u32>,
     labels: HashMap<u32, String>,
     hops: HashMap<u32, usize>,
+    /// rows picked one by one (a selection of the timeline): drawn
+    /// ungrouped, one edge per row, all of them, whatever the filter says
+    exact: bool,
 }
 
 /// A recording in progress: one screenshot per frame, streamed to the
@@ -798,6 +823,7 @@ impl Viewer {
             table_scope: None,
             table_scope_gen: 0,
             table_sel: None,
+            table_multi: std::collections::BTreeSet::new(),
             table_open_whole: false,
             viewer_apps: None,
             table_raw_rows: Vec::new(),
@@ -858,6 +884,13 @@ impl Viewer {
             show_last_log: false,
         };
         v.requery(true);
+        // `--rows`: the window opens on exactly those rows
+        if let Some(r) = &opts.rows {
+            match parse_rows(r) {
+                Ok(rows) => v.rows_to_graph_view(&rows),
+                Err(e) => v.status = e,
+            }
+        }
         v
     }
 
@@ -879,6 +912,7 @@ impl Viewer {
             }
         }
         self.graph = match &self.overlay {
+            Some(o) if o.exact => GraphView::from_edges(&self.store, &Filter { grouping: super::query::Grouping::PerEvent, limit: o.edges.len().max(1), ..self.filter.clone() }, o.edges.clone()),
             Some(o) => GraphView::from_edges(&self.store, &self.filter, o.edges.clone()),
             None => GraphView::build(&self.store, &self.filter),
         };
@@ -1311,7 +1345,7 @@ impl Viewer {
     /// Whether anything narrows the view beyond "everything".
     fn filters_active(&self) -> bool {
         let f = &self.filter;
-        f.view != View::All || !f.host.trim().is_empty() || !f.user.trim().is_empty() || !f.logon_type.trim().is_empty() || !f.from.trim().is_empty() || !f.to.trim().is_empty() || f.min_score > 0 || f.hunt.iter().any(|h| !h) || f.results.iter().any(|r| !r) || f.verdict.iter().any(|v| !v) || f.grouping != super::query::Grouping::Fold
+        f.view != View::All || !f.host.trim().is_empty() || !f.user.trim().is_empty() || !f.logon_type.trim().is_empty() || !f.from.trim().is_empty() || !f.to.trim().is_empty() || f.min_score > 0 || f.hunt.iter().any(|h| !h) || f.results.iter().any(|r| !r) || f.verdict.iter().any(|v| !v) || f.grouping != super::query::Grouping::PerAccount
     }
 
     /// A verdict on a connection: written at once when it is one row,
@@ -3576,7 +3610,7 @@ impl Viewer {
     }
 
     fn set_overlay(&mut self, title: String, edges: Vec<u32>, labels: HashMap<u32, String>, hops: HashMap<u32, usize>) {
-        self.overlay = Some(Overlay { title, edges, labels, hops });
+        self.overlay = Some(Overlay { title, edges, labels, hops, exact: false });
         self.requery(true);
         self.arrange_by_hops();
     }
@@ -4505,6 +4539,12 @@ impl Viewer {
                 }
             }
             // on to agentc00pr: the dialog, a new case of that name in that folder, go
+            // exactly these rows in the graph, ungrouped: `rows=12,57` (lines
+            // of the first timeline), `rows=2:12` (of the second)
+            other if other.starts_with("rows=") => match parse_rows(&other["rows=".len()..]) {
+                Ok(rows) => self.rows_to_graph_view(&rows),
+                Err(e) => self.status = e,
+            },
             // hosts and addresses: the table, a level, merge what it allows
             "hosts" => self.open_hosts(),
             other if other.starts_with("hosts-level=") => {
@@ -4871,6 +4911,22 @@ impl Viewer {
         v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         v.truncate(10);
         v
+    }
+}
+
+#[cfg(test)]
+mod rows_option_tests {
+    use super::parse_rows;
+
+    /// `--rows` takes the lines an editor shows: the header is 1.
+    #[test]
+    fn rows_are_given_by_their_line_in_the_file() {
+        assert_eq!(parse_rows("2").unwrap(), vec![(0, 0)]);
+        assert_eq!(parse_rows("12, 57,301").unwrap(), vec![(0, 10), (0, 55), (0, 299)]);
+        assert_eq!(parse_rows("1:12,2:40").unwrap(), vec![(0, 10), (1, 38)]);
+        for bad in ["", "1", "0:5", "x", "3:1", "2:"] {
+            assert!(parse_rows(bad).is_err(), "{bad}");
+        }
     }
 }
 

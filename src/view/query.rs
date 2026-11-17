@@ -22,13 +22,16 @@ pub enum View {
 /// How the rows of a view become drawn edges.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Grouping {
-    /// one edge per origin, destination, account and result; a pair with
-    /// more than `FOLD_ABOVE` accounts between them becomes one edge
+    /// grouped by hosts: one edge per origin, destination and result,
+    /// every account between the two in it
+    PerPair,
+    /// one edge per connection: origin, destination, account and result.
+    /// (`Fold`, the name saved views have from when a pair with more than
+    /// six accounts was drawn as one edge on its own: no pair is, now.)
     #[default]
-    Fold,
-    /// one edge per origin, destination, account and result, never folded
+    #[serde(alias = "Fold")]
     PerAccount,
-    /// one edge per row
+    /// ungrouped: one edge per row
     PerEvent,
 }
 
@@ -73,7 +76,7 @@ impl Default for Filter {
             to: String::new(),
             limit: 600,
             min_score: 0,
-            grouping: Grouping::Fold,
+            grouping: Grouping::PerAccount,
         }
     }
 }
@@ -268,10 +271,6 @@ impl GraphView {
         GraphView { nodes: Vec::new(), edges: Vec::new(), node_of_host: HashMap::new(), events: Vec::new(), edge_of_event: Vec::new(), connections: 0, truncated: false }
     }
 
-    /// Hosts with more than this many accounts between them are drawn as
-    /// one edge.
-    pub const FOLD_ABOVE: usize = 6;
-
     pub fn build(s: &Store, f: &Filter) -> GraphView {
         let selected = f.select(s);
         Self::from_selection(s, f, selected)
@@ -323,7 +322,7 @@ impl GraphView {
         list.sort_by(|a, b| hunt_rank(a.1.hunt).cmp(&hunt_rank(b.1.hunt)).then_with(|| b.1.count.cmp(&a.1.count)).then_with(|| a.1.first.cmp(&b.1.first)).then_with(|| a.0.cmp(&b.0)));
         let truncated = list.len() > f.limit;
         list.truncate(f.limit);
-        // fold the accounts of a busy pair
+        // grouped by hosts: the accounts of every pair in one edge
         let mut by_pair: HashMap<(u32, u32, u8), Vec<usize>> = HashMap::new();
         for (i, ((src, dst, _, result), _)) in list.iter().enumerate() {
             by_pair.entry((*src, *dst, *result)).or_default().push(i);
@@ -333,7 +332,7 @@ impl GraphView {
         let mut pairs: Vec<((u32, u32, u8), Vec<usize>)> = by_pair.into_iter().collect();
         pairs.sort_by_key(|(k, _)| *k);
         for ((src, dst, result), idx) in pairs {
-            if idx.len() <= Self::FOLD_ABOVE || f.grouping != Grouping::Fold {
+            if idx.len() < 2 || f.grouping != Grouping::PerPair {
                 continue;
             }
             let mut g = GEdge { src, dst, user: None, users: Vec::new(), result, count: 0, first: i64::MAX, last: i64::MIN, hunt: 0, score: f32::NAN, why: 0, verdicts: [0; 4], logon_types: Vec::new(), event_ids: Vec::new(), src_is_ip: false, rows: Vec::new(), first_event: usize::MAX };
@@ -459,9 +458,15 @@ mod tests {
     #[test]
     fn findings_neighbourhood_and_folding() {
         let (s, path) = store();
-        let f = Filter::default();
+        // by connection, as the window opens: the spray is its eight accounts, however many
+        let g = GraphView::build(&s, &Filter::default());
+        assert_eq!(g.edges.len(), 10);
+        assert!(g.edges.iter().all(|e| e.user.is_some()));
+        // a view saved when a busy pair folded by itself reads as by connection
+        assert_eq!(serde_json::from_str::<Grouping>("\"Fold\"").unwrap(), Grouping::PerAccount);
+        let f = Filter { grouping: Grouping::PerPair, ..Filter::default() };
         let g = GraphView::build(&s, &f);
-        // findings: the significant login, the candidate failure, the spray folded into one edge
+        // grouped by hosts: the significant login, the candidate failure, the spray in one edge
         assert_eq!(g.edges.len(), 3, "{:?}", g.edges.iter().map(|e| (e.src, e.dst, e.users.len())).collect::<Vec<_>>());
         let folded = g.edges.iter().find(|e| e.user.is_none()).expect("a folded edge");
         assert_eq!(folded.users.len(), 8);

@@ -500,8 +500,8 @@ impl Viewer {
             let on: Vec<&str> = VERDICT_NAMES.iter().enumerate().filter(|(i, _)| f.verdict[*i]).map(|(_, n)| if n.is_empty() { "unmarked" } else { *n }).collect();
             chips.push((format!("verdict: {}", on.join(", ")), CONFIRMED, Box::new(|d: &mut Filter| d.verdict = [true; 4])));
         }
-        if f.grouping != Grouping::Fold {
-            chips.push((match f.grouping { Grouping::PerAccount => "one edge per account", _ => "one edge per event" }.to_string(), Color32::from_rgb(160, 170, 190), Box::new(|d: &mut Filter| d.grouping = Grouping::Fold)));
+        if f.grouping != Grouping::PerAccount {
+            chips.push((match f.grouping { Grouping::PerPair => "grouped by hosts", _ => "ungrouped: one edge per event" }.to_string(), Color32::from_rgb(160, 170, 190), Box::new(|d: &mut Filter| d.grouping = Grouping::PerAccount)));
         }
         if chips.is_empty() {
             return false;
@@ -658,9 +658,9 @@ impl Viewer {
 
             section(ui, "Grouping");
             for (g, label, tip) in [
-                (Grouping::Fold, "Group accounts", "one edge per origin, destination, account and result; a pair with more than six accounts becomes one edge"),
-                (Grouping::PerAccount, "One edge per account", "never fold a busy pair: every account is its own curve"),
-                (Grouping::PerEvent, "One edge per event", "every row is its own curve, with its time; for a tight window"),
+                (Grouping::PerPair, "Grouped by hosts", "one edge per origin, destination and result: every account between two hosts in it. Its rows are all the events of all of them"),
+                (Grouping::PerAccount, "By connection", "one edge per origin, destination, account and result: the connection the hunt judges. Every pair alike, however many accounts it has"),
+                (Grouping::PerEvent, "Ungrouped", "one edge per event: every row is its own curve, with its time; for a tight window or a selection"),
             ] {
                 if ui.add(egui::RadioButton::new(self.draft.grouping == g, label)).on_hover_text(tip).clicked() {
                     self.draft.grouping = g;

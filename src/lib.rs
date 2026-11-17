@@ -399,6 +399,19 @@ pub struct Cli {
     #[arg(long)]
     focus: Option<String>,
 
+    /// For `view`: open on exactly these rows of the timeline, as a graph
+    /// of their own: one edge per row (ungrouped) and only the hosts they
+    /// name, whatever the filters would show. Rows are given by their
+    /// line in the file, as an editor and the Timeline mode number them
+    /// (the header is line 1, the first row 2), comma separated: `--rows
+    /// 12,57,301`. With several timelines, `N:LINE` is a line of the N-th
+    /// `-f` (`--rows 1:12,2:40`). A row that names no origin other than
+    /// its destination has no edge and is said. Back to the view (right
+    /// click on the background) leaves the selection. It is how another
+    /// program hands a selection of rows to masstin's graph.
+    #[arg(long, value_name = "LINE,LINE")]
+    rows: Option<String>,
+
     /// For `view`: what draws the window, `glow` (OpenGL, a GPU) or
     /// `software` (masstin's own CPU rasteriser). Left out, it is picked by
     /// itself: software over a remote desktop or without a GPU driver on
@@ -793,6 +806,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                     files: config.file.clone(),
                     alpha: config.alpha,
                     focus: config.focus.clone(),
+                    rows: config.rows.clone(),
                     start: config.start_time.clone(),
                     end: config.end_time.clone(),
                     renderer: config.renderer.clone(),

@@ -46,6 +46,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--merge-hosts-skip ADDRESS,ADDRESS` | With `--merge-hosts`: addresses to leave as they are whatever the evidence says |
 | `--carry-marks FILE.csv` | `merge` / `graph-hunt-csv`: copy `verdict` and `notes` from an earlier timeline onto the rows with the same 14 event columns |
 | `--focus HOST` | `view`: open on the neighbourhood of this host (name or IP, `*` wildcards) instead of the hunt's findings; `--start-time` / `--end-time` bound the window |
+| `--rows LINE,LINE` | `view`: open on exactly these rows as a graph of their own, one edge per row (ungrouped) and only the hosts they name. Rows by their line in the file (the header is line 1, the first row 2); `N:LINE` is a line of the N-th `-f`. How another program hands a selection of rows to masstin's graph |
 | `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account`; the report opens with the reconstructed chain. Requires `--report` |
 | `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
 | `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |

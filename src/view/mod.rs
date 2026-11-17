@@ -28,6 +28,8 @@ pub struct Options {
     pub alpha: f64,
     /// open on this host's neighbourhood instead of the findings
     pub focus: Option<String>,
+    /// open on exactly these rows, ungrouped (`--rows`)
+    pub rows: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
     /// `glow` (OpenGL) or `software` (the CPU); None: picked by itself, unless

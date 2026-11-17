@@ -27,6 +27,12 @@ pub(super) struct TableScope {
 
 enum RowAct {
     Select((u16, u32)),
+    /// Ctrl + click: one more row, or one fewer
+    Toggle((u16, u32)),
+    /// Shift + click: every row from the one picked to this one
+    Range((u16, u32)),
+    /// exactly the rows picked (or this one), in the graph
+    Exact((u16, u32)),
     Graph((u16, u32)),
     Copy((u16, u32)),
     Connection((u16, u32)),
@@ -150,6 +156,7 @@ impl Viewer {
         self.table_scope_gen += 1;
         self.table_find.clear();
         self.table_sel = None;
+        self.table_multi.clear();
         self.show_table = true;
     }
 
@@ -200,6 +207,28 @@ impl Viewer {
             self.tab = Tab::Selection;
             self.load_rows(k);
         }
+    }
+
+    /// Exactly these rows in the graph: one edge per row (ungrouped), the
+    /// hosts they name and nothing else, whatever the filters say. Rows
+    /// without an origin have no edge to draw.
+    pub(super) fn rows_to_graph_view(&mut self, rows: &[(u16, u32)]) {
+        let mut edges: Vec<u32> = rows.iter().filter_map(|r| self.store.edge_at(r.0, r.1)).map(|e| e as u32).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        let asked = rows.len();
+        if edges.is_empty() {
+            self.status = format!("Of the {} row(s) selected none names an origin other than its destination: the graph has nothing to draw of them", asked);
+            return;
+        }
+        let n = edges.len();
+        self.overlay = Some(Overlay { title: format!("{} row(s) selected in the timeline", n), edges, labels: HashMap::new(), hops: HashMap::new(), exact: true });
+        self.selected = None;
+        self.show_table = false;
+        self.fit_pending = true;
+        self.requery(true);
+        let left = if asked > n { format!(" ({} of the {} selected have no origin and are not drawn)", asked - n, asked) } else { String::new() };
+        self.status = format!("Graph: exactly the {} row(s) selected, one edge per row{}. Right-click the background › Back to the view returns", n, left);
     }
 
     /// From a row to its connection in the graph. A connection the graph
@@ -378,9 +407,38 @@ impl Viewer {
             self.table_scope = None;
             self.table_scope_gen += 1;
             self.table_sel = None;
+            self.table_multi.clear();
         }
         match act {
-            Some(RowAct::Select(row)) => self.pick_row(row),
+            Some(RowAct::Select(row)) => {
+                self.table_multi.clear();
+                self.pick_row(row)
+            }
+            Some(RowAct::Toggle(row)) => {
+                // the row picked before is the first of the selection
+                if self.table_multi.is_empty() {
+                    if let Some(prev) = self.table_sel {
+                        self.table_multi.insert(prev);
+                    }
+                }
+                if !self.table_multi.remove(&row) {
+                    self.table_multi.insert(row);
+                }
+                self.table_sel = Some(row);
+                self.status = format!("Timeline: {} row(s) selected (right-click: show exactly them in the graph)", self.table_multi.len());
+            }
+            Some(RowAct::Range(row)) => {
+                let shown: Vec<(u16, u32)> = self.table_raw_rows().to_vec();
+                let anchor = self.table_sel.unwrap_or(row);
+                if let (Some(a), Some(b)) = (shown.iter().position(|r| *r == anchor), shown.iter().position(|r| *r == row)) {
+                    self.table_multi.extend(shown[a.min(b)..=a.max(b)].iter().copied());
+                }
+                self.status = format!("Timeline: {} row(s) selected (right-click: show exactly them in the graph)", self.table_multi.len());
+            }
+            Some(RowAct::Exact(row)) => {
+                let rows: Vec<(u16, u32)> = if self.table_multi.contains(&row) { self.table_multi.iter().copied().collect() } else { vec![row] };
+                self.rows_to_graph_view(&rows);
+            }
             Some(RowAct::Graph(row)) => self.row_to_graph(row),
             Some(RowAct::Copy(row)) => match self.store.raw_texts(row.0, &[row.1]) {
                 Ok(t) => {
@@ -484,7 +542,7 @@ impl Viewer {
                     });
                     let rect = r.response.rect.expand2(Vec2::new(4.0, 0.0));
                     let resp = ui.interact(rect, ui.scope_id().with(("timeline-row", key.0, key.1)), Sense::click());
-                    let picked = self.table_sel == Some(key);
+                    let picked = self.table_sel == Some(key) || self.table_multi.contains(&key);
                     if picked {
                         ui.painter().rect_filled(rect, CornerRadius::ZERO, Color32::from_rgba_unmultiplied(theme::ACCENT.r(), theme::ACCENT.g(), theme::ACCENT.b(), 46));
                     } else if resp.hovered() {
@@ -494,7 +552,11 @@ impl Viewer {
                     }
                     if resp.double_clicked() {
                         act = Some(RowAct::Graph(key));
-                    } else if resp.clicked() || resp.secondary_clicked() {
+                    } else if resp.clicked() {
+                        let mods = ui.input(|i| i.modifiers);
+                        act = Some(if mods.command { RowAct::Toggle(key) } else if mods.shift { RowAct::Range(key) } else { RowAct::Select(key) });
+                    } else if resp.secondary_clicked() && !self.table_multi.contains(&key) {
+                        // a right click on a row outside the selection is about that row
                         act = Some(RowAct::Select(key));
                     }
                     resp.context_menu(|ui| {
@@ -503,6 +565,12 @@ impl Viewer {
                         if icon_button(ui, ic::GRAPH, "Show its connection in the graph").on_hover_text("Graph mode, with the connection of this row selected (a double click does the same)").clicked() {
                             ui.close();
                             act = Some(RowAct::Graph(key));
+                        }
+                        let n_sel = if self.table_multi.contains(&key) { self.table_multi.len() } else { 1 };
+                        let label = if n_sel > 1 { format!("Show exactly these {} rows in the graph", n_sel) } else { "Show exactly this row in the graph".to_string() };
+                        if icon_button(ui, ic::CROSSHAIR, &label).on_hover_text("A graph of the selection alone: one edge per row, ungrouped, and only the hosts they name. Ctrl + click and Shift + click pick several rows").clicked() {
+                            ui.close();
+                            act = Some(RowAct::Exact(key));
                         }
                         if icon_button(ui, ic::FUNNEL, "Only the rows of its connection").clicked() {
                             ui.close();
