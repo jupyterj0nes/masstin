@@ -462,6 +462,50 @@ struct MarkDialog {
     picked: Vec<bool>,
 }
 
+/// One `--event`: what an event must be to answer to it. An empty field is
+/// not asked about.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct EventCond {
+    /// unix seconds, UTC
+    pub t: Option<i64>,
+    /// the digits after the second, when the time was given with them
+    pub fraction: String,
+    pub user: String,
+    pub origin: String,
+    pub destination: String,
+}
+
+/// `TIME,USER,ORIGIN,DESTINATION`.
+pub(crate) fn parse_event(text: &str) -> Result<EventCond, String> {
+    let p: Vec<&str> = text.split(',').map(str::trim).collect();
+    if p.len() != 4 {
+        return Err(format!("--event {}: four fields, TIME,USER,ORIGIN,DESTINATION (an empty one is not asked about)", text));
+    }
+    let mut c = EventCond { user: p[1].to_uppercase(), origin: p[2].to_uppercase(), destination: p[3].to_uppercase(), ..EventCond::default() };
+    if !p[0].is_empty() {
+        let t = crate::graph_hunt_common::parse_ts(p[0]).ok_or_else(|| format!("--event {}: `{}` is not a time (YYYY-MM-DD HH:MM:SS, UTC)", text, p[0]))?;
+        c.t = Some(t.and_utc().timestamp());
+        if let Some(rest) = p[0].get(19..).and_then(|r| r.strip_prefix('.')) {
+            c.fraction = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().trim_end_matches('0').to_string();
+        }
+    }
+    if c.t.is_none() && c.user.is_empty() && c.origin.is_empty() && c.destination.is_empty() {
+        return Err(format!("--event {}: every field is empty", text));
+    }
+    Ok(c)
+}
+
+/// Whether a host answers to a name given: its own name or one merged
+/// into it, in any case, short or fully qualified.
+pub(crate) fn host_answers(names: &[String], asked: &str) -> bool {
+    let short = |s: &str| -> String { if s.parse::<std::net::IpAddr>().is_ok() { s.to_string() } else { s.split('.').next().unwrap_or(s).to_string() } };
+    let asked_short = short(asked);
+    names.iter().any(|n| {
+        let n = n.to_uppercase();
+        n == asked || short(&n) == asked_short
+    })
+}
+
 /// `12,57,2:301`: rows by their line in the file (1 is the header, so the
 /// first row is 2), of the first timeline or, with `N:`, of the N-th.
 pub(crate) fn parse_rows(text: &str) -> Result<Vec<(u16, u32)>, String> {
@@ -890,6 +934,10 @@ impl Viewer {
                 Ok(rows) => v.rows_to_graph_view(&rows),
                 Err(e) => v.status = e,
             }
+        }
+        // `--event`: the window opens on exactly the events named
+        if !opts.events.is_empty() {
+            v.events_to_graph_view(&opts.events);
         }
         v
     }
@@ -4539,6 +4587,11 @@ impl Viewer {
                 }
             }
             // on to agentc00pr: the dialog, a new case of that name in that folder, go
+            // exactly the events named, as `--event`; several with `;` between
+            other if other.starts_with("events=") => {
+                let conds: Vec<String> = other["events=".len()..].split(';').map(|c| c.replace('|', ",")).collect();
+                self.events_to_graph_view(&conds);
+            }
             // exactly these rows in the graph, ungrouped: `rows=12,57` (lines
             // of the first timeline), `rows=2:12` (of the second)
             other if other.starts_with("rows=") => match parse_rows(&other["rows=".len()..]) {
@@ -4916,7 +4969,30 @@ impl Viewer {
 
 #[cfg(test)]
 mod rows_option_tests {
-    use super::parse_rows;
+    use super::{host_answers, parse_event, parse_rows};
+
+    #[test]
+    fn an_event_is_named_by_what_it_is() {
+        let c = parse_event("2026-11-03 11:12:56, alice ,ws01,SRV01.corp.test").unwrap();
+        assert_eq!((c.t, c.fraction.as_str(), c.user.as_str(), c.origin.as_str(), c.destination.as_str()), (Some(1_793_704_376), "", "ALICE", "WS01", "SRV01.CORP.TEST"));
+        // the fraction, as an event log or a case tool writes it
+        assert_eq!(parse_event("2026-11-03T11:12:56.143498Z,,,").unwrap().fraction, "143498");
+        assert_eq!(parse_event("2026-11-03 11:12:56.500000,,,").unwrap().fraction, "5");
+        // an empty field is not asked about; all of them empty asks nothing
+        let c = parse_event(",alice,,SRV01").unwrap();
+        assert_eq!((c.t, c.origin.as_str()), (None, ""));
+        for bad in ["", ",,,", "alice,SRV01", "yesterday,alice,WS01,SRV01", "a,b,c,d,e"] {
+            assert!(parse_event(bad).is_err(), "{bad}");
+        }
+        // a host answers by its name or one merged into it, short or qualified, and an address whole
+        let names = vec!["DEV-DC01".to_string(), "10.10.0.37".to_string(), "dev-dc01.dev.corp.test".to_string()];
+        for asked in ["DEV-DC01", "DEV-DC01.DEV.CORP.TEST", "DEV-DC01.OTHER", "10.10.0.37"] {
+            assert!(host_answers(&names, asked), "{asked}");
+        }
+        for asked in ["DEV-DC02", "10.10.0.3", "10"] {
+            assert!(!host_answers(&names, asked), "{asked}");
+        }
+    }
 
     /// `--rows` takes the lines an editor shows: the header is 1.
     #[test]

@@ -228,7 +228,67 @@ impl Viewer {
         self.fit_pending = true;
         self.requery(true);
         let left = if asked > n { format!(" ({} of the {} selected have no origin and are not drawn)", asked - n, asked) } else { String::new() };
-        self.status = format!("Graph: exactly the {} row(s) selected, one edge per row{}. Right-click the background › Back to the view returns", n, left);
+        self.status = format!("Graph: exactly the {} row(s) selected, one edge per row{}", n, left);
+    }
+
+    /// Exactly the events these conditions name (`--event`), in the graph:
+    /// the events of any of them, one edge each.
+    pub(super) fn events_to_graph_view(&mut self, conds: &[String]) {
+        let mut parsed: Vec<EventCond> = Vec::new();
+        for c in conds {
+            match parse_event(c) {
+                Ok(p) => parsed.push(p),
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            }
+        }
+        let mut hit = vec![0usize; parsed.len()];
+        let mut edges: Vec<u32> = Vec::new();
+        for (ei, e) in self.store.edges.iter().enumerate() {
+            let mut any = false;
+            for (k, c) in parsed.iter().enumerate() {
+                if c.t.is_some_and(|t| t != e.t) {
+                    continue;
+                }
+                if !c.user.is_empty() && !self.store.users.name(e.user).eq_ignore_ascii_case(&c.user) {
+                    continue;
+                }
+                if !c.origin.is_empty() && !host_answers(&self.store.aliases[e.src as usize], &c.origin) {
+                    continue;
+                }
+                if !c.destination.is_empty() && !host_answers(&self.store.aliases[e.dst as usize], &c.destination) {
+                    continue;
+                }
+                // the instant itself, when it was given: read off the row
+                if !c.fraction.is_empty() {
+                    let raw = self.store.raw_row(e.file, e.line).ok().and_then(|r| r.into_iter().next()).unwrap_or_default();
+                    let got: String = raw.get(19..).and_then(|r| r.strip_prefix('.')).map(|r| r.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>()).unwrap_or_default();
+                    if got.trim_end_matches('0') != c.fraction {
+                        continue;
+                    }
+                }
+                hit[k] += 1;
+                any = true;
+            }
+            if any {
+                edges.push(ei as u32);
+            }
+        }
+        let unanswered = hit.iter().filter(|h| **h == 0).count();
+        if edges.is_empty() {
+            self.status = format!("None of the {} event(s) asked for is in the graph of this timeline: no row with an origin answers (the time is UTC; an event from a host to itself has no edge)", parsed.len());
+            return;
+        }
+        let n = edges.len();
+        self.overlay = Some(Overlay { title: format!("{} event(s) asked for", n), edges, labels: HashMap::new(), hops: HashMap::new(), exact: true });
+        self.selected = None;
+        self.show_table = false;
+        self.fit_pending = true;
+        self.requery(true);
+        let left = if unanswered > 0 { format!(" ({} of the {} asked for have no event with an origin here)", unanswered, parsed.len()) } else { String::new() };
+        self.status = format!("Graph: exactly the {} event(s) that answer to the {} asked for, one edge per event{}", n, parsed.len(), left);
     }
 
     /// From a row to its connection in the graph. A connection the graph

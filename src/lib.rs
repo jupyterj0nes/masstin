@@ -412,6 +412,31 @@ pub struct Cli {
     #[arg(long, value_name = "LINE,LINE")]
     rows: Option<String>,
 
+    /// For `view`: open on exactly the events that answer to this, as a
+    /// graph of their own: one edge per event (ungrouped) and only the
+    /// hosts they name, whatever the filters would show. An event is
+    /// named by what it is, not by where it sits in the file:
+    /// `TIME,USER,ORIGIN,DESTINATION`, for example `--event "2026-11-03
+    /// 11:12:56,alice,WS01,SRV01"`. TIME is UTC, to the second or with
+    /// its fraction (`2026-11-03T11:12:56.143498Z` is read too; with a
+    /// fraction only the events of that instant answer); ORIGIN and
+    /// DESTINATION are a host name or an address, in any case, short or
+    /// fully qualified, and an address or a name merged into a host
+    /// answers for it; an empty field is not asked about (`,alice,,SRV01`
+    /// is every login of alice on SRV01). Repeat the option for several:
+    /// the events of any of them are drawn. An event that names no
+    /// origin other than its destination has no edge. It is how a case
+    /// tool hands a selection of rows to masstin's graph without knowing
+    /// the timeline's lines.
+    #[arg(long = "event", value_name = "TIME,USER,ORIGIN,DESTINATION")]
+    event: Vec<String>,
+
+    /// For `view`: a file with one `--event` per line (lines that are
+    /// empty or start with `#` are skipped), for a selection too long for
+    /// a command line.
+    #[arg(long, value_name = "FILE")]
+    events_file: Option<String>,
+
     /// For `view`: what draws the window, `glow` (OpenGL, a GPU) or
     /// `software` (masstin's own CPU rasteriser). Left out, it is picked by
     /// itself: software over a remote desktop or without a GPU driver on
@@ -807,6 +832,14 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                     alpha: config.alpha,
                     focus: config.focus.clone(),
                     rows: config.rows.clone(),
+                    events: {
+                        let mut ev = config.event.clone();
+                        if let Some(f) = &config.events_file {
+                            let text = std::fs::read_to_string(f).map_err(|e| format!("--events-file {}: {}", f, e))?;
+                            ev.extend(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_string));
+                        }
+                        ev
+                    },
                     start: config.start_time.clone(),
                     end: config.end_time.clone(),
                     renderer: config.renderer.clone(),

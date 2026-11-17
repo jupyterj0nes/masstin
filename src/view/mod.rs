@@ -30,6 +30,8 @@ pub struct Options {
     pub focus: Option<String>,
     /// open on exactly these rows, ungrouped (`--rows`)
     pub rows: Option<String>,
+    /// open on exactly the events these name, ungrouped (`--event`)
+    pub events: Vec<String>,
     pub start: Option<String>,
     pub end: Option<String>,
     /// `glow` (OpenGL) or `software` (the CPU); None: picked by itself, unless
