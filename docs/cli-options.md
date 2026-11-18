@@ -52,4 +52,3 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--events-file FILE` | `view`: one `--event` per line, for a long selection |
 | `--seed LIST` | `graph-hunt*`: known-bad hosts, IPs, accounts or `host:account` (an account by its name, `alice`, is every account of that name; `alice@DEV` or `DEV\alice` is the one of that domain); the report opens with the reconstructed chain. Requires `--report` |
 | `--seed-from` / `--seed-to` | `graph-hunt*`: only logins in this UTC range start the seed chain |
-| `--sigma LIST` | `graph-hunt*`: Hayabusa / Chainsaw JSON or JSONL files or directories; a rule that fired during a login session becomes one more measured signal |

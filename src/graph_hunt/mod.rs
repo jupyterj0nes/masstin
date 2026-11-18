@@ -30,7 +30,6 @@ pub(crate) fn settings(
     report: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
-    sigma: Option<&str>,
 ) -> Option<engine::Settings> {
     let cutoff = match parse_cutoff(investigation_from) {
         Some(c) => c,
@@ -83,8 +82,7 @@ pub(crate) fn settings(
     };
     let seed_from = bound(seed_from, "--seed-from")?;
     let seed_to = bound(seed_to, "--seed-to")?;
-    let sigma: Vec<String> = sigma.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
-    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, sigma, host_merges: std::collections::HashMap::new(), host_level: String::new() })
+    Some(engine::Settings { cutoff, alpha, only, skip, end, seeds, seed_from, seed_to, host_merges: std::collections::HashMap::new(), host_level: String::new() })
 }
 
 /// graph-hunt-csv: the same hunt straight from timeline CSVs, no database.
@@ -100,13 +98,12 @@ pub fn graph_hunt_csv(
     seed: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
-    sigma: Option<&str>,
     annotate: bool,
     carry_marks: Option<&str>,
     if_hunted: crate::graph_hunt_common::record::IfHunted,
     merge_hosts: Option<(crate::graph_hunt_common::hostmap::Level, std::collections::HashSet<String>)>,
 ) {
-    let mut settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
+    let mut settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
         Some(s) => s,
         None => {
             crate::mark_failed();
@@ -161,9 +158,8 @@ pub async fn graph_hunt(
     seed: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
-    sigma: Option<&str>,
 ) {
-    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
+    let settings = match settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
         Some(s) => s,
         None => {
             crate::mark_failed();

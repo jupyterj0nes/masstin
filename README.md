@@ -96,7 +96,7 @@ A connection is one origin logging in to one destination with one account on one
 |---|---|
 | The viewer: evidence in, filters, neighbourhoods, paths, marks, presentation, recording, filming | [docs/viewer.md](docs/viewer.md) |
 | `-a parse` and every `parse-*` action, noise filtering, triage detection, carving, merge | [docs/parsing.md](docs/parsing.md) |
-| graph-hunt: options, output columns, report, seeds, Sigma corroboration, detection quality | [docs/graph-hunt.md](docs/graph-hunt.md) |
+| graph-hunt: options, output columns, report, seeds, detection quality | [docs/graph-hunt.md](docs/graph-hunt.md) |
 | The statistics behind the hunt | [docs/graph-hunt-statistics.md](docs/graph-hunt-statistics.md) |
 | The timeline's columns · artifacts and fields | [docs/csv-format.md](docs/csv-format.md) · [ARTIFACTS.md](ARTIFACTS.md) |
 | Custom parsers (YAML rules) | [docs/custom-parsers.md](docs/custom-parsers.md) |

@@ -820,7 +820,7 @@ impl Viewer {
                     row(ui, "Report (optional)", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut f.report).desired_width(380.0).hint_text("a Markdown file"));
                     });
-                    hint(ui, "The graph must have been loaded with one relationship per event (--ungrouped). The full hunt, with seeds, Sigma and detectors, is Hunt › Run the hunt on the timeline itself.");
+                    hint(ui, "The graph must have been loaded with one relationship per event (--ungrouped). The full hunt, with seeds and detectors, is Hunt › Run the hunt on the timeline itself.");
                 }
             }
             ui.add_space(4.0);

@@ -9,8 +9,7 @@
 //!    normal), and where it ends if not with the timeline.
 //! 2. What you know (optional): the hosts, addresses or accounts known to
 //!    be compromised, from which the incident is rebuilt hop by hop
-//!    (`--seed`), and the Sigma hits of Hayabusa or Chainsaw that
-//!    corroborate a connection (`--sigma`).
+//!    (`--seed`).
 //! 3. How strict: the false discovery rate (`--alpha`) and the detectors
 //!    (`--skip-detectors` / `--only-detectors`), each said in words.
 //! 4. Results: the verdicts into the timeline or not (`--no-annotate`, with
@@ -27,7 +26,7 @@ use crate::view::icons as ic;
 use crate::view::theme;
 
 /// The detectors, as `--skip-detectors` names them, with what each looks for.
-pub(super) const DETECTORS: [(&str, &str); 13] = [
+pub(super) const DETECTORS: [(&str, &str); 12] = [
     ("novel-edge", "an account used on a machine it never logged on to before"),
     ("origin-fanout", "an origin reaching machines it never reached before"),
     ("cred-rotation", "an origin using accounts it never used before"),
@@ -40,7 +39,6 @@ pub(super) const DETECTORS: [(&str, &str); 13] = [
     ("credential-switch", "an account owned by other origins, used to reach somewhere new"),
     ("pagerank-spike", "a machine suddenly central in the network (PageRank)"),
     ("betweenness-spike", "a machine suddenly on many paths between others (betweenness)"),
-    ("sigma", "a Sigma hit on a machine while a login session is open on it (needs the Sigma hits)"),
 ];
 
 /// The false discovery rates offered by name.
@@ -59,9 +57,8 @@ pub(super) struct HuntForm {
     pub seeds: String,
     pub seed_from: String,
     pub seed_to: String,
-    pub sigma: String,
     /// one per DETECTORS entry: on runs it
-    pub detectors: [bool; 13],
+    pub detectors: [bool; 12],
     /// write hunt, hunt_score, hunt_why into the timeline(s)
     pub annotate: bool,
     /// what to do with a timeline that already carries a hunt (asked when
@@ -89,8 +86,7 @@ impl Default for HuntForm {
             seeds: String::new(),
             seed_from: String::new(),
             seed_to: String::new(),
-            sigma: String::new(),
-            detectors: [true; 13],
+            detectors: [true; 12],
             annotate: true,
             if_hunted: Default::default(),
             merge_hosts: None,
@@ -180,10 +176,6 @@ impl HuntForm {
                     args.push(v.trim().to_string());
                 }
             }
-        }
-        if !self.sigma.trim().is_empty() {
-            args.push("--sigma".into());
-            args.push(self.sigma.trim().to_string());
         }
         if let Some((flag, v)) = self.detector_arg() {
             args.push(flag.into());
@@ -459,7 +451,7 @@ impl Viewer {
     }
 
     fn hunt_step_known(&mut self, ui: &mut egui::Ui) {
-        hint(ui, "Optional: what the case already knows. Both can stay empty.");
+        hint(ui, "Optional: what the case already knows. It can stay empty.");
         theme::section(ui, "Known compromised");
         ui.add(egui::TextEdit::singleline(&mut self.hunt_form.seeds).desired_width(640.0).hint_text("hosts, IP addresses or accounts, separated by commas: WEB01, 10.0.0.5, svc-backup"));
         hint(ui, "From these the incident is rebuilt: every hop they took in the investigation, in order, with the session ends and how sure each hop is, as the first section of the report (--seed). The report is written for it.");
@@ -471,9 +463,6 @@ impl Viewer {
                 time_field(ui, &mut self.hunt_form.seed_to, "its end");
             });
         }
-        theme::section(ui, "Sigma hits");
-        path_row(ui, &mut self.hunt_form.sigma, "Hayabusa or Chainsaw output: JSON / JSONL files or a folder", Some(("JSON", &["json", "jsonl"])), true);
-        hint(ui, "A Sigma hit on a machine while a login session is open on it corroborates that connection, and the report names the rule (--sigma).");
     }
 
     fn hunt_step_strict(&mut self, ui: &mut egui::Ui) {
@@ -502,7 +491,7 @@ impl Viewer {
         ui.horizontal(|ui| {
             hint(ui, "Every detector runs by default; untick one to leave it out.");
             if ui.small_button("all").on_hover_text("Tick every one").clicked() {
-                self.hunt_form.detectors = [true; 13];
+                self.hunt_form.detectors = [true; 12];
             }
         });
         for (i, (name, what)) in DETECTORS.iter().enumerate() {
@@ -511,9 +500,6 @@ impl Viewer {
                 ui.label(egui::RichText::new(*what).size(12.5).color(if self.hunt_form.detectors[i] { TEXT } else { theme::DIM }));
                 ui.label(egui::RichText::new(*name).monospace().size(10.5).color(theme::DIM));
             });
-        }
-        if self.hunt_form.detectors[12] && self.hunt_form.sigma.trim().is_empty() {
-            ui.label(egui::RichText::new("The Sigma detector has nothing to read without the Sigma hits (the previous step).").color(theme::DIM).small());
         }
     }
 
@@ -621,10 +607,10 @@ mod tests {
         f.detectors[10] = false;
         f.detectors[11] = false;
         assert_eq!(f.detector_arg(), Some(("--skip-detectors", "pagerank-spike,betweenness-spike".to_string())));
-        f.detectors = [false; 13];
+        f.detectors = [false; 12];
         f.detectors[0] = true;
         assert_eq!(f.detector_arg(), Some(("--only-detectors", "novel-edge".to_string())));
-        f.detectors = [false; 13];
+        f.detectors = [false; 12];
         assert!(f.problem().is_some());
     }
 
@@ -653,14 +639,13 @@ mod tests {
     }
 
     #[test]
-    fn sigma_carry_and_end_on_the_command_line() {
+    fn carry_and_end_on_the_command_line() {
         let mut f = usual();
         f.end = "2026-11-11 00:00:00".into();
-        f.sigma = "D:/hayabusa/out.jsonl".into();
         f.carry = "D:/c/old.csv".into();
         let c = f.command(&["t.csv".to_string()]);
         let s = c.join(" ");
-        assert!(s.contains("--end-time 2026-11-11 00:00:00 --alpha 0.05 --sigma D:/hayabusa/out.jsonl --carry-marks D:/c/old.csv"));
+        assert!(s.contains("--end-time 2026-11-11 00:00:00 --alpha 0.05 --carry-marks D:/c/old.csv"));
         f.end = "tomorrow".into();
         assert!(f.problem().is_some());
     }

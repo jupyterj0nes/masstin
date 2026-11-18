@@ -321,8 +321,7 @@ pub struct Cli {
     /// For `graph-hunt`: comma-separated list of detector names to skip.
     /// Available: novel-edge, community-bridge, origin-fanout, cred-rotation,
     /// pagerank-spike, betweenness-spike, failed-sweep, preauth-sweep,
-    /// probe-then-success, rare-logon-type, causal-path, credential-switch,
-    /// sigma.
+    /// probe-then-success, rare-logon-type, causal-path, credential-switch.
     /// Example: --skip-detectors pagerank-spike,betweenness-spike
     #[arg(long)]
     skip_detectors: Option<String>,
@@ -498,13 +497,6 @@ pub struct Cli {
     /// ("YYYY-MM-DD HH:MM:SS", UTC). Default: the end of the window.
     #[arg(long)]
     seed_to: Option<String>,
-
-    /// For `graph-hunt` / `graph-hunt-neo4j`: Sigma hits from Hayabusa or
-    /// Chainsaw (JSON / JSONL files or directories, comma-separated). A hit
-    /// on a machine while a login session is open on it corroborates that
-    /// connection (coordinate `sigma`), and the report names the rule.
-    #[arg(long)]
-    sigma: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -548,7 +540,7 @@ enum ActionType {
     MergeNeo4jNodes,
     /// Merge two :host nodes in a Memgraph graph: transfers all edges from `--old-node` to `--new-node` and deletes the old node. Same as `merge-neo4j-nodes` but for Memgraph.
     MergeMemgraphNodes,
-    /// Statistical lateral-movement hunt on a graph loaded into Memgraph with --ungrouped. Every signal is a probability measured against the network's own baseline (conformal p-values, Benjamini-Hochberg at --alpha); no MAGE plugin needed. Requires --database and --investigation-from. Options: --report, --seed, --sigma, --only/--skip-detectors.
+    /// Statistical lateral-movement hunt on a graph loaded into Memgraph with --ungrouped. Every signal is a probability measured against the network's own baseline (conformal p-values, Benjamini-Hochberg at --alpha); no MAGE plugin needed. Requires --database and --investigation-from. Options: --report, --seed, --only/--skip-detectors.
     #[value(alias = "graph-hunt")]
     GraphHunt,
     /// Same statistical hunt on a graph loaded into Neo4j with --ungrouped. Edges are read once over bolt and every statistic (PageRank, betweenness, Louvain included) is computed in memory; no GDS plugin needed. Requires --database, --user and --investigation-from; --db selects the database. Password from $NEO4J_PASSWORD or a prompt.
@@ -835,7 +827,6 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed.as_deref(),
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
-                config.sigma.as_deref(),
             )
             .await;
         }
@@ -924,7 +915,6 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed.as_deref(),
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
-                config.sigma.as_deref(),
                 !config.no_annotate,
                 config.carry_marks.as_deref(),
                 match config.if_hunted.as_deref() {
@@ -957,7 +947,6 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
                 config.seed.as_deref(),
                 config.seed_from.as_deref(),
                 config.seed_to.as_deref(),
-                config.sigma.as_deref(),
             )
             .await;
         }

@@ -24,9 +24,8 @@ pub async fn graph_hunt_neo4j(
     seed: Option<&str>,
     seed_from: Option<&str>,
     seed_to: Option<&str>,
-    sigma: Option<&str>,
 ) {
-    let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to, sigma) {
+    let settings = match crate::graph_hunt::settings(investigation_from, skip_detectors, only_detectors, alpha, end_time, seed, report, seed_from, seed_to) {
         Some(s) => s,
         None => {
             crate::mark_failed();
