@@ -58,6 +58,12 @@ pub(super) struct Ingest {
     pub parser: usize,
     pub output: String,
     pub add: bool,
+    /// The timeline open in the window that the new evidence is appended to
+    /// (its rows added, sorted, duplicates dropped; the rows it has keep their
+    /// marks and their hunt). Empty: the parse writes a timeline of its own.
+    pub append_to: String,
+    /// the append was proposed once for this evidence (the analyst's choice stays)
+    pub append_offered: bool,
     pub open_here: bool,
     pub open_table: bool,
     pub open_external: bool,
@@ -85,7 +91,7 @@ pub(super) struct Ingest {
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
     }
 }
 
@@ -115,6 +121,17 @@ impl Ingest {
     /// Whether the command is `masstin -a parse`: the parser masstin picked,
     /// or an option only `parse` has (carving, rules), which then reads what
     /// it knows by itself and the rest with the rules.
+    /// The new evidence goes into the timeline open in the window: `parse`
+    /// reads that timeline with the evidence and writes over it.
+    pub fn append_on(&self) -> bool {
+        !self.append_to.trim().is_empty() && self.uses_parse() && !self.carve_only_on()
+    }
+
+    /// The timeline the run writes.
+    pub fn target(&self) -> String {
+        if self.append_on() { self.append_to.trim().to_string() } else { self.output.trim().to_string() }
+    }
+
     pub fn uses_parse(&self) -> bool {
         self.is_auto() || self.carve_on() || self.rules_on()
     }
@@ -153,6 +170,10 @@ impl Ingest {
             args.push(if Path::new(s).is_dir() { "-d" } else { "-f" }.into());
             args.push(s.clone());
         }
+        if self.append_on() {
+            args.push("-f".into());
+            args.push(self.append_to.trim().to_string());
+        }
         if self.rules_on() {
             args.push("--rules".into());
             args.push(self.rules.trim().to_string());
@@ -175,7 +196,7 @@ impl Ingest {
         }
         self.push_advanced(&mut args);
         args.push("-o".into());
-        args.push(self.output.trim().to_string());
+        args.push(self.target());
         args.push("--overwrite".into());
         args
     }
@@ -239,6 +260,7 @@ impl Viewer {
         self.ingest.scan = None;
         self.ingest.verdict = None;
         self.ingest.output.clear();
+            self.ingest.append_offered = false;
         self.ingest.carve = false;
         self.ingest.rules.clear();
         self.ingest.ignore_local = false;
@@ -405,9 +427,10 @@ impl Viewer {
 
     pub(super) fn run_ingest(&mut self) {
         let args = self.ingest.command();
-        let out = self.ingest.output.trim().to_string();
+        let out = self.ingest.target();
+        let appending = self.ingest.append_on();
         let title = if self.ingest.carve_only_on() { "Carving".to_string() } else if self.ingest.uses_parse() { "Parsing".to_string() } else { format!("Parsing with {}", PARSERS[self.ingest.parser].action) };
-        self.start_job(JobKind::Ingest, title, args, vec![out], self.ingest.add);
+        self.start_job(JobKind::Ingest, title, args, vec![out], self.ingest.add && !appending);
         self.ingest.step = 3;
         self.ingest.log_open = false;
     }
@@ -555,6 +578,7 @@ impl Viewer {
                 self.ingest.scan = None;
                 self.ingest.verdict = None;
                 self.ingest.output.clear();
+            self.ingest.append_offered = false;
                 self.ingest.carve = false;
                 self.ingest.carve_only = false;
                 self.ingest.rules.clear();
@@ -628,6 +652,7 @@ impl Viewer {
             if let Some(i) = remove {
                 self.ingest.sources.remove(i);
                 self.ingest.output.clear();
+            self.ingest.append_offered = false;
                 self.start_scan();
             }
             theme::section(ui, "What masstin found");
@@ -700,6 +725,7 @@ impl Viewer {
         if !self.ingest.sources.contains(&s) {
             self.ingest.sources.push(s);
             self.ingest.output.clear();
+            self.ingest.append_offered = false;
             self.start_scan();
         }
     }
@@ -783,6 +809,35 @@ impl Viewer {
 
     fn ingest_step_output(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("The timeline CSV the parser writes, and what to do with it when it is done.").color(theme::MUTED));
+        // one timeline open and the parser that can read a timeline with the
+        // evidence: propose to add the new rows to it, once
+        let can_append = self.files.len() == 1 && self.ingest.uses_parse() && !self.ingest.carve_only_on() && !Path::new(&self.files[0]).starts_with(std::env::temp_dir());
+        if can_append && !self.ingest.append_offered {
+            self.ingest.append_offered = true;
+            self.ingest.append_to = self.files[0].clone();
+        }
+        if !can_append {
+            self.ingest.append_to.clear();
+        }
+        if self.ingest.append_on() {
+            theme::section(ui, "Timeline it is added to");
+            ui.label(egui::RichText::new(self.ingest.append_to.trim()).monospace().size(12.0));
+            ui.label(egui::RichText::new("The rows of the new evidence are added to the timeline open here, sorted, a row it already has not written twice. The rows it has keep your marks, your notes and their hunt; run the hunt again to judge the new ones.").color(theme::MUTED).size(12.0));
+            ui.horizontal(|ui| {
+                if ui.button("Write a timeline of its own instead").on_hover_text("The new evidence gets its own timeline CSV, and the one open is left as it is").clicked() {
+                    self.ingest.append_to.clear();
+                }
+            });
+            self.ingest_step_done_options(ui, true);
+            return;
+        }
+        if can_append {
+            ui.horizontal(|ui| {
+                if ui.button(format!("{}  Add it to the timeline open here", ic::PLUS)).on_hover_text("One timeline for the case: the new rows are added to the one open, sorted and without duplicates, and its marks are kept").clicked() {
+                    self.ingest.append_to = self.files[0].clone();
+                }
+            });
+        }
         theme::section(ui, "Timeline to write");
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ingest.output).desired_width(520.0).hint_text("…\\case.csv"));
@@ -801,15 +856,26 @@ impl Viewer {
                 ui.label(egui::RichText::new(format!("{}  the folder does not exist; the parser will fail", ic::WARNING)).color(SIGNIFICANT).small());
             }
         }
+        self.ingest_step_done_options(ui, false);
+    }
+
+    /// What to do with the timeline when the run ends, the noise filters,
+    /// the advanced options and the command. `appending`: the timeline is
+    /// the one open, read again when it is done.
+    fn ingest_step_done_options(&mut self, ui: &mut egui::Ui, appending: bool) {
         theme::section(ui, "When it is done");
-        // the table shows the timeline open in the window: asking for it opens it here
-        if self.ingest.open_table {
+        if appending {
+            self.ingest.open_here = true;
+            let mut on = true;
+            ui.add_enabled(false, egui::Checkbox::new(&mut on, "Read it again in this window")).on_disabled_hover_text("It is the timeline open here: the window shows it with the new rows");
+        } else if self.ingest.open_table {
+            // the table shows the timeline open in the window: asking for it opens it here
             let mut on = true;
             ui.add_enabled(false, egui::Checkbox::new(&mut on, "Open it in this window")).on_disabled_hover_text("The table shows the timeline open in this window, so it is opened here too");
         } else {
             ui.checkbox(&mut self.ingest.open_here, "Open it in this window");
         }
-        if (self.ingest.open_here || self.ingest.open_table) && !self.files.is_empty() {
+        if !appending && (self.ingest.open_here || self.ingest.open_table) && !self.files.is_empty() {
             ui.indent("ingest-add", |ui| {
                 ui.radio_value(&mut self.ingest.add, false, "instead of the timelines open now");
                 ui.radio_value(&mut self.ingest.add, true, "added to the timelines open now");
@@ -1522,6 +1588,28 @@ mod tests {
         i.carve = true;
         i.rules = "D:/my rules".into();
         assert_eq!(i.command_line(), "masstin -a parse -f D:/case --rules \"D:/my rules\" --carve -o out.csv --overwrite");
+    }
+
+    #[test]
+    fn the_new_evidence_is_added_to_the_timeline_open() {
+        // the timeline open is read with the evidence and written over: one timeline
+        // (rules given: the run is `parse`, the one that reads a timeline with the evidence)
+        let mut i = Ingest { sources: vec!["D:/no-such-evidence".into()], output: "own.csv".into(), rules: "D:/rules".into(), ..Default::default() };
+        assert!(i.uses_parse());
+        assert!(!i.append_on());
+        assert_eq!(i.target(), "own.csv");
+        i.append_to = "D:/case/open.csv".into();
+        assert!(i.append_on());
+        assert_eq!(i.target(), "D:/case/open.csv");
+        let c = i.command();
+        assert_eq!(&c[..2], &["-a", "parse"]);
+        assert!(c.windows(2).any(|w| w[0] == "-f" && w[1] == "D:/case/open.csv"), "{:?}", c);
+        assert_eq!(&c[c.len() - 3..], &["-o", "D:/case/open.csv", "--overwrite"]);
+        // a timeline of its own again
+        i.append_to.clear();
+        let c = i.command();
+        assert!(!c.iter().any(|a| a == "D:/case/open.csv"));
+        assert_eq!(&c[c.len() - 3..], &["-o", "own.csv", "--overwrite"]);
     }
     #[test]
     fn the_noise_filters_go_on_the_command_line_trimmed() {

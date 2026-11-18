@@ -5733,6 +5733,11 @@ impl Viewer {
                 self.requery(false);
             }
             other if other.starts_with("out=") => self.ingest.output = other["out=".len()..].to_string(),
+            // the new evidence in a timeline of its own, not added to the one open
+            "ingest-own" => {
+                self.ingest.append_offered = true;
+                self.ingest.append_to.clear();
+            }
             other if other.starts_with("drop=") || other.starts_with("drop+=") => {
                 // as if the file had been dropped on the window; `drop+=` adds
                 let (add, p) = match other.strip_prefix("drop+=") {
