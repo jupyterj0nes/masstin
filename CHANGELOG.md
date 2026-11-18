@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Cortex XDR: a wizard that checks the connection.** Reading from a tenant is now five steps (the tenant, what to read, which events, the timeline, the run), reached from Evidence and from the first step of the ingest wizard. The first step says where the three values are in Cortex and **checks the connection** before anything is read: green with the kind of key and the quota used today, red with the tenant's own words and what to do. The period has buttons for the last 24 hours, 3, 7 and 30 days.
+- **`--cortex-check`**: the same check from the command line: one request that costs no compute units, the tenant's answer, exit code 0 when it accepted.
+- **Cortex XDR: a progress bar.** Each source shows the share of its period read so far and the events collected, in the console and in the window.
 - **Paths: everything from a host, as a tree.** *Reach from origin* and *Ways into destination* are now *Everything from the origin* / *Everything into the destination*, and their answer is a tree in the window as well as on the canvas: each host under the one its first arrival came from, with the account, the moment and the hop. Click a host for its branch alone; its magnifier lists every path between the two.
 - **Paths: every chain of an account or of a period, wherever it starts.** With the origin (or the destination) box empty, the tree starts at every host a chain of the logins searched can start at (or end at): give an account, or dates, and it is every chain of that account or of that period.
 - **Paths: the same account all along.** A tick that keeps every chain to one account from its first hop to its last, whichever account it is (by its bare name: `ana@CORP` and `ana@WS01` are one). It combines with chaining by time or by session, with the account, the dates and the rest.

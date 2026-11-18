@@ -164,8 +164,12 @@ pub async fn parse_cortex_data(
         );
     }
 
+    // the share of the window read so far, as a bar
+    let span_of = |a: &str, b: &str| bisect_time_window(a, b, 0).map(|(_, half)| half * 2).unwrap_or(0);
+    let mut share = crate::banner::ShareBar::new(if has_bounds { span_of(&cortex_start_str, &cortex_end_str) } else { 0 }, "network connections");
     while let Some((w_start, w_end)) = work.pop() {
         pass += 1;
+        let this_span = span_of(&w_start, &w_end);
 
         // Pre-pass status line: which window, queue depth, running totals.
         if has_bounds {
@@ -225,6 +229,7 @@ pub async fn parse_cortex_data(
                     max_passes
                 ));
                 all_data.extend(batch);
+                share.add(this_span, all_data.len());
                 truncated_passes += 1;
                 continue;
             }
@@ -247,13 +252,16 @@ pub async fn parse_cortex_data(
                         batch_len, min_window_secs
                     ));
                     all_data.extend(batch);
+                share.add(this_span, all_data.len());
                 }
             }
         } else {
             all_data.extend(batch);
+                share.add(this_span, all_data.len());
         }
     }
 
+    share.finish();
     if has_bounds {
         crate::banner::print_phase_detail(
             "Auto-pagination complete:",
@@ -333,6 +341,23 @@ fn get_timestamp(record: &Value) -> Option<i64> {
 /// Prompts the user for an API key and returns it as a `String`.
 fn prompt_for_api_key_and_id() -> Result<(String, String), Box<dyn Error>> {
     api_key_and_id()
+}
+
+/// `--cortex-check`: ask the tenant whether the URL, the key and its ID
+/// work, with the one request that costs nothing (the XQL quota), and say
+/// what it answered. Nothing is read and no timeline is written.
+pub async fn check_connection(base_url: &str) -> Result<(), Box<dyn Error>> {
+    crate::banner::print_phase("1", "1", "Checking the connection with Cortex XDR...");
+    crate::banner::print_phase_detail("Tenant:", base_url.trim_end_matches('/'));
+    let (key, id) = api_key_and_id()?;
+    let client = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    match crate::cortex_auth::Auth::connect(&client, base_url, &key, &id).await {
+        Ok(_) => {
+            crate::banner::print_info("Cortex answered: the URL, the key and its ID work, and the key may run XQL queries");
+            Ok(())
+        }
+        Err(e) => Err(format!("Cortex did not accept the connection: {}", e).into()),
+    }
 }
 
 /// The API key and its id: from `$CORTEX_API_KEY_ID` and `$CORTEX_API_KEY`

@@ -143,8 +143,11 @@ pub async fn parse_cortex_eventlog_data(
     let mut work: Vec<(String, String)> = vec![(start.to_string(), end.to_string())];
     let mut pass = 0usize;
     let mut truncated = 0usize;
+    let span_of = |a: &str, b: &str| crate::parse_cortex::bisect_time_window(a, b, 0).map(|(_, half)| half * 2).unwrap_or(0);
+    let mut share = crate::banner::ShareBar::new(span_of(start, end), "event logs of the agents");
     while let Some((w_start, w_end)) = work.pop() {
         pass += 1;
+        let this_span = span_of(&w_start, &w_end);
         let batch = crate::parse_cortex::run_xql(client, &start_url, &results_url, &stream_url, auth, &query(&w_start, &w_end), debug).await?;
         crate::banner::print_phase_detail(&format!("Pass {}", pass), &format!("{} → {}: {} events", w_start, w_end, batch.len()));
         if batch.len() >= SATURATION_THRESHOLD && pass < max_passes {
@@ -159,7 +162,9 @@ pub async fn parse_cortex_eventlog_data(
             truncated += 1;
         }
         all.extend(batch);
+        share.add(this_span, all.len());
     }
+    share.finish();
     if truncated > 0 {
         crate::banner::print_warning(&format!("{} window(s) returned the API's maximum and may be cut: narrow the time range or lower --cortex-min-window-secs", truncated));
     }

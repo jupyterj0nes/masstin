@@ -297,6 +297,14 @@ Reads a Cortex XDR tenant through its XQL API. One action, `parse-cortex`, reads
 
 A source the tenant does not have is said and left out. `--cortex-sources` picks them.
 
+**Check the connection first.** `--cortex-check` asks the tenant whether the URL, the key and its ID work, with the one request that costs no compute units (the XQL quota), says what it answered (the kind of key, the quota used today, or its refusal in its own words with what it usually means) and ends: nothing is read, nothing is written, and the exit code is 0 when the tenant accepted.
+
+```bash
+masstin -a parse-cortex --cortex-url https://api-TENANT.xdr.eu.paloaltonetworks.com --cortex-check
+```
+
+**Progress.** While a source is read, a bar says the share of the period read so far (a period that holds more than the API returns at once is split and asked again in pieces, and the bar moves as each piece comes back), with the events collected.
+
 ```bash
 # Everything the tenant has, one timeline (the key from the environment, or asked)
 export CORTEX_API_KEY_ID=12 CORTEX_API_KEY='...'

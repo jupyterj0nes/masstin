@@ -234,7 +234,7 @@ impl Job {
 }
 
 impl Viewer {
-    fn masstin_exe() -> std::path::PathBuf {
+    pub(super) fn masstin_exe() -> std::path::PathBuf {
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("masstin"))
     }
 
@@ -573,6 +573,10 @@ impl Viewer {
     pub(super) fn job_window(&mut self, ctx: &egui::Context) {
         // an ingest shows in its wizard while that is open
         if self.ingest.open && self.job.as_ref().map_or(false, |j| j.kind == JobKind::Ingest) {
+            return;
+        }
+        // and a reading from Cortex in its own
+        if self.show_cortex && self.cortex_form.step == 4 && self.job.as_ref().map_or(false, |j| j.kind == JobKind::Remote) {
             return;
         }
         if let Some(job) = self.job.as_ref() {

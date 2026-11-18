@@ -23,6 +23,7 @@ Every flag, grouped by the actions that use it. Back to the [README](../README.m
 | `--admin-ports` | `parse-cortex`: widen network port list to full admin set (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986). Default is RDP/SMB/SSH + WinRM. |
 | `--cortex-event-ids` | `parse-cortex-evtx-forensics`: comma-separated override of the default Windows Event ID set |
 | `--cortex-min-window-secs` | Auto-pagination floor for both Cortex actions when a time window saturates the API 1M cap (default 300) |
+| `--cortex-check` | For `parse-cortex`: only ask the tenant whether `--cortex-url`, the key and its ID work (a request that costs no compute units), say what it answered and end. Exit code 0 when accepted |
 | `--cortex-max-passes` | Hard cap on auto-pagination passes for both Cortex actions (default 200) |
 | `--all-volumes` | Scan all NTFS volumes on the system (parse-image, requires admin) |
 | `--overwrite` | Overwrite the output file if it exists. Asked for by every action that writes a timeline (the parsers, `merge`, `carve-image`, the Cortex actions): without it an existing `-o` is an error, said before anything is read. `-o` is never one of the files being read (the timeline would replace the evidence), unless that file is a masstin timeline being merged into |

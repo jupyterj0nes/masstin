@@ -5806,6 +5806,21 @@ impl Viewer {
             "paths-map" => self.path_in_map = true,
             "paths-alone" => self.path_in_map = false,
             "paths-reshow" => self.reshow_path(),
+            // the Cortex wizard, for tests: open it, fill it, move through it
+            "cortex" => self.show_cortex = true,
+            "cortex-check" => {
+                self.cortex_form.go_on = false;
+                self.cortex_check_start();
+            }
+            "cortex-shown-ok" => {
+                // (the look of an accepted connection, with no tenant asked)
+                self.cortex_form.check = remote::CortexCheck::Accepted(vec!["Key: Advanced (signed with a nonce and the time)".into(), "Quota: 1.25 of 100 compute units used today".into()]);
+                self.cortex_form.checked = self.cortex_form.tenant_digest();
+            }
+            other if other.starts_with("cortex-url=") => self.cortex_form.url = other["cortex-url=".len()..].to_string(),
+            other if other.starts_with("cortex-id=") => self.cortex_form.key_id = other["cortex-id=".len()..].to_string(),
+            other if other.starts_with("cortex-key=") => self.cortex_form.key = other["cortex-key=".len()..].to_string(),
+            other if other.starts_with("cortex-step=") => self.cortex_form.step = other["cortex-step=".len()..].parse().unwrap_or(0),
             "paths-open" => self.show_paths = true,
             other if other.starts_with("merge=") => {
                 // merge=FROM>INTO: the analyst's merge of two hosts that are one

@@ -288,8 +288,10 @@ pub async fn parse_cortex_evtx_forensics_data(
         );
     }
 
+    let mut share = crate::banner::ShareBar::new(match (epoch_start, epoch_end) { (Some(s), Some(e)) => e - s, _ => 0 }, "forensics event logs");
     while let Some((w_start, w_end)) = work.pop() {
         pass += 1;
+        let this_span = match (w_start, w_end) { (Some(s), Some(e)) => e - s, _ => 0 };
 
         if has_bounds {
             let span_secs = match (w_start, w_end) { (Some(s), Some(e)) => e - s, _ => -1 };
@@ -344,6 +346,7 @@ pub async fn parse_cortex_evtx_forensics_data(
                     max_passes
                 ));
                 all_data.extend(batch);
+                share.add(this_span, all_data.len());
                 truncated_passes += 1;
                 continue;
             }
@@ -365,12 +368,15 @@ pub async fn parse_cortex_evtx_forensics_data(
                         batch_len, min_window_secs
                     ));
                     all_data.extend(batch);
+                share.add(this_span, all_data.len());
                 }
             }
         } else {
             all_data.extend(batch);
+                share.add(this_span, all_data.len());
         }
     }
+    share.finish();
 
     if has_bounds {
         crate::banner::print_phase_detail(

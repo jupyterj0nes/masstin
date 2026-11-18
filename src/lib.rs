@@ -185,6 +185,18 @@ pub struct Cli {
     #[arg(long, default_value_t = 300)]
     cortex_min_window_secs: i64,
 
+    /// For `parse-cortex`: only check the connection. Asks the tenant whether
+    /// --cortex-url, the API key and its ID work, with the one request that
+    /// costs no compute units (the XQL quota), says what the tenant answered
+    /// (the kind of key, the quota used today, or its refusal in its own
+    /// words with what it usually means) and ends: nothing is read and no
+    /// timeline is written. Exit code 0 when the tenant accepted, 1 when it
+    /// did not. The key comes from $CORTEX_API_KEY / $CORTEX_API_KEY_ID, or
+    /// is asked on the console. Example:
+    /// masstin -a parse-cortex --cortex-url https://api-TENANT.xdr.eu.paloaltonetworks.com --cortex-check
+    #[arg(long, default_value_t = false)]
+    cortex_check: bool,
+
     /// For `parse-cortex`: hard cap on the total number of auto-pagination
     /// passes. Prevents a pathological tenant (e.g. sustained saturation at
     /// minute granularity) from blowing up memory or API quota. When reached,
@@ -716,6 +728,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         }
         ActionType::ParserElastic => {
             parse_events_elastic(&config.file, &config.directory, config.output.as_ref());
+        }
+        ActionType::ParseCortex if config.cortex_check => {
+            crate::parse_cortex::check_connection(config.cortex_url.as_ref().unwrap()).await?;
         }
         ActionType::ParseCortex => {
             let sources = crate::parse_cortex::sources_from(config.cortex_sources.as_deref())?;

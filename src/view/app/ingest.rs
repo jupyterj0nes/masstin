@@ -522,6 +522,11 @@ impl Viewer {
         });
         match action {
             Some("run") => self.run_ingest(),
+            Some("cortex") => {
+                // the same question, answered by a tenant instead of a folder
+                open = false;
+                self.show_cortex = true;
+            }
             Some("open-timelines") => {
                 let files = self.ingest.scan.as_ref().map(|s| s.timelines.clone()).unwrap_or_default();
                 if self.open_files(files) {
@@ -573,7 +578,6 @@ impl Viewer {
     }
 
     fn ingest_step_sources(&mut self, ui: &mut egui::Ui, action: &mut Option<&str>) {
-        let _ = action;
         ui.label(egui::RichText::new("Give masstin the evidence: a folder (a triage, an export of event logs, a whole case), disk images, EVTX files, Linux or macOS logs, or timelines already parsed. It looks at what is there and says which parser takes it.").color(theme::MUTED));
         ui.add_space(8.0);
         // the drop zone
@@ -600,6 +604,13 @@ impl Viewer {
                         self.add_source(p.to_string_lossy().to_string());
                     }
                 }
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Nothing on disk?").color(theme::MUTED).size(12.5));
+            if ui.add(egui::Button::new(format!("{}  Read it from a Cortex XDR tenant…", ic::CLOUD)).min_size(Vec2::new(0.0, 26.0))).on_hover_text("Lateral movement straight from a Cortex XDR tenant through its API: network connections, the event logs the agents send and the ones the forensics add-on collected, into one timeline. A wizard checks the connection first").clicked() {
+                *action = Some("cortex");
             }
         });
         if !self.ingest.sources.is_empty() {

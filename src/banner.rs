@@ -345,6 +345,39 @@ pub fn print_processing_start() {
     );
 }
 
+/// The share of a time window read so far: a bar from 0 to 100 that moves
+/// as each piece of the window is read (a query to an API that answers a
+/// window at a time, split when it holds too much). Hidden when the window
+/// has no bounds (nothing to measure against).
+pub struct ShareBar {
+    pb: ProgressBar,
+    total: i64,
+    done: i64,
+    what: String,
+}
+
+impl ShareBar {
+    /// `total`: the seconds of the whole window; `what`: what is being read.
+    pub fn new(total: i64, what: &str) -> ShareBar {
+        let pb = if total > 0 { create_progress_bar(100) } else { ProgressBar::hidden() };
+        pb.set_message(format!("{}: asking the tenant", what));
+        pb.set_position(0);
+        ShareBar { pb, total, done: 0, what: what.to_string() }
+    }
+    /// A piece of `secs` seconds is read; `collected` events so far.
+    pub fn add(&mut self, secs: i64, collected: usize) {
+        if self.total <= 0 {
+            return;
+        }
+        self.done = (self.done + secs.max(0)).min(self.total);
+        self.pb.set_message(format!("{}: {} events so far", self.what, collected));
+        self.pb.set_position((self.done as f64 * 100.0 / self.total as f64).round() as u64);
+    }
+    pub fn finish(self) {
+        self.pb.finish_and_clear();
+    }
+}
+
 pub fn create_progress_bar(total: u64) -> ProgressBar {
     if is_silent() {
         return ProgressBar::hidden();
