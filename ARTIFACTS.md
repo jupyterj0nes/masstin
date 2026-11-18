@@ -144,4 +144,4 @@ Queries the Cortex XDR `forensics_event_log` dataset, which backs both the XDR f
 
 ---
 
-**Total:** 33 Windows Event IDs across 12 EVTX sources + 9 Linux artifact types + macOS Unified Log (`.logarchive` and `log show` JSON) + Winlogbeat JSON + Cortex XDR + YAML custom parsers (VPN, firewall, proxy, JSON)
+**Total:** 37 Windows Event IDs across 12 EVTX channels + 9 Linux artifact types + macOS Unified Log (`.logarchive` and `log show` JSON) + Winlogbeat JSON + Cortex XDR + YAML custom parsers (VPN, firewall, proxy, JSON)

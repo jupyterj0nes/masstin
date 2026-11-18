@@ -576,7 +576,7 @@ Timelines of every layout (12, 14 or 19 columns) are read; the output has the 19
 
 
 ## Supported artifacts at a glance
-Masstin parses **33+ Windows Event IDs** across **12 EVTX sources**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](../ARTIFACTS.md).
+Masstin parses **37 Windows Event IDs** across **12 EVTX channels**, plus Linux artifacts, UAL databases, Winlogbeat JSON, and Cortex XDR. For a full breakdown, see [ARTIFACTS.md](../ARTIFACTS.md).
 
 ## Windows EVTX
 
