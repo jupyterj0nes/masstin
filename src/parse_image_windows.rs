@@ -448,7 +448,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Extract from image files — use image name as temp subdirectory
     let mut linux_log_dirs: Vec<String> = Vec::new();
-    let mut task_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
+    let mut task_dirs: Vec<(String, String, Vec<String>)> = Vec::new(); // (dir, hostname, every name the machine goes by)
     let mut ntuser_dirs: Vec<(String, String)> = Vec::new(); // (dir, hostname)
 
     let mut images_processed = 0;
@@ -477,9 +477,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                 if let Some(linux_dir) = artifacts.linux_logs_dir {
                     linux_log_dirs.push(linux_dir.to_string_lossy().to_string());
                 }
-                let hostname = extract_hostname_from_evtx_dir(&artifacts.evtx_dir);
+                // every name the machine goes by in its logs, the latest last
+                let names = extract_hostnames_from_evtx_dir(&artifacts.evtx_dir);
+                let hostname = names.last().cloned().unwrap_or_default();
                 if let Some(tdir) = artifacts.tasks_dir {
-                    task_dirs.push((tdir.to_string_lossy().to_string(), hostname.clone()));
+                    task_dirs.push((tdir.to_string_lossy().to_string(), hostname.clone(), names.clone()));
                 }
                 if let Some(ndir) = artifacts.ntuser_dir {
                     ntuser_dirs.push((ndir.to_string_lossy().to_string(), hostname));
@@ -502,9 +504,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // Parse Scheduled Tasks for remote activity (silent — only shows if found)
     let mut all_task_events = Vec::new();
     if !task_dirs.is_empty() {
-        for (tdir, hostname) in &task_dirs {
+        for (tdir, hostname, names) in &task_dirs {
             let dirs_vec = vec![tdir.clone()];
-            let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname);
+            let events = crate::parse_tasks::parse_scheduled_tasks(&dirs_vec, hostname, names);
             all_task_events.extend(events);
         }
     }
@@ -690,52 +692,80 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     }
 }
 
-/// Extract hostname from extracted EVTX files by reading the Computer field from the first record.
-fn extract_hostname_from_evtx_dir(evtx_dir: &Path) -> String {
-    // Find Security.evtx or any .evtx in the extracted directory
+/// The names the machine goes by in its own logs: the Computer field of the
+/// first and of the last record of Security.evtx (or System.evtx). A machine
+/// renamed after its installation has two, and the oldest records keep the
+/// old one; the latest name comes last.
+fn extract_hostnames_from_evtx_dir(evtx_dir: &Path) -> Vec<String> {
     let candidates = ["Security.evtx", "System.evtx"];
+    let mut names: Vec<String> = Vec::new();
     for candidate in &candidates {
-        // Search recursively in partition subdirectories
+        // Search in partition subdirectories
         if let Ok(entries) = fs::read_dir(evtx_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     let evtx_path = path.join(candidate);
                     if evtx_path.exists() {
-                        if let Some(hostname) = read_hostname_from_evtx(&evtx_path) {
-                            return hostname;
+                        for n in read_hostnames_from_evtx(&evtx_path) {
+                            // the latest name seen ends up last
+                            names.retain(|x| !x.eq_ignore_ascii_case(&n));
+                            names.push(n);
                         }
                     }
                 }
             }
         }
+        if !names.is_empty() { break; }
     }
-    String::new()
+    names
 }
 
-/// Read the Computer field from the first record of an EVTX file.
-fn read_hostname_from_evtx(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
+fn computer_of(xml: &str) -> Option<String> {
+    let start = xml.find("<Computer>")? + "<Computer>".len();
+    let end = xml[start..].find("</Computer>")?;
+    let hostname = xml[start..start + end].trim().to_string();
+    if hostname.is_empty() { None } else { Some(hostname) }
+}
+
+/// The Computer field of the first record of an EVTX file and of its last
+/// one (first, then last, when they differ). The last one is read from the
+/// file's last chunk alone, so a large log is not rendered whole for this.
+fn read_hostnames_from_evtx(path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
     let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    let cursor = std::io::Cursor::new(data);
-    let mut parser = evtx::EvtxParser::from_read_seek(cursor).ok()?;
-    for record in parser.records() {
-        if let Ok(r) = record {
-            let xml = r.data;
-            // Quick extraction of <Computer> from XML
-            if let Some(start) = xml.find("<Computer>") {
-                let start = start + "<Computer>".len();
-                if let Some(end) = xml[start..].find("</Computer>") {
-                    let hostname = xml[start..start + end].trim().to_string();
-                    if !hostname.is_empty() {
-                        return Some(hostname);
-                    }
-                }
+    match File::open(path) { Ok(mut f) => { if f.read_to_end(&mut data).is_err() { return out; } } Err(_) => return out }
+
+    // first record
+    if let Ok(mut parser) = evtx::EvtxParser::from_read_seek(std::io::Cursor::new(data.clone())) {
+        for record in parser.records() {
+            if let Ok(r) = record {
+                if let Some(h) = computer_of(&r.data) { out.push(h); break; }
             }
         }
     }
-    None
+    // last record: the last chunk that holds any
+    if let Ok(mut parser) = evtx::EvtxParser::from_read_seek(std::io::Cursor::new(data)) {
+        let settings = std::sync::Arc::new(evtx::ParserSettings::default());
+        let mut last: Option<String> = None;
+        let mut chunks: Vec<evtx::EvtxChunkData> = parser.chunks().flatten().collect();
+        while let Some(mut chunk_data) = chunks.pop() {
+            if let Ok(mut chunk) = chunk_data.parse(settings.clone()) {
+                for rec in chunk.iter() {
+                    if let Ok(rec) = rec {
+                        if let Ok(r) = rec.into_xml() {
+                            if let Some(h) = computer_of(&r.data) { last = Some(h); }
+                        }
+                    }
+                }
+            }
+            if last.is_some() { break; }
+        }
+        if let Some(h) = last {
+            if !out.iter().any(|x| x.eq_ignore_ascii_case(&h)) { out.push(h); }
+        }
+    }
+    out
 }
 
 /// Extract the most common computer name from an existing CSV (dst_computer column).

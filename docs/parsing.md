@@ -247,7 +247,7 @@ masstin -a parse-image --all-volumes -o timeline.csv
 
 > **Note:** Reading raw volumes requires elevated privileges — run as Administrator on Windows or with `sudo` on Linux.
 
-> **PowerShell users:** Do not end paths with `\` inside single quotes — PowerShell interprets `\` before the closing quote as an escape character, corrupting the command arguments. Masstin detects this and warns you, but the safest approach is to omit the trailing `\` or use double quotes: `-d "C:\evidence\image.vmdk"`.
+> **PowerShell users:** in Windows PowerShell 5.1 (the one Windows ships with), a quoted path **with spaces** that ends in `\` swallows the arguments after it, with single and with double quotes alike: `-d 'D:\my case\' -o out.csv` reaches masstin as one odd path. Masstin detects this and warns you, but the safest approach is to leave the trailing `\` out. PowerShell 7.3 and later pass it correctly.
 
 ## User Access Logging (UAL)
 
@@ -594,7 +594,7 @@ Masstin parses **37 Windows Event IDs** across **12 EVTX channels**, plus Linux 
 | **WinRM/Operational** | 6 | PowerShell Remoting session init — destination host from connection field (source system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **WMI-Activity/Operational** | 5858 | Remote WMI execution — source machine from ClientMachine field (destination system) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **Sysmon/Operational** | 3 | Network connections on lateral-movement service ports (22, 135, 139, 445, 1433, 3306, 3389, 5900, 5985, 5986); direction from `Initiated`, initiating process in `detail` | |
-| **Scheduled Tasks XML** | — | Remotely registered tasks detected via Author field (MACHINE\user) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
+| **Scheduled Tasks XML** | — | Remotely registered tasks detected via Author field (MACHINE\user); a task whose Author names the machine itself is left out, under any name the machine goes by in its own logs (a renamed machine keeps its old name in its oldest records) | [Read more →](https://weinvestigateanything.com/en/artifacts/winrm-wmi-schtasks-lateral-movement/) |
 | **MountPoints2 (NTUSER.DAT)** | — | Remote share connections from each user's registry (##SERVER#SHARE with LastWriteTime); transaction logs applied, deleted share keys recovered from free hive cells | [Read more →](https://weinvestigateanything.com/en/artifacts/mountpoints2-lateral-movement/) |
 
 ## UAL (User Access Logging)

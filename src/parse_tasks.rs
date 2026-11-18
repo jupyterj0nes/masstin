@@ -11,7 +11,12 @@ use crate::parse::{LogData, is_debug_mode};
 
 /// Parse all Scheduled Task XML files in the given directories.
 /// Returns LogData events for tasks with a remote Author (MACHINE\user format).
-pub fn parse_scheduled_tasks(dirs: &[String], computer_name: &str) -> Vec<LogData> {
+///
+/// `own_names` are the other names this same machine has gone by in its
+/// logs (a renamed machine keeps its old name in its oldest records and in
+/// the Author of the tasks registered before the rename). A task whose
+/// Author names the machine itself, under any of them, is a local one.
+pub fn parse_scheduled_tasks(dirs: &[String], computer_name: &str, own_names: &[String]) -> Vec<LogData> {
     let mut results = Vec::new();
 
     for dir in dirs {
@@ -19,7 +24,7 @@ pub fn parse_scheduled_tasks(dirs: &[String], computer_name: &str) -> Vec<LogDat
         if !dir_path.exists() {
             continue;
         }
-        parse_tasks_recursive(dir_path, dir, computer_name, &mut results);
+        parse_tasks_recursive(dir_path, dir, computer_name, own_names, &mut results);
     }
 
     // Summary printed by caller (parse_image), not here
@@ -27,7 +32,7 @@ pub fn parse_scheduled_tasks(dirs: &[String], computer_name: &str) -> Vec<LogDat
     results
 }
 
-fn parse_tasks_recursive(dir: &Path, base_dir: &str, computer_name: &str, results: &mut Vec<LogData>) {
+fn parse_tasks_recursive(dir: &Path, base_dir: &str, computer_name: &str, own_names: &[String], results: &mut Vec<LogData>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -36,16 +41,16 @@ fn parse_tasks_recursive(dir: &Path, base_dir: &str, computer_name: &str, result
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            parse_tasks_recursive(&path, base_dir, computer_name, results);
+            parse_tasks_recursive(&path, base_dir, computer_name, own_names, results);
         } else if path.is_file() {
-            if let Some(log_data) = parse_single_task(&path, base_dir, computer_name) {
+            if let Some(log_data) = parse_single_task(&path, base_dir, computer_name, own_names) {
                 results.push(log_data);
             }
         }
     }
 }
 
-fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str) -> Option<LogData> {
+fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str, own_names: &[String]) -> Option<LogData> {
     // Read file content — tasks are XML, sometimes UTF-16
     let raw = fs::read(path).ok()?;
     let content = decode_task_xml(&raw);
@@ -66,6 +71,11 @@ fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str) -> Option
     let src_short = src_machine.split('.').next().unwrap_or(src_machine);
     let dst_short = computer_name.split('.').next().unwrap_or(computer_name);
     if src_short.eq_ignore_ascii_case(dst_short) {
+        return None;
+    }
+    // ... or the machine under a name it had before (or after) a rename: the
+    // Author keeps the name of the day the task was registered
+    if own_names.iter().any(|n| n.split('.').next().unwrap_or(n).eq_ignore_ascii_case(src_short)) {
         return None;
     }
 
@@ -163,4 +173,61 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     let end = xml[start..].find(&close)? + start;
     let value = xml[start..end].trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(dir: &Path, name: &str, author: &str) {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><Task><RegistrationInfo><Date>2026-11-10T08:32:43</Date><Author>{}</Author><URI>\\{}</URI></RegistrationInfo><Actions><Exec><Command>C:\\x.bat</Command></Exec></Actions></Task>",
+            author, name
+        );
+        fs::write(dir.join(name), xml).unwrap();
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("masstin_tasks_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_task_registered_from_another_machine_is_reported() {
+        let d = tmp("remote");
+        task(&d, "Updater", "ATTACKER-PC\\admin");
+        let r = parse_scheduled_tasks(&[d.to_string_lossy().to_string()], "SRV01", &[]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].workstation_name, "ATTACKER-PC");
+        assert_eq!(r[0].computer, "SRV01");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_task_of_the_machine_itself_is_not_reported() {
+        let d = tmp("local");
+        task(&d, "Updater", "SRV01\\Administrator");
+        task(&d, "Other", "srv01.corp.local\\Administrator");
+        let r = parse_scheduled_tasks(&[d.to_string_lossy().to_string()], "SRV01.corp.local", &[]);
+        assert!(r.is_empty(), "{:?}", r.iter().map(|x| &x.detail).collect::<Vec<_>>());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_renamed_machine_is_not_a_remote_origin_of_its_own_tasks() {
+        // the logs start under the name Windows gave the machine at install
+        // and go on under the one it was renamed to; a task registered after
+        // the rename carries the new name, one registered before, the old
+        let d = tmp("renamed");
+        task(&d, "AfterRename", "DEV-SRV01\\Administrator");
+        task(&d, "BeforeRename", "WIN-9NNLCJ81NUL\\Administrator");
+        task(&d, "Remote", "OTHER-PC\\admin");
+        let own = vec!["WIN-9NNLCJ81NUL".to_string(), "DEV-SRV01.dev.corp.test".to_string()];
+        let r = parse_scheduled_tasks(&[d.to_string_lossy().to_string()], "DEV-SRV01.dev.corp.test", &own);
+        assert_eq!(r.len(), 1, "{:?}", r.iter().map(|x| &x.detail).collect::<Vec<_>>());
+        assert_eq!(r[0].workstation_name, "OTHER-PC");
+        let _ = fs::remove_dir_all(&d);
+    }
 }
