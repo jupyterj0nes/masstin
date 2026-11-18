@@ -192,6 +192,9 @@ pub struct Store {
     /// it (a Windows 4648, an auditd `connect`): (the host the session is
     /// on, its logon ID) -> (time, destination), in time order
     launched: HashMap<(u32, u64), Vec<(i64, u32)>>,
+    /// the same records by where they go: (origin, destination) ->
+    /// (time, the logon ID of the session), in time order
+    launch_at: HashMap<(u32, u32), Vec<(i64, u64)>>,
     /// how many such records the timeline has
     pub launches: usize,
 }
@@ -445,7 +448,16 @@ impl Store {
         for v in launched.values_mut() {
             v.sort_unstable();
         }
-        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known, lid: edge_lid, launched, launches })
+        let mut launch_at: HashMap<(u32, u32), Vec<(i64, u64)>> = HashMap::new();
+        for ((src, id), records) in &launched {
+            for &(t, dst) in records {
+                launch_at.entry((*src, dst)).or_default().push((t, *id));
+            }
+        }
+        for v in launch_at.values_mut() {
+            v.sort_unstable();
+        }
+        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known, lid: edge_lid, launched, launch_at, launches })
     }
 
     /// The logon ID of an edge, as the number it is paired by (0: none).
@@ -460,6 +472,25 @@ impl Store {
     /// as the connection is made: up to five minutes before the logon it
     /// ends in, for a password typed by hand, and never after it but for
     /// the clocks of two machines), and inside the session.
+    /// What the session `into` opened is recorded to have connected to,
+    /// by the host it is on: (time, destination), in time order.
+    pub fn launches_of(&self, into: u32) -> &[(i64, u32)] {
+        let id = self.logon_key(into);
+        if id == 0 {
+            return &[];
+        }
+        self.launched.get(&(self.edges[into as usize].dst, id)).map_or(&[], |v| v.as_slice())
+    }
+
+    /// The logon IDs of the sessions on the origin of `next` that are
+    /// recorded to have connected to where it goes, when it goes.
+    pub fn launchers_of(&self, next: u32) -> Vec<u64> {
+        let e = &self.edges[next as usize];
+        let Some(records) = self.launch_at.get(&(e.src, e.dst)) else { return Vec::new() };
+        let from = records.partition_point(|r| r.0 < e.t - 300);
+        records[from..].iter().take_while(|r| r.0 <= e.t + 5).map(|r| r.1).collect()
+    }
+
     pub fn launched_by(&self, into: u32, next: u32) -> bool {
         let (a, b) = (&self.edges[into as usize], &self.edges[next as usize]);
         let id = self.logon_key(into);

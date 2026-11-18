@@ -3,11 +3,14 @@
 //!
 //! A path from A to B is a chain of logins where every hop happens after
 //! the previous one, no later than `max_gap` seconds after it, and no host
-//! is entered twice. Asked **by session**, the hop out of a host must leave
-//! while the session the hop into it opened is still open: between that
-//! logon and its logoff, which the timeline pairs by logon ID (a logon
-//! whose logoff the timeline does not have cannot be followed, unless the
-//! gap is asked for in its place). The search is a depth-first walk over each host's
+//! is entered twice. Asked **by session**, the hop out of a host is tied to
+//! the session the hop into it opened, by that session's logon ID, in
+//! either of two ways: the host has its own record of that session
+//! connecting to the next host (a 4648, an auditd `connect`: the session
+//! MADE the hop), or the hop leaves while the session is still open,
+//! between its logon and its logoff, which the timeline pairs by logon ID
+//! (a logon whose logoff the timeline does not have cannot be followed
+//! that way, unless the gap is asked for in its place). The search is a depth-first walk over each host's
 //! outgoing edges, which are sorted by time, so the candidates of the next
 //! hop start at a binary search and everything earlier is skipped.
 //!
@@ -36,18 +39,18 @@ pub struct PathQuery {
     pub results: [bool; 4],
     /// leave out machine accounts (`NAME$`)
     pub skip_machine_accounts: bool,
-    /// the next hop leaves inside the session the hop before opened,
-    /// instead of within `max_gap` of it
+    /// the next hop is tied to the session the hop before opened, instead
+    /// of leaving within `max_gap` of it: the session is recorded to have
+    /// made it, or it leaves while the session is open
     pub by_session: bool,
     /// by session: a logon with no logoff in the timeline is followed for
     /// `max_gap` (instead of not at all)
     pub gap_without_session: bool,
     /// the only logins that may be a hop, by store edge; `None`: any
     pub only: Option<std::rc::Rc<Vec<bool>>>,
-    /// the next hop was MADE by the session the hop before opened: the
-    /// host in between has its own record of that session connecting to
-    /// the next one (a 4648, an auditd `connect`). Neither the gap nor the
-    /// end of the session is asked for besides: the record is the proof
+    /// only the first of the two ways of `by_session`: every hop was MADE
+    /// by the session the hop before opened, by the record of the host in
+    /// between. Leaving while the session is open is not enough
     pub launched: bool,
 }
 
@@ -90,11 +93,11 @@ fn hop_ok(s: &Store, ei: u32, e: &Edge, q: &PathQuery) -> bool {
 }
 
 /// How long after hop `ei` the next one may leave; `None`: it cannot be
-/// followed (by session, and the timeline has no logoff for it).
+/// followed by its time alone (by session, and the timeline has no logoff
+/// for it; or only what a session is recorded to have made is asked for).
 fn window(s: &Store, q: &PathQuery, ei: u32) -> Option<i64> {
     if q.launched {
-        // whenever the session's own record says (see `Store::launched_by`)
-        return Some(i64::MAX / 4);
+        return None;
     }
     if !q.by_session {
         return Some(q.max_gap);
@@ -104,6 +107,12 @@ fn window(s: &Store, q: &PathQuery, ei: u32) -> Option<i64> {
         None if q.gap_without_session => Some(q.max_gap),
         None => None,
     }
+}
+
+/// Whether the records of what a session made are part of the question
+/// (and the timeline has any).
+fn by_records(s: &Store, q: &PathQuery) -> bool {
+    (q.by_session || q.launched) && s.launches > 0
 }
 
 /// Every time-respecting path from `origin` to `dest`, shortest first,
@@ -136,7 +145,7 @@ pub fn search(s: &Store, q: &PathQuery) -> (Vec<Path>, bool) {
         let mut chain: Vec<u32> = Vec::new();
         let mut budget = BUDGET;
         let room = q.max_paths.saturating_mul(20).saturating_add(1000);
-        dfs(s, q, hops, room, q.origin, q.from.unwrap_or(i64::MIN), q.to.unwrap_or(i64::MAX), &mut visited, &mut chain, &mut found, &mut budget);
+        dfs(s, q, hops, room, q.origin, None, &mut visited, &mut chain, &mut found, &mut budget);
         cut |= budget == 0;
         found.sort_by(|a, b| a.span(s).cmp(&b.span(s)).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)).then_with(|| a.edges.cmp(&b.edges)));
         for p in found {
@@ -153,45 +162,85 @@ pub fn search(s: &Store, q: &PathQuery) -> (Vec<Path>, bool) {
 }
 
 /// The chains of exactly `hops` logins from `host` to the destination.
+/// `into` is the hop that entered `host` (none at the origin): the logins
+/// that can follow it are the ones inside its window (the gap, or its
+/// session) and, by session, the ones its session is recorded to have made.
 #[allow(clippy::too_many_arguments)]
-fn dfs(s: &Store, q: &PathQuery, hops: usize, room: usize, host: u32, not_before: i64, not_after: i64, visited: &mut HashSet<u32>, chain: &mut Vec<u32>, out: &mut Vec<Path>, budget: &mut usize) {
+fn dfs(s: &Store, q: &PathQuery, hops: usize, room: usize, host: u32, into: Option<u32>, visited: &mut HashSet<u32>, chain: &mut Vec<u32>, out: &mut Vec<Path>, budget: &mut usize) {
     if chain.len() >= hops || out.len() >= room || *budget == 0 {
         return;
     }
-    let last = chain.len() + 1 == hops;
     let edges = s.out_adj.of(host);
-    // first edge at or after `not_before` (edges of a host are in time order)
-    let start = edges.partition_point(|&ei| s.edges[ei as usize].t < not_before);
-    for &ei in &edges[start..] {
-        *budget = budget.saturating_sub(1);
-        if *budget == 0 || out.len() >= room {
-            return;
+    let end = q.to.unwrap_or(i64::MAX);
+    // inside the window: from the moment after the hop in, as long as it lasts
+    let (lo, hi) = match into {
+        None => (q.from.unwrap_or(i64::MIN), end),
+        Some(i) => {
+            let t = s.edges[i as usize].t;
+            match window(s, q, i) {
+                Some(w) => (t + 1, t.saturating_add(w).min(end)),
+                None => (1, 0),
+            }
         }
-        let e = &s.edges[ei as usize];
-        if e.t > not_after {
-            break;
+    };
+    if lo <= hi {
+        // (edges of a host are in time order)
+        let start = edges.partition_point(|&ei| s.edges[ei as usize].t < lo);
+        for &ei in &edges[start..] {
+            if s.edges[ei as usize].t > hi || !take(s, q, hops, room, ei, visited, chain, out, budget) {
+                break;
+            }
         }
-        // the last hop enters the destination and no other does
-        if last != (e.dst == q.dest) || visited.contains(&e.dst) || !hop_ok(s, ei, e, q) {
-            continue;
-        }
-        if q.launched && chain.last().map_or(false, |&before| !s.launched_by(before, ei)) {
-            continue;
-        }
-        chain.push(ei);
-        if last {
-            out.push(Path { edges: chain.clone() });
-        } else if let Some(w) = window(s, q, ei) {
-            visited.insert(e.dst);
-            let next_after = (e.t + 1).max(not_before);
-            // the gap (or the session) runs from THIS hop; only the end of
-            // the time window is carried along
-            let window_end = e.t.saturating_add(w).min(q.to.unwrap_or(i64::MAX));
-            dfs(s, q, hops, room, e.dst, next_after, window_end, visited, chain, out, budget);
-            visited.remove(&e.dst);
-        }
-        chain.pop();
     }
+    // made by the session, whenever its own record says
+    if let Some(i) = into.filter(|_| by_records(s, q)) {
+        let after = s.edges[i as usize].t + 1;
+        let mut tried: Vec<u32> = Vec::new();
+        for &(t, dst) in s.launches_of(i) {
+            let (from, to) = ((t - 5).max(after), (t + 300).min(end));
+            let start = edges.partition_point(|&ei| s.edges[ei as usize].t < from);
+            for &ei in &edges[start..] {
+                let e = &s.edges[ei as usize];
+                if e.t > to {
+                    break;
+                }
+                // (not one the window already gave)
+                if e.dst != dst || (lo <= e.t && e.t <= hi) || tried.contains(&ei) || !s.launched_by(i, ei) {
+                    continue;
+                }
+                tried.push(ei);
+                if !take(s, q, hops, room, ei, visited, chain, out, budget) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One login tried as the next hop of the chain; false when the search
+/// has to stop (nothing left to spend, or enough found).
+#[allow(clippy::too_many_arguments)]
+fn take(s: &Store, q: &PathQuery, hops: usize, room: usize, ei: u32, visited: &mut HashSet<u32>, chain: &mut Vec<u32>, out: &mut Vec<Path>, budget: &mut usize) -> bool {
+    *budget = budget.saturating_sub(1);
+    if *budget == 0 || out.len() >= room {
+        return false;
+    }
+    let e = &s.edges[ei as usize];
+    let last = chain.len() + 1 == hops;
+    // the last hop enters the destination and no other does
+    if last != (e.dst == q.dest) || visited.contains(&e.dst) || !hop_ok(s, ei, e, q) {
+        return true;
+    }
+    chain.push(ei);
+    if last {
+        out.push(Path { edges: chain.clone() });
+    } else {
+        visited.insert(e.dst);
+        dfs(s, q, hops, room, e.dst, Some(ei), visited, chain, out, budget);
+        visited.remove(&e.dst);
+    }
+    chain.pop();
+    true
 }
 
 /// A host in a cone: how far from the seed, when it was first reached,
@@ -266,15 +315,20 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         /// last moment it can be continued), in time order; one that is
         /// later, no shorter and lasts no less than another replaces it
         arrivals: VecDeque<(i64, usize, u32, i64)>,
+        /// every arrival, by what a record ties it to a login by (by
+        /// session, when the timeline has records of what sessions made):
+        /// forward its logon ID, backward the host it goes to
+        tied: HashMap<u64, Vec<(i64, usize, u32)>>,
         queued: bool,
     }
+    let records = by_records(s, q);
     let mut best: HashMap<u32, Reach> = HashMap::new();
     best.insert(seed, Reach { hop: 0, t: t0, via: None });
     let mut support: HashSet<u32> = HashSet::new();
     let mut hosts: HashMap<u32, Host> = HashMap::new();
     let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
     let start = first_at(seed, tau(t0));
-    hosts.insert(seed, Host { next: start, until: limit, arrivals: VecDeque::new(), queued: false });
+    hosts.insert(seed, Host { next: start, until: limit, arrivals: VecDeque::new(), tied: HashMap::new(), queued: false });
     if let Some(ei) = nth(seed, start) {
         heap.push(Reverse((etau(ei), seed)));
         hosts.get_mut(&seed).unwrap().queued = true;
@@ -287,14 +341,21 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         if !arriving.is_empty() && heap.peek().map_or(true, |r| (r.0).0 > arriving[0].1) {
             for (v, te, hops, ei) in arriving.drain(..) {
                 let first_next = first_at(v, te.saturating_add(1));
-                let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), queued: false });
+                let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), tied: HashMap::new(), queued: false });
                 let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
-                // (an arrival is told from another by its own records when they are asked for: none replaces another)
-                while !q.launched && hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
+                while hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
                     hv.arrivals.pop_back();
                 }
                 hv.arrivals.push_back((te, hops, ei, expiry));
                 hv.until = hv.until.max(expiry);
+                if records {
+                    // a record may tie it to a login at any later moment
+                    let key = if forward { s.logon_key(ei) } else { s.edges[ei as usize].dst as u64 + 1 };
+                    if key != 0 {
+                        hv.tied.entry(key).or_default().push((te, hops, ei));
+                    }
+                    hv.until = i64::MAX;
+                }
                 if !hv.queued {
                     hv.next = hv.next.max(first_next);
                     if let Some(n) = nth(v, hv.next) {
@@ -324,11 +385,25 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
                 // walking back by session, it is THIS login's session that
                 // must hold the hop already found out of the host
                 let back = if q.by_session && !forward { window(s, q, ei).unwrap_or(-1) } else { i64::MAX };
-                // of the arrivals this login can continue, the one with the fewest hops
-                // asked for the session's own record of the hop: the arrival and this login are tied by it
-                let made = |a: &(i64, usize, u32, i64)| !q.launched || if forward { s.launched_by(a.2, ei) } else { s.launched_by(ei, a.2) };
-                match host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back && made(a)).min_by_key(|a| a.1) {
-                    Some(a) => (ei, a.1, Some(a.2)),
+                // of the arrivals this login can continue, the one with the fewest hops:
+                // the ones whose window it is in...
+                let mut from: Option<(usize, u32)> = if q.launched { None } else { host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back).min_by_key(|a| a.1).map(|a| (a.1, a.2)) };
+                // ...and the ones a record of the host says made it (forward:
+                // the sessions recorded to have connected to where this login
+                // goes; backward: the hops out this login's session is
+                // recorded to have made)
+                if records && !host.tied.is_empty() {
+                    let keys: Vec<u64> = if forward { s.launchers_of(ei) } else { s.launches_of(ei).iter().map(|r| r.1 as u64 + 1).collect() };
+                    for k in keys {
+                        for a in host.tied.get(&k).map_or(&[][..], |v| v.as_slice()) {
+                            if a.0 < te && from.map_or(true, |f| a.1 < f.0) && if forward { s.launched_by(a.2, ei) } else { s.launched_by(ei, a.2) } {
+                                from = Some((a.1, a.2));
+                            }
+                        }
+                    }
+                }
+                match from {
+                    Some(a) => (ei, a.0, Some(a.1)),
                     None => {
                         if let Some(n) = nth(h, host.next) {
                             heap.push(Reverse((etau(n), h)));
@@ -718,13 +793,13 @@ mod tests {
         if eb.src != ea.dst || eb.t <= ea.t {
             return false;
         }
-        if q.launched {
-            // some record written from the host in between, with the logon
-            // ID of `a`, of a connection to where `b` goes, when `b` goes,
-            // while the session of `a` is open (when its end is known)
+        // made by the session: some record written from the host in between,
+        // with the logon ID of `a`, of a connection to where `b` goes, when
+        // `b` goes, while the session of `a` is open (when its end is known)
+        let made = {
             let id = s.logon_key(a as u32);
             let open_until = s.session_of(a as u32).map(|d| ea.t + d + 5);
-            return id != 0
+            id != 0
                 && (0..s.edges.len()).any(|r| {
                     let er = &s.edges[r];
                     matches!(s.event_ids.name(er.event_id), "4648" | "AUDIT_CONNECT")
@@ -735,7 +810,13 @@ mod tests {
                         && open_until.map_or(true, |u| er.t <= u)
                         && eb.t >= er.t - 5
                         && eb.t <= er.t + 300
-                });
+                })
+        };
+        if q.launched {
+            return made;
+        }
+        if q.by_session && made {
+            return true;
         }
         let room = if !q.by_session {
             Some(q.max_gap)

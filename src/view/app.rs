@@ -318,9 +318,6 @@ pub struct Viewer {
     path_by_session: bool,
     /// by session: a logon with no logoff is followed for the gap
     path_session_gap: bool,
-    /// every hop was made by the session before it, by the record of the
-    /// host in between (a 4648, an auditd connect)
-    path_launched: bool,
     /// the search runs over the whole timeline, not over what the filters select
     path_scope_all: bool,
     /// only the logins of these accounts are hops
@@ -1125,7 +1122,6 @@ impl Viewer {
             path_skip_machine: true,
             path_by_session: false,
             path_session_gap: false,
-            path_launched: false,
             path_scope_all: false,
             path_user: String::new(),
             path_from: String::new(),
@@ -4075,14 +4071,14 @@ impl Viewer {
             by_session: self.path_by_session,
             gap_without_session: self.path_session_gap,
             only,
-            launched: self.path_launched,
+            launched: false,
         };
         (q, rows)
     }
 
     /// What was searched, in words: "by session, in 1,204 of 39,679 rows (what the filters select)".
     fn path_scope_text(&self, q: &PathQuery, rows: usize) -> String {
-        let how = if q.launched { "by what each session is recorded to have launched" } else if q.by_session { if q.gap_without_session { "by session (the gap where a logon has no logoff)" } else { "by session" } } else { "by time" };
+        let how = if q.by_session { if q.gap_without_session { "by session (the gap where a logon has no logoff)" } else { "by session" } } else { "by time" };
         let whose = if self.path_user.trim().is_empty() { String::new() } else { format!(", account {}", self.path_user.trim()) };
         format!("{}, in {} of {} rows ({}{})", how, group_digits(rows), group_digits(self.store.edges.len()), if self.path_scope_all { "the whole timeline" } else { "what the filters select" }, whose)
     }
@@ -4111,21 +4107,11 @@ impl Viewer {
             // why not, as far as a wider search can tell
             let mut hints: Vec<String> = Vec::new();
             let mut wider = q.clone();
-            if q.launched {
-                wider.launched = false;
-                wider.by_session = true;
-                wider.gap_without_session = false;
-                let by_session = paths::find_paths(&self.store, &wider).len();
-                wider.by_session = false;
-                let by_time = paths::find_paths(&self.store, &wider).len();
-                if by_session > 0 || by_time > 0 {
-                    hints.push(format!("By session there {} and by time {}: what is missing is the record of a host in between saying that the session itself connected to the next one (a 4648 on Windows; on Linux an auditd connect record, which needs an audit rule on connect). This timeline has {} such record(s).", if by_session == 1 { "is 1 path".to_string() } else { format!("are {} paths", by_session) }, by_time, group_digits(self.store.launches)));
-                }
-            } else if q.by_session {
+            if q.by_session {
                 wider.by_session = false;
                 let n = paths::find_paths(&self.store, &wider).len();
                 if n > 0 {
-                    hints.push(format!("By time alone there {}: the sessions that would link the hops are not in the timeline (no logoff with their logon ID), or the next hop left after the session ended. Tick «the gap where a logon has no logoff», or chain by time.", if n == 1 { "is 1 path".to_string() } else { format!("are {} paths", n) }));
+                    hints.push(format!("By time alone there {}: nothing ties those hops to the session before them. The host in between has no record of the session making the next hop (a 4648 on Windows, an auditd connect record on Linux), and the session's end is not in the timeline (no logoff with its logon ID) or the next hop left after it. Tick «the gap where a logon has no logoff», or chain by time.", if n == 1 { "is 1 path".to_string() } else { format!("are {} paths", n) }));
                 }
             }
             if hints.is_empty() && (q.only.is_some() || q.from.is_some() || q.to.is_some()) {
@@ -4141,7 +4127,7 @@ impl Viewer {
             if hints.is_empty() {
                 hints.push(why_no_path(&self.store, &q));
             }
-            self.path_msg = format!("No path from {} to {} within {} hops{}. Searched {}.\n{}", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, if q.launched || (q.by_session && !q.gap_without_session) { String::new() } else { format!(" and {:.1} h per hop", self.path_gap_h) }, scope, hints.join("\n")) + cut;
+            self.path_msg = format!("No path from {} to {} within {} hops{}. Searched {}.\n{}", self.store.hosts.name(o), self.store.hosts.name(d), q.max_hops, if q.by_session && !q.gap_without_session { String::new() } else { format!(" and {:.1} h per hop", self.path_gap_h) }, scope, hints.join("\n")) + cut;
             return;
         }
         self.path_msg = format!("{} path(s), shortest first{}. Searched {}.{}", self.path_found.len(), if self.path_found.len() >= q.max_paths { " (as many as «Max paths» allows: there may be more)" } else { "" }, scope, cut);
@@ -4299,25 +4285,18 @@ impl Viewer {
                     find |= suggest_box(ui, 1, &mut self.path_suggest, &mut self.path_dest, 200.0, "host or address", &hosts);
                 });
 
-                theme::section_help(ui, "How one hop leads to the next", "Three readings, each stronger than the one before.\n\nBy time: the next hop leaves the host after the one that entered it, and no later than the gap. It is what «could have happened», and it finds the most.\n\nBy session (logon ID): the next hop leaves the host while the session the hop before opened there is still open, between that logon and its end, which the timeline pairs by their logon ID (on Linux, the process id of the sshd of the connection). It needs the end of the session to be in the timeline: where it is not, the logon cannot be followed (or is followed for the gap, if you tick that).\n\nLaunched by the session: the host in between has its own record of that very session connecting to the next host. On Windows it is a 4648 (a process of the session used credentials for another machine), which carries the session's logon ID; on Linux an auditd connect record, which carries the login session (ses) of the process that connected. It is the strongest: not «a hop left while the session was open» but «that session made the hop». It needs those records: Windows writes 4648 only when credentials are given explicitly, and auditd records connect only with a rule for it.");
+                theme::section_help(ui, "How one hop leads to the next", "By time: the next hop leaves the host after the one that entered it, and no later than the gap. It is what «could have happened», and it finds the most.\n\nBy session (logon ID): the next hop is tied to the session the hop before opened on that host, by that session's logon ID. Two kinds of evidence do it, and either is enough:\n\n• The host's own record that the session MADE the hop: on Windows a 4648 (a process of the session used credentials for another machine), on Linux an auditd connect record (it needs an audit rule on connect). Each carries the session's ID. It is the strongest: such a hop is drawn =(account time)-> in the list of paths.\n\n• The hop leaves while the session is still open, between its logon and its end, which the timeline pairs by their logon ID (on Linux, the process id of the sshd of the connection). It needs the end of the session in the timeline: where it is not, the logon cannot be followed this way (or is followed for the gap, if you tick that).");
                 ui.horizontal(|ui| {
-                    let mode = if self.path_launched { 2 } else if self.path_by_session { 1 } else { 0 };
-                    let mut pick = mode;
-                    ui.selectable_value(&mut pick, 0, format!("{}  by time", super::icons::CLOCK)).on_hover_text("Coherent in time: each hop after the one before and within the gap. Finds every chain that could have happened");
-                    ui.selectable_value(&mut pick, 1, format!("{}  by session (logon ID)", super::icons::KEY)).on_hover_text("The next hop leaves while the session the hop before opened is still open (its logon and its end share a logon ID). Not always possible: it needs the end of the session in the timeline");
-                    ui.selectable_value(&mut pick, 2, format!("{}  launched by the session", super::icons::LINK)).on_hover_text("The strongest: the host in between has its own record of that session connecting to the next host (a 4648 on Windows, an auditd connect record on Linux, each with the session's ID)");
-                    if pick != mode {
-                        self.path_by_session = pick == 1;
-                        self.path_launched = pick == 2;
-                    }
+                    ui.selectable_value(&mut self.path_by_session, false, format!("{}  by time", super::icons::CLOCK)).on_hover_text("Coherent in time: each hop after the one before and within the gap. Finds every chain that could have happened");
+                    ui.selectable_value(&mut self.path_by_session, true, format!("{}  by session (logon ID)", super::icons::KEY)).on_hover_text("Each hop is tied to the session the hop before opened, by its logon ID: the host has its own record of that session making the hop (4648, auditd connect), or the hop leaves while the session is still open (its logon and its end share the logon ID)");
+                    ui.label(egui::RichText::new(format!("{} of {} logons have their session  ·  {} record(s) of what a session made", group_digits(self.store.sessions_known), group_digits(self.store.logons), group_digits(self.store.launches))).small().color(if self.path_by_session && self.store.sessions_known == 0 && self.store.launches == 0 { CANDIDATE } else { MUTED })).on_hover_text("What a search by session has to work with in this timeline. Successful logons whose end is in it too (same host, same logon ID): a hop can be told to have left while they were open. And the rows written from the origin of a connection with the logon ID of the session that made it (4648, auditd connect): a hop can be told to have been made by a session");
                 });
-                ui.label(egui::RichText::new(format!("{} of {} logons have their session  ·  {} record(s) of what a session launched (4648, auditd connect)", group_digits(self.store.sessions_known), group_digits(self.store.logons), group_digits(self.store.launches))).small().color(if (self.path_by_session && self.store.sessions_known == 0) || (self.path_launched && self.store.launches == 0) { CANDIDATE } else { MUTED })).on_hover_text("Successful logons of this timeline whose end is in it too (same host, same logon ID): only these can be followed by session. And the rows written from the origin of a connection with the logon ID of the session that made it: only with these can a hop be told to have been launched by a session");
-                if self.path_by_session && !self.path_launched {
+                if self.path_by_session {
                     ui.checkbox(&mut self.path_session_gap, "the gap where a logon has no logoff").on_hover_text("A logon whose logoff is not in the timeline is followed for the gap below instead of not at all: sessions where the timeline has them, time where it does not");
                 }
                 ui.horizontal(|ui| {
-                    theme::label_help(ui, "Max gap per hop (h)", "The longest a hop may wait after the one before it, in hours. By session it only counts for logons with no logoff, when that box is ticked: a session lasts what it lasts. Launched by the session, it does not count: the record says when.");
-                    ui.add_enabled(!self.path_launched && (!self.path_by_session || self.path_session_gap), egui::DragValue::new(&mut self.path_gap_h).range(0.05..=24.0 * 90.0).speed(0.5).fixed_decimals(1));
+                    theme::label_help(ui, "Max gap per hop (h)", "The longest a hop may wait after the one before it, in hours. By session it only counts for logons with no logoff, when that box is ticked: a session lasts what it lasts.");
+                    ui.add_enabled(!self.path_by_session || self.path_session_gap, egui::DragValue::new(&mut self.path_gap_h).range(0.05..=24.0 * 90.0).speed(0.5).fixed_decimals(1));
                     ui.add_space(10.0);
                     theme::label_help(ui, "Max hops", "The longest chain looked for: 3 is origin → A → B → destination.");
                     ui.add(egui::DragValue::new(&mut self.path_hops).range(1..=12));
@@ -4413,7 +4392,7 @@ impl Viewer {
                                 text.push_str(&format!("  {}({}{})->  {}", if by_session { "=" } else { "-" }, if u.is_empty() { "?" } else { u }, &fmt_time(e.t)[10..16].replace(' ', " "), self.store.hosts.name(e.dst)));
                             }
                             if made > 0 {
-                                text.push_str(&format!("   [{} hop(s) launched by the session before: =]", made));
+                                text.push_str(&format!("   [= {} hop(s) the session before is recorded to have made]", made));
                             }
                             let span = p.span(&self.store);
                             let label = format!("{}.  {} hop(s) · {}  ·  {}", i + 1, p.hops(), if span >= 3600 { format!("{:.1} h", span as f32 / 3600.0) } else { format!("{} min", span / 60) }, text);
@@ -5688,11 +5667,7 @@ impl Viewer {
                 self.path_by_session = true;
                 self.path_session_gap = true;
             }
-            "paths-time" => {
-                self.path_by_session = false;
-                self.path_launched = false;
-            }
-            "paths-launched" => self.path_launched = true,
+            "paths-time" => self.path_by_session = false,
             "paths-all" => self.path_scope_all = true,
             "paths-filtered" => self.path_scope_all = false,
             other if other.starts_with("paths-user=") => self.path_user = other["paths-user=".len()..].to_string(),
