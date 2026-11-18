@@ -2492,9 +2492,16 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
                     let fname = match fkey { Ok(f) => f, Err(_) => continue };
                     let name = fname.name().to_string_lossy().to_string();
 
-                    if !name.eq_ignore_ascii_case("NTUSER.DAT") { continue; }
+                    // the hive and its transaction logs: a hive copied from a
+                    // running system keeps its latest writes in .LOG1 / .LOG2,
+                    // and they are replayed only if they sit beside it
+                    let suffix = if name.eq_ignore_ascii_case("NTUSER.DAT") { "" }
+                        else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG1") { ".LOG1" }
+                        else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG2") { ".LOG2" }
+                        else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG") { ".LOG" }
+                        else { continue };
 
-                    // Extract this NTUSER.DAT
+                    // Extract this file
                     let ntfs_file = match file_entry.file_reference().to_file(&ntfs, &mut partition_reader) {
                         Ok(f) => f, Err(_) => continue
                     };
@@ -2506,7 +2513,7 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
                     let mut attached = data_value.attach(&mut partition_reader);
 
                     // Save as username_NTUSER.DAT
-                    let output_path = output_dir.join(format!("{}_NTUSER.DAT", one_component(&username)));
+                    let output_path = output_dir.join(format!("{}_NTUSER.DAT{}", one_component(&username), suffix));
                     let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
                     let mut buf = [0u8; 65536];
@@ -2525,10 +2532,10 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
 
                     if is_debug_mode() {
                         let size = fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-                        eprintln!("[DEBUG] Extracted {}'s NTUSER.DAT ({} bytes)", username, size);
+                        eprintln!("[DEBUG] Extracted {}'s NTUSER.DAT{} ({} bytes)", username, suffix, size);
                     }
-                    count += 1;
-                    break; // Found NTUSER.DAT for this user, move to next user
+                    // the logs ride along; only the hive is counted
+                    if suffix.is_empty() { count += 1; }
                 }
             }
         }
