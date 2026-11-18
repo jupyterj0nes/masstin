@@ -147,7 +147,13 @@ pub fn search(s: &Store, q: &PathQuery) -> (Vec<Path>, bool) {
         let room = q.max_paths.saturating_mul(20).saturating_add(1000);
         dfs(s, q, hops, room, q.origin, None, &mut visited, &mut chain, &mut found, &mut budget);
         cut |= budget == 0;
-        found.sort_by(|a, b| a.span(s).cmp(&b.span(s)).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)).then_with(|| a.edges.cmp(&b.edges)));
+        // of the chains of one route, the one with the most hops its sessions
+        // are recorded to have made is the one to show; then the quickest
+        // (however the paths were asked for: the mark is drawn in every list)
+        let made = |p: &Path| -> usize { if s.launches > 0 { p.edges.windows(2).filter(|w| s.launched_by(w[0], w[1])).count() } else { 0 } };
+        let mut found: Vec<(usize, Path)> = found.into_iter().map(|p| (made(&p), p)).collect();
+        found.sort_by(|(ma, a), (mb, b)| mb.cmp(ma).then_with(|| a.span(s).cmp(&b.span(s))).then_with(|| s.edges[a.edges[0] as usize].t.cmp(&s.edges[b.edges[0] as usize].t)).then_with(|| a.edges.cmp(&b.edges)));
+        let found: Vec<Path> = found.into_iter().map(|x| x.1).collect();
         for p in found {
             if seen.insert(p.edges.iter().map(|&ei| { let e = &s.edges[ei as usize]; (e.src, e.dst, e.user) }).collect()) {
                 out.push(p);
@@ -706,6 +712,48 @@ mod tests {
         assert_eq!(find_paths(&s, &only).len(), 0);
         assert_eq!(find_paths(&s, &PathQuery { dest: h("C"), ..only.clone() }).len(), 1);
         assert_eq!(reach(&only, true), ["10.0.0.1", "B", "C"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// By session, a hop the session before it is recorded to have made
+    /// needs no logoff; and of two chains of the same route the one whose
+    /// hops are so recorded is the one listed.
+    #[test]
+    fn a_hop_the_session_made_needs_no_logoff_and_is_the_one_shown() {
+        let path = std::env::temp_dir().join(format!("masstin-made-{}.csv", std::process::id()));
+        let at = |min: u32| format!("2026-01-05T10:{:02}:00Z", min);
+        let body = [
+            crate::csv_out::HEADER.to_string(),
+            // two logons of ana into B a minute apart; neither has a logoff
+            format!("{},B,SUCCESSFUL_LOGON,4624,3,ana,CORP,,10.0.0.1,,,0xb1,,Security.evtx,,,,,", at(1)),
+            format!("{},B,SUCCESSFUL_LOGON,4624,3,ana,CORP,,10.0.0.1,,,0xb2,,Security.evtx,,,,,", at(2)),
+            // B's own record: the session 0xb1 used credentials for C, and the logon on C
+            format!("{},C,CONNECT,4648,3,ana,CORP,B,,,,0xb1,,Security.evtx,,,,,", at(5)),
+            format!("{},C,SUCCESSFUL_LOGON,4624,3,ana,CORP,,B,,,0xc1,,Security.evtx,,,,,", at(5)),
+            // and a logon on D from C that nothing ties to anything
+            format!("{},D,SUCCESSFUL_LOGON,4624,3,ana,CORP,,C,,,0xd1,,Security.evtx,,,,,", at(9)),
+        ]
+        .join("
+");
+        std::fs::write(&path, format!("{}
+", body)).unwrap();
+        let s = Store::load(&[path.to_string_lossy().to_string()], 0.05).unwrap();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        assert_eq!((s.sessions_known, s.launches), (0, 1));
+        let q = PathQuery { origin: h("10.0.0.1"), dest: h("C"), by_session: true, ..Default::default() };
+        let found = find_paths(&s, &q);
+        assert_eq!(found.len(), 1);
+        // through the logon of 10:01, the one whose session made the hop
+        assert_eq!(s.edges[found[0].edges[0] as usize].t % 3600, 60);
+        assert!(s.launched_by(found[0].edges[0], found[0].edges[1]));
+        // by time both chains are there, and the one recorded is still the one shown
+        let by_time = find_paths(&s, &PathQuery { by_session: false, ..q.clone() });
+        assert_eq!((by_time.len(), s.edges[by_time[0].edges[0] as usize].t % 3600), (1, 60));
+        // D: nothing says the session on C made that hop, and it has no end
+        assert!(find_paths(&s, &PathQuery { dest: h("D"), ..q.clone() }).is_empty());
+        assert_eq!(find_paths(&s, &PathQuery { dest: h("D"), gap_without_session: true, ..q.clone() }).len(), 1);
+        let reach: HashSet<u32> = cone(&s, q.origin, 0, &q, true).0.keys().copied().collect();
+        assert_eq!(reach, HashSet::from([h("10.0.0.1"), h("B"), h("C")]));
         let _ = std::fs::remove_file(path);
     }
 
