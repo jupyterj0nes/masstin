@@ -48,6 +48,9 @@ pub struct PathQuery {
     pub gap_without_session: bool,
     /// the only logins that may be a hop, by store edge; `None`: any
     pub only: Option<std::rc::Rc<Vec<bool>>>,
+    /// every hop of a chain is by the same account (by its bare name:
+    /// `ana@CORP` and `ana@WS01` are one), whichever it is
+    pub same_account: bool,
     /// only the first of the two ways of `by_session`: every hop was MADE
     /// by the session the hop before opened, by the record of the host in
     /// between. Leaving while the session is open is not enough
@@ -56,7 +59,7 @@ pub struct PathQuery {
 
 impl Default for PathQuery {
     fn default() -> Self {
-        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true, by_session: false, gap_without_session: false, only: None, launched: false }
+        PathQuery { origin: 0, dest: 0, from: None, to: None, max_hops: 6, max_gap: 86_400, max_paths: 50, results: [true, false, false, false], skip_machine_accounts: true, by_session: false, gap_without_session: false, only: None, launched: false, same_account: false }
     }
 }
 
@@ -237,6 +240,9 @@ fn take(s: &Store, q: &PathQuery, hops: usize, room: usize, ei: u32, visited: &m
     if last != (e.dst == q.dest) || visited.contains(&e.dst) || !hop_ok(s, ei, e, q) {
         return true;
     }
+    if q.same_account && chain.last().map_or(false, |&before| s.user_key(s.edges[before as usize].user) != s.user_key(e.user)) {
+        return true;
+    }
     chain.push(ei);
     if last {
         out.push(Path { edges: chain.clone() });
@@ -271,7 +277,79 @@ pub fn backward_cone(s: &Store, dest: u32, to: i64, q: &PathQuery) -> HashMap<u3
 }
 
 /// The cone of `seed`, forward in time or back, and the logins that
-/// support it besides each host's own (see below).
+/// support it besides each host's own (see `cone_from`).
+pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (HashMap<u32, Reach>, Vec<u32>) {
+    let c = cone_from(s, &[seed], t0, q, forward);
+    (c.reach, c.support)
+}
+
+/// What a cone found: every host reached, and how to walk to each.
+pub struct Cone {
+    pub forward: bool,
+    /// each host with its first arrival (the seeds at hop 0)
+    pub reach: HashMap<u32, Reach>,
+    /// logins that hold the picture together besides each host's own: an
+    /// arrival later than a host's first that a hop out of it continued
+    pub support: Vec<u32>,
+    /// for each login that is a hop of the cone, the hop it continued
+    /// (`u32::MAX`: a login of a seed)
+    parent: Vec<u32>,
+}
+
+impl Cone {
+    /// The chain of logins between a seed and `host`, in time order: from
+    /// a seed to the host (forward) or from the host to a seed (backward).
+    pub fn chain(&self, host: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = self.reach.get(&host).and_then(|r| r.via);
+        while let Some(ei) = at {
+            if out.len() > 64 {
+                break;
+            }
+            out.push(ei);
+            at = self.parent.get(ei as usize).copied().filter(|p| *p != u32::MAX);
+        }
+        if self.forward {
+            out.reverse();
+        }
+        out
+    }
+}
+
+/// The hosts a chain can start at (forward) or end at (backward) among
+/// the logins the question allows, when no host is named: the ones whose
+/// first allowed login out comes before any allowed login into them (a
+/// chain cannot have come from somewhere else), or, backward, whose last
+/// login in comes after every login out.
+pub fn chain_ends(s: &Store, q: &PathQuery, forward: bool) -> Vec<u32> {
+    let allowed = |ei: u32| -> bool {
+        let e = &s.edges[ei as usize];
+        e.src != e.dst && hop_ok(s, ei, e, q) && q.from.map_or(true, |f| e.t >= f) && q.to.map_or(true, |t| e.t <= t)
+    };
+    let mut ends = Vec::new();
+    for h in 0..s.hosts.len() as u32 {
+        let (outs, ins) = (s.out_adj.of(h), s.in_adj.of(h));
+        let t = |ei: &u32| s.edges[*ei as usize].t;
+        if forward {
+            let first_out = outs.iter().find(|ei| allowed(**ei)).map(t);
+            let first_in = ins.iter().find(|ei| allowed(**ei)).map(t);
+            if first_out.is_some_and(|o| first_in.map_or(true, |i| o <= i)) {
+                ends.push(h);
+            }
+        } else {
+            let last_in = ins.iter().rev().find(|ei| allowed(**ei)).map(t);
+            let last_out = outs.iter().rev().find(|ei| allowed(**ei)).map(t);
+            if last_in.is_some_and(|i| last_out.map_or(true, |o| i >= o)) {
+                ends.push(h);
+            }
+        }
+    }
+    ends
+}
+
+/// The cone of several seeds at once, forward in time or back: every host
+/// a chain of logins reaches from any of them (or that reaches any of
+/// them), the seeds themselves at hop 0.
 ///
 /// The logins are walked in the order of time, and a host keeps EVERY
 /// arrival that can still be continued, not its first one only: a login
@@ -279,10 +357,12 @@ pub fn backward_cone(s: &Store, dest: u32, to: i64, q: &PathQuery) -> HashMap<u3
 /// than `max_gap` earlier. (Keeping the first arrival alone, a host
 /// entered at 09:00 and again at 17:00 could not be left at 17:30 with a
 /// gap of an hour, and everything reached from there was missing from the
-/// cone.) A host's `Reach` is its first arrival, as before; when the hop
-/// into it left a host through a LATER arrival than that host's first, the
-/// login of that arrival is given too, so what is drawn holds together.
-pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (HashMap<u32, Reach>, Vec<u32>) {
+/// cone.) A host's `Reach` is its first arrival; when the hop into it left
+/// a host through a LATER arrival than that host's first, the login of
+/// that arrival is given too, so what is drawn holds together. Asked for
+/// the same account all along, the arrivals of each account are kept
+/// apart: a login continues only an arrival of its own account.
+pub fn cone_from(s: &Store, seeds: &[u32], t0: i64, q: &PathQuery, forward: bool) -> Cone {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     // time as the walk runs it: as it is forward, negated backward
@@ -312,15 +392,19 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
             l.len() - l.partition_point(|&ei| s.edges[ei as usize].t <= x.saturating_neg())
         }
     };
+    /// (time, hops, login, the last moment it can be continued)
+    type Arrival = (i64, usize, u32, i64);
+    #[derive(Default)]
     struct Host {
         /// the next login to look at, in walk order
         next: usize,
         /// no login after this can be a hop (the last arrival plus the gap)
         until: i64,
-        /// arrivals that can still be continued: (time, hops, login, the
-        /// last moment it can be continued), in time order; one that is
-        /// later, no shorter and lasts no less than another replaces it
-        arrivals: VecDeque<(i64, usize, u32, i64)>,
+        /// arrivals that can still be continued, by the account they are
+        /// kept apart by (one group when accounts are not asked about),
+        /// in time order; one that is later, no shorter and lasts no less
+        /// than another replaces it
+        arrivals: HashMap<u32, VecDeque<Arrival>>,
         /// every arrival, by what a record ties it to a login by (by
         /// session, when the timeline has records of what sessions made):
         /// forward its logon ID, backward the host it goes to
@@ -328,16 +412,22 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         queued: bool,
     }
     let records = by_records(s, q);
+    let group = |ei: u32| -> u32 { if q.same_account { s.user_key(s.edges[ei as usize].user).wrapping_add(1) } else { 0 } };
+    let seeds: HashSet<u32> = seeds.iter().copied().collect();
+    let mut parent = vec![u32::MAX; s.edges.len()];
     let mut best: HashMap<u32, Reach> = HashMap::new();
-    best.insert(seed, Reach { hop: 0, t: t0, via: None });
     let mut support: HashSet<u32> = HashSet::new();
     let mut hosts: HashMap<u32, Host> = HashMap::new();
     let mut heap: BinaryHeap<Reverse<(i64, u32)>> = BinaryHeap::new();
-    let start = first_at(seed, tau(t0));
-    hosts.insert(seed, Host { next: start, until: limit, arrivals: VecDeque::new(), tied: HashMap::new(), queued: false });
-    if let Some(ei) = nth(seed, start) {
-        heap.push(Reverse((etau(ei), seed)));
-        hosts.get_mut(&seed).unwrap().queued = true;
+    for &seed in &seeds {
+        best.insert(seed, Reach { hop: 0, t: t0, via: None });
+        let start = first_at(seed, tau(t0));
+        let mut host = Host { next: start, until: limit, ..Host::default() };
+        if let Some(ei) = nth(seed, start) {
+            heap.push(Reverse((etau(ei), seed)));
+            host.queued = true;
+        }
+        hosts.insert(seed, host);
     }
     // the arrivals of the moment being walked: (host, time, hops, login).
     // They wait until every login of that moment is done: one of them may
@@ -347,12 +437,13 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         if !arriving.is_empty() && heap.peek().map_or(true, |r| (r.0).0 > arriving[0].1) {
             for (v, te, hops, ei) in arriving.drain(..) {
                 let first_next = first_at(v, te.saturating_add(1));
-                let hv = hosts.entry(v).or_insert(Host { next: 0, until: i64::MIN, arrivals: VecDeque::new(), tied: HashMap::new(), queued: false });
+                let hv = hosts.entry(v).or_insert(Host { until: i64::MIN, ..Host::default() });
                 let expiry = if q.by_session && !forward { i64::MAX } else { window(s, q, ei).map_or(te, |w| te.saturating_add(w)) };
-                while hv.arrivals.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
-                    hv.arrivals.pop_back();
+                let kept = hv.arrivals.entry(group(ei)).or_default();
+                while kept.back().map_or(false, |a| a.1 >= hops && a.3 <= expiry) {
+                    kept.pop_back();
                 }
-                hv.arrivals.push_back((te, hops, ei, expiry));
+                kept.push_back((te, hops, ei, expiry));
                 hv.until = hv.until.max(expiry);
                 if records {
                     // a record may tie it to a login at any later moment
@@ -379,21 +470,27 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
             host.queued = false;
             let Some(ei) = nth(h, host.next) else { continue };
             let te = etau(ei);
-            if te > limit || (h != seed && te > host.until) {
+            if te > limit || (!seeds.contains(&h) && te > host.until) {
                 // nothing more from here until another arrival
                 continue;
             }
             host.next += 1;
-            if h == seed {
+            if seeds.contains(&h) {
                 (ei, 0usize, None)
             } else {
-                host.arrivals.retain(|a| a.3 >= te);
+                let mine = group(ei);
                 // walking back by session, it is THIS login's session that
                 // must hold the hop already found out of the host
                 let back = if q.by_session && !forward { window(s, q, ei).unwrap_or(-1) } else { i64::MAX };
                 // of the arrivals this login can continue, the one with the fewest hops:
                 // the ones whose window it is in...
-                let mut from: Option<(usize, u32)> = if q.launched { None } else { host.arrivals.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back).min_by_key(|a| a.1).map(|a| (a.1, a.2)) };
+                let mut from: Option<(usize, u32)> = None;
+                if !q.launched {
+                    if let Some(kept) = host.arrivals.get_mut(&mine) {
+                        kept.retain(|a| a.3 >= te);
+                        from = kept.iter().filter(|a| a.0 < te && te.saturating_sub(a.0) <= back).min_by_key(|a| a.1).map(|a| (a.1, a.2));
+                    }
+                }
                 // ...and the ones a record of the host says made it (forward:
                 // the sessions recorded to have connected to where this login
                 // goes; backward: the hops out this login's session is
@@ -402,7 +499,7 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
                     let keys: Vec<u64> = if forward { s.launchers_of(ei) } else { s.launches_of(ei).iter().map(|r| r.1 as u64 + 1).collect() };
                     for k in keys {
                         for a in host.tied.get(&k).map_or(&[][..], |v| v.as_slice()) {
-                            if a.0 < te && from.map_or(true, |f| a.1 < f.0) && if forward { s.launched_by(a.2, ei) } else { s.launched_by(ei, a.2) } {
+                            if a.0 < te && from.map_or(true, |f| a.1 < f.0) && group(a.2) == mine && if forward { s.launched_by(a.2, ei) } else { s.launched_by(ei, a.2) } {
                                 from = Some((a.1, a.2));
                             }
                         }
@@ -423,7 +520,8 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
         let e = &s.edges[ei as usize];
         let te = etau(ei);
         let v = if forward { e.dst } else { e.src };
-        if v != seed && v != h && hops < q.max_hops && hop_ok(s, ei, e, q) {
+        if !seeds.contains(&v) && v != h && hops < q.max_hops && hop_ok(s, ei, e, q) {
+            parent[ei as usize] = enabling.unwrap_or(u32::MAX);
             if !best.contains_key(&v) {
                 best.insert(v, Reach { hop: hops + 1, t: e.t, via: Some(ei) });
                 if let Some(en) = enabling {
@@ -444,7 +542,7 @@ pub fn cone(s: &Store, seed: u32, t0: i64, q: &PathQuery, forward: bool) -> (Has
     }
     let mut support: Vec<u32> = support.into_iter().collect();
     support.sort_unstable();
-    (best, support)
+    Cone { forward, reach: best, support, parent }
 }
 
 /// The canned questions: short tables over a set of edges (the view's).
@@ -559,7 +657,8 @@ mod tests {
     }
 
     fn store() -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("masstin-paths-{}.csv", std::process::id()));
+        // (one file per test: they run at the same time)
+        let path = std::env::temp_dir().join(format!("masstin-paths-{}-{:?}.csv", std::process::id(), std::thread::current().id()).replace(['(', ')'], ""));
         let lines = vec![
             csv_out::HEADER.to_string(),
             row(1, 9, "10.0.0.5", "WS01", "alice", "SUCCESSFUL_LOGON"),
@@ -841,6 +940,11 @@ mod tests {
         if eb.src != ea.dst || eb.t <= ea.t {
             return false;
         }
+        // the same account, by its bare name
+        let bare = |u: u32| s.users.name(u).split('@').next().unwrap().to_lowercase();
+        if q.same_account && bare(ea.user) != bare(eb.user) {
+            return false;
+        }
         // made by the session: some record written from the host in between,
         // with the logon ID of `a`, of a connection to where `b` goes, when
         // `b` goes, while the session of `a` is open (when its end is known)
@@ -913,14 +1017,14 @@ mod tests {
 
     /// Every host a chain of logins reaches from the seed (or that reaches
     /// it), by trying every chain; a chain may pass a host twice.
-    fn every_reach(s: &Store, q: &PathQuery, seed: u32, forward: bool) -> HashSet<u32> {
+    fn every_reach(s: &Store, q: &PathQuery, seeds: &[u32], forward: bool) -> HashSet<u32> {
         let n = s.edges.len();
         let far = |i: usize| if forward { s.edges[i].dst } else { s.edges[i].src };
         let near = |i: usize| if forward { s.edges[i].src } else { s.edges[i].dst };
-        let usable = |i: usize| may_hop(s, q, i) && far(i) != seed;
+        let usable = |i: usize| may_hop(s, q, i) && !seeds.contains(&far(i));
         let mut done = vec![false; n];
-        let mut level: Vec<usize> = (0..n).filter(|&i| near(i) == seed && usable(i)).collect();
-        let mut hosts: HashSet<u32> = HashSet::from([seed]);
+        let mut level: Vec<usize> = (0..n).filter(|&i| seeds.contains(&near(i)) && usable(i)).collect();
+        let mut hosts: HashSet<u32> = seeds.iter().copied().collect();
         for _ in 0..q.max_hops {
             let mut after = Vec::new();
             for &a in &level {
@@ -948,7 +1052,7 @@ mod tests {
         let mut checked = (0usize, 0usize, 0usize);
         // paths whose every hop the session before it is recorded to have made
         let mut made = 0usize;
-        for seed in 0..60u64 {
+        for seed in 0..36u64 {
             let (s, path) = chance_store(seed, "all");
             let h = |n: &str| s.hosts.get(n);
             let (Some(o), Some(d)) = (h("HA"), h("HD")) else {
@@ -957,7 +1061,7 @@ mod tests {
             };
             let ana: std::rc::Rc<Vec<bool>> = std::rc::Rc::new(s.edges.iter().map(|e| s.users.name(e.user).to_lowercase().starts_with("ana")).collect());
             let mid = (s.t_min + s.t_max) / 2;
-            for combo in 0..(2 * 3 * 3 * 2 * 2 * 3 * 3 * 2) {
+            for combo in 0..(2 * 3 * 3 * 2 * 2 * 3 * 3 * 2 * 2) {
                 let mut c = combo;
                 let mut pick = |n: usize| -> usize {
                     let k = c % n;
@@ -977,9 +1081,11 @@ mod tests {
                     by_session: false,
                     gap_without_session: false,
                     launched: false,
+                    same_account: false,
                     max_paths: 100_000,
                 };
                 let chain = pick(2);
+                let q = PathQuery { same_account: pick(2) == 1, ..q };
                 for mode in 0..4 {
                     // the session modes on half the combinations (they share the rest)
                     if mode > 0 && chain == 0 {
@@ -1010,15 +1116,30 @@ mod tests {
                     }
                     checked.0 += 1;
                     checked.1 += want.len();
-                    // the cones
+                    // the cones: of one seed, and of two at once
                     for forward in [true, false] {
-                        let seed_host = if forward { o } else { d };
-                        let t0 = if forward { q.from.unwrap_or(i64::MIN) } else { q.to.unwrap_or(i64::MAX) };
-                        let got: HashSet<u32> = cone(&s, seed_host, t0, &q, forward).0.keys().copied().collect();
-                        let want = every_reach(&s, &q, seed_host, forward);
-                        let names = |v: &HashSet<u32>| { let mut n: Vec<&str> = v.iter().map(|x| s.hosts.name(*x)).collect(); n.sort(); n.join(" ") };
-                        assert_eq!(names(&got), names(&want), "seed {} combo {} mode {} forward {}: {:?}", seed, combo, mode, forward, q);
-                        checked.2 += want.len() - 1;
+                        for both in [false, true] {
+                            let seeds: Vec<u32> = if both { vec![o, d] } else { vec![if forward { o } else { d }] };
+                            let t0 = if forward { q.from.unwrap_or(i64::MIN) } else { q.to.unwrap_or(i64::MAX) };
+                            let found = cone_from(&s, &seeds, t0, &q, forward);
+                            let got: HashSet<u32> = found.reach.keys().copied().collect();
+                            let want = every_reach(&s, &q, &seeds, forward);
+                            let names = |v: &HashSet<u32>| { let mut n: Vec<&str> = v.iter().map(|x| s.hosts.name(*x)).collect(); n.sort(); n.join(" ") };
+                            assert_eq!(names(&got), names(&want), "seed {} combo {} mode {} forward {} both {}: {:?}", seed, combo, mode, forward, both, q);
+                            checked.2 += want.len() - seeds.len();
+                            // the chain given for each host is one: from a seed to it (or from it to a seed), every hop allowed and following the one before
+                            for (host, r) in &found.reach {
+                                let chain = found.chain(*host);
+                                assert_eq!(chain.len(), r.hop, "seed {} combo {} mode {} forward {}: the chain of {}", seed, combo, mode, forward, s.hosts.name(*host));
+                                if chain.is_empty() {
+                                    continue;
+                                }
+                                let (first, last) = (&s.edges[chain[0] as usize], &s.edges[*chain.last().unwrap() as usize]);
+                                assert!(if forward { seeds.contains(&first.src) && last.dst == *host } else { first.src == *host && seeds.contains(&last.dst) });
+                                assert!(chain.iter().all(|&e| may_hop(&s, &q, e as usize)));
+                                assert!(chain.windows(2).all(|w| follows(&s, &q, w[0] as usize, w[1] as usize)), "seed {} combo {} mode {} forward {}: the chain of {} does not hold", seed, combo, mode, forward, s.hosts.name(*host));
+                            }
+                        }
                     }
                 }
             }
@@ -1056,6 +1177,40 @@ mod tests {
         // to D, three hops: found, as one path
         let (found, _) = search(&s, &PathQuery { origin: h("10.0.0.1"), dest: h("D"), ..Default::default() });
         assert_eq!((found.len(), found[0].hops()), (1, 3));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With no host named, a tree starts at every host a chain can start
+    /// at; the same account all along keeps a chain to one account; and
+    /// the chain given for a host of the tree is the way to it.
+    #[test]
+    fn a_tree_starts_where_chains_start_and_follows_one_account() {
+        let (s, path) = store();
+        let h = |n: &str| s.hosts.get(n).unwrap();
+        let names = |v: Vec<u32>| { let mut n: Vec<String> = v.iter().map(|x| s.hosts.name(*x).to_string()).collect(); n.sort(); n };
+        let q = PathQuery { max_gap: 6 * 3600, ..Default::default() };
+        // 10.0.0.5 is never entered; SRV01 leaves (08:00) before anything enters it (10:00)
+        assert_eq!(names(chain_ends(&s, &q, true)), ["10.0.0.5", "SRV01"]);
+        // FS01 is entered and never left
+        assert_eq!(names(chain_ends(&s, &q, false)), ["FS01"]);
+        // the tree of 10.0.0.5, and the chain to its farthest host
+        let tree = cone_from(&s, &[h("10.0.0.5")], 0, &q, true);
+        assert_eq!(names(tree.reach.keys().copied().collect()), ["10.0.0.5", "DC01", "SRV01", "WS01"]);
+        let chain: Vec<String> = tree.chain(h("DC01")).iter().map(|&e| format!("{}>{}", s.hosts.name(s.edges[e as usize].src), s.hosts.name(s.edges[e as usize].dst))).collect();
+        assert_eq!(chain, ["10.0.0.5>WS01", "WS01>SRV01", "SRV01>DC01"]);
+        assert!(tree.chain(h("10.0.0.5")).is_empty());
+        // back from DC01: the same three hops, in time order
+        let back = cone_from(&s, &[h("DC01")], i64::MAX, &q, false);
+        let chain: Vec<String> = back.chain(h("10.0.0.5")).iter().map(|&e| s.hosts.name(s.edges[e as usize].dst).to_string()).collect();
+        assert_eq!(chain, ["WS01", "SRV01", "DC01"]);
+        // one account all along: alice goes as far as SRV01; the hop to DC01 is admin's
+        let one = PathQuery { same_account: true, ..q.clone() };
+        assert_eq!(names(cone_from(&s, &[h("10.0.0.5")], 0, &one, true).reach.keys().copied().collect()), ["10.0.0.5", "SRV01", "WS01"]);
+        assert!(find_paths(&s, &PathQuery { origin: h("10.0.0.5"), dest: h("DC01"), ..one.clone() }).is_empty());
+        assert_eq!(find_paths(&s, &PathQuery { origin: h("10.0.0.5"), dest: h("SRV01"), ..one.clone() }).len(), 1);
+        // from both starts at once: what either reaches, each start at hop 0
+        let both = cone_from(&s, &chain_ends(&s, &q, true), 0, &q, true);
+        assert_eq!((both.reach[&h("SRV01")].hop, both.reach[&h("DC01")].hop, both.reach[&h("WS01")].hop), (0, 1, 1));
         let _ = std::fs::remove_file(path);
     }
 

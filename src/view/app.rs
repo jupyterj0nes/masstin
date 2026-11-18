@@ -318,6 +318,13 @@ pub struct Viewer {
     path_by_session: bool,
     /// by session: a logon with no logoff is followed for the gap
     path_session_gap: bool,
+    /// every hop of a chain is by the same account, whichever it is
+    path_same_account: bool,
+    /// everything from a host (or into it): the tree last asked for
+    path_tree: Option<PathTree>,
+    /// the settings of the Paths window are folded away: the boxes, the
+    /// buttons and what was found are all it shows
+    path_compact: bool,
     /// the search runs over the whole timeline, not over what the filters select
     path_scope_all: bool,
     /// only the logins of these accounts are hops
@@ -805,6 +812,15 @@ fn suggest_box(ui: &mut egui::Ui, me: u8, state: &mut Option<Suggest>, text: &mu
     false
 }
 
+/// Everything from a host, or into it: the cone, and its hosts as the
+/// rows of a tree (each under the host its first arrival came from).
+struct PathTree {
+    cone: paths::Cone,
+    /// (host, how deep in the tree), in the order they are listed
+    rows: Vec<(u32, usize)>,
+    title: String,
+}
+
 struct Trail {
     title: String,
     edges: std::collections::HashSet<u32>,
@@ -1122,6 +1138,9 @@ impl Viewer {
             path_skip_machine: true,
             path_by_session: false,
             path_session_gap: false,
+            path_same_account: false,
+            path_tree: None,
+            path_compact: false,
             path_scope_all: false,
             path_user: String::new(),
             path_from: String::new(),
@@ -4072,6 +4091,7 @@ impl Viewer {
             gap_without_session: self.path_session_gap,
             only,
             launched: false,
+            same_account: self.path_same_account,
         };
         (q, rows)
     }
@@ -4079,7 +4099,7 @@ impl Viewer {
     /// What was searched, in words: "by session, in 1,204 of 39,679 rows (what the filters select)".
     fn path_scope_text(&self, q: &PathQuery, rows: usize) -> String {
         let how = if q.by_session { if q.gap_without_session { "by session (the gap where a logon has no logoff)" } else { "by session" } } else { "by time" };
-        let whose = if self.path_user.trim().is_empty() { String::new() } else { format!(", account {}", self.path_user.trim()) };
+        let whose = format!("{}{}", if self.path_user.trim().is_empty() { String::new() } else { format!(", account {}", self.path_user.trim()) }, if q.same_account { ", the same account all along" } else { "" });
         format!("{}, in {} of {} rows ({}{})", how, group_digits(rows), group_digits(self.store.edges.len()), if self.path_scope_all { "the whole timeline" } else { "what the filters select" }, whose)
     }
 
@@ -4162,26 +4182,122 @@ impl Viewer {
         }
     }
 
+    /// Everything from the origin (forward) or into the destination: every
+    /// host a chain of logins reaches, as a tree. With no host named, from
+    /// (or into) every host a chain of the logins searched can start at
+    /// (end at): every chain of an account, or of a period.
     fn run_cone(&mut self, forward: bool) {
-        let field = if forward { self.path_origin.clone() } else { self.path_dest.clone() };
-        let Some(h) = self.host_named(&field) else {
-            self.path_msg = if forward { "name the origin of the cone".into() } else { "name the destination of the cone".into() };
-            return;
-        };
-        let (q, rows) = self.path_query(h, h);
+        let field = if forward { self.path_origin.trim().to_string() } else { self.path_dest.trim().to_string() };
+        let (q, rows) = self.path_query(0, 0);
         let scope = self.path_scope_text(&q, rows);
-        let t0 = if forward { q.from.unwrap_or(self.store.t_min) } else { q.to.unwrap_or(self.store.t_max) };
-        let (reach, support) = paths::cone(&self.store, h, t0, &q, forward);
-        let mut edges: Vec<u32> = reach.values().filter_map(|r| r.via).collect();
-        edges.extend(support);
-        let labels: HashMap<u32, String> = reach.iter().map(|(host, r)| (*host, if r.hop == 0 { (if forward { "origin" } else { "destination" }).to_string() } else { format!("hop {} · {}", r.hop, &fmt_time(r.t)[5..16]) })).collect();
-        let hops: HashMap<u32, usize> = reach.iter().map(|(host, r)| (*host, r.hop)).collect();
         self.path_found.clear();
-        self.path_msg = format!("{} host(s) {} {} within {} hops. Searched {}.", reach.len().saturating_sub(1), if forward { "reachable from" } else { "that could reach" }, self.store.hosts.name(h), q.max_hops, scope);
-        if edges.is_empty() {
+        self.path_tree = None;
+        let seeds: Vec<u32> = if field.is_empty() {
+            paths::chain_ends(&self.store, &q, forward)
+        } else {
+            match self.host_named(&field) {
+                Some(h) => vec![h],
+                None => {
+                    self.path_msg = format!("No host of the timeline is called {} (the arrow next to the box lists them). Leave the box empty for every chain of the account or the dates set below, wherever it {}.", field, if forward { "starts" } else { "ends" });
+                    return;
+                }
+            }
+        };
+        if seeds.is_empty() {
+            self.path_msg = format!("No login of the ones searched can {} a chain. Searched {}.", if forward { "start" } else { "end" }, scope);
             return;
         }
-        self.set_overlay(format!("{} {}", if forward { "reach of" } else { "ways into" }, self.store.hosts.name(h)), edges, labels, hops);
+        let t0 = if forward { q.from.unwrap_or(self.store.t_min) } else { q.to.unwrap_or(self.store.t_max) };
+        let cone = paths::cone_from(&self.store, &seeds, t0, &q, forward);
+        let reached = cone.reach.len().saturating_sub(seeds.len());
+        let whose = if field.is_empty() {
+            format!("{} host(s) where a chain {} (no host named: every one the logins searched allow)", group_digits(seeds.len()), if forward { "starts" } else { "ends" })
+        } else {
+            self.store.hosts.name(seeds[0]).to_string()
+        };
+        self.path_msg = format!("{} host(s) {} {} within {} hops. Searched {}.", group_digits(reached), if forward { "reachable from" } else { "that could reach" }, whose, q.max_hops, scope);
+        if reached == 0 {
+            if self.overlay.as_ref().map_or(false, |o| !o.exact) || self.trail.is_some() {
+                self.overlay = None;
+                self.trail = None;
+                self.requery(false);
+            }
+            return;
+        }
+        // the tree: each host under the one its first arrival came from
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut roots: Vec<u32> = Vec::new();
+        for (host, r) in &cone.reach {
+            match r.via {
+                Some(ei) => {
+                    let e = &self.store.edges[ei as usize];
+                    children.entry(if forward { e.src } else { e.dst }).or_default().push(*host);
+                }
+                None => roots.push(*host),
+            }
+        }
+        // (a seed that reaches nothing is no branch)
+        roots.retain(|h| children.contains_key(h));
+        roots.sort_by_key(|h| self.store.hosts.name(*h).to_string());
+        for v in children.values_mut() {
+            v.sort_by_key(|h| (cone.reach[h].t, self.store.hosts.name(*h).to_string()));
+            if !forward {
+                v.reverse();
+            }
+        }
+        let mut rows: Vec<(u32, usize)> = Vec::new();
+        let mut stack: Vec<(u32, usize)> = roots.iter().rev().map(|h| (*h, 0)).collect();
+        let mut listed: HashSet<u32> = HashSet::new();
+        while let Some((h, depth)) = stack.pop() {
+            if !listed.insert(h) {
+                continue;
+            }
+            rows.push((h, depth));
+            if let Some(kids) = children.get(&h) {
+                for k in kids.iter().rev() {
+                    stack.push((*k, depth + 1));
+                }
+            }
+        }
+        let title = if field.is_empty() { format!("every chain {} {} host(s)", if forward { "from" } else { "into" }, seeds.len()) } else { format!("{} {}", if forward { "reach of" } else { "ways into" }, self.store.hosts.name(seeds[0])) };
+        self.path_tree = Some(PathTree { cone, rows, title });
+        self.show_tree();
+    }
+
+    /// The whole tree on the canvas.
+    fn show_tree(&mut self) {
+        let Some(tree) = &self.path_tree else { return };
+        let forward = tree.cone.forward;
+        let mut edges: Vec<u32> = tree.cone.reach.values().filter_map(|r| r.via).collect();
+        edges.extend(tree.cone.support.iter().copied());
+        let labels: HashMap<u32, String> = tree.cone.reach.iter().map(|(host, r)| (*host, if r.hop == 0 { (if forward { "origin" } else { "destination" }).to_string() } else { format!("hop {} · {}", r.hop, &fmt_time(r.t)[5..16]) })).collect();
+        let hops: HashMap<u32, usize> = tree.cone.reach.iter().map(|(host, r)| (*host, r.hop)).collect();
+        let title = tree.title.clone();
+        self.set_overlay(title, edges, labels, hops);
+    }
+
+    /// One branch of the tree on the canvas: the chain between its seed
+    /// and a host.
+    fn show_tree_chain(&mut self, host: u32) {
+        let Some(tree) = &self.path_tree else { return };
+        let chain = tree.cone.chain(host);
+        if chain.is_empty() {
+            return;
+        }
+        let forward = tree.cone.forward;
+        let n = chain.len();
+        let mut labels: HashMap<u32, String> = HashMap::new();
+        let mut hops: HashMap<u32, usize> = HashMap::new();
+        let first = &self.store.edges[chain[0] as usize];
+        labels.insert(first.src, if forward { "origin".to_string() } else { format!("hop {} back", n) });
+        hops.insert(first.src, 0);
+        for (k, &ei) in chain.iter().enumerate() {
+            let e = &self.store.edges[ei as usize];
+            labels.insert(e.dst, if !forward && k + 1 == n { "destination".to_string() } else if forward { format!("hop {} · {}", k + 1, &fmt_time(e.t)[11..16]) } else { format!("hop {} back · {}", n - k - 1, &fmt_time(e.t)[11..16]) });
+            hops.insert(e.dst, k + 1);
+        }
+        let title = format!("chain {} {}", if forward { "to" } else { "from" }, self.store.hosts.name(host));
+        self.set_overlay(title, chain, labels, hops);
     }
 
     fn set_overlay(&mut self, title: String, edges: Vec<u32>, labels: HashMap<u32, String>, hops: HashMap<u32, usize>) {
@@ -4263,6 +4379,10 @@ impl Viewer {
         let mut cone: Option<bool> = None;
         let mut pick: Option<usize> = None;
         let mut reshow = false;
+        // the tree: a branch picked, every path to a host asked for, the whole of it again
+        let mut branch: Option<u32> = None;
+        let mut all_paths: Option<u32> = None;
+        let mut whole_tree = false;
         let (hosts, accounts) = self.path_name_lists();
         let screen_h = ctx.content_rect().height();
         // sized by what it holds (a fixed width, as tall as its contents, and
@@ -4272,9 +4392,9 @@ impl Viewer {
             // (a window that is not resized by hand offers its last size as the room there is: say how tall it may get)
             ui.set_max_height((screen_h - 150.0).max(240.0));
             egui::ScrollArea::vertical().max_height((screen_h - 150.0).max(240.0)).auto_shrink([false, true]).show(ui, |ui| {
-                ui.add(egui::Label::new(egui::RichText::new("A path is a chain of logins from one host to another, each hop after the one before, no host entered twice: how someone could have moved from the origin to the destination. Hover any ? for what a setting does.").color(MUTED)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new("A path is a chain of logins from one host to another, each hop after the one before: how someone could have moved. Ask for the paths between two hosts, or for everything that leaves a host (or arrives at it) as a tree, or for every chain of an account or a period wherever it starts. Hover any ? for what a setting does.").color(MUTED)).wrap());
 
-                theme::section_help(ui, "From where to where", "The host the chain starts at and the one it ends at. Type part of a name or an address and pick from the list that opens, or use the arrow to see every host of the timeline. «Paths from here» and «Paths to here» in a host's right-click menu fill these boxes. For «Reach from origin» only the origin is needed; for «Ways into destination», only the destination.");
+                theme::section_help(ui, "From where to where", "The host the chain starts at and the one it ends at. Type part of a name or an address and pick from the list that opens, or use the arrow to see every host of the timeline. «Paths from here» and «Paths to here» in a host's right-click menu fill these boxes.\n\nFor «Everything from the origin» only the origin is used, and for «Everything into the destination» only the destination. Leave that box EMPTY and the tree starts at every host a chain can start at (or end at): with an account below, every chain that account made; with dates, every chain of that period.");
                 ui.horizontal(|ui| {
                     ui.label("Origin");
                     find |= suggest_box(ui, 0, &mut self.path_suggest, &mut self.path_origin, 200.0, "host or address", &hosts);
@@ -4284,13 +4404,33 @@ impl Viewer {
                     ui.label("Destination");
                     find |= suggest_box(ui, 1, &mut self.path_suggest, &mut self.path_dest, 200.0, "host or address", &hosts);
                 });
+                ui.horizontal(|ui| {
+                    let mut shown = !self.path_compact;
+                    if ui.toggle_value(&mut shown, format!("{}  settings", super::icons::FUNNEL)).on_hover_text("Show or fold away the settings of the search (how hops are chained, which logins count, how it is shown), to leave room for what was found. Folded, they still apply, and the line next to this says them").changed() {
+                        self.path_compact = !shown;
+                    }
+                    if self.path_compact {
+                        let mut said: Vec<String> = vec![if self.path_by_session { "by session".to_string() } else { format!("by time, {:.1} h per hop", self.path_gap_h) }, format!("up to {} hops", self.path_hops), if self.path_scope_all { "the whole timeline".to_string() } else { "inside the filters".to_string() }];
+                        if !self.path_user.trim().is_empty() {
+                            said.push(format!("account {}", self.path_user.trim()));
+                        }
+                        if self.path_same_account {
+                            said.push("the same account all along".to_string());
+                        }
+                        if !self.path_from.trim().is_empty() || !self.path_to.trim().is_empty() {
+                            said.push(format!("{} → {}", if self.path_from.trim().is_empty() { "start" } else { self.path_from.trim() }, if self.path_to.trim().is_empty() { "end" } else { self.path_to.trim() }));
+                        }
+                        ui.add(egui::Label::new(egui::RichText::new(said.join("  ·  ")).small().color(MUTED)).truncate());
+                    }
+                });
+                if !self.path_compact {
 
                 theme::section_help(ui, "How one hop leads to the next", "By time: the next hop leaves the host after the one that entered it, and no later than the gap. It is what «could have happened», and it finds the most.\n\nBy session (logon ID): the next hop is tied to the session the hop before opened on that host, by that session's logon ID. Two kinds of evidence do it, and either is enough:\n\n• The host's own record that the session MADE the hop: on Windows a 4648 (a process of the session used credentials for another machine), on Linux an auditd connect record (it needs an audit rule on connect). Each carries the session's ID. It is the strongest: such a hop is drawn =(account time)-> in the list of paths.\n\n• The hop leaves while the session is still open, between its logon and its end, which the timeline pairs by their logon ID (on Linux, the process id of the sshd of the connection). It needs the end of the session in the timeline: where it is not, the logon cannot be followed this way (or is followed for the gap, if you tick that).");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.path_by_session, false, format!("{}  by time", super::icons::CLOCK)).on_hover_text("Coherent in time: each hop after the one before and within the gap. Finds every chain that could have happened");
                     ui.selectable_value(&mut self.path_by_session, true, format!("{}  by session (logon ID)", super::icons::KEY)).on_hover_text("Each hop is tied to the session the hop before opened, by its logon ID: the host has its own record of that session making the hop (4648, auditd connect), or the hop leaves while the session is still open (its logon and its end share the logon ID)");
-                    ui.label(egui::RichText::new(format!("{} of {} logons have their session  ·  {} record(s) of what a session made", group_digits(self.store.sessions_known), group_digits(self.store.logons), group_digits(self.store.launches))).small().color(if self.path_by_session && self.store.sessions_known == 0 && self.store.launches == 0 { CANDIDATE } else { MUTED })).on_hover_text("What a search by session has to work with in this timeline. Successful logons whose end is in it too (same host, same logon ID): a hop can be told to have left while they were open. And the rows written from the origin of a connection with the logon ID of the session that made it (4648, auditd connect): a hop can be told to have been made by a session");
                 });
+                ui.add(egui::Label::new(egui::RichText::new(format!("{} of {} logons have their session  ·  {} record(s) of what a session made", group_digits(self.store.sessions_known), group_digits(self.store.logons), group_digits(self.store.launches))).small().color(if self.path_by_session && self.store.sessions_known == 0 && self.store.launches == 0 { CANDIDATE } else { MUTED })).wrap()).on_hover_text("What a search by session has to work with in this timeline. Successful logons whose end is in it too (same host, same logon ID): a hop can be told to have left while they were open. And the rows written from the origin of a connection with the logon ID of the session that made it (4648, auditd connect): a hop can be told to have been made by a session");
                 if self.path_by_session {
                     ui.checkbox(&mut self.path_session_gap, "the gap where a logon has no logoff").on_hover_text("A logon whose logoff is not in the timeline is followed for the gap below instead of not at all: sessions where the timeline has them, time where it does not");
                 }
@@ -4332,6 +4472,10 @@ impl Viewer {
                         }
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.path_same_account, "the same account all along").on_hover_text("Every hop of a chain is by the same account, whichever it is: the chains one account made, for every account at once. The domain or the machine after the name does not count (ana@CORP and ana@WS01 are one). With an account written above, this adds nothing");
+                    theme::help(ui, "Without it a chain may change accounts from hop to hop, as an intruder does when new credentials are found on the way: A enters B as ana, then B enters C as admin. With it, a chain is one account moving: fewer chains, and each of them the trace of one identity. Use it to follow what a single account did without naming it.");
+                });
                 ui.horizontal_wrapped(|ui| {
                     theme::label_help(ui, "Hops are", "Which events count as a hop. A logon that succeeded is a movement; a failed one or a connection is an attempt, worth adding when looking for what someone tried. Machine accounts (NAME$) log on to each other all day and are left out unless asked.");
                     for (i, name) in RESULT_NAMES.iter().enumerate() {
@@ -4351,21 +4495,23 @@ impl Viewer {
                         reshow = true;
                     }
                 });
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.add(egui::Button::new(egui::RichText::new("Find paths").strong().color(Color32::from_rgb(30, 24, 8))).fill(ACCENT)).on_hover_text("Every chain of logins from the origin to the destination, as set above. Enter in a box does the same").clicked() {
                         find = true;
                     }
-                    if ui.button("Reach from origin").on_hover_text("Every host a chain of logins could have reached from the origin, with the hop and the moment it was first reached (the destination is not used)").clicked() {
+                    if ui.button(format!("{}  Everything from the origin", super::icons::GRAPH)).on_hover_text("The tree of every host a chain of logins reaches from the origin, branch by branch, with the account and the moment of each arrival (the destination is not used). With the origin box empty: from every host a chain can start at, for the account and the dates set above").clicked() {
                         cone = Some(true);
                     }
-                    if ui.button("Ways into destination").on_hover_text("Every host from which a chain of logins could have reached the destination, walking back in time (the origin is not used)").clicked() {
+                    if ui.button(format!("{}  Everything into the destination", super::icons::GRAPH)).on_hover_text("The tree of every host from which a chain of logins reaches the destination, walking back in time (the origin is not used). With the destination box empty: into every host a chain can end at").clicked() {
                         cone = Some(false);
                     }
                     if (self.overlay.is_some() || self.trail.is_some()) && ui.button("Back to the view").on_hover_text("Leave the path or the cone and draw again what the filters select").clicked() {
                         self.overlay = None;
                         self.trail = None;
                         self.path_found.clear();
+                        self.path_tree = None;
                         self.path_msg.clear();
                         self.requery(false);
                     }
@@ -4402,9 +4548,68 @@ impl Viewer {
                         }
                     });
                 }
+                if let Some(tree) = &self.path_tree {
+                    let forward = tree.cone.forward;
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(theme::semibold(&tree.title, 12.5).color(TEXT));
+                        theme::help(ui, "Every host the chains reach, each under the host its first arrival came from, with the account and the moment of that arrival. Click a host for its branch alone: the chain of logins between the start and it. The magnifier asks for every path between the two, not only the first. A host is listed once, where it was first reached; other ways into it are what the magnifier finds.");
+                        if ui.small_button("the whole tree").on_hover_text("Draw the whole tree again, after looking at one branch").clicked() {
+                            whole_tree = true;
+                        }
+                        if tree.rows.len() > 3000 {
+                            ui.label(egui::RichText::new(format!("the first 3,000 of {} hosts", group_digits(tree.rows.len()))).small().color(MUTED));
+                        }
+                    });
+                    egui::ScrollArea::vertical().id_salt("paths-tree").max_height(if self.path_compact { (screen_h * 0.62).clamp(160.0, 900.0) } else { (screen_h * 0.34).clamp(120.0, 380.0) }).auto_shrink([false, true]).show(ui, |ui| {
+                        for &(host, depth) in tree.rows.iter().take(3000) {
+                            let r = tree.cone.reach[&host];
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.add_space(depth as f32 * 16.0);
+                                let name = self.store.hosts.name(host);
+                                match r.via {
+                                    None => {
+                                        ui.label(theme::semibold(name, 12.0).color(ACCENT));
+                                        ui.label(egui::RichText::new(if forward { "start" } else { "end" }).small().color(MUTED));
+                                    }
+                                    Some(ei) => {
+                                        let e = &self.store.edges[ei as usize];
+                                        let u = self.store.users.name(e.user);
+                                        let label = format!("{} {}", if forward { "→" } else { "←" }, name);
+                                        if ui.add(egui::Button::new(egui::RichText::new(label).size(12.0)).frame(false)).on_hover_text("Show this branch alone: the chain of logins between the start and this host").clicked() {
+                                            branch = Some(host);
+                                        }
+                                        ui.label(egui::RichText::new(format!("{} · {} · hop {}", if u.is_empty() { "?" } else { u }, &fmt_time(e.t)[5..16], r.hop)).small().color(MUTED));
+                                        if ui.add(egui::Button::new(egui::RichText::new(super::icons::MAGNIFYING_GLASS).size(11.0)).frame(false)).on_hover_text("Every path between the start of this branch and this host, not only the first one").clicked() {
+                                            all_paths = Some(host);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
                 ui.add_space(4.0);
             });
         });
+        if let Some(h) = branch {
+            self.show_tree_chain(h);
+        }
+        if whole_tree {
+            self.show_tree();
+        }
+        if let Some(h) = all_paths {
+            // between the seed of its branch and the host
+            let ends = self.path_tree.as_ref().map(|t| (t.cone.forward, t.cone.chain(h)));
+            if let Some((forward, chain)) = ends.filter(|(_, c)| !c.is_empty()) {
+                let (a, b) = (self.store.edges[chain[0] as usize].src, self.store.edges[*chain.last().unwrap() as usize].dst);
+                let _ = forward;
+                self.path_origin = self.store.hosts.name(a).to_string();
+                self.path_dest = self.store.hosts.name(b).to_string();
+                find = true;
+            }
+        }
         if find {
             self.run_paths();
         } else if reshow {
@@ -5287,6 +5492,7 @@ impl Viewer {
                 if self.overlay.is_some() {
                     self.overlay = None;
                     self.path_found.clear();
+                    self.path_tree = None;
                     self.path_msg.clear();
                     self.requery(false);
                 }
@@ -5626,8 +5832,31 @@ impl Viewer {
                 self.overlay = None;
                 self.trail = None;
                 self.path_found.clear();
+                self.path_tree = None;
                 self.path_msg.clear();
                 self.requery(false);
+            }
+            "paths-compact" => self.path_compact = true,
+            "paths-full" => self.path_compact = false,
+            "paths-same-account" => self.path_same_account = true,
+            "paths-any-account" => self.path_same_account = false,
+            "tree-say" => {
+                // the tree as the window lists it, for a test to read
+                if let Some(tree) = &self.path_tree {
+                    println!("TREE| {} ({} rows)", tree.title, tree.rows.len());
+                    for &(host, depth) in tree.rows.iter().take(60) {
+                        let r = tree.cone.reach[&host];
+                        let by = r.via.map(|ei| { let e = &self.store.edges[ei as usize]; format!("  {} {}  hop {}", self.store.users.name(e.user), fmt_time(e.t), r.hop) }).unwrap_or_default();
+                        println!("TREE| {}{}{}", "    ".repeat(depth), self.store.hosts.name(host), by);
+                    }
+                } else {
+                    println!("TREE| none");
+                }
+            }
+            other if other.starts_with("tree-pick=") => {
+                if let Some(h) = self.host_named(&other["tree-pick=".len()..]) {
+                    self.show_tree_chain(h);
+                }
             }
             "paths-say" => {
                 // what the window says and what is drawn, for a test to read

@@ -197,6 +197,18 @@ pub struct Store {
     launch_at: HashMap<(u32, u32), Vec<(i64, u64)>>,
     /// how many such records the timeline has
     pub launches: usize,
+    /// per account: a number for its bare name (`ana` of `ana@CORP`,
+    /// `CORP\ana`, `Ana@WS01`), so the same person's accounts are told to
+    /// be one along a chain
+    user_keys: Vec<u32>,
+}
+
+/// The name of an account without its domain or machine, in lower case:
+/// `ana` for `ana@CORP`, `CORP\ana`, `Ana`.
+pub fn bare_account(account: &str) -> String {
+    let a = account.trim();
+    let a = a.rsplit('\\').next().unwrap_or(a);
+    a.split('@').next().unwrap_or(a).to_lowercase()
 }
 
 /// A row written from the ORIGIN of a connection, whose logon ID is the
@@ -457,7 +469,15 @@ impl Store {
         for v in launch_at.values_mut() {
             v.sort_unstable();
         }
-        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known, lid: edge_lid, launched, launch_at, launches })
+        let mut bare = Interner::default();
+        let user_keys: Vec<u32> = users.names.iter().map(|n| bare.id(&bare_account(n))).collect();
+        Ok(Store { files, hosts, aliases, users, logon_types, event_ids, whys, edges, by_time, out_adj, in_adj, notes, rows_total, rows_without_origin, rows_bad_time, t_min, t_max, session, logons, sessions_known, lid: edge_lid, launched, launch_at, launches, user_keys })
+    }
+
+    /// The number of an account's bare name: equal for the accounts of one
+    /// name, whatever their domain or machine.
+    pub fn user_key(&self, user: u32) -> u32 {
+        self.user_keys.get(user as usize).copied().unwrap_or(u32::MAX)
     }
 
     /// The logon ID of an edge, as the number it is paired by (0: none).
