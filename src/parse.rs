@@ -289,6 +289,11 @@ pub(crate) enum TriageType {
     Kape,
     Velociraptor,
     CortexXdr,
+    /// The forensic triage Cortex XDR runs from its console and offers for
+    /// download ("online"), as opposed to the offline collector's package:
+    /// one folder per collector, a table (`.csv`) or the collector's raw
+    /// files in a zip named after it.
+    CortexXdrOnline,
     /// UAC — Unix-like Artifacts Collector (https://github.com/tclahr/uac).
     /// Linux / macOS / *BSD / Solaris / ESXi triage. Output is a tar.gz by
     /// default (zip with `-f zip`) named `uac-<host>-<os>-<YYYYMMDDhhmmss>`.
@@ -301,6 +306,7 @@ impl TriageType {
             TriageType::Kape => "KAPE",
             TriageType::Velociraptor => "Velociraptor Offline Collector",
             TriageType::CortexXdr => "Cortex XDR Offline Collector",
+            TriageType::CortexXdrOnline => "Cortex XDR online triage",
             TriageType::Uac => "UAC (Unix-like Artifacts Collector)",
         }
     }
@@ -309,9 +315,84 @@ impl TriageType {
             TriageType::Kape => "KAPE",
             TriageType::Velociraptor => "Velociraptor",
             TriageType::CortexXdr => "Cortex XDR",
+            TriageType::CortexXdrOnline => "Cortex XDR online",
             TriageType::Uac => "UAC",
         }
     }
+}
+
+/// Tables the Cortex XDR online triage writes as `<name>/<file>.csv`.
+const CORTEX_ONLINE_TABLES: &[&str] = &[
+    "process_listing", "netstat", "bodyfile", "lsof", "uname", "mount", "env", "systemctl", "systemd", "history",
+    "auditd", "sudo_log", "syslog", "lastb", "known_hosts", "authorized_keys", "modinfo", "ufw", "etc", "config",
+];
+
+/// Collectors of the online triage that only a Linux host has.
+const CORTEX_ONLINE_LINUX: &[&str] = &[
+    "auth_logs", "wtmp_btmp_utmp", "audit_logs_raw", "syslog_files", "cron_files", "systemd_units", "passwd_group_files",
+    "ssh_server_config", "ld_so_preload", "bash_history_all_users", "sudo_log", "lastb", "auditd", "systemctl", "systemd", "ufw",
+];
+
+fn cortex_online_parts(entry: &str) -> Option<(String, String)> {
+    let norm = entry.replace('\\', "/");
+    let mut parts = norm.trim_start_matches("./").split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(dir), Some(file), None) if !file.is_empty() => Some((dir.to_string(), file.to_string())),
+        _ => None,
+    }
+}
+
+/// `<collector>/<collector>_<32 hex>_<32 hex>.zip`: the raw files one
+/// collector of the Cortex XDR online triage brought, with their manifest.
+pub(crate) fn is_cortex_online_collector_zip(entry: &str) -> bool {
+    let Some((dir, file)) = cortex_online_parts(entry) else { return false };
+    let Some(rest) = file.strip_suffix(".zip").and_then(|f| f.strip_prefix(dir.as_str())) else { return false };
+    let ids: Vec<&str> = rest.split('_').collect();
+    ids.len() == 3 && ids[0].is_empty() && ids[1..].iter().all(|i| i.len() == 32 && i.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The layout of a Cortex XDR online triage: two collector zips, or one
+/// with two of the known tables, or five of the known tables alone.
+pub(crate) fn is_cortex_online_layout(entries: &[String]) -> bool {
+    let collectors = entries.iter().filter(|n| is_cortex_online_collector_zip(n)).count();
+    let tables = entries
+        .iter()
+        .filter(|n| cortex_online_parts(n).map_or(false, |(dir, file)| file.ends_with(".csv") && CORTEX_ONLINE_TABLES.contains(&dir.as_str())))
+        .count();
+    collectors >= 2 || (collectors >= 1 && tables >= 2) || tables >= 5
+}
+
+/// Whether an online triage was taken from a Linux host: it has a collector
+/// that only exists there (its authentication logs, wtmp, cron...).
+pub(crate) fn cortex_online_is_linux(entries: &[String]) -> bool {
+    entries.iter().any(|n| cortex_online_parts(n).map_or(false, |(dir, _)| CORTEX_ONLINE_LINUX.contains(&dir.as_str())))
+}
+
+/// The host a Cortex XDR online triage was taken from: the `host_name`
+/// column its tables all carry, read from the smallest table with a row.
+pub(crate) fn cortex_online_hostname(zip_path: &Path) -> Option<String> {
+    let file = File::open(zip_path).ok()?;
+    let mut archive = ZipArchive::new(file).ok()?;
+    let mut tables: Vec<(u64, usize)> = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(e) = archive.by_index_raw(i) {
+            if e.name().to_lowercase().ends_with(".csv") && e.size() > 0 {
+                tables.push((e.size(), i));
+            }
+        }
+    }
+    tables.sort();
+    for (_, i) in tables {
+        let Ok(entry) = archive.by_index(i) else { continue };
+        let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(entry);
+        let Some(col) = reader.headers().ok().and_then(|h| h.iter().position(|c| c == "host_name")) else { continue };
+        if let Some(Ok(record)) = reader.records().next() {
+            if let Some(host) = record.get(col).map(str::trim).filter(|h| !h.is_empty()) {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Archive stem without the compression AND container extensions:
@@ -451,6 +532,14 @@ pub(crate) fn detect_triage_type(zip_path: &str, entries: &[String]) -> Option<T
         return Some(TriageType::CortexXdr);
     }
 
+    // 1b. Cortex XDR online triage: the zip the console offers for download.
+    //     One folder per collector at the root, holding a table or the
+    //     collector's raw files in a zip named after it. The name of the
+    //     download says nothing, so the layout alone decides.
+    if is_cortex_online_layout(entries) {
+        return Some(TriageType::CortexXdrOnline);
+    }
+
     // 2. Velociraptor Offline Collector — three matching paths.
     //    a) Root files combine
     //         client_info.json + (collection_context.json OR uploads.json)
@@ -547,6 +636,9 @@ pub(crate) fn extract_triage_hostname(zip_path: &str, kind: TriageType) -> Optio
                 Some(host)
             }
         }
+        // the host as the agent reported it, in the package's own tables;
+        // the name of the download is whatever the analyst saved it as
+        TriageType::CortexXdrOnline => cortex_online_hostname(Path::new(zip_path)).or_else(|| Some(stem.to_string())),
         TriageType::CortexXdr => {
             // offline_collector_output_<HOST>_<YYYY-MM-DD>_<HH-MM-SS>
             let prefix = "offline_collector_output_";

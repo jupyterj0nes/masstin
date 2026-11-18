@@ -67,12 +67,20 @@ pub struct Scan {
     pub secs: f32,
 }
 
+/// The label of a Cortex XDR online triage taken from a Linux host.
+pub const CORTEX_ONLINE_LINUX_LABEL: &str = "Cortex XDR online (Linux)";
+
+/// A triage package whose content is Linux evidence.
+fn is_linux_triage(kind: &str) -> bool {
+    kind == "UAC" || kind == CORTEX_ONLINE_LINUX_LABEL
+}
+
 impl Scan {
     pub fn windows(&self) -> usize {
-        self.evtx + self.mdb + self.evtx_zips + self.triages.iter().filter(|(_, k)| *k != "UAC").count()
+        self.evtx + self.mdb + self.evtx_zips + self.triages.iter().filter(|(_, k)| !is_linux_triage(k)).count()
     }
     pub fn linux_total(&self) -> usize {
-        self.linux.values().sum::<usize>() + self.uac + self.linux_tars + self.triages.iter().filter(|(_, k)| *k == "UAC").count()
+        self.linux.values().sum::<usize>() + self.uac + self.linux_tars + self.triages.iter().filter(|(_, k)| is_linux_triage(k)).count()
     }
     pub fn mac(&self) -> usize {
         self.logarchives + self.mac_json
@@ -98,7 +106,7 @@ impl Scan {
         if !self.images.is_empty() {
             parts.push(n(self.images.len(), "disk image", "disk images"));
         }
-        let win_triages: Vec<&str> = self.triages.iter().filter(|(_, k)| *k != "UAC").map(|(_, k)| *k).collect();
+        let win_triages: Vec<&str> = self.triages.iter().filter(|(_, k)| !is_linux_triage(k)).map(|(_, k)| *k).collect();
         if !win_triages.is_empty() {
             let mut kinds: Vec<&str> = win_triages.clone();
             kinds.sort();
@@ -117,6 +125,10 @@ impl Scan {
         let uac = self.uac + self.triages.iter().filter(|(_, k)| *k == "UAC").count();
         if uac > 0 {
             parts.push(n(uac, "UAC triage", "UAC triages"));
+        }
+        let cortex_linux = self.triages.iter().filter(|(_, k)| *k == CORTEX_ONLINE_LINUX_LABEL).count();
+        if cortex_linux > 0 {
+            parts.push(n(cortex_linux, "Cortex XDR online triage (Linux)", "Cortex XDR online triages (Linux)"));
         }
         if self.linux_tars > 0 {
             parts.push(n(self.linux_tars, "Linux triage", "Linux triages"));
@@ -197,6 +209,13 @@ pub fn judge(s: &Scan) -> Verdict {
                 why.push_str(", ");
             }
             why.push_str(&n(s.uac, "UAC archive", "UAC archives"));
+        }
+        let cortex = s.triages.iter().filter(|(_, k)| *k == CORTEX_ONLINE_LINUX_LABEL).count();
+        if cortex > 0 {
+            if !why.is_empty() {
+                why.push_str(", ");
+            }
+            why.push_str(&n(cortex, "Cortex XDR online triage of a Linux host", "Cortex XDR online triages of Linux hosts"));
         }
         if s.linux_tars > 0 {
             if !why.is_empty() {
@@ -282,6 +301,10 @@ fn look_at(p: &Path, s: &mut Scan) {
         let entries = crate::parse::read_zip_top_entries(p);
         let kind = entries.as_ref().and_then(|e| crate::parse::detect_triage_type(&p.to_string_lossy(), e));
         match kind {
+            // an online triage of a Linux host is Linux evidence: its logs are read by parse-linux
+            Some(crate::parse::TriageType::CortexXdrOnline) if entries.as_ref().map_or(false, |e| crate::parse::cortex_online_is_linux(e)) => {
+                s.triages.push((name.clone(), CORTEX_ONLINE_LINUX_LABEL))
+            }
             Some(k) => s.triages.push((name.clone(), k.short_label())),
             None if entries.map_or(false, |e| e.iter().any(|n| n.to_ascii_lowercase().ends_with(".evtx"))) => s.evtx_zips += 1,
             None => s.archives += 1,
@@ -520,6 +543,81 @@ mod tests {
         assert_eq!(v.parser, Some(PARSE_WINDOWS));
         assert!(v.sure);
         assert_eq!(v.why, "1 ZIP of EVTX files.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cortex_online_triage_of_a_linux_host_is_linux_evidence() {
+        let mut s = Scan::default();
+        s.triages.push(("websrv01.zip".into(), CORTEX_ONLINE_LINUX_LABEL));
+        s.triages.push(("dbsrv02.zip".into(), CORTEX_ONLINE_LINUX_LABEL));
+        assert_eq!((s.windows(), s.linux_total()), (0, 2));
+        assert_eq!(s.summary(), "2 Cortex XDR online triages (Linux)");
+        let v = judge(&s);
+        assert_eq!(v.parser, Some(PARSE_LINUX));
+        assert_eq!(v.why, "2 Cortex XDR online triages of Linux hosts.");
+        // beside a Windows package the massive pass takes both
+        s.triages.push(("k1.zip".into(), "KAPE"));
+        assert_eq!((s.windows(), s.linux_total()), (1, 2));
+        assert_eq!(judge(&s).parser, Some(PARSE_MASSIVE));
+    }
+
+    #[test]
+    fn the_layout_of_a_cortex_online_triage_is_recognised() {
+        use crate::parse::{cortex_online_is_linux, detect_triage_type, is_cortex_online_collector_zip, is_cortex_online_layout, TriageType};
+        let id = "0123456789abcdef0123456789abcdef";
+        let v = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let auth = format!("auth_logs/auth_logs_{id}_{id}.zip");
+        let cron = format!("cron_files/cron_files_{id}_{id}.zip");
+        assert!(is_cortex_online_collector_zip(&auth));
+        // another folder's name, short ids, a deeper path
+        assert!(!is_cortex_online_collector_zip(&format!("auth_logs/cron_files_{id}_{id}.zip")));
+        assert!(!is_cortex_online_collector_zip("auth_logs/auth_logs_12_34.zip"));
+        assert!(!is_cortex_online_collector_zip(&format!("x/auth_logs/auth_logs_{id}_{id}.zip")));
+        let linux = v(&["netstat/netstat.csv", "lsof/lsof.csv", &auth, &cron]);
+        assert_eq!(detect_triage_type("anything.zip", &linux), Some(TriageType::CortexXdrOnline));
+        assert!(cortex_online_is_linux(&linux));
+        // tables alone, when enough of the known ones; no Linux collector among them
+        let tables = v(&["process_listing/p.csv", "netstat/netstat.csv", "lsof/lsof.csv", "mount/mount.csv", "env/env.csv"]);
+        assert!(is_cortex_online_layout(&tables) && !cortex_online_is_linux(&tables));
+        // a zip of spreadsheets, one collector zip on its own, the offline collector's package
+        assert!(!is_cortex_online_layout(&v(&["sales/2026.csv", "sales/2025.csv", "hr/people.csv", "it/assets.csv", "it/users.csv"])));
+        assert!(!is_cortex_online_layout(&v(&[&cron])));
+        assert_eq!(detect_triage_type("offline_collector_output_H_2026-04-06_12-00-00.zip", &v(&["output/manifest.json", "output/cortex-xdr-payload.log"])), Some(TriageType::CortexXdr));
+    }
+
+    #[test]
+    fn the_host_of_a_cortex_online_triage_comes_from_its_tables() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("masstin_cortex_online_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("some-download.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let o = zip::write::FileOptions::default();
+            // an empty table first: the host comes from one that has a row
+            w.start_file("uname/uname.csv", o).unwrap();
+            w.write_all(b"model,host_name
+").unwrap();
+            w.start_file("netstat/netstat.csv", o).unwrap();
+            w.write_all(b"protocol,host_name
+tcp,websrv01
+").unwrap();
+            w.finish().unwrap();
+        }
+        assert_eq!(crate::parse::cortex_online_hostname(&zip_path).as_deref(), Some("websrv01"));
+        let p = zip_path.to_string_lossy().to_string();
+        assert_eq!(crate::parse::extract_triage_hostname(&p, crate::parse::TriageType::CortexXdrOnline).as_deref(), Some("websrv01"));
+        // no table at all: the name of the download is what is left
+        let bare = dir.join("dbsrv07.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&bare).unwrap());
+            w.start_file("readme.txt", zip::write::FileOptions::default()).unwrap();
+            w.write_all(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        assert_eq!(crate::parse::extract_triage_hostname(&bare.to_string_lossy(), crate::parse::TriageType::CortexXdrOnline).as_deref(), Some("dbsrv07"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

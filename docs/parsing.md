@@ -62,7 +62,7 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 | UAL databases (`LogFiles/Sum/*.mdb`) | ✅ | ✅ | ✅ |
 | Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
 | MountPoints2 (NTUSER.DAT registry hive) | ❌ | ✅ | ✅ |
-| Triage detection (KAPE / Velociraptor / Cortex XDR) with per-source labels | ✅ | ❌ | ✅ |
+| Triage detection (KAPE / Velociraptor / Cortex XDR offline collector and online triage) with per-source labels | ✅ | ❌ | ✅ |
 | Loose-artifact promotion of `-d` directories into the pipeline | ❌ | ❌ | ✅ |
 
 Rule of thumb:
@@ -460,6 +460,7 @@ Archives nest freely: a zip wrapping two UAC tarballs, or a tar.gz wrapping anot
 | **KAPE** | `_kape.cli` at any level, `Console/KAPE.log`, or 5+ entries matching `<host>/C/Windows/System32/winevt/Logs/*.evtx` | Filename pattern `<host>_<digits>...zip` (only when the shape is unambiguous; KAPE has no enforced filename) |
 | **Velociraptor Offline Collector** | Top-level `client_info.json` + (`collection_context.json` OR `uploads.json`); encrypted variant uses `metadata.json` + `data.zip` | Filename pattern `Collection-<host>-<YYYY-MM-DD>T...Z.zip` |
 | **Cortex XDR Offline Collector** | Any entry ending in `cortex-xdr-payload.log` (this filename is unique to the XDR collector) | Filename pattern `offline_collector_output_<host>_<YYYY-MM-DD>_<HH-MM-SS>.zip` |
+| **Cortex XDR online triage** (the zip the console offers for download) | One folder per collector at the root, holding a table (`netstat/netstat.csv`) or the collector's raw files in a zip named after it (`auth_logs/auth_logs_<32 hex>_<32 hex>.zip`): two such zips, or one with two of the known tables, or five of the known tables | The `host_name` column of the package's own tables; the name of the download is anything, and is used only when no table has a row |
 | **UAC (Unix-like Artifacts Collector)** | `uac.log` at the archive root plus the `[root]/` or `live_response/` layout directory (tar.gz by default, zip with `-f zip`); or the enforced filename `uac-<host>-<os>-<YYYYMMDDhhmmss>` | Filename pattern `uac-<host>-<os>-<YYYYMMDDhhmmss>.tar.gz`. UAC writes `unknown` when it was run against a mounted image, so masstin then falls back to `[root]/etc/hostname`, `/etc/sysconfig/network`, `uac.log`, `/etc/hosts` and the syslog header of the collected logs |
 
 **Phase 1 output** (folder containing 2 triages plus a forensic image with NTUSER.DAT hives). Notice that every counter — triages, EVTX inside compressed archives, MountPoints2 from registry, Scheduled Tasks from XML — appears as `=>` lines INSIDE the same `[1/3]` block, not scattered before/after the phase header:

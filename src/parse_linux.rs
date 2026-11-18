@@ -2675,17 +2675,75 @@ fn register_tar_extracts(
     }
 }
 
+/// Open one zip met during discovery: detect the triage it is from its
+/// entry listing and its name, extract it (nested archives included) and
+/// fold the result into the discovery state.
+#[allow(clippy::too_many_arguments)]
+fn register_zip_extract(
+    p: &Path,
+    lower: &str,
+    temp_dir: &Path,
+    archives_scanned: &mut usize,
+    triage_dirs: &mut Vec<(PathBuf, crate::parse::TriageInfo)>,
+    triages: &mut Vec<crate::parse::TriageInfo>,
+    all_dirs: &mut Vec<PathBuf>,
+    archive_dirs: &mut Vec<(PathBuf, String)>,
+) {
+    if is_debug_mode() {
+        println!("[DEBUG] ZIP detected: {}", p.display());
+    }
+    *archives_scanned += 1;
+    let zip_path_str = p.to_string_lossy().to_string();
+
+    // Detect triage type from top-level entries AND zip path
+    // BEFORE extraction. The filename + path heuristics catch
+    // re-zipped Velociraptor extracts whose JSON metadata
+    // markers are missing (happens when users extract a VR
+    // collection and re-zip only the C/ subtree).
+    let triage_kind = crate::parse::read_zip_top_entries(p)
+        .and_then(|entries| crate::parse::detect_triage_type(&zip_path_str, &entries));
+
+    let mut tar_out: Vec<TarExtract> = Vec::new();
+    let extracted = extract_zips_recursive(p, temp_dir, &mut tar_out);
+
+    // extract_zips_recursive lists nested-zip dirs first and
+    // the outer zip's own dir LAST; that last one is the root
+    // of this zip's extraction.
+    if let Some(kind) = triage_kind {
+        let hostname = crate::parse::extract_triage_hostname(&zip_path_str, kind);
+        let info = crate::parse::TriageInfo {
+            kind,
+            zip_path: zip_path_str.clone(),
+            hostname,
+            artifact_count: 0,
+        };
+        if let Some(outer_dir) = extracted.last() {
+            triage_dirs.push((outer_dir.clone(), info.clone()));
+        }
+        triages.push(info);
+    }
+    if let Some(outer_dir) = extracted.last() {
+        archive_dirs.push((outer_dir.clone(), lower.to_string()));
+    }
+
+    all_dirs.extend(extracted);
+    register_tar_extracts(
+        tar_out, archives_scanned, triage_dirs,
+        triages, all_dirs, archive_dirs,
+    );
+}
+
 pub fn parse_linux(files: &[String], dirs: &[String], output: Option<&String>) {
     // a tarball given with -f (a UAC collection, a tar of /etc and /var/log)
     // is opened as the archive it is, as when it lies in a folder given with
     // -d; before, it was read as one log file and nothing matched
-    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()));
+    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()) || f.to_lowercase().ends_with(".zip"));
     parse_linux_inner(&logs, &archives, dirs, output, false);
 }
 
 /// Quiet mode: skip phase headers and summary (used when integrated into parse-image mixed pipeline)
 pub fn parse_linux_quiet(files: &[String], dirs: &[String], output: Option<&String>) {
-    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()));
+    let (archives, logs): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| is_tar_archive(&f.to_lowercase()) || f.to_lowercase().ends_with(".zip"));
     parse_linux_inner(&logs, &archives, dirs, output, true);
 }
 
@@ -2715,6 +2773,13 @@ pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) 
             let path = entry.path().to_string_lossy().to_string();
             if is_tar_archive(&lower) {
                 archives.push(path);
+            } else if lower.ends_with(".zip") {
+                // a Cortex XDR online triage of a Linux host: its logs are in
+                // the collectors' zips, which the Windows walk does not read
+                let entries = crate::parse::read_zip_top_entries(entry.path()).unwrap_or_default();
+                if crate::parse::is_cortex_online_layout(&entries) && crate::parse::cortex_online_is_linux(&entries) {
+                    archives.push(path);
+                }
             } else if is_linux_artifact(&name) && !is_config_not_log(entry.path()) {
                 logs.push(path);
             }
@@ -2766,48 +2831,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             if !p.is_file() { continue; }
             let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
             if lower.ends_with(".zip") {
-                if is_debug_mode() {
-                    println!("[DEBUG] ZIP detected: {}", p.display());
-                }
-                archives_scanned += 1;
-                let zip_path_str = p.to_string_lossy().to_string();
-
-                // Detect triage type from top-level entries AND zip path
-                // BEFORE extraction. The filename + path heuristics catch
-                // re-zipped Velociraptor extracts whose JSON metadata
-                // markers are missing (happens when users extract a VR
-                // collection and re-zip only the C/ subtree).
-                let triage_kind = crate::parse::read_zip_top_entries(&p)
-                    .and_then(|entries| crate::parse::detect_triage_type(&zip_path_str, &entries));
-
-                let mut tar_out: Vec<TarExtract> = Vec::new();
-                let extracted = extract_zips_recursive(&p, &temp_dir, &mut tar_out);
-
-                // extract_zips_recursive lists nested-zip dirs first and
-                // the outer zip's own dir LAST; that last one is the root
-                // of this zip's extraction.
-                if let Some(kind) = triage_kind {
-                    let hostname = crate::parse::extract_triage_hostname(&zip_path_str, kind);
-                    let info = crate::parse::TriageInfo {
-                        kind,
-                        zip_path: zip_path_str.clone(),
-                        hostname,
-                        artifact_count: 0,
-                    };
-                    if let Some(outer_dir) = extracted.last() {
-                        triage_dirs.push((outer_dir.clone(), info.clone()));
-                    }
-                    triages.push(info);
-                }
-                if let Some(outer_dir) = extracted.last() {
-                    archive_dirs.push((outer_dir.clone(), lower.clone()));
-                }
-
-                all_dirs.extend(extracted);
-                register_tar_extracts(
-                    tar_out, &mut archives_scanned, &mut triage_dirs,
-                    &mut triages, &mut all_dirs, &mut archive_dirs,
-                );
+                register_zip_extract(&p, &lower, &temp_dir, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut all_dirs, &mut archive_dirs);
             } else if is_tar_archive(&lower) {
                 if is_debug_mode() {
                     println!("[DEBUG] TAR detected: {}", p.display());
@@ -2825,6 +2849,10 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     for a in archives {
         let p = Path::new(a);
         let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if p.is_file() && lower.ends_with(".zip") {
+            register_zip_extract(p, &lower, &temp_dir, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut all_dirs, &mut archive_dirs);
+            continue;
+        }
         if !p.is_file() || !is_tar_archive(&lower) {
             continue;
         }
@@ -2940,10 +2968,20 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 }
             }
         };
-        let mut dst_host = root2host
-            .entry(root.clone())
-            .or_insert_with(|| discover_hostname(&root))
-            .clone();
+        // A Cortex XDR online triage keeps each file under a made-up folder
+        // (`entry_1_0/auth.log`): the folders say nothing about the host,
+        // the package's tables do.
+        let from_package = triage_dirs
+            .iter()
+            .find(|(dir, info)| info.kind == crate::parse::TriageType::CortexXdrOnline && path.starts_with(dir))
+            .and_then(|(_, info)| info.hostname.clone());
+        let mut dst_host = match from_package {
+            Some(h) => h,
+            None => root2host
+                .entry(root.clone())
+                .or_insert_with(|| discover_hostname(&root))
+                .clone(),
+        };
 
         // Fallback: if hostname is still unknown/generic, extract from the log's RFC3164 header
         if dst_host == "unknown" || dst_host == "C:" || dst_host.len() <= 2 {
