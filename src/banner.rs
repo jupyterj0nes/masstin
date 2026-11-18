@@ -378,6 +378,36 @@ impl ShareBar {
     }
 }
 
+/// A piece of work that is a known number of stages (the hunt): one bar
+/// that moves a step at each, saying which one it is on.
+static STAGES: std::sync::Mutex<Option<ProgressBar>> = std::sync::Mutex::new(None);
+
+/// The next stage of `total`: the bar is made at the first one.
+pub fn stage(total: u64, what: &str) {
+    let Ok(mut bar) = STAGES.lock() else { return };
+    match bar.as_ref() {
+        Some(pb) => pb.inc(1),
+        None => {
+            let pb = create_progress_bar(total);
+            pb.set_position(1);
+            *bar = Some(pb);
+        }
+    }
+    if let Some(pb) = bar.as_ref() {
+        pb.set_message(what.to_string());
+        pb.tick();
+    }
+}
+
+/// The work is over: the bar goes.
+pub fn stages_end() {
+    if let Ok(mut bar) = STAGES.lock() {
+        if let Some(pb) = bar.take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
 pub fn create_progress_bar(total: u64) -> ProgressBar {
     if is_silent() {
         return ProgressBar::hidden();

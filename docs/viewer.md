@@ -151,7 +151,7 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 ## The hunt, from the window
 
-While the hunt runs, the mastiff and a sweep cross the canvas; they go on until the timeline it wrote has been read again (which happens away from the window, so nothing freezes), and the findings then light up one after another in time order.
+While the hunt runs, a bar over the canvas says the stage it is on (of ten: reading the timeline, learning what is normal, weighing every connection, writing the result…), the percentage and the seconds. While the hunt runs, the mastiff and a sweep cross the canvas; they go on until the timeline it wrote has been read again (which happens away from the window, so nothing freezes), and the findings then light up one after another in time order.
 
 The last step has a tick box, **Read each address as the host it is**, with the level (Strict, Standard, Broad): the hunt then runs with `--merge-hosts`, one machine where the timeline has a name in some rows and an address in others. It is off unless you tick it.
 

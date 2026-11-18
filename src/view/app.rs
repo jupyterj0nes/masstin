@@ -3153,6 +3153,34 @@ impl Viewer {
             painter.add(egui::Shape::mesh(mesh));
             painter.line_segment([Pos2::new(x, canvas.top()), Pos2::new(x, canvas.bottom())], Stroke::new(1.5, draw::fade(ACCENT, 0.6)));
             keep_moving = true;
+            // and a bar says how far the hunt is: its stage, of how many
+            let (pos, len, what) = match self.job.as_ref().filter(|j| j.kind == tasks::JobKind::Hunt) {
+                Some(j) if j.done.is_some() => (1u64, 1u64, "reading the result".to_string()),
+                Some(j) => j.progress.bar.clone().unwrap_or((0, 10, "starting".to_string())),
+                None => (1, 1, "reading the result".to_string()),
+            };
+            // (a stage under way counts as half done, and the bar eases to where it is)
+            let target = if len == 0 { 0.0 } else { ((pos as f32 - 0.5) / len as f32).clamp(0.02, 1.0) };
+            let shown = ui.ctx().animate_value_with_time(egui::Id::new("hunt-bar"), target, 0.6);
+            let w = (canvas.width() * 0.46).clamp(260.0, 560.0);
+            let track = Rect::from_center_size(Pos2::new(canvas.center().x, canvas.bottom() - 34.0), Vec2::new(w, 8.0));
+            let plate = track.expand2(Vec2::new(16.0, 24.0)).translate(Vec2::new(0.0, -8.0));
+            painter.rect_filled(plate, CornerRadius::same(12), Color32::from_rgba_unmultiplied(10, 14, 22, 215));
+            painter.rect_stroke(plate, CornerRadius::same(12), Stroke::new(1.0, draw::fade(ACCENT, 0.35)), egui::StrokeKind::Inside);
+            painter.rect_filled(track, CornerRadius::same(4), theme::FIELD);
+            let fill = Rect::from_min_size(track.min, Vec2::new((track.width() * shown).max(8.0), track.height()));
+            let mut bar = egui::epaint::Mesh::default();
+            let (c0, c1) = (theme::CYAN, theme::MAGENTA);
+            let mix = |f: f32| Color32::from_rgb((c0.r() as f32 + (c1.r() as f32 - c0.r() as f32) * f) as u8, (c0.g() as f32 + (c1.g() as f32 - c0.g() as f32) * f) as u8, (c0.b() as f32 + (c1.b() as f32 - c0.b() as f32) * f) as u8);
+            bar.vertices.extend([v(fill.left_top(), c0), v(fill.right_top(), mix(shown)), v(fill.right_bottom(), mix(shown)), v(fill.left_bottom(), c0)]);
+            bar.add_triangle(0, 1, 2);
+            bar.add_triangle(0, 2, 3);
+            painter.with_clip_rect(fill).add(egui::Shape::mesh(bar));
+            // a light runs along what is done
+            let glint = fill.left() + ((t * 0.9).fract()) * fill.width();
+            painter.with_clip_rect(fill).rect_filled(Rect::from_center_size(Pos2::new(glint, fill.center().y), Vec2::new(26.0, fill.height())), CornerRadius::same(4), Color32::from_rgba_unmultiplied(255, 255, 255, 70));
+            painter.text(Pos2::new(track.left(), track.top() - 9.0), Align2::LEFT_BOTTOM, format!("Hunting  ·  {}", what), FontId::proportional(12.5), TEXT);
+            painter.text(Pos2::new(track.right(), track.top() - 9.0), Align2::RIGHT_BOTTOM, format!("{:.0} %   {:.0} s", shown * 100.0, t), FontId::monospace(11.0), draw::fade(ACCENT, 0.9));
         }
         let t_edges = std::time::Instant::now();
 

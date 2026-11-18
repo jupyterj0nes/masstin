@@ -1091,6 +1091,7 @@ pub async fn run(graph: &Graph, dialect: &Dialect, cfg: &Settings, output: Optio
 pub fn run_csv(files: &[String], dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, annotate: Option<Annotate>) {
     let clock = std::time::Instant::now();
     crate::banner::print_phase("3", "4", "Reading the timeline CSV...");
+    crate::banner::stage(HUNT_STAGES, "reading the timeline");
     let (corpus, notes) = match corpus_from_csv(files) {
         Ok(x) => x,
         Err(e) => {
@@ -1121,11 +1122,15 @@ pub struct Annotate<'a> {
     pub if_hunted: super::record::IfHunted,
 }
 
+/// The stages of a hunt, for its progress bar.
+const HUNT_STAGES: u64 = 10;
+
 fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&str>, report_path: Option<&str>, clock: std::time::Instant, annotate: Option<Annotate>) {
     if corpus.bad_ts > 0 {
         crate::banner::print_phase_detail("Warning:", &format!("{} edge row(s) with an unparseable time ignored", corpus.bad_ts));
     }
     crate::banner::print_phase("4", "4", "Computing statistics...");
+    crate::banner::stage(HUNT_STAGES, "putting the events in order");
     let mut corpus = corpus;
     corpus.canonical();
     if let Some(end) = cfg.end {
@@ -1153,6 +1158,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         crate::mark_failed();
         return;
     }
+    crate::banner::stage(HUNT_STAGES, "writing the findings and the report");
     // with the timeline annotated, no -o means no findings table (it used
     // to go to stdout, which is where the summary goes)
     if output.is_some() || annotate.is_none() {
@@ -1184,6 +1190,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
         }
     }
     if let Some(a) = annotate {
+        crate::banner::stage(HUNT_STAGES, "writing the hunt into the timeline");
         match annotate_timelines(a.files, &corpus, &ents, &rows, alpha, cfg, a.carry_marks, a.if_hunted) {
             Ok((lines, written)) => {
                 for l in lines {
@@ -1217,6 +1224,7 @@ fn run_with(corpus: Corpus, dialect: &Dialect, cfg: &Settings, output: Option<&s
             }
         }
     }
+    crate::banner::stages_end();
     crate::banner::print_phase_detail("Done:", &format!("{} rows in {:.1}s", rows.len(), clock.elapsed().as_secs_f64()));
 }
 
@@ -1848,6 +1856,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         return (Vec::new(), lines, alpha, Vec::new(), None, ents);
     }
 
+    crate::banner::stage(HUNT_STAGES, "what each machine's logs cover");
     // ── coverage per destination machine: log-file spans from the loader,
     //    or (older graphs) the days with events ──
     let mut cov_ok: HashMap<u32, BTreeSet<i32>> = HashMap::new();
@@ -1878,6 +1887,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
     let covered = |m: &HashMap<u32, BTreeSet<i32>>, d: u32, day: i32| m.get(&d).map(|s| s.contains(&day)).unwrap_or(false);
     let kref = |m: &HashMap<u32, BTreeSet<i32>>, d: u32| m.get(&d).map(|s| s.range(..cutoff_day).count()).unwrap_or(0);
 
+    crate::banner::stage(HUNT_STAGES, "choosing the baseline days");
     // ── panel: destinations covered on every day from S to the cutoff; S
     //    maximises (panel size x null days) ──
     let bd: Vec<i32> = base_days.iter().copied().collect();
@@ -1972,6 +1982,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         base_days.len()
     ));
 
+    crate::banner::stage(HUNT_STAGES, "learning what is normal");
     // ── baseline item indexes ──
     let mut ix_triple: DayIndex<(u32, u32, u32)> = DayIndex::new();
     // (origin, destination, account, result): the connection itself
@@ -2008,6 +2019,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         }
     }
 
+    crate::banner::stage(HUNT_STAGES, "the network before each day");
     // ── reference graphs (the pairs of the earlier days) for Louvain and
     //    centrality ──
     let want_comm = enabled[3];
@@ -2127,6 +2139,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
             .unwrap_or((e.day as i64 + 1) * 86_400 - 1)
     };
 
+    crate::banner::stage(HUNT_STAGES, "weighing every connection");
     // ── per-day facts ──
     let mut triples: Vec<TripleDay> = Vec::new();
     let mut origin_days: BTreeMap<(i32, u32), OriginDay> = BTreeMap::new();
@@ -2273,6 +2286,7 @@ fn analyse(c: &mut Corpus, dialect: &Dialect, cfg: &Settings, hits: &[sigma::Sig
         }
         i = j;
     }
+    crate::banner::stage(HUNT_STAGES, "chains of logins");
     // causal paths (Hopper, Ho et al. 2021): a login B -> C as a2 is caused
     // by one of the logins A -> B that entered B earlier the same UTC day
     // (the day is the unit of the whole analysis; Hopper uses the session

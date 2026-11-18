@@ -244,15 +244,20 @@ pub fn card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) 
     // (an interact over the frame afterwards would sit on top of them)
     ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
         let hovered = ui.response().hovered();
+        // how much the pointer is on it, eased: nothing snaps
+        let warm = ui.ctx().animate_bool_with_time(ui.response().id.with("warm"), hovered, 0.14);
         let fill = if selected { Color32::from_rgb(16, 48, 52) } else { PANEL_2 };
         let stroke = if selected {
-            Stroke::new(1.0, super::draw::fade(CYAN, 0.8))
-        } else if hovered {
-            Stroke::new(1.0, super::draw::fade(CYAN, 0.45))
+            Stroke::new(1.0, super::draw::fade(CYAN, 0.8 + 0.2 * warm))
+        } else if warm > 0.0 {
+            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * warm * 0.55) as u8;
+            Stroke::new(1.0, Color32::from_rgb(mix(BORDER.r(), CYAN.r()), mix(BORDER.g(), CYAN.g()), mix(BORDER.b(), CYAN.b())))
         } else {
             Stroke::new(1.0, BORDER)
         };
-        egui::Frame::new().fill(fill).stroke(stroke).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
+        // a light behind the card under the pointer
+        let shadow = egui::Shadow { offset: [0, 2], blur: (14.0 * warm) as u8, spread: 0, color: super::draw::fade(CYAN, 0.16 * warm) };
+        egui::Frame::new().fill(fill).stroke(stroke).shadow(shadow).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             add(ui);
         });

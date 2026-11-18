@@ -1120,9 +1120,22 @@ pub(super) fn stepper(ui: &mut egui::Ui, step: usize, labels: &[&str]) {
     let span = r.rect.width() - 2.0 * pad;
     let xs: Vec<f32> = (0..n).map(|i| r.rect.left() + pad + span * i as f32 / (n - 1).max(1) as f32).collect();
     let y = r.rect.top() + 13.0;
+    // how far along the steps, eased: the line fills in as a step is passed
+    let along = ui.ctx().animate_value_with_time(r.id.with("along"), step as f32, 0.3);
     for i in 0..n.saturating_sub(1) {
-        let c = if i < step { theme::CYAN } else { theme::BORDER_2 };
-        p.line_segment([Pos2::new(xs[i] + 12.0, y), Pos2::new(xs[i + 1] - 12.0, y)], Stroke::new(1.5, c));
+        let (a, b) = (Pos2::new(xs[i] + 12.0, y), Pos2::new(xs[i + 1] - 12.0, y));
+        p.line_segment([a, b], Stroke::new(1.5, theme::BORDER_2));
+        let part = (along - i as f32).clamp(0.0, 1.0);
+        if part > 0.0 {
+            p.line_segment([a, Pos2::new(a.x + (b.x - a.x) * part, y)], Stroke::new(1.8, theme::CYAN));
+        }
+    }
+    // the step under way breathes
+    if step < n {
+        let t = ui.input(|i| i.time) as f32;
+        let beat = (t * 2.2).sin() * 0.5 + 0.5;
+        p.circle_stroke(Pos2::new(xs[step], y), 13.5 + 3.0 * beat, Stroke::new(1.2, draw::fade(theme::CYAN, 0.35 * (1.0 - beat))));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
     }
     for (i, l) in labels.iter().enumerate() {
         let c = Pos2::new(xs[i], y);
@@ -1263,28 +1276,43 @@ pub(super) fn progress_ui(ui: &mut egui::Ui, job: &Job) {
     }
 }
 
-/// A bar like the console's `[=====>----] 12/120 Security.evtx`, drawn.
+/// A bar like the console's `[=====>----] 12/120 Security.evtx`, drawn:
+/// the logo's run from cyan to magenta, a light moving along what is done,
+/// and the fill easing to where the work is instead of jumping.
 fn bar_ui(ui: &mut egui::Ui, pos: u64, len: u64, msg: &str, done: bool) {
     let w = ui.available_width().min(560.0);
-    let (r, p) = ui.allocate_painter(Vec2::new(w, 12.0), Sense::hover());
-    let track = r.rect.shrink2(Vec2::new(0.0, 2.0));
+    let (r, p) = ui.allocate_painter(Vec2::new(w, 14.0), Sense::hover());
+    let track = r.rect.shrink2(Vec2::new(0.0, 3.0));
     p.rect_filled(track, CornerRadius::same(4), theme::FIELD);
-    let f = if done { 1.0 } else if len == 0 { 0.0 } else { (pos as f32 / len as f32).clamp(0.0, 1.0) };
+    let target = if done { 1.0 } else if len == 0 { 0.0 } else { (pos as f32 / len as f32).clamp(0.0, 1.0) };
+    let f = ui.ctx().animate_value_with_time(r.id.with("fill"), target, 0.35);
     if f > 0.0 {
         let fill = Rect::from_min_size(track.min, Vec2::new((track.width() * f).max(6.0), track.height()));
         let mut mesh = egui::epaint::Mesh::default();
         let v = |x: f32, y: f32, c: Color32| egui::epaint::Vertex { pos: Pos2::new(x, y), uv: egui::epaint::WHITE_UV, color: c };
-        let (a, b) = (theme::CYAN, theme::VIOLET);
+        let (a, z) = (theme::CYAN, theme::MAGENTA);
+        // the colour at the end of the fill: as far along the run as the work is
+        let b = Color32::from_rgb((a.r() as f32 + (z.r() as f32 - a.r() as f32) * f) as u8, (a.g() as f32 + (z.g() as f32 - a.g() as f32) * f) as u8, (a.b() as f32 + (z.b() as f32 - a.b() as f32) * f) as u8);
         mesh.vertices.extend([v(fill.left(), fill.top(), a), v(fill.right(), fill.top(), b), v(fill.right(), fill.bottom(), b), v(fill.left(), fill.bottom(), a)]);
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
         p.with_clip_rect(fill).add(egui::Shape::mesh(mesh));
-        p.rect_stroke(fill, CornerRadius::same(4), Stroke::new(1.0, draw::fade(theme::CYAN, 0.5)), egui::StrokeKind::Inside);
+        if !done {
+            let t = ui.input(|i| i.time) as f32;
+            let x = fill.left() + (t * 0.8).fract() * fill.width();
+            p.with_clip_rect(fill).rect_filled(Rect::from_center_size(Pos2::new(x, fill.center().y), Vec2::new(24.0, fill.height())), CornerRadius::same(4), Color32::from_rgba_unmultiplied(255, 255, 255, 64));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        // a glow under the bar
+        p.rect_stroke(fill.expand(1.5), CornerRadius::same(5), Stroke::new(1.0, draw::fade(b, 0.28)), egui::StrokeKind::Outside);
     }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(egui::RichText::new(format!("{} / {}", pos, len)).monospace().size(11.0).color(theme::CYAN));
-        ui.label(egui::RichText::new(format!("{:.0} %", f * 100.0)).monospace().size(11.0).color(theme::DIM));
+        // (a bar out of a hundred is a share: the percentage says it all)
+        if len != 100 {
+            ui.label(egui::RichText::new(format!("{} / {}", pos, len)).monospace().size(11.0).color(theme::CYAN));
+        }
+        ui.label(egui::RichText::new(format!("{:.0} %", target * 100.0)).monospace().size(11.0).color(if len == 100 { theme::CYAN } else { theme::DIM }));
         if !msg.is_empty() {
             ui.add(egui::Label::new(egui::RichText::new(msg).size(11.5).color(theme::MUTED)).truncate());
         }

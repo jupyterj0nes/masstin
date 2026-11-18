@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The hunt has a progress bar.** A hunt reports the stage it is on, of ten (reading the timeline, learning what is normal, weighing every connection, writing the result…): a bar in the console, and in the window a bar over the canvas with the stage, the percentage and the seconds, under the mastiff and the sweep.
+- **The viewer: progress that moves.** Every bar (ingest, Cortex, the hunt) runs from cyan to magenta as the logo does, eases to where the work is instead of jumping, and has a light moving along what is done. The steps of a wizard fill their line as they are passed and the one under way breathes; a card lights up under the pointer.
 - **Cortex XDR: a wizard that checks the connection.** Reading from a tenant is now five steps (the tenant, what to read, which events, the timeline, the run), reached from Evidence and from the first step of the ingest wizard. The first step says where the three values are in Cortex and **checks the connection** before anything is read: green with the kind of key and the quota used today, red with the tenant's own words and what to do. The period has buttons for the last 24 hours, 3, 7 and 30 days.
 - **`--cortex-check`**: the same check from the command line: one request that costs no compute units, the tenant's answer, exit code 0 when it accepted.
 - **Cortex XDR: a progress bar.** Each source shows the share of its period read so far and the events collected, in the console and in the window.
