@@ -1483,6 +1483,11 @@ const REMOTE_ACCESS_PORTS: [u16; 9] = [22, 23, 135, 139, 445, 3389, 5900, 5985, 
 /// pid of its sshd, time) of its logins.
 static AUDIT_CONNECTS: std::sync::Mutex<Vec<AuditConnect>> = std::sync::Mutex::new(Vec::new());
 static AUDIT_SESSIONS: std::sync::Mutex<Vec<(String, u64, u32, i64)>> = std::sync::Mutex::new(Vec::new());
+/// Tests run in threads of one process and share the two lists above: a
+/// test that reads them holds this while a parse of another test empties
+/// them (a run of masstin has one parse, so nothing of the kind happens).
+#[cfg(test)]
+static AUDIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `msg=audit(1763418000.123:456)` -> (seconds, serial): the event a record belongs to.
 fn audit_stamp(line: &str) -> Option<(i64, u64)> {
@@ -3109,6 +3114,8 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     if !quiet { crate::banner::print_output_start(); }
     resolve_audit_uids(&mut collected);
     // what the login sessions connected to, by the audit logs' own records
+    #[cfg(test)]
+    let _audit_lists = AUDIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut connects = AUDIT_CONNECTS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
     let sessions = AUDIT_SESSIONS.lock().map(|mut a| std::mem::take(&mut *a)).unwrap_or_default();
     if !archive_dirs.is_empty() {
@@ -3451,6 +3458,8 @@ mod review_2026_11_tests {
     /// login (the pid of its sshd), one per connection.
     #[test]
     fn auditd_connect_records_become_rows_of_the_session() {
+        // (no parse of another test empties the shared lists between the read and the look)
+        let _audit_lists = AUDIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("masstin-auditconn-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("audit.log");
