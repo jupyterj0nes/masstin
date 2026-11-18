@@ -1501,9 +1501,11 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
             }
         }
         ActionType::Merge => {
-            // Merge requires at least two files
-            if config.file.len() < 2 {
-                return Err(String::from("You must specify at least two files to merge."));
+            // Two timelines to merge; one is enough when the merge is asked
+            // to change it (a noise filter, or marks carried from an earlier one)
+            let changes_one = config.ignore_local || config.exclude_users.is_some() || config.exclude_hosts.is_some() || config.exclude_ips.is_some() || config.carry_marks.is_some();
+            if config.file.is_empty() || (config.file.len() < 2 && !changes_one) {
+                return Err(String::from("You must specify at least two files to merge (one is enough with --ignore-local, --exclude-* or --carry-marks)."));
             }
         }
         ActionType::MergeNeo4jNodes => {
