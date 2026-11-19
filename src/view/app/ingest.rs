@@ -1332,13 +1332,27 @@ pub(super) fn progress_ui(ui: &mut egui::Ui, job: &Job) {
     }
     if !pr.notes.is_empty() {
         ui.add_space(2.0);
-        let from = pr.notes.len().saturating_sub(8);
-        for n in &pr.notes[from..] {
+        // Every line the run reported (each source read, each count), not the last
+        // few: nineteen packages are nineteen lines. Eight show at a time and the
+        // rest scroll; while the run goes on the list stays at its newest line.
+        const SHOWN: usize = 8;
+        let total = pr.notes.len();
+        if total > SHOWN {
             ui.horizontal(|ui| {
                 ui.add_space(22.0);
-                ui.add(egui::Label::new(egui::RichText::new(format!("{}  {}", ic::CARET_RIGHT, n)).color(EDGE_OK).size(12.0)).truncate());
+                ui.label(egui::RichText::new(format!("{} lines, {} shown at a time: scroll to see them all", total, SHOWN)).color(theme::DIM).small());
             });
         }
+        let row_h = ui.text_style_height(&egui::TextStyle::Body).max(14.0) + ui.spacing().item_spacing.y + 2.0;
+        egui::ScrollArea::vertical().id_salt("progress-notes").max_height(row_h * SHOWN as f32).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+            for n in &pr.notes {
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    // cut to the width of the window; the whole line on hover
+                    ui.add(egui::Label::new(egui::RichText::new(format!("{}  {}", ic::CARET_RIGHT, n)).color(EDGE_OK).size(12.0)).truncate()).on_hover_text(n);
+                });
+            }
+        });
     }
 }
 
