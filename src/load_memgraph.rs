@@ -211,7 +211,8 @@ pub async fn load_memgraph(
                 let cols: Vec<String> = crate::graph_hunt_common::engine::csv_fields(line);
                 for c in [idx_dst, idx_src_computer, idx_src_ip] {
                     if let Some(v) = cols.get(c) {
-                        let mut v = v.replace("\\", "").replace("[", "").replace("]", "").to_uppercase();
+                        let v = v.replace("\\", "").replace("[", "").replace("]", "");
+                        let mut v = crate::graph_hunt_common::canonical_ipv6(&v).unwrap_or_else(|| v.to_uppercase());
                         if v.contains(':') && !looks_like_ip(&v) {
                             v = v.split(':').next().unwrap_or("").to_string();
                         }
@@ -241,7 +242,12 @@ pub async fn load_memgraph(
                 .enumerate()
                 .map(|(i, f)| {
                     let f = f.replace("\\", "").replace("[", "").replace("]", "");
-                    if i == idx_target_user || i == idx_subject_user { f } else { f.to_uppercase() }
+                    if i == idx_target_user || i == idx_subject_user {
+                        f
+                    } else {
+                        // an IPv6 address in the hunt's one spelling of it
+                        crate::graph_hunt_common::canonical_ipv6(&f).unwrap_or_else(|| f.to_uppercase())
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(",")
@@ -433,7 +439,8 @@ pub async fn load_memgraph(
                     log_source: parts.get(idx_log_source).cloned().unwrap_or_default(),
                     subject_user: parts[idx_subject_user].clone(),
                     subject_domain: parts[idx_subject_domain].clone(),
-                    target_domain: parts[idx_target_domain].clone(),
+                    // the domain the name carries after @ is not lost with it
+                    target_domain: crate::graph_hunt_common::edge_domain(&parts[idx_target_user], &parts[idx_target_domain]),
                     src_computer: parts[idx_src_computer].clone(),
                     src_ip: parts[idx_src_ip].clone(),
                 });
@@ -564,7 +571,7 @@ pub async fn load_memgraph(
                 src_computer: src_computer_raw.to_string(),
                 src_ip: src_ip_raw.to_string(),
                 target_user_name: clean_user(relation_type),
-                target_domain_name: row[6].to_string(),
+                target_domain_name: crate::graph_hunt_common::edge_domain(relation_type, row[6]),
                 subject_user_name: clean_user(row[3]),
                 subject_domain_name: row[4].to_string(),
                 event_type: row.get(10).map(|s| s.to_string()).unwrap_or_default(),

@@ -145,6 +145,35 @@ pub fn parse_ts(s: &str) -> Option<NaiveDateTime> {
 /// `Some("2026-10-20T03:00:00")` (with the fraction, to the microsecond,
 /// when there is one), or None when the cell is fine as it is (UTC, with
 /// `Z`, `+00:00` or no zone) or is not a time.
+/// An IPv6 address in the one spelling the hunt uses for it, in upper case:
+/// `fd00:cdc:a:0:1:0:0:28` and `FD00:CDC:A:0:1::28` are the same address and
+/// must be the same node. An IPv4-mapped address is its IPv4 address. `None`
+/// for anything that is not an IPv6 address written whole (a name, an IPv4
+/// address, an address with a zone or a port), which is left as it is.
+///
+/// The loaders call it on every host and address cell so a loaded graph
+/// names an address as graph-hunt-csv does (`engine::clean_host`).
+pub(crate) fn canonical_ipv6(cell: &str) -> Option<String> {
+    let v6 = cell.trim().parse::<std::net::Ipv6Addr>().ok()?;
+    Some(match v6.to_ipv4_mapped() {
+        Some(v4) => v4.to_string(),
+        None => v6.to_string().to_uppercase(),
+    })
+}
+
+/// The domain a row gives for its account, as the loaders store it on the
+/// edge: the one the name itself carries after `@` (`alice@dev.corp`) when
+/// it has one, else the row's domain column. The edge's relationship type is
+/// the bare name, so without this the domain of such an account was lost and
+/// the hunt over a loaded graph named `ALICE` what graph-hunt-csv names
+/// `ALICE@DEV`.
+pub(crate) fn edge_domain(user: &str, domain_column: &str) -> String {
+    match user.trim().rsplit('\\').next().unwrap_or(user).split_once('@') {
+        Some((_, d)) if !d.trim().is_empty() => d.trim().to_string(),
+        _ => domain_column.to_string(),
+    }
+}
+
 pub fn utc_if_rewritten(raw: &str) -> Option<String> {
     let t = raw.trim();
     let upper = t.to_ascii_uppercase();

@@ -264,7 +264,12 @@ fn clean_row(
         .enumerate()
         .map(|(i, f)| {
             let f = f.replace("\\", "").replace("[", "").replace("]", "");
-            if i == idx.target_user || i == idx.subject_user { f } else { f.to_uppercase() }
+            if i == idx.target_user || i == idx.subject_user {
+                f
+            } else {
+                // an IPv6 address in the hunt's one spelling of it
+                crate::graph_hunt_common::canonical_ipv6(&f).unwrap_or_else(|| f.to_uppercase())
+            }
         })
         .collect();
     let mut row: Vec<&str> = fields.iter().map(|x| x.as_str()).collect();
@@ -506,7 +511,7 @@ fn resolve_to_edge(
         src_computer: src_computer_raw.to_string(),
         src_ip: src_ip_raw.to_string(),
         target_user_name: clean_user(relation_type),
-        target_domain_name: parts[idx.target_domain].clone(),
+        target_domain_name: crate::graph_hunt_common::edge_domain(relation_type, &parts[idx.target_domain]),
         subject_user_name: clean_user(&parts[idx.subject_user]),
         subject_domain_name: parts[idx.subject_domain].clone(),
         logon_id: if idx.logon_id == NONE_COL || idx.logon_id >= parts.len() { String::new() } else { parts[idx.logon_id].trim_matches('"').to_string() },
@@ -908,7 +913,8 @@ pub async fn load_neo4j(
                     log_source: if idx.log_source == NONE_COL || idx.log_source >= parts.len() { String::new() } else { parts[idx.log_source].clone() },
                     subject_user: parts[idx.subject_user].clone(),
                     subject_domain: parts[idx.subject_domain].clone(),
-                    target_domain: parts[idx.target_domain].clone(),
+                    // the domain the name carries after @ is not lost with it
+                    target_domain: crate::graph_hunt_common::edge_domain(&parts[idx.target_user], &parts[idx.target_domain]),
                     src_computer: parts[idx.src_computer].clone(),
                     src_ip: parts[idx.src_ip].clone(),
                 });
@@ -1041,6 +1047,31 @@ pub async fn load_neo4j(
 mod ip_tests {
     use super::{clean_row, extract_leading_ip, looks_like_ip, parse_indices, RowOutcome, NONE_COL};
     use std::collections::HashSet;
+
+    #[test]
+    fn an_ipv6_address_has_one_spelling_and_an_account_keeps_its_domain() {
+        use crate::graph_hunt_common::{canonical_ipv6, edge_domain};
+        // the two ways the same address is written give the same node name,
+        // the one graph-hunt-csv uses
+        assert_eq!(canonical_ipv6("fd00:cdc:a:0:1:0:0:28").as_deref(), Some("FD00:CDC:A:0:1::28"));
+        assert_eq!(canonical_ipv6("FD00:CDC:A:0:1::28").as_deref(), Some("FD00:CDC:A:0:1::28"));
+        assert_eq!(canonical_ipv6("::ffff:10.0.0.5").as_deref(), Some("10.0.0.5"));
+        assert_eq!(crate::graph_hunt_common::engine::clean_host("fd00:cdc:a:0:1:0:0:28").to_uppercase(), "FD00:CDC:A:0:1::28");
+        // names, IPv4 addresses and hex words are not touched
+        for other in ["10.0.0.1", "WEB01", "CAFE", "BADC0DE", "fe80::1%eth0", "10.0.0.1:3389", ""] {
+            assert_eq!(canonical_ipv6(other), None, "{other}");
+        }
+        // the domain the name carries wins over the column, as in the hunt's account_id
+        assert_eq!(edge_domain("HealthMailbox1@offsec.lan", ""), "offsec.lan");
+        assert_eq!(edge_domain("alice@dev.corp", "OTHER"), "dev.corp");
+        assert_eq!(edge_domain("alice", "DEV"), "DEV");
+        assert_eq!(edge_domain("alice@", "DEV"), "DEV");
+        assert_eq!(edge_domain("alice", ""), "");
+        // and it is the domain the hunt reads back from the edge
+        let key = |user: &str, col: &str| crate::graph_hunt_common::account::domain_key(user.split('@').next().unwrap(), &edge_domain(user, col), "DC01");
+        assert_eq!(key("HealthMailbox1@offsec.lan", ""), crate::graph_hunt_common::account::domain_key("HealthMailbox1@offsec.lan", "", "DC01"));
+        assert_eq!(key("HealthMailbox1@offsec.lan", ""), "OFFSEC");
+    }
 
     #[test]
     fn ipv6_and_hex_names() {
