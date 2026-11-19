@@ -5501,6 +5501,22 @@ impl Viewer {
                 self.saved.push(SavedView { name, filter: self.draft.clone(), style: self.style.clone(), places: Vec::new() });
                 self.persist();
             }
+            // a saved view picked as the Filters menu picks it: its filter,
+            // its style and the places it keeps
+            other if other.starts_with("view=") => {
+                let name = &other["view=".len()..];
+                if let Some(v) = self.saved.iter().find(|v| v.name == name).cloned() {
+                    self.preset = v.name.clone();
+                    self.draft = v.filter.clone();
+                    self.style = v.style.clone();
+                    if !v.places.is_empty() {
+                        self.restore_places = Some(v.places.clone());
+                    }
+                    self.requery(false);
+                } else {
+                    eprintln!("masstin: no saved view named {}", name);
+                }
+            }
             "close" => {
                 self.ingest.open = false;
                 self.show_hunt = false;
