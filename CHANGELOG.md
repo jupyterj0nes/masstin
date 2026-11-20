@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **The viewer copies to the clipboard again.** It was built without eframe's `clipboard` feature (the default features are off, and the list given back left it out), so every copy went to an in-process buffer and never reached the system: **Copy the row**, **Copy the name** of a host and Ctrl + C on selected text did nothing, and said nothing. The feature is back, with `links` (the link to the documentation did not open either), on both renderers: OpenGL and the CPU one used over remote desktop. Checked against the Windows clipboard on both. A test keeps both features in the manifest.
+- **Every cell can be copied.** A right click on a cell of the timeline has **Copy the cell (column)**, the value as the file has it. With several rows picked, **Copy these N rows** copies them all, one line each, in the file's order; **Ctrl + C** copies the rows picked when no text field has the focus and no text is selected.
+- `MASSTIN_VIEW_AUTO`: `view=NAME` opens a saved view by its name, as the Filters menu does; `copy-rows=LINE+LINE` copies rows to the clipboard.
+
 ## v1.4.9 — 2026-11-19
 
 - **Cortex XDR online triage: recognised, read as Linux evidence, under its own host.** The zip the Cortex XDR console offers for download after a triage is one folder per collector, a table (`netstat/netstat.csv`) or the collector's raw files in a zip named after it (`auth_logs/auth_logs_<id>_<id>.zip`). `parse` called it an archive of no known layout and read nothing from it; `parse-linux` on its folder read its logs but named the host `entry_1_0`, the made-up folder each file sits in. It is now a triage type of its own, recognised by that layout whatever the download is called; one taken from a Linux host counts as Linux evidence, so `parse` hands it to the Linux parser, alone or beside Windows packages, and its events carry the host its tables give in their `host_name` column. Tested on Linux packages only.

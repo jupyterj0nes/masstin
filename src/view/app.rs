@@ -5707,6 +5707,17 @@ impl Viewer {
                     Err(e) => eprintln!("masstin: cannot write the rows copy: {}", e),
                 }
             }
+            // rows of the first file to the system clipboard, as "Copy the row" does (copy-rows=0+1)
+            other if other.starts_with("copy-rows=") => {
+                let rows: Vec<(u16, u32)> = other["copy-rows=".len()..].split('+').filter_map(|s| s.trim().parse().ok()).map(|l| (0u16, l)).collect();
+                match self.rows_text(&rows) {
+                    Ok(t) => {
+                        ctx.copy_text(t);
+                        eprintln!("masstin: copied {} row(s) to the clipboard", rows.len());
+                    }
+                    Err(e) => eprintln!("masstin: cannot copy the rows: {}", e),
+                }
+            }
             "style" => self.show_labels = true,
             "when" => self.show_when = true,
             other if other.starts_with("when-cal=") => self.when_open_cal = Some(other["when-cal=".len()..].to_string()),

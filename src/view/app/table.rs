@@ -291,8 +291,33 @@ enum RowAct {
     /// the rows picked (or this one), in agentc00pr's viewer
     Agent((u16, u32)),
     Graph((u16, u32)),
+    /// the row (or the rows picked, when it is one of them) as the file has them
     Copy((u16, u32)),
+    /// the value of one cell
+    CopyCell(String),
     Connection((u16, u32)),
+}
+
+/// What Ctrl + C copies in the timeline: the rows picked, when nothing else
+/// takes the keys (a text field with the focus, text selected in a label,
+/// which egui copies itself).
+pub(super) fn copy_key_takes_rows(pressed: bool, focused_widget: bool, label_selection: bool, picked: bool) -> bool {
+    pressed && !focused_widget && !label_selection && picked
+}
+
+/// Rows as their files have them, one line each, in the order given; each
+/// run of rows of the same file is read in one pass.
+pub(super) fn rows_text(store: &Store, rows: &[(u16, u32)]) -> std::io::Result<String> {
+    let mut out: Vec<String> = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        let file = rows[i].0;
+        let j = rows[i..].iter().position(|r| r.0 != file).map_or(rows.len(), |p| i + p);
+        let lines: Vec<u32> = rows[i..j].iter().map(|r| r.1).collect();
+        out.extend(store.raw_texts(file, &lines)?);
+        i = j;
+    }
+    Ok(out.join("\n"))
 }
 
 /// One field as CSV writes it.
@@ -717,6 +742,11 @@ impl Viewer {
 
     /// The copy of these rows, next to nothing of the case: in the
     /// system's temporary folder, named after the timeline and the rows.
+    /// The rows as the file has them, one line each, in the order given.
+    pub(super) fn rows_text(&self, rows: &[(u16, u32)]) -> std::io::Result<String> {
+        rows_text(&self.store, rows)
+    }
+
     pub(super) fn write_rows_copy(&mut self, rows: &[(u16, u32)], label: &str) -> std::io::Result<String> {
         let dir = std::env::temp_dir().join(format!("masstin_view_{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -907,6 +937,14 @@ impl Viewer {
             self.table_sel = None;
             self.table_multi.clear();
         }
+        let picked = self.table_sel.or_else(|| self.table_multi.iter().next().copied());
+        let pressed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let focused = ctx.memory(|m| m.focused().is_some());
+        let selecting = ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
+        let act = match (act, picked) {
+            (None, Some(row)) if copy_key_takes_rows(pressed, focused, selecting, true) => Some(RowAct::Copy(row)),
+            (a, _) => a,
+        };
         match act {
             Some(RowAct::Select(row)) => {
                 self.table_multi.clear();
@@ -943,13 +981,21 @@ impl Viewer {
                 self.rows_to_agentc00pr(&rows, &what);
             }
             Some(RowAct::Graph(row)) => self.row_to_graph(row),
-            Some(RowAct::Copy(row)) => match self.store.raw_texts(row.0, &[row.1]) {
-                Ok(t) => {
-                    ctx.copy_text(t.into_iter().next().unwrap_or_default());
-                    self.status = format!("Line {} copied", row.1 + 2);
+            Some(RowAct::Copy(row)) => {
+                let mut rows: Vec<(u16, u32)> = if self.table_multi.contains(&row) && self.table_multi.len() > 1 { self.table_multi.iter().copied().collect() } else { vec![row] };
+                rows.sort_unstable();
+                match self.rows_text(&rows) {
+                    Ok(t) => {
+                        ctx.copy_text(t);
+                        self.status = if rows.len() > 1 { format!("{} rows copied", rows.len()) } else { format!("Line {} copied", row.1 + 2) };
+                    }
+                    Err(e) => self.status = format!("Cannot read the row: {}", e),
                 }
-                Err(e) => self.status = format!("Cannot read the row: {}", e),
-            },
+            }
+            Some(RowAct::CopyCell(value)) => {
+                self.status = format!("Copied: {}", value.chars().take(80).collect::<String>());
+                ctx.copy_text(value);
+            }
             Some(RowAct::Connection(row)) => match self.graph_edge_of_row(row) {
                 Ok(k) => self.timeline_of_edge(k),
                 Err(why) => self.status = format!("Line {}: {}", row.1 + 2, why),
@@ -1184,7 +1230,15 @@ impl Viewer {
                             act = Some(RowAct::Connection(key));
                         }
                         ui.separator();
-                        if icon_button(ui, ic::LINK, "Copy the row").on_hover_text("The row as the file has it").clicked() {
+                        if let Some((ci, value)) = self.table_ctx_cell.clone() {
+                            let name = cols.get(ci).copied().unwrap_or("");
+                            if icon_button(ui, ic::LINK, &format!("Copy the cell ({})", name)).on_hover_text("This cell's value, as the file has it").clicked() {
+                                ui.close();
+                                act = Some(RowAct::CopyCell(value));
+                            }
+                        }
+                        let label = if n_sel > 1 { format!("Copy these {} rows", n_sel) } else { "Copy the row".to_string() };
+                        if icon_button(ui, ic::LINK, &label).on_hover_text("As the file has them, one line each. Ctrl + C copies the rows picked too").clicked() {
                             ui.close();
                             act = Some(RowAct::Copy(key));
                         }
@@ -1357,5 +1411,48 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("plain"), "plain");
+    }
+
+    /// Copying rows gives them as their files have them, one line each, in
+    /// the order asked, across files, a quoted multi-line field whole.
+    #[test]
+    fn copied_rows_are_the_files_text_in_order() {
+        let a = [
+            row("2026-01-01T08:00:00+00:00", "SRV01", "alice", "WS01", "plain"),
+            row("2026-01-01T09:00:00+00:00", "SRV02", "bob", "WS02", "\"two\nlines\""),
+            row("2026-01-01T10:00:00+00:00", "SRV03", "carol", "WS03", "\"a, b\""),
+        ];
+        let b = [row("2026-01-02T08:00:00+00:00", "SRV09", "dave", "WS09", "other file")];
+        let pa = timeline("rows_text_a.csv", &a.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let pb = timeline("rows_text_b.csv", &b.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let store = Store::load(&[pa.to_string_lossy().to_string(), pb.to_string_lossy().to_string()], 0.05).unwrap();
+        assert_eq!(rows_text(&store, &[(0, 0)]).unwrap(), a[0]);
+        assert_eq!(rows_text(&store, &[(0, 0), (0, 1), (0, 2)]).unwrap(), format!("{}\n{}\n{}", a[0], a[1], a[2]));
+        assert_eq!(rows_text(&store, &[(0, 2), (1, 0), (0, 1)]).unwrap(), format!("{}\n{}\n{}", a[2], b[0], a[1]), "the order given, files mixed");
+        assert_eq!(rows_text(&store, &[]).unwrap(), "");
+        assert!(rows_text(&store, &[(0, 9)]).is_err(), "a row that is not there says so");
+        let _ = std::fs::remove_file(pa);
+        let _ = std::fs::remove_file(pb);
+    }
+
+    /// Ctrl + C copies the rows picked only when nothing else takes it.
+    #[test]
+    fn the_copy_key_takes_the_rows_only_when_free() {
+        assert!(copy_key_takes_rows(true, false, false, true));
+        assert!(!copy_key_takes_rows(false, false, false, true), "no key, no copy");
+        assert!(!copy_key_takes_rows(true, true, false, true), "a text field with the focus copies its own text");
+        assert!(!copy_key_takes_rows(true, false, true, true), "text selected in a label is what is copied");
+        assert!(!copy_key_takes_rows(true, false, false, false), "no row picked");
+    }
+
+    /// Without eframe's `clipboard` feature every copy (Copy the row, Copy
+    /// the cell, Ctrl + C on selected text) silently goes nowhere, and without
+    /// `links` no link opens: the manifest must keep both.
+    #[test]
+    fn the_build_keeps_the_clipboard_and_links() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let line = manifest.lines().find(|l| l.trim_start().starts_with("eframe =")).expect("eframe dependency");
+        assert!(line.contains("\"clipboard\""), "eframe without the clipboard: {line}");
+        assert!(line.contains("\"links\""), "eframe without links: {line}");
     }
 }

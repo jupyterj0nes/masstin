@@ -53,7 +53,7 @@ systemd-journal-reader = "0.1.1"
 tar = "0.4"
 chrono-tz = "0.10"
 macos-unifiedlogs = "0.7"
-eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37", optional = true, default-features = false, features = ["clipboard", "links", "default_fonts", "glow", "wayland", "x11"] }
 # the window drawn without a GPU (src/view/softwin.rs): the same winit and egui-winit eframe uses
 egui-winit = { version = "0.37", optional = true, default-features = false }
 winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06"] }
