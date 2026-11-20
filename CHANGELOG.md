@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## v1.4.10 — 2026-11-20
 
 - **The viewer copies to the clipboard again.** It was built without eframe's `clipboard` feature (the default features are off, and the list given back left it out), so every copy went to an in-process buffer and never reached the system: **Copy the row**, **Copy the name** of a host and Ctrl + C on selected text did nothing, and said nothing. The feature is back, with `links` (the link to the documentation did not open either), on both renderers: OpenGL and the CPU one used over remote desktop. Checked against the Windows clipboard on both. A test keeps both features in the manifest.
 - **Every cell can be copied.** A right click on a cell of the timeline has **Copy the cell (column)**, the value as the file has it. With several rows picked, **Copy these N rows** copies them all, one line each, in the file's order; **Ctrl + C** copies the rows picked when no text field has the focus and no text is selected.
+- **Every line a run reports can be read.** Under the progress bar of a run the window listed only the last eight lines of what the parser reported, with nothing to say there were more: a folder of nineteen triage packages showed seven of them. The list now holds every line, eight at a time with a scroll bar, says how many there are, stays at the newest while the run goes on, and shows a cut line whole on hover.
 - `MASSTIN_VIEW_AUTO`: `view=NAME` opens a saved view by its name, as the Filters menu does; `copy-rows=LINE+LINE` copies rows to the clipboard.
 
 ## v1.4.9 — 2026-11-19
