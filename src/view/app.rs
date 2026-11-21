@@ -476,6 +476,12 @@ pub struct Viewer {
     pending_load: Option<loading::PendingLoad>,
     /// ticks of a big graph's layout under way on a worker thread
     layout_work: Option<super::layout::Work>,
+    /// `MASSTIN_VIEW_DEBUG`: works of the layout taken and dropped since the last report
+    layout_works: (u32, u32),
+    /// a big graph's layout ticks on a worker (four cores or more)
+    layout_worker: bool,
+    /// the meshes the plain lines are drawn in: one per thread of the window's pool, eight at most
+    plain_parts: usize,
     /// the drawing reduced because the window was too slow (and the style before)
     safeguard: Option<safeguard::Safeguard>,
     /// since when the frames have been slow
@@ -699,8 +705,8 @@ fn why_no_path_itself(store: &Store, q: &PathQuery) -> String {
 }
 
 /// `1234567` as `1,234,567`.
-/// How many meshes the plain lines are drawn in: one per core the CPU
-/// rasteriser can use, eight at most.
+/// The most meshes the plain lines are drawn in (one per thread of the
+/// window's pool otherwise: a single one on two cores).
 const PLAIN_PARTS: usize = 8;
 
 /// A mesh of quads (four vertices, six indices each, as `draw::line_quad`
@@ -1285,6 +1291,9 @@ impl Viewer {
             hunt_loading: None,
             pending_load: None,
             layout_work: None,
+            layout_works: (0, 0),
+            layout_worker: super::layout_worker_pays(super::cores()),
+            plain_parts: rayon::current_num_threads().clamp(1, PLAIN_PARTS),
             safeguard: None,
             slow_since: None,
             safeguard_declined: None,
@@ -2940,7 +2949,7 @@ impl Viewer {
             return;
         }
         let t = std::time::Instant::now();
-        let big = self.layout.len() >= super::layout::BIG_GRAPH;
+        let big = self.layout.len() >= super::layout::BIG_GRAPH && self.layout_worker;
         // light mode: a frame drawn by the CPU costs a quarter of a second or more, so the
         // layout does all its ticks now (microseconds each for a lab) rather than two a frame
         // while a host is held, a few ticks a frame so the rest follows it rather than settling anew each frame
@@ -2950,8 +2959,12 @@ impl Viewer {
             // remote desktop for half a minute). A worker ticks now while the
             // window draws, and the hosts move when its ticks are done.
             if let Some(w) = &self.layout_work {
-                if self.layout.poll_work(w, self.graph_id) != super::layout::WorkState::Pending {
-                    self.layout_work = None;
+                match self.layout.poll_work(w, self.graph_id) {
+                    super::layout::WorkState::Pending => {}
+                    s => {
+                        if s == super::layout::WorkState::Adopted { self.layout_works.0 += 1 } else { self.layout_works.1 += 1 }
+                        self.layout_work = None;
+                    }
                 }
             }
             if self.layout_work.is_none() && self.layout.is_running() {
@@ -2963,7 +2976,9 @@ impl Viewer {
             self.layout_work.is_some() || self.layout.is_running()
         } else {
             self.layout_work = None;
-            let (budget, max_ticks) = if self.dragging.is_some() { (4, 3) } else if self.light_mode { (60, 2000) } else { (4, 2) };
+            // in the frame (a lab, or a big graph on a machine of fewer than four cores)
+            let heavy = self.layout.len() >= super::layout::BIG_GRAPH;
+            let (budget, max_ticks) = if self.dragging.is_some() { (4, if heavy { 1 } else { 3 }) } else if self.light_mode { (60, 2000) } else if heavy { (8, 1) } else { (4, 2) };
             self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks)
         };
         // the centring came back after a host was unpinned: the camera moves with it
@@ -3274,7 +3289,7 @@ impl Viewer {
         // the plain lines go in several meshes, each its own primitive (a clip a
         // hundredth of a pixel apart): the CPU rasteriser draws primitives on
         // all the cores, and one mesh of 40,000 lines was one core's work
-        let plain_slots: Vec<(egui::Painter, egui::layers::ShapeIdx)> = (0..PLAIN_PARTS)
+        let plain_slots: Vec<(egui::Painter, egui::layers::ShapeIdx)> = (0..self.plain_parts)
             .map(|i| {
                 let p = painter.with_clip_rect(painter.clip_rect().shrink(i as f32 * 0.01));
                 let s = p.add(egui::Shape::Noop);
@@ -3427,7 +3442,7 @@ impl Viewer {
             }
         }
 
-        for (part, (p, slot)) in split_mesh(plain_mesh, PLAIN_PARTS).into_iter().zip(plain_slots) {
+        for (part, (p, slot)) in split_mesh(plain_mesh, self.plain_parts).into_iter().zip(plain_slots) {
             p.set(slot, egui::Shape::mesh(part));
         }
 
@@ -6444,7 +6459,8 @@ impl Viewer {
         if std::env::var_os("MASSTIN_VIEW_DEBUG").is_some() {
             let since = (now - self.fps_since).as_secs_f32();
             if since >= 2.0 {
-                eprintln!("[view] {} frame(s) in {:.1} s ({:.1} a second) · in masstin {:.1} ms · in eframe (tessellate, render, present) {:.1} ms{}", self.fps_count, since, self.fps_count as f32 / since, self.inside_ms, self.outside_ms, if self.light_mode { " · light mode" } else { "" });
+                eprintln!("[view] {} frame(s) in {:.1} s ({:.1} a second) · in masstin {:.1} ms · in eframe (tessellate, render, present) {:.1} ms{} · layout {} ({} works taken, {} dropped){}", self.fps_count, since, self.fps_count as f32 / since, self.inside_ms, self.outside_ms, if self.light_mode { " · light mode" } else { "" }, if self.layout.is_running() { "running" } else { "still" }, self.layout_works.0, self.layout_works.1, if self.safeguard.is_some() { " · drawing reduced" } else { "" });
+                self.layout_works = (0, 0);
                 self.fps_count = 0;
                 self.fps_since = now;
             }

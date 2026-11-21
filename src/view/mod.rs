@@ -199,6 +199,10 @@ pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
     }
     crate::banner::print_phase("2", "2", "Opening the viewer (close the window to end)");
+    // the window's own pool (the CPU rasteriser's primitives): every core but
+    // one, which the window's thread and the system keep; on two cores a
+    // single helper, so nothing waits on three threads sharing two cores
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(pool_threads(cores())).thread_name(|i| format!("masstin-view-{}", i)).build_global();
     let title = window_title(&opts.case, &opts.files);
     let icon = image::load_from_memory(include_bytes!("../../resources/masstin_icon.png")).ok().map(|img| {
         let rgba = img.to_rgba8();
@@ -231,4 +235,47 @@ pub fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// The cores the window may count on: what the system gives the process, or
+/// `MASSTIN_VIEW_CORES` (to try a small machine's behaviour on a big one).
+pub(crate) fn cores() -> usize {
+    cores_from(std::env::var("MASSTIN_VIEW_CORES").ok().as_deref(), std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
+
+/// [`cores`] from the variable's text and what the system says.
+pub(crate) fn cores_from(var: Option<&str>, system: usize) -> usize {
+    var.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(system).max(1)
+}
+
+/// The window's pool: every core but one, one at least.
+pub(crate) fn pool_threads(cores: usize) -> usize {
+    cores.saturating_sub(1).max(1)
+}
+
+/// A big graph's layout ticks on a worker only with a core to spare for it
+/// besides the window's and the rasteriser's: four cores or more. On two, the
+/// worker took a core the drawing needed and the frames came slower than
+/// with the ticks in the frame (measured on a two-core VM over remote desktop).
+pub(crate) fn layout_worker_pays(cores: usize) -> bool {
+    cores >= 4
+}
+
+#[cfg(test)]
+mod cores_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_sizes_its_help_by_the_cores() {
+        assert_eq!(cores_from(None, 12), 12);
+        assert_eq!(cores_from(Some("2"), 12), 2);
+        assert_eq!(cores_from(Some("0"), 12), 12, "not a figure: the system's");
+        assert_eq!(cores_from(Some("x"), 8), 8);
+        assert_eq!(cores_from(None, 0), 1);
+        assert_eq!(pool_threads(12), 11);
+        assert_eq!(pool_threads(2), 1);
+        assert_eq!(pool_threads(1), 1);
+        assert!(layout_worker_pays(4) && layout_worker_pays(12));
+        assert!(!layout_worker_pays(2) && !layout_worker_pays(3));
+    }
 }

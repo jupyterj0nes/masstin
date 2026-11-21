@@ -72,8 +72,9 @@ impl Viewer {
             self.slow_since = None;
             let why = format!("{:.0} ms a frame with {} hosts and {} connections", cost, group_digits(self.graph.nodes.len()), group_digits(self.graph.edges.len()));
             let saved = self.style.clone();
+            // the scene is drawn anew from the style by itself; a requery would
+            // lay the graph out again and set thousands of hosts moving
             self.style = reduced(&saved);
-            self.requery(false);
             self.safeguard = Some(Safeguard { saved, why: why.clone(), graph: self.graph_id });
             self.status = format!("Drawing reduced to stay responsive ({:.0} ms a frame)", cost);
         }
@@ -87,11 +88,6 @@ impl Viewer {
         if by_hand {
             self.safeguard_declined = Some(self.graph_id);
             self.status = "Drawing restored: the safeguard leaves this view alone".to_string();
-        }
-        self.requery(false);
-        if by_hand {
-            // the requery made the view anew: it is still the one declined
-            self.safeguard_declined = Some(self.graph_id);
         }
     }
 
