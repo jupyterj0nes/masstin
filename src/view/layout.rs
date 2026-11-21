@@ -254,6 +254,33 @@ pub struct Layout {
     grid: HashMap<(i32, i32), Vec<u32>, BuildHasherDefault<DefaultHasher>>,
 }
 
+/// Hosts from which a graph is big: its layout ticks on a worker thread
+/// and warms up only a little when touched.
+pub const BIG_GRAPH: usize = 1500;
+/// The most a big graph warms up for a drag, a drop or a change of style.
+pub const BIG_GRAPH_HEAT: f32 = 0.08;
+
+/// Ticks of a layout running on a worker thread (see [`Layout::start_work`]).
+pub struct Work {
+    rx: std::sync::mpsc::Receiver<Layout>,
+    /// the positions the worker started from: a host the window moved since is the window's
+    sent_pos: Vec<V2>,
+    sent_alpha: f32,
+    sent_unsettled: bool,
+    /// the graph it is about (the window's graph id)
+    pub tag: u64,
+    /// no thread could be started: nothing will come
+    failed: bool,
+}
+
+/// What came of a work: still under way, taken into the layout, or dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WorkState {
+    Pending,
+    Adopted,
+    Discarded,
+}
+
 impl Layout {
     /// A fresh layout: nodes on a phyllotaxis spiral (so nothing starts on
     /// top of anything), the ones with a known position where they were.
@@ -286,7 +313,101 @@ impl Layout {
         self.pos.len()
     }
 
+    /// The simulation without its scratch (the quadtree, the grid): what a
+    /// worker needs to carry on from here.
+    pub fn snapshot(&self) -> Layout {
+        Layout {
+            pos: self.pos.clone(),
+            vel: self.vel.clone(),
+            fixed: self.fixed.clone(),
+            radius: self.radius.clone(),
+            links: self.links.clone(),
+            degree: self.degree.clone(),
+            alpha: self.alpha,
+            link_distance: self.link_distance,
+            group: self.group.clone(),
+            aspect: self.aspect,
+            max_radius: self.max_radius,
+            unsettled: self.unsettled,
+            cold_since: self.cold_since,
+            held: self.held,
+            recentred: V2::default(),
+            tree: Tree::new(),
+            force: Vec::new(),
+            stack: Vec::new(),
+            grid: HashMap::default(),
+        }
+    }
+
+    /// Ticks on a thread of its own, for `budget` (at least one tick), from
+    /// a snapshot of this layout; [`Layout::poll_work`] takes the result. A
+    /// tick of a graph of thousands of hosts is tens of milliseconds that the
+    /// window spent not drawing; here it draws while the worker ticks.
+    pub fn start_work(&self, budget: std::time::Duration, tag: u64) -> Work {
+        let mut w = self.snapshot();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("masstin-layout".into()).spawn(move || {
+            w.tick_for(budget, usize::MAX);
+            let _ = tx.send(w);
+        });
+        Work { rx, sent_pos: self.pos.clone(), sent_alpha: self.alpha, sent_unsettled: self.unsettled, tag, failed: spawned.is_err() }
+    }
+
+    /// Has the worker ended? Its positions are taken when this is still the
+    /// graph it worked on (`tag`) and the window moved none of the free
+    /// hosts meanwhile (a fill, a fit, Lay out again: the window's positions
+    /// win, and the next work starts from them). Hosts fixed here since
+    /// (held, pinned) keep their place; the cooling is taken unless the
+    /// window reheated or stopped the layout meanwhile.
+    pub fn poll_work(&mut self, work: &Work, tag: u64) -> WorkState {
+        if work.failed {
+            return WorkState::Discarded;
+        }
+        match work.rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => WorkState::Pending,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => WorkState::Discarded,
+            Ok(w) => {
+                if tag == work.tag && self.adopt(w, work) {
+                    WorkState::Adopted
+                } else {
+                    WorkState::Discarded
+                }
+            }
+        }
+    }
+
+    fn adopt(&mut self, w: Layout, work: &Work) -> bool {
+        let n = self.pos.len();
+        if w.pos.len() != n || work.sent_pos.len() != n || self.fixed.len() != n {
+            return false;
+        }
+        if (0..n).any(|i| !self.fixed[i] && self.pos[i] != work.sent_pos[i]) {
+            return false;
+        }
+        for i in 0..n {
+            if self.fixed[i] {
+                self.vel[i] = V2::default();
+            } else {
+                self.pos[i] = w.pos[i];
+                self.vel[i] = w.vel[i];
+            }
+        }
+        if self.alpha == work.sent_alpha && self.unsettled == work.sent_unsettled {
+            self.alpha = w.alpha;
+            self.unsettled = w.unsettled;
+            self.cold_since = w.cold_since;
+        }
+        self.held = w.held;
+        self.recentred += w.recentred;
+        true
+    }
+
+    /// Sets the hosts moving again. A big graph warms up only a little for a
+    /// drag, a drop or a change of style ([`BIG_GRAPH`] hosts or more): at
+    /// the heat a lab takes, thousands of hosts moved for seconds and the
+    /// window drew them all the while. A full heat (1.0) is a full one.
     pub fn reheat(&mut self, alpha: f32) {
+        let alpha = if self.pos.len() >= BIG_GRAPH && alpha < 1.0 { alpha.min(BIG_GRAPH_HEAT) } else { alpha };
         self.alpha = self.alpha.max(alpha);
         self.cold_since = None;
     }
@@ -843,5 +964,110 @@ mod drift_tests {
         eprintln!("start centroid ({:.0}, {:.0}) bounds ({:.0},{:.0})-({:.0},{:.0})", c0.x, c0.y, lo0.x, lo0.y, hi0.x, hi0.y);
         eprintln!("end   centroid ({:.0}, {:.0}) bounds ({:.0},{:.0})-({:.0},{:.0})", c.x, c.y, lo.x, lo.y, hi.x, hi.y);
         assert!(c.len() < 300.0, "the ball drifted to {:?}", c);
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    fn star(n: usize) -> Layout {
+        let links: Vec<(usize, usize)> = (1..n).map(|i| (i % 5, i)).collect();
+        let radius: Vec<f32> = (0..n).map(|i| if i < 5 { 30.0 } else { 12.0 }).collect();
+        Layout::new(radius, links, &vec![None; n])
+    }
+
+    fn wait(l: &mut Layout, w: &Work, tag: u64) -> WorkState {
+        let t = std::time::Instant::now();
+        loop {
+            match l.poll_work(w, tag) {
+                WorkState::Pending if t.elapsed().as_secs() < 30 => std::thread::sleep(std::time::Duration::from_millis(2)),
+                s => return s,
+            }
+        }
+    }
+
+    /// A worker ticks the same simulation the window would: ticked on a
+    /// worker or here, from the same state, the hosts end in the same places.
+    #[test]
+    fn a_worker_ticks_as_the_window_would() {
+        let mut here = star(400);
+        let mut there = star(400);
+        let w = there.start_work(std::time::Duration::from_millis(0), 7);
+        assert_eq!(wait(&mut there, &w, 7), WorkState::Adopted);
+        here.tick_for(std::time::Duration::from_millis(0), usize::MAX);
+        assert_eq!(here.pos, there.pos, "one tick, the same on both");
+        assert_eq!(here.alpha, there.alpha, "it cooled as much");
+    }
+
+    /// The window's changes made while the worker ran win: another graph,
+    /// a free host moved by the window, a reheat or a stop; a host fixed
+    /// meanwhile keeps its place while the others move.
+    #[test]
+    fn the_window_wins_over_a_stale_worker() {
+        let mut l = star(300);
+        let w = l.start_work(std::time::Duration::from_millis(0), 1);
+        assert_eq!(wait(&mut l, &w, 2), WorkState::Discarded, "another graph");
+
+        let mut l = star(300);
+        let before = l.pos.clone();
+        let w = l.start_work(std::time::Duration::from_millis(0), 1);
+        l.pos[10] = V2::new(5000.0, 5000.0);
+        assert_eq!(wait(&mut l, &w, 1), WorkState::Discarded, "a free host moved by the window");
+        assert_eq!(l.pos[10], V2::new(5000.0, 5000.0));
+        assert_eq!(l.pos[11], before[11], "nothing else changed either");
+
+        let mut l = star(300);
+        let w = l.start_work(std::time::Duration::from_millis(0), 1);
+        l.fixed[3] = true;
+        let kept = l.pos[3];
+        assert_eq!(wait(&mut l, &w, 1), WorkState::Adopted);
+        assert_eq!(l.pos[3], kept, "fixed meanwhile: it stays");
+        assert!(l.pos[20] != star(300).pos[20], "the others moved");
+
+        let mut l = star(300);
+        let w = l.start_work(std::time::Duration::from_millis(0), 1);
+        l.stop();
+        assert_eq!(wait(&mut l, &w, 1), WorkState::Adopted);
+        assert!(!l.is_running(), "stopped meanwhile: it stays stopped");
+
+        let mut l = star(300);
+        l.alpha = 0.01;
+        let w = l.start_work(std::time::Duration::from_millis(0), 1);
+        l.reheat(0.8);
+        assert_eq!(wait(&mut l, &w, 1), WorkState::Adopted);
+        assert_eq!(l.alpha, 0.8, "reheated meanwhile: the heat is the window's");
+    }
+
+    /// A big graph warms up only a little when touched; a lab as before,
+    /// and a full heat is a full one on both.
+    #[test]
+    fn a_big_graph_warms_up_only_a_little() {
+        let mut big = star(BIG_GRAPH);
+        big.stop();
+        big.reheat(0.5);
+        assert_eq!(big.alpha, BIG_GRAPH_HEAT);
+        big.reheat(1.0);
+        assert_eq!(big.alpha, 1.0);
+        let mut lab = star(200);
+        lab.stop();
+        lab.reheat(0.5);
+        assert_eq!(lab.alpha, 0.5);
+    }
+
+    /// The worker ends: a big graph settles through works one after another,
+    /// as the window starts them, and each work is bounded by its budget.
+    #[test]
+    fn works_one_after_another_settle_the_graph() {
+        let mut l = star(2000);
+        let mut works = 0;
+        while l.is_running() && works < 2000 {
+            let w = l.start_work(std::time::Duration::from_millis(15), 3);
+            let t = std::time::Instant::now();
+            assert_eq!(wait(&mut l, &w, 3), WorkState::Adopted);
+            assert!(t.elapsed().as_millis() < 2000, "a work keeps to its budget (one tick at least)");
+            works += 1;
+        }
+        assert!(!l.is_running(), "settled after {} works", works);
     }
 }

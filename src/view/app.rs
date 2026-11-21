@@ -473,6 +473,8 @@ pub struct Viewer {
     hunt_loading: Option<std::sync::mpsc::Receiver<Result<Store, String>>>,
     /// timelines being read away from the window (an opener waiting for them)
     pending_load: Option<loading::PendingLoad>,
+    /// ticks of a big graph's layout under way on a worker thread
+    layout_work: Option<super::layout::Work>,
     reveal_rank: Vec<f32>,
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
@@ -1243,6 +1245,7 @@ impl Viewer {
             sel_at: 0.0,
             hunt_loading: None,
             pending_load: None,
+            layout_work: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
             show_labels: false,
@@ -2895,12 +2898,32 @@ impl Viewer {
             return;
         }
         let t = std::time::Instant::now();
-        let big = self.layout.len() > 1500;
+        let big = self.layout.len() >= super::layout::BIG_GRAPH;
         // light mode: a frame drawn by the CPU costs a quarter of a second or more, so the
         // layout does all its ticks now (microseconds each for a lab) rather than two a frame
         // while a host is held, a few ticks a frame so the rest follows it rather than settling anew each frame
-        let (budget, max_ticks) = if self.dragging.is_some() { (4, if big { 1 } else { 3 }) } else if self.light_mode { (60, 2000) } else if big { (8, 1) } else { (4, 2) };
-        let ticking = self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks);
+        let ticking = if big {
+            // A tick of thousands of hosts is tens of milliseconds, and a frame
+            // waited for it (two or three a frame: 3 to 4 frames a second over
+            // remote desktop for half a minute). A worker ticks now while the
+            // window draws, and the hosts move when its ticks are done.
+            if let Some(w) = &self.layout_work {
+                if self.layout.poll_work(w, self.graph_id) != super::layout::WorkState::Pending {
+                    self.layout_work = None;
+                }
+            }
+            if self.layout_work.is_none() && self.layout.is_running() {
+                // as long as a frame takes: the worker ticks the whole time the
+                // window draws, and its hosts are there for the next frame
+                let budget = (self.frame_ms * 0.9).clamp(20.0, 250.0) as u64;
+                self.layout_work = Some(self.layout.start_work(std::time::Duration::from_millis(budget), self.graph_id));
+            }
+            self.layout_work.is_some() || self.layout.is_running()
+        } else {
+            self.layout_work = None;
+            let (budget, max_ticks) = if self.dragging.is_some() { (4, 3) } else if self.light_mode { (60, 2000) } else { (4, 2) };
+            self.layout.tick_for(std::time::Duration::from_millis(budget), max_ticks)
+        };
         // the centring came back after a host was unpinned: the camera moves with it
         let r = std::mem::take(&mut self.layout.recentred);
         if r.len2() > 0.0 {
