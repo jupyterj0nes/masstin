@@ -357,72 +357,76 @@ impl Viewer {
             (None, Some(vf)) => vf.merges.clone(),
             (None, None) => self.merges.clone(),
         };
-        match Store::load_with(&files, self.alpha, &merges) {
-            Ok(s) => {
-                self.store = s;
-                self.files = files;
-                self.merges = merges;
-                if let Some(vf) = own {
-                    self.saved = vf.views;
-                    self.subnet_defs = vf.subnets;
-                    if let Some(st) = vf.last_style {
-                        self.style = st;
-                    }
-                    self.case_missing.clear();
-                }
-                if let Some((_, c)) = &own_case {
-                    self.saved = c.views.views.clone();
-                    self.subnet_defs = c.views.subnets.clone();
-                    if let Some(st) = c.views.last_style.clone() {
-                        self.style = st;
-                    }
-                    self.case_missing.clear();
-                }
-                // what was typed for the timeline open before is not this
-                // one's: the hunt's dates, seeds and files, the merge's list
-                self.hunt_form = super::hunt::HuntForm::default();
-                self.merge_form = super::tasks::MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() };
-                self.builtin = super::super::views::builtin_views(self.store.t_max);
-                self.views_path = ViewsFile::path_for(&self.files[0]);
-                self.story_path = Story::path_for(&self.files[0]);
-                if !in_case {
-                    match own_case {
-                        Some((p, c)) => {
-                            self.story = c.story;
-                            self.notes = Notes { path: p.clone(), notes: c.notes };
-                            self.case = Some(p);
+        let what = if files.len() == 1 { std::path::Path::new(&files[0]).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| files[0].clone()) } else { format!("{} timelines", files.len()) };
+        self.load_then(
+            files.clone(),
+            merges.clone(),
+            what,
+            Box::new(move |v: &mut Viewer, r: Result<Store, String>| match r {
+                Ok(s) => {
+                    v.table_raw_cache.clear();
+                    v.store = s;
+                    v.files = files;
+                    v.merges = merges;
+                    if let Some(vf) = own {
+                        v.saved = vf.views;
+                        v.subnet_defs = vf.subnets;
+                        if let Some(st) = vf.last_style {
+                            v.style = st;
                         }
-                        None => {
-                            self.case = None;
-                            self.story = Story::load(&self.story_path);
-                            self.notes = Notes::load(&Notes::path_for(&self.files[0]));
+                        v.case_missing.clear();
+                    }
+                    if let Some((_, c)) = &own_case {
+                        v.saved = c.views.views.clone();
+                        v.subnet_defs = c.views.subnets.clone();
+                        if let Some(st) = c.views.last_style.clone() {
+                            v.style = st;
+                        }
+                        v.case_missing.clear();
+                    }
+                    // what was typed for the timeline open before is not this
+                    // one's: the hunt's dates, seeds and files, the merge's list
+                    v.hunt_form = super::hunt::HuntForm::default();
+                    v.merge_form = super::tasks::MergeForm { inputs: Vec::new(), output: String::new(), from: String::new(), to: String::new(), carry: String::new() };
+                    v.builtin = super::super::views::builtin_views(v.store.t_max);
+                    v.views_path = ViewsFile::path_for(&v.files[0]);
+                    v.story_path = Story::path_for(&v.files[0]);
+                    if !in_case {
+                        match own_case {
+                            Some((p, c)) => {
+                                v.story = c.story;
+                                v.notes = Notes { path: p.clone(), notes: c.notes };
+                                v.case = Some(p);
+                            }
+                            None => {
+                                v.case = None;
+                                v.story = Story::load(&v.story_path);
+                                v.notes = Notes::load(&Notes::path_for(&v.files[0]));
+                            }
                         }
                     }
-                }
-                self.remembered.clear();
-                if self.draft.view == View::Findings && !self.store.edges.iter().any(|e| e.hunt != 0) {
-                    self.draft.view = View::All;
-                }
-                self.fit_pending = true;
-                self.requery(true);
-                self.status = format!("Opened: {}", self.status);
-                match self.case.clone() {
-                    Some(p) => {
-                        if let Err(e) = self.write_case(&p) {
-                            self.status = format!("cannot write the case {}: {}", p.display(), e);
-                        }
-                        remember(&[p.to_string_lossy().to_string()]);
+                    v.remembered.clear();
+                    if v.draft.view == View::Findings && !v.store.edges.iter().any(|e| e.hunt != 0) {
+                        v.draft.view = View::All;
                     }
-                    None => remember(&self.files),
+                    v.fit_pending = true;
+                    v.requery(true);
+                    v.status = format!("Opened: {}", v.status);
+                    match v.case.clone() {
+                        Some(p) => {
+                            if let Err(e) = v.write_case(&p) {
+                                v.status = format!("cannot write the case {}: {}", p.display(), e);
+                            }
+                            remember(&[p.to_string_lossy().to_string()]);
+                        }
+                        None => remember(&v.files),
+                    }
+                    v.recent = load_recent();
                 }
-                self.recent = load_recent();
-                true
-            }
-            Err(e) => {
-                self.status = format!("Cannot read: {}", e);
-                false
-            }
-        }
+                Err(e) => v.status = format!("Cannot read: {}", e),
+            }),
+        );
+        true
     }
 
     pub(super) fn run_ingest(&mut self) {

@@ -64,14 +64,14 @@ impl Viewer {
         if let Err(e) = self.save_notes() {
             self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
         }
-        match self.reload_store() {
+        self.reload_store_then(Box::new(move |v: &mut Viewer, r: Result<(), String>| match r {
             Ok(()) => {
-                self.remembered.clear();
-                self.requery(false);
-                self.status = format!("{} address(es) merged into their hosts — {}", done, self.status);
+                v.remembered.clear();
+                v.requery(false);
+                v.status = format!("{} address(es) merged into their hosts — {}", done, v.status);
             }
-            Err(e) => self.status = format!("Cannot read the timeline again: {}", e),
-        }
+            Err(e) => v.status = format!("Cannot read the timeline again: {}", e),
+        }));
     }
 
     pub(super) fn hosts_window(&mut self, ctx: &egui::Context) {

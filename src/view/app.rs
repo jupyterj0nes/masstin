@@ -25,6 +25,7 @@ mod hosts;
 mod table;
 mod viewers;
 mod when;
+mod loading;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -470,6 +471,8 @@ pub struct Viewer {
     sel_at: f32,
     /// the timeline a hunt just wrote, being read again away from the window
     hunt_loading: Option<std::sync::mpsc::Receiver<Result<Store, String>>>,
+    /// timelines being read away from the window (an opener waiting for them)
+    pending_load: Option<loading::PendingLoad>,
     reveal_rank: Vec<f32>,
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
@@ -1239,6 +1242,7 @@ impl Viewer {
             sel_seen: None,
             sel_at: 0.0,
             hunt_loading: None,
+            pending_load: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
             show_labels: false,
@@ -1976,13 +1980,13 @@ impl Viewer {
     }
 
     fn reload(&mut self) {
-        match self.reload_store() {
+        self.reload_store_then(Box::new(|v: &mut Viewer, r: Result<(), String>| match r {
             Ok(()) => {
-                self.requery(false);
-                self.status = format!("Timeline read again: {}", self.status);
+                v.requery(false);
+                v.status = format!("Timeline read again: {}", v.status);
             }
-            Err(e) => self.status = format!("Cannot read the timeline: {}", e),
-        }
+            Err(e) => v.status = format!("Cannot read the timeline: {}", e),
+        }));
     }
 
     // ───────────────────────── UI: details pane ─────────────────────────
@@ -5424,7 +5428,8 @@ impl Viewer {
             return;
         }
         let now = std::time::Instant::now();
-        if now < self.auto_next {
+        // a timeline being read: the next action waits for it, as a hand would
+        if now < self.auto_next || self.loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
@@ -6514,6 +6519,8 @@ impl Viewer {
         self.studio_window(&ctx);
         self.poll_job(&ctx);
         self.poll_hunt_loaded(&ctx);
+        self.poll_pending_load(&ctx);
+        self.loading_overlay(&ctx);
         self.job_window(&ctx);
         self.last_log_window(&ctx);
         self.drop_overlay(&ctx);

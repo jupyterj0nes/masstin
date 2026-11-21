@@ -17,17 +17,6 @@ pub(super) struct MergeHostsEdit {
 }
 
 impl Viewer {
-    /// Read the timelines again with the current merges applied.
-    pub(super) fn reload_store(&mut self) -> Result<(), String> {
-        match Store::load_with(&self.files, self.alpha, &self.merges) {
-            Ok(s) => {
-                self.store = s;
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
     /// `from` becomes part of `into`; the picture is rebuilt around it.
     pub(super) fn merge_hosts(&mut self, from: &str, into: &str) {
         let from = from.trim().to_uppercase();
@@ -48,14 +37,14 @@ impl Viewer {
         if let Err(e) = self.save_notes() {
             self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
         }
-        match self.reload_store() {
+        self.reload_store_then(Box::new(move |v: &mut Viewer, r: Result<(), String>| match r {
             Ok(()) => {
-                self.remembered.clear();
-                self.requery(false);
-                self.status = format!("{} merged into {} — {}", from, into, self.status);
+                v.remembered.clear();
+                v.requery(false);
+                v.status = format!("{} merged into {} — {}", from, into, v.status);
             }
-            Err(e) => self.status = format!("Cannot read the timeline again: {}", e),
-        }
+            Err(e) => v.status = format!("Cannot read the timeline again: {}", e),
+        }));
     }
 
     pub(super) fn unmerge_host(&mut self, from: &str) {
@@ -69,14 +58,15 @@ impl Viewer {
         if let Err(e) = self.save_notes() {
             self.status = format!("cannot write {}: {}", self.notes.path.display(), e);
         }
-        match self.reload_store() {
+        let from = from.to_uppercase();
+        self.reload_store_then(Box::new(move |v: &mut Viewer, r: Result<(), String>| match r {
             Ok(()) => {
-                self.remembered.clear();
-                self.requery(false);
-                self.status = format!("{} is its own host again — {}", from.to_uppercase(), self.status);
+                v.remembered.clear();
+                v.requery(false);
+                v.status = format!("{} is its own host again — {}", from, v.status);
             }
-            Err(e) => self.status = format!("Cannot read the timeline again: {}", e),
-        }
+            Err(e) => v.status = format!("Cannot read the timeline again: {}", e),
+        }));
     }
 
     /// The names merged into this host (the ones the analyst merged, not the

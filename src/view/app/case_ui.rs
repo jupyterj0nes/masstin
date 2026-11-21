@@ -29,39 +29,45 @@ impl Viewer {
             self.status = format!("The case {} names no timeline that is there: {}", path.display(), missing.join(", "));
             return false;
         }
-        match Store::load_with(&found, self.alpha, &c.views.merges) {
-            Ok(s) => {
-                self.store = s;
-                self.files = found;
-                self.case_missing = missing.clone();
-                self.merges = c.views.merges.clone();
-                self.subnet_defs = c.views.subnets.clone();
-                self.saved = c.views.views.clone();
-                if let Some(st) = c.views.last_style.clone() {
-                    self.style = st;
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let merges = c.views.merges.clone();
+        let first = found.first().cloned().unwrap_or_default();
+        let what = format!("the case {} ({} timeline{})", name, found.len(), if found.len() == 1 { "" } else { "s" });
+        self.load_then(
+            found.clone(),
+            merges,
+            what,
+            Box::new(move |v: &mut Viewer, r: Result<Store, String>| match r {
+                Ok(s) => {
+                    v.store = s;
+                    v.table_raw_cache.clear();
+                    v.files = found;
+                    v.case_missing = missing.clone();
+                    v.merges = c.views.merges.clone();
+                    v.subnet_defs = c.views.subnets.clone();
+                    v.saved = c.views.views.clone();
+                    if let Some(st) = c.views.last_style.clone() {
+                        v.style = st;
+                    }
+                    v.views_path = ViewsFile::path_for(&v.files[0]);
+                    v.story_path = Story::path_for(&v.files[0]);
+                    v.story = c.story.clone();
+                    v.notes = Notes { path: path.clone(), notes: c.notes.clone() };
+                    v.case = Some(path.clone());
+                    v.remembered.clear();
+                    if v.draft.view == View::Findings && !v.store.edges.iter().any(|e| e.hunt != 0) {
+                        v.draft.view = View::All;
+                    }
+                    v.fit_pending = true;
+                    v.requery(true);
+                    v.status = if missing.is_empty() { format!("Case {}: {}", name, v.status) } else { format!("Case {}, without {} (not found): {}", name, missing.join(", "), v.status) };
+                    remember(&[path.to_string_lossy().to_string()]);
+                    v.recent = load_recent();
                 }
-                self.views_path = ViewsFile::path_for(&self.files[0]);
-                self.story_path = Story::path_for(&self.files[0]);
-                self.story = c.story.clone();
-                self.notes = Notes { path: path.clone(), notes: c.notes.clone() };
-                self.case = Some(path.clone());
-                self.remembered.clear();
-                if self.draft.view == View::Findings && !self.store.edges.iter().any(|e| e.hunt != 0) {
-                    self.draft.view = View::All;
-                }
-                self.fit_pending = true;
-                self.requery(true);
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                self.status = if missing.is_empty() { format!("Case {}: {}", name, self.status) } else { format!("Case {}, without {} (not found): {}", name, missing.join(", "), self.status) };
-                remember(&[path.to_string_lossy().to_string()]);
-                self.recent = load_recent();
-                true
-            }
-            Err(e) => {
-                self.status = format!("cannot read {}: {}", self.files.first().cloned().unwrap_or_default(), e);
-                false
-            }
-        }
+                Err(e) => v.status = format!("cannot read {}: {}", first, e),
+            }),
+        );
+        true
     }
 
     /// Evidence › Save as a case…: from then on everything kept goes to that
