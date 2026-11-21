@@ -26,6 +26,7 @@ mod table;
 mod viewers;
 mod when;
 mod loading;
+mod safeguard;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -475,6 +476,12 @@ pub struct Viewer {
     pending_load: Option<loading::PendingLoad>,
     /// ticks of a big graph's layout under way on a worker thread
     layout_work: Option<super::layout::Work>,
+    /// the drawing reduced because the window was too slow (and the style before)
+    safeguard: Option<safeguard::Safeguard>,
+    /// since when the frames have been slow
+    slow_since: Option<std::time::Instant>,
+    /// the view whose reduction the analyst undid: left alone
+    safeguard_declined: Option<u64>,
     reveal_rank: Vec<f32>,
     /// `MASSTIN_VIEW_AUTO=hunt=…`: press Run as soon as the window opens
     hunt_autorun: bool,
@@ -1246,6 +1253,9 @@ impl Viewer {
             hunt_loading: None,
             pending_load: None,
             layout_work: None,
+            safeguard: None,
+            slow_since: None,
+            safeguard_declined: None,
             reveal_rank: Vec::new(),
             hunt_autorun: false,
             show_labels: false,
@@ -2341,7 +2351,7 @@ impl Viewer {
     // ───────────────────────── style ─────────────────────────
 
     fn views_now(&self) -> ViewsFile {
-        ViewsFile { views: self.saved.clone(), last_style: Some(self.style.clone()), merges: self.merges.clone(), subnets: self.subnet_defs.clone() }
+        ViewsFile { views: self.saved.clone(), last_style: Some(self.style_to_save()), merges: self.merges.clone(), subnets: self.subnet_defs.clone() }
     }
 
     fn persist(&self) {
@@ -2437,7 +2447,7 @@ impl Viewer {
                     } else {
                         Vec::new()
                     };
-                    self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style.clone(), places });
+                    self.saved.push(SavedView { name: name.clone(), filter: self.draft.clone(), style: self.style_to_save(), places });
                     self.saved.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                     self.preset = name;
                     self.persist();
@@ -3086,7 +3096,7 @@ impl Viewer {
         let dimmed = self.focus_t;
         let z = self.zoom;
         let motion = self.style.motion;
-        let lod = self.edges_on_screen > 2500;
+        let lod = self.edges_on_screen > 2500 || self.safeguard.is_some();
         let fs = self.style.font_scale;
         let (reveal_done, reveal_now) = self.reveal();
         let cur_step = self.current_step();
@@ -5526,7 +5536,7 @@ impl Viewer {
             other if other.starts_with("save-view=") => {
                 let name = other["save-view=".len()..].to_string();
                 self.saved.retain(|v| v.name != name);
-                self.saved.push(SavedView { name, filter: self.draft.clone(), style: self.style.clone(), places: Vec::new() });
+                self.saved.push(SavedView { name, filter: self.draft.clone(), style: self.style_to_save(), places: Vec::new() });
                 self.persist();
             }
             // a saved view picked as the Filters menu picks it: its filter,
@@ -6399,6 +6409,7 @@ impl Viewer {
             }
         }
         self.watch_frame_cost(dt);
+        self.watch_safeguard();
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.hud = !self.hud;
         }

@@ -1225,6 +1225,7 @@ impl Viewer {
             ui.label(egui::RichText::new(&self.status).color(if self.graph.truncated { CANDIDATE } else { theme::MUTED }).size(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(format!("{:.0} %", self.zoom * 100.0)).color(theme::DIM).size(12.0));
+                self.safeguard_chip(ui);
                 ui.label(egui::RichText::new(format!("{} rows · {} edges · {} hosts · {} accounts · {} → {}", self.store.rows_total, self.store.edges.len(), self.store.hosts.len(), self.store.users.len(), &fmt_time(self.store.t_min)[..10], &fmt_time(self.store.t_max)[..10])).color(theme::DIM).size(12.0));
             });
         });
