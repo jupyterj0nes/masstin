@@ -699,6 +699,38 @@ fn why_no_path_itself(store: &Store, q: &PathQuery) -> String {
 }
 
 /// `1234567` as `1,234,567`.
+/// How many meshes the plain lines are drawn in: one per core the CPU
+/// rasteriser can use, eight at most.
+const PLAIN_PARTS: usize = 8;
+
+/// A mesh of quads (four vertices, six indices each, as `draw::line_quad`
+/// makes them) cut into `parts` meshes of about as many quads, in order.
+/// Empty parts are left out.
+fn split_mesh(mesh: egui::epaint::Mesh, parts: usize) -> Vec<egui::epaint::Mesh> {
+    let quads = mesh.indices.len() / 6;
+    if quads == 0 {
+        return Vec::new();
+    }
+    let parts = parts.clamp(1, quads);
+    if parts == 1 {
+        return vec![mesh];
+    }
+    let per = quads.div_ceil(parts);
+    let mut out = Vec::with_capacity(parts);
+    for c in 0..parts {
+        let (q0, q1) = (c * per, ((c + 1) * per).min(quads));
+        if q0 >= q1 {
+            break;
+        }
+        let mut m = egui::epaint::Mesh::with_texture(mesh.texture_id);
+        m.vertices.extend_from_slice(&mesh.vertices[q0 * 4..q1 * 4]);
+        let base = (q0 * 4) as u32;
+        m.indices.extend(mesh.indices[q0 * 6..q1 * 6].iter().map(|i| i - base));
+        out.push(m);
+    }
+    out
+}
+
 fn group_digits(n: usize) -> String {
     let d = n.to_string();
     let mut out = String::with_capacity(d.len() + d.len() / 3);
@@ -3239,7 +3271,16 @@ impl Viewer {
         let mut edges_drawn = 0usize;
         let mut taken: Vec<Rect> = Vec::new();
         // the plain edges go into one mesh, drawn under everything else
-        let plain_slot = painter.add(egui::Shape::Noop);
+        // the plain lines go in several meshes, each its own primitive (a clip a
+        // hundredth of a pixel apart): the CPU rasteriser draws primitives on
+        // all the cores, and one mesh of 40,000 lines was one core's work
+        let plain_slots: Vec<(egui::Painter, egui::layers::ShapeIdx)> = (0..PLAIN_PARTS)
+            .map(|i| {
+                let p = painter.with_clip_rect(painter.clip_rect().shrink(i as f32 * 0.01));
+                let s = p.add(egui::Shape::Noop);
+                (p, s)
+            })
+            .collect();
         let mut plain_mesh = egui::epaint::Mesh::default();
         let crowd = (3000.0 / self.edges_on_screen.max(1) as f32).clamp(0.3, 1.0);
         for k in 0..self.graph.edges.len() {
@@ -3386,8 +3427,8 @@ impl Viewer {
             }
         }
 
-        if !plain_mesh.is_empty() {
-            painter.set(plain_slot, egui::Shape::mesh(plain_mesh));
+        for (part, (p, slot)) in split_mesh(plain_mesh, PLAIN_PARTS).into_iter().zip(plain_slots) {
+            p.set(slot, egui::Shape::mesh(part));
         }
 
         // ── the dots that travel along the edges that matter ──
@@ -6623,5 +6664,47 @@ impl Drop for Viewer {
                 j.cancel();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod split_mesh_tests {
+    use super::*;
+
+    fn quads(n: usize) -> egui::epaint::Mesh {
+        let mut m = egui::epaint::Mesh::default();
+        for i in 0..n {
+            let y = i as f32 * 3.0;
+            draw::line_quad(&mut m, Pos2::new(0.0, y), Pos2::new(100.0, y + 1.0), 1.5, Color32::from_rgb((i % 250) as u8, 10, 20));
+        }
+        m
+    }
+
+    /// The parts hold every quad once, in order, each part a mesh of its
+    /// own whose indices point into it; the triangles are the same.
+    #[test]
+    fn the_parts_hold_every_line_once() {
+        let whole = quads(1003);
+        let parts = split_mesh(whole.clone(), PLAIN_PARTS);
+        assert_eq!(parts.len(), PLAIN_PARTS);
+        assert_eq!(parts.iter().map(|p| p.indices.len()).sum::<usize>(), whole.indices.len());
+        let mut tris = Vec::new();
+        for p in &parts {
+            assert!(p.is_valid(), "indices inside the part");
+            for t in p.indices.chunks(3) {
+                tris.push(t.iter().map(|&i| (p.vertices[i as usize].pos, p.vertices[i as usize].color)).collect::<Vec<_>>());
+            }
+        }
+        let want: Vec<_> = whole.indices.chunks(3).map(|t| t.iter().map(|&i| (whole.vertices[i as usize].pos, whole.vertices[i as usize].color)).collect::<Vec<_>>()).collect();
+        assert_eq!(tris, want, "the same triangles, in the same order");
+    }
+
+    /// Few lines, or none: as many parts as there are lines, never an empty one.
+    #[test]
+    fn few_lines_make_few_parts() {
+        assert!(split_mesh(egui::epaint::Mesh::default(), PLAIN_PARTS).is_empty());
+        assert_eq!(split_mesh(quads(3), PLAIN_PARTS).len(), 3);
+        assert_eq!(split_mesh(quads(1), 1).len(), 1);
+        assert!(split_mesh(quads(17), PLAIN_PARTS).iter().all(|p| !p.indices.is_empty()));
     }
 }

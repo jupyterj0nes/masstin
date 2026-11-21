@@ -3,8 +3,10 @@
 //! LICENSE-MIT in this folder), brought into masstin and ported to egui 0.37 for
 //! the window drawn without a GPU (remote desktop, servers, VMs). Changes from the
 //! original: a module of a std crate instead of a no_std crate; the winit runner,
-//! the statistics, the test helpers and the rayon / log options left out (their
-//! `cfg(feature = ...)` blocks are inert here); the standard HashMap instead of
+//! the statistics, the test helpers and the log option left out (their
+//! `cfg(feature = ...)` blocks are inert here); the rayon blocks on (the
+//! primitives are rasterised on all the cores: masstin draws a big graph's
+//! lines as several primitives for it); the standard HashMap instead of
 //! egui's ahash; texture deltas read as egui 0.37 hands them (several per texture);
 //! the `constify` specialisation of the rectangle rasteriser written out by hand.
 #![allow(unexpected_cfgs, dead_code, clippy::all)]
@@ -263,7 +265,7 @@ impl EguiSoftwareRender {
 
         let tiles_x = self.tiles_dim[0];
 
-        #[cfg(feature = "rayon")]
+        #[cfg(all())] // rayon: on in masstin
         {
             use rayon::{
                 iter::{IndexedParallelIterator, ParallelIterator},
@@ -313,7 +315,7 @@ impl EguiSoftwareRender {
                     }
                 });
         }
-        #[cfg(not(feature = "rayon"))]
+        #[cfg(any())] // rayon: on in masstin
         {
             for (tile_idx, &mask) in self.dirty_tiles.iter().enumerate() {
                 if mask & Self::OCCUPIED_TILE_MASK == 0 {
@@ -515,12 +517,12 @@ impl EguiSoftwareRender {
         }
 
         // Render paint jobs in parallel
-        #[cfg(feature = "rayon")]
+        #[cfg(all())] // rayon: on in masstin
         use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-        #[cfg(feature = "rayon")]
+        #[cfg(all())] // rayon: on in masstin
         let iter = paint_jobs.par_iter().enumerate();
 
-        #[cfg(not(feature = "rayon"))]
+        #[cfg(any())] // rayon: on in masstin
         let iter = paint_jobs.iter().enumerate();
 
         let updates: Vec<CacheUpdate> = iter
@@ -706,7 +708,7 @@ impl EguiSoftwareRender {
         let mut canvas =
             BufferMutRef::new(&mut self.canvas.data, self.canvas.width, self.canvas.height);
 
-        #[cfg(feature = "rayon")]
+        #[cfg(all())] // rayon: on in masstin
         {
             use rayon::{
                 iter::{IndexedParallelIterator, ParallelIterator},
@@ -760,7 +762,7 @@ impl EguiSoftwareRender {
                 });
         }
 
-        #[cfg(not(feature = "rayon"))]
+        #[cfg(any())] // rayon: on in masstin
         {
             for tile_idx in self
                 .dirty_tiles
