@@ -494,6 +494,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    // what the images gave (their EVTX folders): Windows evidence for sure;
+    // the folders added next may hold none (a folder of Linux packages)
+    let image_dirs = extracted_dirs.len();
     // Add real directories for loose EVTX/log files (only in massive mode)
     if include_loose_artifacts {
         for d in &real_dirs {
@@ -574,8 +577,19 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Phase 2+3: Parse extracted directories and generate output CSV
     let empty_files: Vec<String> = vec![];
-    let has_windows = !extracted_dirs.is_empty();
     let has_linux = !linux_log_dirs.is_empty() || !loose_linux_archives.is_empty() || !loose_linux_logs.is_empty();
+    let has_windows = !extracted_dirs.is_empty();
+    // With Linux evidence, the Windows half runs only when there is Windows
+    // evidence to read: a folder of Linux packages ran it anyway, and the
+    // window and the console showed its three phases, "0 EVTX artifacts" and
+    // a summary of 0 events while the Linux packages were being read. The
+    // Linux half still goes through the merge, which writes the timeline as
+    // it always did (one copy of each row).
+    let windows_present = has_windows
+        && (image_dirs > 0
+            || !all_task_events.is_empty()
+            || !all_mountpoint_events.is_empty()
+            || has_windows_artifacts(&extracted_dirs[image_dirs..]));
 
     if has_windows && has_linux {
         // Both OS types found — parse each separately, then merge into one CSV
@@ -588,24 +602,28 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         // summaries name no output (the merged timeline is the output)
         let was_part = crate::banner::in_parse_part();
         crate::banner::set_parse_part(true);
-        crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
-        crate::parse::parse_events_ex(
-            &empty_files,
-            &extracted_dirs,
-            Some(&win_tmp_str),
-            &all_task_events,
-            &all_mountpoint_events,
-        );
-        all_task_events.clear();
-        all_mountpoint_events.clear();
+        if windows_present {
+            crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
+            crate::parse::parse_events_ex(
+                &empty_files,
+                &extracted_dirs,
+                Some(&win_tmp_str),
+                &all_task_events,
+                &all_mountpoint_events,
+            );
+            all_task_events.clear();
+            all_mountpoint_events.clear();
+        }
 
         crate::banner::print_info("Parsing Linux artifacts (auth.log, wtmp, etc.)...");
+        // alone, the Linux half shows its own phases and counts (the packages
+        // found, the logs, the bar): they are all there is to watch
         crate::parse_linux::parse_linux_with_archives(
             &loose_linux_logs,
             &loose_linux_archives,
             &linux_log_dirs,
             Some(&linux_tmp_str),
-            true,
+            windows_present,
         );
         crate::banner::set_parse_part(was_part);
 
@@ -613,11 +631,16 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         crate::parse_image_linux::rewrite_log_filenames_linux(&linux_tmp_str);
 
         // Merge both CSVs into the final output (deduplicated, sorted by time_created)
-        crate::banner::print_info("Merging Windows + Linux timelines...");
-        let merge_files_list = vec![win_tmp_str.clone(), linux_tmp_str.clone()];
+        let merge_files_list = if windows_present {
+            crate::banner::print_info("Merging Windows + Linux timelines...");
+            vec![win_tmp_str.clone(), linux_tmp_str.clone()]
+        } else {
+            crate::banner::print_info("Writing the timeline (one copy of each row)...");
+            vec![linux_tmp_str.clone()]
+        };
         match crate::merge::merge_files(&merge_files_list, output, None, None, None) {
             Ok(()) => {
-                crate::banner::print_phase_result("Merged Windows + Linux timeline generated");
+                crate::banner::print_phase_result(if windows_present { "Merged Windows + Linux timeline generated" } else { "Timeline generated" });
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to merge timelines: {}", e);
@@ -690,6 +713,16 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     for t in &zip_img_temps {
         let _ = fs::remove_dir_all(t);
     }
+}
+
+/// Is there anything for the Windows half in these folders: an EVTX, loose
+/// or in a zip the Windows walk opens, or a UAL database? The same discovery
+/// the Windows half does, with nothing printed.
+pub(crate) fn has_windows_artifacts(dirs: &[String]) -> bool {
+    if dirs.is_empty() {
+        return false;
+    }
+    crate::parse::any_evtx_in(dirs) || dirs.iter().any(|d| !crate::parse_ual::find_ual_databases(d).is_empty())
 }
 
 /// The names the machine goes by in its own logs: the Computer field of the
@@ -2547,6 +2580,36 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
 #[cfg(test)]
 mod review_2026_11_tests {
     use super::*;
+
+    /// A folder of Linux packages has nothing for the Windows half, which
+    /// then does not run; an EVTX, loose or in a zip, or a UAL database does.
+    #[test]
+    fn the_windows_half_runs_only_on_windows_evidence() {
+        let base = std::env::temp_dir().join(format!("masstin_winpresent_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let s = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let linux = base.join("linux");
+        fs::create_dir_all(linux.join("logs")).unwrap();
+        fs::write(linux.join("uac-web01-linux-20261119000000.tar.gz"), b"\x1f\x8b not a real tarball").unwrap();
+        fs::write(linux.join("logs").join("auth.log"), b"Nov 19 10:00:00 web01 sshd[1]: Accepted password for bob from 10.0.0.5 port 22 ssh2\n").unwrap();
+        assert!(!has_windows_artifacts(&[s(&linux)]), "Linux packages and logs only");
+        assert!(!has_windows_artifacts(&[]), "no folder");
+        let loose = base.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        fs::write(loose.join("Security.evtx"), b"ElfFile\0").unwrap();
+        assert!(has_windows_artifacts(&[s(&linux), s(&loose)]), "a loose EVTX");
+        let zipped = base.join("zipped");
+        fs::create_dir_all(&zipped).unwrap();
+        {
+            let f = fs::File::create(zipped.join("kape-ws01.zip")).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("C/Windows/System32/winevt/Logs/Security.evtx", zip::write::FileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut z, b"ElfFile\0").unwrap();
+            z.finish().unwrap();
+        }
+        assert!(has_windows_artifacts(&[s(&zipped)]), "an EVTX inside a zip");
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_vmdk_part_is_told_by_its_whole_tail() {

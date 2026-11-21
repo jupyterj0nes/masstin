@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Ingesting Linux evidence: what the window shows is the Linux packages.** A folder of Linux packages (UAC and the like) went through the Windows half first, which found nothing: the window showed its three phases, *0 EVTX artifacts found* and a summary of 0 events, then sat on *Generating output* while every package was read, with the packages listed only at the very end. The Windows half now runs only when there is Windows evidence (an image, an EVTX loose or in a zip, a UAL database, scheduled tasks or MountPoints2). Alone, the Linux half shows its own phases: a bar over the packages while they are read (*Reading uac-…tar.gz*, 3/12), one *Triage found* line per package with its host, the logs found, and a bar over the logs that names the host and the log (`web01: auth.log`) instead of a temporary folder or a journal's machine id. The timeline written is the same, byte for byte (checked over five real UAC packages).
 - **The handles of the time strip are easy to take.** Which handle a drag moved was judged where the pointer was when egui calls it a drag, 6 points or more from the press, and a handle had to be within 7 points of there: a press a little off a handle, or a quick move, missed it and moved the replay head instead. It is now judged where the button went down, a handle is taken within 10 points, and when both handles are within reach (a narrow window) the direction decides, From to the left and To to the right, so the window can always be widened.
 
 ## v1.4.10 — 2026-11-20

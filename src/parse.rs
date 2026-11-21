@@ -2644,7 +2644,12 @@ fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> (usize, us
 
 // ---------------------------------------------------------------------------------------
 // SEARCH FOR EVTX FILES IN DIRECTORIES (AND ZIP)
-// ---------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------
+/// Any EVTX under these folders, loose or in a zip, as the Windows walk finds them.
+pub(crate) fn any_evtx_in(directories: &[String]) -> bool {
+    !find_evtx_files(directories).evtx_files.is_empty()
+}
+
 fn find_evtx_files(directories: &[String]) -> DiscoveryResult {
     let mut result = DiscoveryResult {
         evtx_files: Vec::new(),

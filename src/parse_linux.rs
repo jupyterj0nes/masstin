@@ -2792,6 +2792,17 @@ pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) 
     (archives, logs)
 }
 
+/// What the bar of the Linux pass says for a log: `host: file`, cut to 80
+/// characters on a character boundary.
+fn bar_message(host: &str, file: &str) -> String {
+    let m = format!("{}: {}", host, file);
+    if m.chars().count() > 80 {
+        format!("{}...", m.chars().take(77).collect::<String>())
+    } else {
+        m
+    }
+}
+
 fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], output: Option<&String>, quiet: bool) {
     let start_time = std::time::Instant::now();
 
@@ -2845,23 +2856,33 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             }
         }
     }
-    // Tarballs named one by one (parse-massive's loose Linux evidence).
+    // Tarballs named one by one (parse-massive's loose Linux evidence). Each
+    // is read whole before the first log is parsed: a bar says which one,
+    // of how many, or a folder of packages is minutes of nothing to see.
+    let pb_archives = if archives.len() > 1 { Some(crate::banner::create_progress_bar(archives.len() as u64)) } else { None };
     for a in archives {
         let p = Path::new(a);
         let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if let Some(pb) = &pb_archives {
+            pb.set_message(format!("Reading {}", p.file_name().and_then(|s| s.to_str()).unwrap_or(a)));
+        }
         if p.is_file() && lower.ends_with(".zip") {
             register_zip_extract(p, &lower, &temp_dir, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut all_dirs, &mut archive_dirs);
-            continue;
+        } else if p.is_file() && is_tar_archive(&lower) {
+            let mut tar_out: Vec<TarExtract> = Vec::new();
+            extract_tar_recursive(p, &temp_dir, a, &mut tar_out);
+            register_tar_extracts(
+                tar_out, &mut archives_scanned, &mut triage_dirs,
+                &mut triages, &mut all_dirs, &mut archive_dirs,
+            );
         }
-        if !p.is_file() || !is_tar_archive(&lower) {
-            continue;
+        // counted once read: 3/12 is three packages done
+        if let Some(pb) = &pb_archives {
+            pb.inc(1);
         }
-        let mut tar_out: Vec<TarExtract> = Vec::new();
-        extract_tar_recursive(p, &temp_dir, a, &mut tar_out);
-        register_tar_extracts(
-            tar_out, &mut archives_scanned, &mut triage_dirs,
-            &mut triages, &mut all_dirs, &mut archive_dirs,
-        );
+    }
+    if let Some(pb) = pb_archives {
+        pb.finish_and_clear();
     }
     // Nested triages live INSIDE their wrapper's extract dir: match the
     // most specific (longest) dir first when labelling sources.
@@ -2938,7 +2959,6 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
     for path in &targets {
         let path_str = path.to_string_lossy().to_string();
-        crate::banner::progress_set_message(&pb, &path_str);
 
         // Find the root dir the hostname heuristics should scan. UAC lays
         // the collected filesystem out under `[root]/` with uac.log as its
@@ -3015,6 +3035,10 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 }
             }
         }
+
+        // the bar names the host and the log, not the folder of the extraction
+        // (a temporary path, or the machine id a journal sits under)
+        pb.set_message(bar_message(&dst_host, path.file_name().and_then(|f| f.to_str()).unwrap_or("")));
 
         if is_debug_mode() {
             println!(
@@ -3182,6 +3206,16 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 #[cfg(test)]
 mod rfc3164_year_tests {
     use super::*;
+
+    /// The bar of the Linux pass names the host and the log, cut on a
+    /// character boundary.
+    #[test]
+    fn the_bar_names_the_host_and_the_log() {
+        assert_eq!(bar_message("web01", "auth.log"), "web01: auth.log");
+        let long = bar_message("bastion01", &format!("system@{}.journal", "é".repeat(90)));
+        assert_eq!(long.chars().count(), 80);
+        assert!(long.starts_with("bastion01: system@") && long.ends_with("..."));
+    }
 
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("masstin_y_{}_{}", name, std::process::id()));
