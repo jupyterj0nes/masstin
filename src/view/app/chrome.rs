@@ -15,6 +15,38 @@ pub(super) enum Brush {
     Scrub,
 }
 
+/// How far from a handle of the time strip, in points, a press still takes it.
+pub(super) const HANDLE_GRAB: f32 = 10.0;
+
+/// What a press at `x` on the time strip takes: the nearer handle within
+/// [`HANDLE_GRAB`] (From when both are as near), else the replay head.
+/// The press is where the button went down, not where the pointer is when
+/// egui calls it a drag: that is 6 points or more away, and judged there a
+/// press on a handle missed it and moved the replay head instead.
+pub(super) fn pick_brush(x: f32, from_x: f32, to_x: f32) -> Brush {
+    let (df, dt) = ((x - from_x).abs(), (x - to_x).abs());
+    if df <= HANDLE_GRAB && df <= dt {
+        Brush::From
+    } else if dt <= HANDLE_GRAB {
+        Brush::To
+    } else {
+        Brush::Scrub
+    }
+}
+
+/// [`pick_brush`] for a drag pressed at `press` and now at `now`: when both
+/// handles are within reach of the press (a narrow window), the direction
+/// decides, From to the left and To to the right, so the window can always
+/// be widened.
+pub(super) fn pick_brush_dragging(press: f32, now: f32, from_x: f32, to_x: f32) -> Brush {
+    let both = (press - from_x).abs() <= HANDLE_GRAB && (press - to_x).abs() <= HANDLE_GRAB;
+    if both && now != press {
+        if now > press { Brush::To } else { Brush::From }
+    } else {
+        pick_brush(press, from_x, to_x)
+    }
+}
+
 /// The inspector's tabs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tab {
@@ -1120,9 +1152,10 @@ impl Viewer {
         }
         // handles
         let handle = |x: f32| Rect::from_center_size(Pos2::new(x, inner.center().y), Vec2::new(8.0, inner.height() + 2.0));
+        let under = resp.hover_pos().map(|p| pick_brush(p.x, xf, xt));
         for (x, which) in [(xf, Brush::From), (xt, Brush::To)] {
             let r = handle(x);
-            let hot = self.brush == Some(which) || resp.hover_pos().map_or(false, |p| r.expand2(Vec2::new(4.0, 0.0)).contains(p));
+            let hot = self.brush == Some(which) || (self.brush.is_none() && under == Some(which));
             painter.rect_filled(r, CornerRadius::same(3), if hot { theme::ACCENT } else { draw::fade(theme::ACCENT, 0.75) });
             painter.vline(x, inner.top()..=inner.bottom(), Stroke::new(1.0, draw::fade(theme::ACCENT, 0.5)));
         }
@@ -1134,15 +1167,10 @@ impl Viewer {
         }
         // interaction
         if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let near = |x: f32| (p.x - x).abs() <= 7.0;
-                self.brush = Some(if near(xf) && (!near(xt) || (p.x - xf).abs() <= (p.x - xt).abs()) {
-                    Brush::From
-                } else if near(xt) {
-                    Brush::To
-                } else {
-                    Brush::Scrub
-                });
+            // where the button went down: by now the pointer has moved on
+            let now = resp.interact_pointer_pos();
+            if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(now) {
+                self.brush = Some(pick_brush_dragging(p.x, now.map_or(p.x, |n| n.x), xf, xt));
             }
         }
         if resp.dragged() || resp.clicked() {
@@ -1182,8 +1210,10 @@ impl Viewer {
             let at = Pos2::new(p.x.clamp(rect.left() + galley.size().x / 2.0 + 10.0, rect.right() - galley.size().x / 2.0 - 10.0), rect.top() + 10.0);
             draw::pill(&painter, at, galley, CAPTION_BG, None, TEXT);
             if self.brush.is_none() {
-                let near = (p.x - xf).abs() <= 7.0 || (p.x - xt).abs() <= 7.0;
+                let near = pick_brush(p.x, xf, xt) != Brush::Scrub;
                 ui.ctx().set_cursor_icon(if near { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Crosshair });
+            } else if matches!(self.brush, Some(Brush::From) | Some(Brush::To)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
         }
     }
@@ -1645,5 +1675,53 @@ impl Viewer {
         if done || !open {
             self.confirm_delete = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A press near a handle of the time strip takes that handle, judged at
+    /// the press: egui calls it a drag only once the pointer is 6 points
+    /// away, and that point alone missed a handle pressed a little off it.
+    #[test]
+    fn a_press_near_a_handle_takes_it() {
+        let (from_x, to_x) = (100.0, 300.0);
+        assert_eq!(pick_brush(100.0, from_x, to_x), Brush::From);
+        assert_eq!(pick_brush(100.0 + HANDLE_GRAB, from_x, to_x), Brush::From);
+        assert_eq!(pick_brush(100.0 - HANDLE_GRAB, from_x, to_x), Brush::From);
+        assert_eq!(pick_brush(297.0, from_x, to_x), Brush::To);
+        assert_eq!(pick_brush(310.0, from_x, to_x), Brush::To);
+        assert_eq!(pick_brush(200.0, from_x, to_x), Brush::Scrub, "between the handles: the replay head");
+        assert_eq!(pick_brush(100.0 + HANDLE_GRAB + 0.5, from_x, to_x), Brush::Scrub);
+        // a press 3 points off the handle that becomes a drag 6 points further on:
+        // judged where the pointer then is (9 points), the old 7-point reach missed it
+        let pressed = 103.0;
+        assert_eq!(pick_brush(pressed, from_x, to_x), Brush::From);
+    }
+
+    /// Handles close together: the nearer one, From when both are as near.
+    #[test]
+    fn handles_close_together_give_the_nearer() {
+        assert_eq!(pick_brush(104.0, 100.0, 106.0), Brush::To);
+        assert_eq!(pick_brush(102.0, 100.0, 106.0), Brush::From);
+        assert_eq!(pick_brush(103.0, 100.0, 106.0), Brush::From, "as near: From");
+        // both at the same place (a window of one second): From, on a press alone
+        assert_eq!(pick_brush(100.0, 100.0, 100.0), Brush::From);
+    }
+
+    /// A narrow window can always be widened: with both handles in reach of
+    /// the press, dragging right takes To and left takes From.
+    #[test]
+    fn a_narrow_window_widens_either_way() {
+        assert_eq!(pick_brush_dragging(100.0, 112.0, 100.0, 100.0), Brush::To);
+        assert_eq!(pick_brush_dragging(100.0, 88.0, 100.0, 100.0), Brush::From);
+        assert_eq!(pick_brush_dragging(103.0, 115.0, 100.0, 106.0), Brush::To);
+        assert_eq!(pick_brush_dragging(103.0, 90.0, 100.0, 106.0), Brush::From);
+        // handles apart: the one pressed, whatever the direction
+        assert_eq!(pick_brush_dragging(100.0, 140.0, 100.0, 300.0), Brush::From);
+        assert_eq!(pick_brush_dragging(300.0, 250.0, 100.0, 300.0), Brush::To);
+        assert_eq!(pick_brush_dragging(200.0, 230.0, 100.0, 300.0), Brush::Scrub);
     }
 }

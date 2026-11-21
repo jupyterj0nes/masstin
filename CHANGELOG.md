@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **The handles of the time strip are easy to take.** Which handle a drag moved was judged where the pointer was when egui calls it a drag, 6 points or more from the press, and a handle had to be within 7 points of there: a press a little off a handle, or a quick move, missed it and moved the replay head instead. It is now judged where the button went down, a handle is taken within 10 points, and when both handles are within reach (a narrow window) the direction decides, From to the left and To to the right, so the window can always be widened.
+
 ## v1.4.10 — 2026-11-20
 
 - **The viewer copies to the clipboard again.** It was built without eframe's `clipboard` feature (the default features are off, and the list given back left it out), so every copy went to an in-process buffer and never reached the system: **Copy the row**, **Copy the name** of a host and Ctrl + C on selected text did nothing, and said nothing. The feature is back, with `links` (the link to the documentation did not open either), on both renderers: OpenGL and the CPU one used over remote desktop. Checked against the Windows clipboard on both. A test keeps both features in the manifest.
