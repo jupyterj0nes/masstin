@@ -28,8 +28,13 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The wizard's look: twelve levels, sixty thousand entries, eight seconds.
+    /// A quick look: twelve levels, sixty thousand entries, eight seconds
+    /// (the command line's check of a single path).
     pub const QUICK: Limits = Limits { depth: 12, entries: 60_000, secs: 8.0 };
+    /// The window's look: it shows what it finds as it goes and the wizard
+    /// does not wait on it, so it goes as far as the parser does, three
+    /// minutes at most.
+    pub const WINDOW: Limits = Limits { depth: 64, entries: 5_000_000, secs: 180.0 };
     /// `masstin parse`: deep enough for any evidence folder.
     pub const FULL: Limits = Limits { depth: 64, entries: 5_000_000, secs: 600.0 };
 }
@@ -245,48 +250,71 @@ pub fn judge(s: &Scan) -> Verdict {
 
 /// Walk the sources (bounded: depth, count, time) and count what is there.
 pub fn scan(sources: &[String], lim: Limits) -> Scan {
+    scan_with(sources, lim, &std::sync::atomic::AtomicBool::new(false), |_| {})
+}
+
+/// [`scan`], level by level: every folder of one level before any of the
+/// next, all the sources together, so what sits near the top (a disk image
+/// beside the triages of a case folder) is found before a deep tree beside
+/// it (a build folder, a mail export) spends the look. `progress` gets what
+/// was found so far about four times a second; `cancel` stops the walk.
+pub fn scan_with(sources: &[String], lim: Limits, cancel: &std::sync::atomic::AtomicBool, mut progress: impl FnMut(&Scan)) -> Scan {
+    use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
+    let mut last = start;
     let mut s = Scan::default();
     let mut budget = lim.entries;
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> = std::collections::VecDeque::new();
     for src in sources {
         let p = Path::new(src);
         if p.is_dir() {
-            walk(p, 0, &mut s, &mut budget, &start, &lim);
+            queue.push_back((p.to_path_buf(), 0));
         } else {
             look_at(p, &mut s);
         }
     }
+    'walk: while let Some((dir, depth)) = queue.pop_front() {
+        if cancel.load(Ordering::Relaxed) {
+            s.truncated = true;
+            break;
+        }
+        if depth > lim.depth || budget == 0 || start.elapsed().as_secs_f32() > lim.secs {
+            s.truncated = true;
+            break;
+        }
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if name.ends_with(".logarchive") {
+            s.logarchives += 1;
+            s.mac_paths.push(dir.to_string_lossy().to_string());
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        s.dirs += 1;
+        for e in rd.flatten() {
+            if budget == 0 {
+                s.truncated = true;
+                break 'walk;
+            }
+            budget -= 1;
+            let p = e.path();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                queue.push_back((p, depth + 1));
+            } else if ft.is_file() {
+                look_at(&p, &mut s);
+            }
+            if last.elapsed().as_millis() >= 250 {
+                last = std::time::Instant::now();
+                s.secs = start.elapsed().as_secs_f32();
+                progress(&s);
+            }
+        }
+    }
+    // the images in the order a walk folder by folder gives them (what
+    // `--carve` reads them in), not the order the levels found them
+    s.images.sort_by_cached_key(|p| Path::new(p).components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>());
     s.secs = start.elapsed().as_secs_f32();
     s
-}
-
-fn walk(dir: &Path, depth: usize, s: &mut Scan, budget: &mut usize, start: &std::time::Instant, lim: &Limits) {
-    if depth > lim.depth || *budget == 0 || start.elapsed().as_secs_f32() > lim.secs {
-        s.truncated = true;
-        return;
-    }
-    let name = dir.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    if name.ends_with(".logarchive") {
-        s.logarchives += 1;
-        s.mac_paths.push(dir.to_string_lossy().to_string());
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    s.dirs += 1;
-    for e in rd.flatten() {
-        if *budget == 0 {
-            s.truncated = true;
-            return;
-        }
-        *budget -= 1;
-        let p = e.path();
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            walk(&p, depth + 1, s, budget, start, lim);
-        } else if ft.is_file() {
-            look_at(&p, s);
-        }
-    }
 }
 
 fn look_at(p: &Path, s: &mut Scan) {
@@ -417,6 +445,54 @@ mod tests {
         for (n, f) in [("Secure-Boot-Update", "secure"), ("SecureBootEncodeUEFI", "secure"), ("messages_old.txt", "messages"), ("wtmpx-notes", "wtmp"), ("securefile", "secure")] {
             assert!(!is_rotated_log_name(n, f), "{}", n);
         }
+    }
+
+    /// An image near the top of a case folder is found even when a deep,
+    /// crowded folder beside it is more than the look's budget (the look
+    /// goes level by level); what was found so far is reported as it goes,
+    /// and a cancelled look stops.
+    #[test]
+    fn the_look_goes_level_by_level_and_reports_as_it_goes() {
+        let dir = std::env::temp_dir().join(format!("masstin_detect_bfs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // "a_build" sorts first and is deep and crowded: 40 levels of 30 files
+        let mut deep = dir.join("a_build");
+        for _ in 0..40 {
+            std::fs::create_dir_all(&deep).unwrap();
+            for i in 0..30 {
+                std::fs::write(deep.join(format!("obj{}.o", i)), b"x").unwrap();
+            }
+            deep = deep.join("sub");
+        }
+        let img_dir = dir.join("z_case").join("images");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        let mut ewf = b"EVF\x09\x0d\x0a\xff\x00".to_vec();
+        ewf.resize(4096, 0);
+        std::fs::write(img_dir.join("srv01.E01"), &ewf).unwrap();
+        std::fs::write(dir.join("z_case").join("Security.evtx"), b"ElfFile").unwrap();
+        // a budget the deep folder alone would use up, depth first
+        let lim = Limits { depth: 64, entries: 300, secs: 60.0 };
+        let s = scan(&[dir.to_string_lossy().to_string()], lim);
+        assert_eq!(s.images.len(), 1, "{:?}", s);
+        assert_eq!(s.evtx, 1);
+        assert!(s.truncated, "the deep folder was not walked to its end");
+        assert_eq!(judge(&s).parser, Some(PARSE_MASSIVE));
+        // a cancelled look stops at once and says it stopped
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let s = scan_with(&[dir.to_string_lossy().to_string()], Limits::WINDOW, &stop, |_| {});
+        assert!(s.truncated);
+        assert_eq!(s.dirs, 0);
+        // the whole of it, with nothing in the way
+        let mut seen = 0usize;
+        let free = std::sync::atomic::AtomicBool::new(false);
+        let s = scan_with(&[dir.to_string_lossy().to_string()], Limits::WINDOW, &free, |p| {
+            assert!(p.files <= 40 * 30 + 2);
+            seen += 1;
+        });
+        assert!(!s.truncated);
+        assert_eq!((s.images.len(), s.evtx, s.files), (1, 1, 40 * 30 + 2));
+        let _ = seen;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

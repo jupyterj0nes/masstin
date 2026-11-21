@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
 use super::tasks::{Job, JobKind};
 use super::*;
@@ -52,7 +54,10 @@ pub(super) struct Ingest {
     /// 0 evidence, 1 parser, 2 timeline, 3 running / done
     pub step: usize,
     pub sources: Vec<String>,
-    scan_rx: Option<Receiver<Scan>>,
+    /// what the look found so far, and whether it is done
+    scan_rx: Option<Receiver<(Scan, bool)>>,
+    /// stops the look under way (other evidence given, or the parse started)
+    scan_cancel: Option<Arc<AtomicBool>>,
     pub scan: Option<Scan>,
     pub verdict: Option<Verdict>,
     pub parser: usize,
@@ -91,11 +96,30 @@ pub(super) struct Ingest {
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan_cancel: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
     }
 }
 
 impl Ingest {
+    /// What the look found so far: the verdict follows it, and so does the
+    /// parser while it is still the one masstin picked (a parser chosen by
+    /// hand stays).
+    pub fn take_scan(&mut self, s: Scan) {
+        let v = judge(&s);
+        // (a verdict of no parser, timelines so far, left the choice open)
+        let picked = self.verdict.as_ref().map_or(true, |old| old.parser.map_or(true, |p| pidx(p) == self.parser));
+        if picked {
+            if let Some(p) = v.parser {
+                self.parser = pidx(p);
+            }
+        }
+        self.scan = Some(s);
+        self.verdict = Some(v);
+        if self.output.trim().is_empty() {
+            self.output = self.default_output();
+        }
+    }
+
     /// Whether the parser is the one masstin picked for sure: then the
     /// command is `masstin -a parse`, which makes the same choice.
     pub fn is_auto(&self) -> bool {
@@ -275,7 +299,12 @@ impl Viewer {
         self.start_scan();
     }
 
+    /// The look at the evidence, in the background: what it finds is shown
+    /// as it comes (level by level, so an image beside a deep folder shows
+    /// up early) and the wizard goes on meanwhile; it goes as far as the
+    /// parser does (`Limits::WINDOW`).
     fn start_scan(&mut self) {
+        self.stop_scan();
         if self.ingest.sources.is_empty() {
             self.ingest.scan = None;
             self.ingest.verdict = None;
@@ -283,32 +312,62 @@ impl Viewer {
         }
         let (tx, rx) = channel();
         let sources = self.ingest.sources.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(detect::scan(&sources, Limits::QUICK));
+            let s = detect::scan_with(&sources, Limits::WINDOW, &stop, |s| {
+                let _ = tx.send((s.clone(), false));
+            });
+            let _ = tx.send((s, true));
         });
         self.ingest.scan_rx = Some(rx);
+        self.ingest.scan_cancel = Some(cancel);
         self.ingest.scan = None;
         self.ingest.verdict = None;
     }
 
+    /// Stops the look under way, if any: what it found stays.
+    pub(super) fn stop_scan(&mut self) {
+        if let Some(c) = self.ingest.scan_cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.ingest.scan_rx = None;
+    }
+
     pub(super) fn poll_scan(&mut self, ctx: &egui::Context) {
+        if self.ingest.scan_rx.is_some() && !self.ingest.open {
+            // the wizard was closed: nobody is waiting for the look
+            self.stop_scan();
+            return;
+        }
         let Some(rx) = self.ingest.scan_rx.as_ref() else { return };
-        match rx.try_recv() {
-            Ok(s) => {
-                let v = judge(&s);
-                if let Some(p) = v.parser {
-                    self.ingest.parser = pidx(p);
-                }
-                self.ingest.scan = Some(s);
-                self.ingest.verdict = Some(v);
-                self.ingest.scan_rx = None;
-                if self.ingest.output.trim().is_empty() {
-                    self.ingest.output = self.ingest.default_output();
+        // the latest of what came since the last frame
+        let mut latest: Option<(Scan, bool)> = None;
+        let mut gone = false;
+        loop {
+            match rx.try_recv() {
+                Ok(m) => latest = Some(m),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ingest.scan_rx = None,
-            Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
         }
+        if let Some((s, done)) = latest {
+            self.ingest.take_scan(s);
+            if done {
+                self.ingest.scan_rx = None;
+                self.ingest.scan_cancel = None;
+                return;
+            }
+        }
+        if gone {
+            self.ingest.scan_rx = None;
+            self.ingest.scan_cancel = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 
     /// Files dropped on the window: timelines open (Ctrl or Shift adds them
@@ -430,6 +489,8 @@ impl Viewer {
     }
 
     pub(super) fn run_ingest(&mut self) {
+        // the parse looks at everything again: the look would only compete with it for the disk
+        self.stop_scan();
         let args = self.ingest.command();
         let out = self.ingest.target();
         let appending = self.ingest.append_on();
@@ -507,7 +568,7 @@ impl Viewer {
                                     action = Some("open-timelines");
                                 }
                             } else {
-                                let ready = !self.ingest.sources.is_empty() && self.ingest.scan_rx.is_none();
+                                let ready = !self.ingest.sources.is_empty() && self.ingest.scan.is_some();
                                 if primary(ui, format!("Next  {}", ic::ARROW_RIGHT), ready).clicked() {
                                     self.ingest.step = 1;
                                 }
@@ -660,7 +721,7 @@ impl Viewer {
                 self.start_scan();
             }
             theme::section(ui, "What masstin found");
-            if self.ingest.scan_rx.is_some() {
+            if self.ingest.scan_rx.is_some() && self.ingest.scan.is_none() {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
                     ui.label(egui::RichText::new("Looking at what this is…").color(theme::MUTED));
@@ -690,7 +751,16 @@ impl Viewer {
                     count_chip(ui, ic::ARCHIVE, s.archives, plural(s.archives, "other archive", "other archives"), theme::DIM);
                 });
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("{} files in {} folders looked at in {:.1} s{}", s.files, s.dirs, s.secs, if s.truncated { "; the look stopped early, the parser goes all the way" } else { "" })).color(theme::DIM).small());
+                if self.ingest.scan_rx.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                        ui.label(egui::RichText::new(look_note(&s, true)).color(theme::MUTED).size(12.0));
+                    });
+                } else if s.truncated {
+                    ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, look_note(&s, false))).color(CANDIDATE).size(12.5));
+                } else {
+                    ui.label(egui::RichText::new(look_note(&s, false)).color(theme::DIM).small());
+                }
                 ui.add_space(6.0);
                 let (icon, color) = match (v.parser, v.sure) {
                     (None, true) => (ic::TABLE, theme::CYAN),
@@ -1245,6 +1315,19 @@ fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke, corner: f32) {
 /// `icon n what` in a pill of the category's colour: one widget, so a
 /// wrapped row moves it whole.
 /// The name of a count in the singular for one, in the plural otherwise.
+
+/// The line under what the look found: how far it went, and what that
+/// means for the evidence not counted yet.
+fn look_note(s: &Scan, looking: bool) -> String {
+    let what = format!("{} files in {} folders", group_digits(s.files), group_digits(s.dirs));
+    if looking {
+        format!("Still looking: {} so far ({:.0} s). What is found is added here as it comes; you can go on meanwhile, the parse looks at everything again.", what, s.secs)
+    } else if s.truncated {
+        format!("The look stopped after {} ({:.0} s): there may be more evidence than shown here, disk images too. The parse looks at everything.", what, s.secs)
+    } else {
+        format!("{} looked at in {:.1} s", what, s.secs)
+    }
+}
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 {
         one
@@ -1502,6 +1585,39 @@ pub(super) fn scratch_csv() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The look reports as it goes: the parser follows what is found while
+    /// it is masstin's pick, and stays once chosen by hand; the note under
+    /// the chips says whether the look is still going or stopped early.
+    #[test]
+    fn the_parser_follows_the_look_until_chosen_by_hand() {
+        use super::*;
+        let mut i = Ingest::default();
+        i.sources = vec!["D:/case".into()];
+        let mut s = Scan::default();
+        s.timelines.push("t.csv".into());
+        i.take_scan(s.clone());
+        assert_eq!(i.verdict.as_ref().unwrap().parser, None);
+        s.linux.insert("secure", 3);
+        i.take_scan(s.clone());
+        assert_eq!(i.parser, P_LINUX, "timelines first left the choice open");
+        s.images.push("D:/case/images/srv.vmdk".into());
+        i.take_scan(s.clone());
+        assert_eq!(i.parser, P_MASSIVE, "an image found later moves the pick");
+        assert!(i.is_auto());
+        i.parser = P_WINDOWS;
+        s.evtx = 4;
+        i.take_scan(s.clone());
+        assert_eq!(i.parser, P_WINDOWS, "a parser chosen by hand stays");
+        s.files = 13_045;
+        s.dirs = 2_079;
+        s.secs = 29.4;
+        assert!(look_note(&s, true).starts_with("Still looking: 13,045 files in 2,079 folders"), "{}", look_note(&s, true));
+        s.truncated = true;
+        assert!(look_note(&s, false).contains("disk images too"));
+        s.truncated = false;
+        assert!(look_note(&s, false).ends_with("looked at in 29.4 s"));
+    }
+
     use super::*;
 
     #[test]
