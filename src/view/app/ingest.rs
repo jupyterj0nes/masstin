@@ -908,7 +908,7 @@ impl Viewer {
             ui.horizontal(|ui| {
                 ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Threads").color(TEXT)));
                 ui.add(egui::TextEdit::singleline(&mut self.ingest.threads).desired_width(60.0).hint_text("auto"));
-                ui.label(egui::RichText::new("all cores but one by default; 1 runs serial (--threads)").color(theme::DIM).small());
+                ui.label(egui::RichText::new("from this window: all cores but two by default, the window and a remote session keep theirs; 1 runs serial (--threads)").color(theme::DIM).small());
             });
             if self.ingest.has_images() {
                 ui.horizontal(|ui| {

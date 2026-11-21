@@ -82,13 +82,33 @@ pub fn decide(asked: Option<usize>, asked_images: Option<usize>, evidence: &[Str
     Decision { workers, cores: snapshot.cores, asked: was_asked, snapshot, medium, asked_images: asked_images.filter(|&n| n >= 1) }
 }
 
-/// The ceiling: all the cores but one when there are four or more; one otherwise.
+/// The ceiling: all the cores but the ones left to the system ([`reserved`],
+/// one unless asked) when there are four or more; one otherwise.
 pub fn policy(cores: usize) -> usize {
+    policy_leaving(cores, reserved())
+}
+
+/// [`policy`] with `reserve` cores left to the system.
+pub fn policy_leaving(cores: usize, reserve: usize) -> usize {
     if cores >= 4 {
-        cores - 1
+        cores.saturating_sub(reserve.max(1)).max(1)
     } else {
         1
     }
+}
+
+/// The cores a run leaves to the rest of the machine: one, or what
+/// `MASSTIN_RESERVE_CORES` says. The viewer asks two for the parses it
+/// starts: the window and, over remote desktop, the session that carries
+/// it need a core of their own while the evidence is read.
+pub fn reserved() -> usize {
+    reserved_from(std::env::var("MASSTIN_RESERVE_CORES").ok().as_deref())
+}
+
+/// [`reserved`] from the variable's text: a whole number, one at least; one
+/// when it is not one.
+pub fn reserved_from(v: Option<&str>) -> usize {
+    v.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(1)
 }
 
 /// Build the global pool and lower the process priority. Once per process;
@@ -144,7 +164,12 @@ pub fn available_now() -> usize {
 
 /// The idle cores less one for the system, within the pool, one at least.
 pub fn idle_workers(idle_cores: f32, workers: usize) -> usize {
-    ((idle_cores - 1.0).floor().max(1.0) as usize).min(workers.max(1))
+    idle_workers_leaving(idle_cores, workers, reserved())
+}
+
+/// [`idle_workers`] with `reserve` idle cores left to the system.
+pub fn idle_workers_leaving(idle_cores: f32, workers: usize, reserve: usize) -> usize {
+    ((idle_cores - reserve.max(1) as f32).floor().max(1.0) as usize).min(workers.max(1))
 }
 
 /// `--parallel-images`, when given.
@@ -676,6 +701,19 @@ mod tests {
         assert_eq!(policy(4), 3);
         assert_eq!(policy(12), 11);
         assert_eq!(policy(64), 63);
+        // cores left to the system: the window's parses leave two
+        assert_eq!(policy_leaving(12, 2), 10);
+        assert_eq!(policy_leaving(4, 2), 2);
+        assert_eq!(policy_leaving(4, 9), 1, "never fewer than one");
+        assert_eq!(policy_leaving(3, 2), 1);
+        assert_eq!(policy_leaving(12, 0), 11, "one at least is left");
+        assert_eq!(idle_workers_leaving(8.4, 11, 2), 6);
+        assert_eq!(idle_workers_leaving(2.5, 11, 2), 1);
+        assert_eq!(idle_workers_leaving(100.0, 10, 2), 10);
+        assert_eq!(reserved_from(None), 1);
+        assert_eq!(reserved_from(Some(" 2 ")), 2);
+        assert_eq!(reserved_from(Some("0")), 1);
+        assert_eq!(reserved_from(Some("two")), 1);
         let d = decide(Some(3), None, &[]);
         assert_eq!(d.workers, 3);
         assert!(d.asked);

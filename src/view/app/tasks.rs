@@ -20,6 +20,10 @@ pub(super) enum JobKind {
     Remote,
 }
 
+/// The cores a run started from the window leaves to the window and the
+/// session (`MASSTIN_RESERVE_CORES`).
+pub(super) const WINDOW_RESERVE_CORES: usize = 2;
+
 pub(super) enum JobMsg {
     Line(String),
     Done(Result<(), String>),
@@ -255,6 +259,12 @@ impl Viewer {
             use std::io::BufRead;
             let mut cmd = std::process::Command::new(&exe);
             cmd.envs(env).args(&args).env("MASSTIN_PROGRESS_PIPE", "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
+            // a run started from the window leaves two cores to the window and,
+            // over remote desktop, to the session that carries it (one is what a
+            // run leaves by itself); a figure set in the environment stands
+            if std::env::var_os("MASSTIN_RESERVE_CORES").is_none() {
+                cmd.env("MASSTIN_RESERVE_CORES", WINDOW_RESERVE_CORES.to_string());
+            }
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;

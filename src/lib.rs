@@ -650,7 +650,9 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         let threads = if d.asked {
             format!("Threads: {} (asked; {})", d.workers, machine)
         } else {
-            format!("Threads: up to {}, what is idle at each moment ({}; --threads fixes it, 1 runs serial)", d.workers, machine)
+            let left = crate::threads::reserved();
+            let left = if left > 1 { format!("{} cores left to the rest of the machine (MASSTIN_RESERVE_CORES); ", left) } else { String::new() };
+            format!("Threads: up to {}, what is idle at each moment ({}; {}--threads fixes it, 1 runs serial)", d.workers, machine, left)
         };
         let images = if !reads_images {
             String::new()
