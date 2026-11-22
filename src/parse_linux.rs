@@ -1858,51 +1858,16 @@ fn ts_secs(rfc3339: &str) -> Option<i64> {
 /// same second and from the same source: learn `uid → name` from those
 /// coincidences (per host; for directory-range uids, >= 10000, the vote is
 /// also pooled across hosts since the uid is global there) and rewrite.
+#[allow(dead_code)]
 fn resolve_audit_uids(rows: &mut Vec<RawEvt>) {
-    let mut by_key: HashMap<(String, String, i64), Vec<String>> = HashMap::new();
+    let mut votes = UidVotes::default();
     for r in rows.iter() {
-        if r.user.is_empty() || r.user.starts_with("uid:") { continue; }
-        if r.evt != "SSH_SUCCESS" && r.evt != "LOGIN" { continue; }
-        if r.tty_or_proc.starts_with("audit") { continue; }
-        if let Some(sec) = ts_secs(&r.ts_rfc3339) {
-            by_key.entry((r.dst_host.clone(), r.remote.clone(), sec)).or_default().push(r.user.clone());
-        }
+        votes.note(r);
     }
-    if by_key.is_empty() { return; }
-    // (host, "uid:n") -> name -> votes ; ("", "uid:n") pools directory uids
-    let mut votes: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
-    for r in rows.iter() {
-        if !r.user.starts_with("uid:") { continue; }
-        let sec = match ts_secs(&r.ts_rfc3339) { Some(s) => s, None => continue };
-        let directory = r.user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
-        for d in -2i64..=2 {
-            if let Some(names) = by_key.get(&(r.dst_host.clone(), r.remote.clone(), sec + d)) {
-                for n in names {
-                    *votes.entry((r.dst_host.clone(), r.user.clone())).or_default().entry(n.clone()).or_default() += 1;
-                    if directory {
-                        *votes.entry((String::new(), r.user.clone())).or_default().entry(n.clone()).or_default() += 1;
-                    }
-                }
-            }
-        }
-    }
-    let winner = |m: &HashMap<String, usize>| -> Option<String> {
-        let total: usize = m.values().sum();
-        m.iter().max_by_key(|(_, &c)| c).filter(|(_, &c)| c * 2 > total).map(|(n, _)| n.clone())
-    };
-    let resolved: HashMap<(String, String), String> = votes
-        .iter()
-        .filter_map(|(k, m)| winner(m).map(|n| (k.clone(), n)))
-        .collect();
+    let resolved = votes.resolve();
     let mut changed = 0usize;
     for r in rows.iter_mut() {
-        if !r.user.starts_with("uid:") { continue; }
-        let directory = r.user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
-        let name = resolved
-            .get(&(r.dst_host.clone(), r.user.clone()))
-            .or_else(|| if directory { resolved.get(&(String::new(), r.user.clone())) } else { None });
-        if let Some(n) = name {
-            r.user = n.clone();
+        if resolved.apply(r) {
             changed += 1;
         }
     }
@@ -1910,6 +1875,89 @@ fn resolve_audit_uids(rows: &mut Vec<RawEvt>) {
         crate::banner::print_info(&format!(
             "{} audit records: uid resolved to account name via sshd/wtmp coincidence", changed
         ));
+    }
+}
+
+/// What [`resolve_audit_uids`] needs of every row, gathered as the rows go
+/// by (they are written to disk host by host and read back one host at a
+/// time): the named logins by host, source and second, and the audit
+/// records that carry a uid. The uids of directory users (10000 and up)
+/// are voted on across hosts, so this is gathered over all of them before
+/// any host is written.
+#[derive(Default)]
+struct UidVotes {
+    by_key: HashMap<(String, String, i64), Vec<String>>,
+    /// (host, remote, "uid:n", second)
+    uid_rows: Vec<(String, String, String, Option<i64>)>,
+}
+
+/// The names the uids resolved to: (host, "uid:n") and, for directory
+/// users, ("", "uid:n").
+struct UidNames(HashMap<(String, String), String>);
+
+impl UidVotes {
+    fn note(&mut self, r: &RawEvt) {
+        if r.user.starts_with("uid:") {
+            self.uid_rows.push((r.dst_host.clone(), r.remote.clone(), r.user.clone(), ts_secs(&r.ts_rfc3339)));
+            return;
+        }
+        if r.user.is_empty() { return; }
+        if r.evt != "SSH_SUCCESS" && r.evt != "LOGIN" { return; }
+        if r.tty_or_proc.starts_with("audit") { return; }
+        if let Some(sec) = ts_secs(&r.ts_rfc3339) {
+            self.by_key.entry((r.dst_host.clone(), r.remote.clone(), sec)).or_default().push(r.user.clone());
+        }
+    }
+
+    fn resolve(&self) -> UidNames {
+        if self.by_key.is_empty() { return UidNames(HashMap::new()); }
+        // (host, "uid:n") -> name -> votes ; ("", "uid:n") pools directory uids
+        let mut votes: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
+        for (host, remote, user, sec) in &self.uid_rows {
+            let sec = match sec { Some(s) => *s, None => continue };
+            let directory = user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
+            for d in -2i64..=2 {
+                if let Some(names) = self.by_key.get(&(host.clone(), remote.clone(), sec + d)) {
+                    for n in names {
+                        *votes.entry((host.clone(), user.clone())).or_default().entry(n.clone()).or_default() += 1;
+                        if directory {
+                            *votes.entry((String::new(), user.clone())).or_default().entry(n.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let winner = |m: &HashMap<String, usize>| -> Option<String> {
+            let total: usize = m.values().sum();
+            m.iter().max_by_key(|(_, &c)| c).filter(|(_, &c)| c * 2 > total).map(|(n, _)| n.clone())
+        };
+        UidNames(votes.iter().filter_map(|(k, m)| winner(m).map(|n| (k.clone(), n))).collect())
+    }
+
+    /// How many of the uid records gathered get a name.
+    fn changed(&self, names: &UidNames) -> usize {
+        self.uid_rows.iter().filter(|(host, _, user, _)| names.name_of(host, user).is_some()).count()
+    }
+}
+
+impl UidNames {
+    fn name_of(&self, host: &str, user: &str) -> Option<&String> {
+        if !user.starts_with("uid:") { return None; }
+        let directory = user[4..].parse::<u32>().map(|u| u >= 10_000).unwrap_or(false);
+        self.0
+            .get(&(host.to_string(), user.to_string()))
+            .or_else(|| if directory { self.0.get(&(String::new(), user.to_string())) } else { None })
+    }
+
+    /// The record's uid replaced by its name; whether it was.
+    fn apply(&self, r: &mut RawEvt) -> bool {
+        match self.name_of(&r.dst_host, &r.user) {
+            Some(n) => {
+                r.user = n.clone();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -1953,9 +2001,9 @@ pub(crate) fn continuous_since(days: &mut Vec<NaiveDate>, max_gap: i64) -> Optio
 /// point every relevant source is present: before the first surviving
 /// `secure` rotation, sshd-only facts (source IP, auth method) are simply
 /// not visible.
-fn print_coverage(rows: &[&RawEvt]) {
-    let fams = ["secure", "journal", "audit", "wtmp", "btmp", "lastlog"];
-    let mut days: HashMap<(String, &'static str), Vec<NaiveDate>> = HashMap::new();
+type CoverageDays = HashMap<(String, &'static str), Vec<NaiveDate>>;
+
+fn coverage_days(rows: &[&RawEvt], days: &mut CoverageDays) {
     for r in rows {
         let d = match r.ts_rfc3339.get(..10).and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()) {
             Some(d) => d,
@@ -1964,6 +2012,16 @@ fn print_coverage(rows: &[&RawEvt]) {
         let h = r.dst_host.split('.').next().unwrap_or(&r.dst_host).to_string();
         days.entry((h, log_family(&r.filename))).or_default().push(d);
     }
+}
+
+fn print_coverage(rows: &[&RawEvt]) {
+    let mut days = CoverageDays::new();
+    coverage_days(rows, &mut days);
+    print_coverage_days(days);
+}
+
+fn print_coverage_days(mut days: CoverageDays) {
+    let fams = ["secure", "journal", "audit", "wtmp", "btmp", "lastlog"];
     let mut hosts: Vec<String> = days.keys().map(|(h, _)| h.clone()).collect();
     hosts.sort();
     hosts.dedup();
@@ -1990,12 +2048,68 @@ fn write_empty_csv(output: Option<&String>) {
     }
 }
 
+/// What [`reduce_rows`] kept of a set of rows, and what it dropped.
+struct Reduced {
+    /// indices of the rows kept, in the order the reduction leaves them
+    /// (the channel's rank, then the order the rows were read in)
+    kept: Vec<usize>,
+    /// rows past the noise filter
+    filtered: usize,
+    duplicates: usize,
+    session_dups: usize,
+    audit_dups: usize,
+}
+
+#[allow(dead_code)]
 fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Option<&String>) {
     if rows.is_empty() && outgoing.is_empty() {
         eprintln!("[WARN] nothing matched lateral-movement filter");
         write_empty_csv(output);
         return;
     }
+    let red = reduce_rows(rows);
+    if red.filtered == 0 {
+        eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
+        write_empty_csv(output);
+        return;
+    }
+    print_reduction(red.duplicates, red.session_dups, red.audit_dups);
+    let mut ordered: Vec<&RawEvt> = red.kept.iter().map(|&i| &rows[i]).collect();
+    ordered.sort_by(|a, b| a.ts_rfc3339.cmp(&b.ts_rfc3339));
+    print_coverage(&ordered);
+    let mut sink: Box<dyn std::io::Write> = match output {
+        Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p).unwrap())),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    write_rows(&mut sink, ordered.iter().map(|r| (r.ts_rfc3339.clone(), row_line(r))), outgoing);
+}
+
+/// The banner lines of what the reduction dropped.
+fn print_reduction(removed: usize, session_dups: usize, audit_dups: usize) {
+    if removed > 0 {
+        crate::banner::print_info(&format!("{} duplicate events removed (journald + rsyslog overlap)", removed));
+    }
+    if session_dups > 0 {
+        crate::banner::print_info(&format!("{} audit records collapsed (further channels of an already counted session)", session_dups));
+    }
+    if audit_dups > 0 {
+        crate::banner::print_info(&format!("{} audit records dropped (same connection already in the sshd log, paired by pid)", audit_dups));
+    }
+}
+
+/// The rank of a row's channel in the reduction: the rsyslog text before
+/// the journal (the file the analyst can open). Also the order of rows of
+/// the same second in the timeline.
+fn channel_rank(t: &str) -> u8 {
+    if t.starts_with("journal-ssh") { 1 } else { 0 }
+}
+
+/// The noise filter, then the copies of one event dropped: the same event
+/// through two channels of a kind, an audit session's further channels,
+/// an audit record whose connection the sshd log already has. Every key
+/// carries the host (a log file is one host's), so a set of rows reduced
+/// host by host keeps exactly what the whole set reduced at once keeps.
+fn reduce_rows(rows: &[RawEvt]) -> Reduced {
 
     // Apply noise filter (--ignore-local / --exclude-*). We build a minimal
     // LogData view of each RawEvt just for the filter check — RawEvt's
@@ -2031,11 +2145,7 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
             crate::filter::should_keep_record(&ld)
         })
         .collect();
-    if filtered.is_empty() {
-        eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
-        write_empty_csv(output);
-        return;
-    }
+    let index_of = |r: &RawEvt| -> usize { (r as *const RawEvt as usize - rows.as_ptr() as usize) / std::mem::size_of::<RawEvt>().max(1) };
     // Same event seen through two channels of the SAME kind is one event:
     // on RHEL 7+ rsyslog's imjournal copies every sshd line from journald
     // into /var/log/secure, so a login parsed from both would appear twice.
@@ -2050,9 +2160,8 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
         else if t == "pam" { "pam" }
         else { "other" }
     };
-    let rank = |t: &str| -> u8 { if t.starts_with("journal-ssh") { 1 } else { 0 } };
     let mut ordered: Vec<&RawEvt> = filtered.clone();
-    ordered.sort_by_key(|r| rank(&r.tty_or_proc));
+    ordered.sort_by_key(|r| channel_rank(&r.tty_or_proc));
     // Keys are 64-bit hashes of the tuple instead of owned tuples.
     fn key_hash(parts: &[&str], sec: i64) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -2084,9 +2193,6 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
         if *claimant == fid { deduped.push(r); }
     }
     let removed = filtered.len() - deduped.len();
-    if removed > 0 {
-        crate::banner::print_info(&format!("{} duplicate events removed (journald + rsyslog overlap)", removed));
-    }
     drop(owner);
     // One successful audit connection = one row: records sharing (host,
     // pid, ses, source) are the channels of one sshd connection, possibly
@@ -2108,9 +2214,6 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
         deduped.retain(|r| { let ok = r.conn == 0 || keep.contains(&k); k += 1; ok });
         before - deduped.len()
     };
-    if session_dups > 0 {
-        crate::banner::print_info(&format!("{} audit records collapsed (further channels of an already counted session)", session_dups));
-    }
     // auditd's USER_LOGIN is the same connection sshd already wrote to
     // secure/auth.log/journald. The two are paired by the identifier they
     // share — the sshd process id — never by time proximity or account
@@ -2168,21 +2271,16 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
         deduped.retain(|_| { let keep = !drop_idx.contains(&k); k += 1; keep });
         n
     };
-    if audit_dups > 0 {
-        crate::banner::print_info(&format!("{} audit records dropped (same connection already in the sshd log, paired by pid)", audit_dups));
-    }
-    let rows = &deduped[..];
+    Reduced { kept: deduped.iter().map(|r| index_of(r)).collect(), filtered: filtered.len(), duplicates: removed, session_dups, audit_dups }
+}
 
-    // Written directly, row by row, instead of through a polars DataFrame:
-    // materialising 14 Utf8 columns for 1.5M rows and sorting them needed
-    // several GB on top of the rows themselves and aborted the process on
-    // the 28-host corpus. Quoting mirrors what polars produced (empty
-    // fields as "", quotes only when needed) so downstream readers see the
-    // same CSV they always did.
-    let mut ordered: Vec<&RawEvt> = rows.to_vec();
-    ordered.sort_by(|a, b| a.ts_rfc3339.cmp(&b.ts_rfc3339));
-    print_coverage(&ordered);
-
+// Written directly, row by row, instead of through a polars DataFrame:
+// materialising 14 Utf8 columns for 1.5M rows and sorting them needed
+// several GB on top of the rows themselves and aborted the process on
+// the 28-host corpus. Quoting mirrors what polars produced (empty
+// fields as "", quotes only when needed) so downstream readers see the
+// same CSV they always did.
+fn row_line(r: &RawEvt) -> String {
     fn q(s: &str) -> String {
         if s.is_empty() {
             "\"\"".to_string()
@@ -2200,21 +2298,7 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
             _ => "CONNECT",
         }
     };
-    let header = format!("{}\n", crate::csv_out::HEADER);
-
-    let mut sink: Box<dyn std::io::Write> = match output {
-        Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p).unwrap())),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
-    use std::io::Write as _;
-    sink.write_all(header.as_bytes()).unwrap();
-    // the outgoing connections of the audit logs, in their place in time
-    let mut outgoing = outgoing.into_iter().peekable();
-    for r in ordered {
-        while outgoing.peek().map_or(false, |(ts, _)| ts.as_str() <= r.ts_rfc3339.as_str()) {
-            sink.write_all(outgoing.next().unwrap().1.as_bytes()).unwrap();
-        }
-        let is_ip = looks_like_ip(&r.remote);
+    let is_ip = looks_like_ip(&r.remote);
         let (src_computer, src_ip) = if is_ip { ("", r.remote.as_str()) } else { (r.remote.as_str(), "") };
         // Every Linux row with a remote source is an SSH session (sshd
         // logs, pts entries in wtmp/lastlog, auditd sshd records). Naming
@@ -2224,7 +2308,7 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
         // `sshd[pid]`, journald `_PID`, auditd `pid=`, wtmp `ut_pid`), the
         // same on the login and on the LOGOFF row that closes it
         let logon_id = if r.pid != 0 { r.pid.to_string() } else { String::new() };
-        let line = format!(
+        format!(
             "{},{},{},{},SSH,{},\"\",{},{},\"\",\"\",{},{},{}{}\n",
             q(&r.ts_rfc3339),
             q(&r.dst_host),
@@ -2237,13 +2321,237 @@ fn build_dataframe(rows: &[RawEvt], outgoing: Vec<(String, String)>, output: Opt
             q(&r.tty_or_proc),
             q(&r.filename),
             crate::csv_out::EMPTY_TAIL,
-        );
+        )
+}
+
+/// The header, then the rows (their time and their line, in order) with the
+/// outgoing connections of the audit logs in their place in time.
+fn write_rows(sink: &mut Box<dyn std::io::Write>, rows: impl Iterator<Item = (String, String)>, outgoing: Vec<(String, String)>) {
+    use std::io::Write as _;
+    let header = format!("{}\n", crate::csv_out::HEADER);
+    sink.write_all(header.as_bytes()).unwrap();
+    let mut outgoing = outgoing.into_iter().peekable();
+    for (ts, line) in rows {
+        while outgoing.peek().map_or(false, |(t, _)| t.as_str() <= ts.as_str()) {
+            sink.write_all(outgoing.next().unwrap().1.as_bytes()).unwrap();
+        }
         sink.write_all(line.as_bytes()).unwrap();
     }
     for (_, line) in outgoing {
         sink.write_all(line.as_bytes()).unwrap();
     }
     sink.flush().unwrap();
+}
+
+// ─────────────────── the rows on disk, one file per host ───────────────────
+//
+// A folder of Linux packages is millions of rows (a brute force is a row an
+// attempt), and every row is seven strings: held all at once they were
+// gigabytes (7 GB for a few dozen UAC packages). The rows of each log go to
+// a file of their host as the log is read; each host is then read back
+// alone, reduced (every key of the reduction carries the host), sorted and
+// written to a run of its own; the runs are merged into the timeline. The
+// order of the rows is the one the whole set gave: time, then the channel's
+// rank, then the order the logs and their rows were read in.
+
+/// Where a row came from: the log's place among the logs read (sorted by
+/// path) and the row's place in that log.
+type RowOrigin = (u32, u32);
+
+fn put_str(w: &mut impl std::io::Write, s: &str) -> std::io::Result<()> {
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())
+}
+
+fn get_u32(r: &mut impl Read) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn get_str(r: &mut impl Read) -> std::io::Result<String> {
+    let n = get_u32(r)? as usize;
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    Ok(String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// The rows of each host, on disk.
+struct HostSpill {
+    dir: PathBuf,
+    files: HashMap<String, PathBuf>,
+    rows: usize,
+}
+
+impl HostSpill {
+    fn new(dir: PathBuf) -> HostSpill {
+        let _ = fs::create_dir_all(&dir);
+        HostSpill { dir, files: HashMap::new(), rows: 0 }
+    }
+
+    /// The rows of log `log`, appended to their hosts' files.
+    fn add(&mut self, rows: &[RawEvt], log: u32) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut by_host: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            match by_host.iter_mut().find(|(h, _)| *h == r.dst_host.as_str()) {
+                Some((_, v)) => v.push(i),
+                None => by_host.push((r.dst_host.as_str(), vec![i])),
+            }
+        }
+        for (host, idx) in by_host {
+            let next = self.dir.join(format!("host-{}.rows", self.files.len()));
+            let path = self.files.entry(host.to_string()).or_insert(next).clone();
+            let f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            for i in idx {
+                let r = &rows[i];
+                w.write_all(&log.to_le_bytes())?;
+                w.write_all(&(i as u32).to_le_bytes())?;
+                w.write_all(&r.pid.to_le_bytes())?;
+                w.write_all(&r.conn.to_le_bytes())?;
+                for s in [&r.ts_rfc3339, &r.user, &r.remote, &r.tty_or_proc, &r.evt, &r.filename, &r.dst_host] {
+                    put_str(&mut w, s)?;
+                }
+            }
+            w.flush()?;
+        }
+        self.rows += rows.len();
+        Ok(())
+    }
+
+    /// A host's rows, in the order they were read.
+    fn read(path: &Path) -> std::io::Result<Vec<(RowOrigin, RawEvt)>> {
+        let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
+        let mut out = Vec::new();
+        loop {
+            let log = match get_u32(&mut r) {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+            let idx = get_u32(&mut r)?;
+            let pid = get_u32(&mut r)?;
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            let conn = u64::from_le_bytes(b);
+            let ts_rfc3339 = get_str(&mut r)?;
+            let user = get_str(&mut r)?;
+            let remote = get_str(&mut r)?;
+            let tty_or_proc = get_str(&mut r)?;
+            let evt = get_str(&mut r)?;
+            let filename = get_str(&mut r)?;
+            let dst_host = get_str(&mut r)?;
+            out.push(((log, idx), RawEvt { ts_rfc3339, user, remote, tty_or_proc, evt, filename, dst_host, pid, conn }));
+        }
+        out.sort_by_key(|(o, _)| *o);
+        Ok(out)
+    }
+}
+
+/// One row of a host's run: its place in the timeline and its line.
+fn put_run_row(w: &mut impl std::io::Write, ts: &str, rank: u8, origin: RowOrigin, line: &str) -> std::io::Result<()> {
+    put_str(w, ts)?;
+    w.write_all(&[rank])?;
+    w.write_all(&origin.0.to_le_bytes())?;
+    w.write_all(&origin.1.to_le_bytes())?;
+    put_str(w, line)
+}
+
+/// The next row of a run: (time, rank, origin, line).
+fn get_run_row(r: &mut impl Read) -> Option<(String, u8, RowOrigin, String)> {
+    let ts = get_str(r).ok()?;
+    let mut rank = [0u8; 1];
+    r.read_exact(&mut rank).ok()?;
+    let a = get_u32(r).ok()?;
+    let b = get_u32(r).ok()?;
+    let line = get_str(r).ok()?;
+    Some((ts, rank[0], (a, b), line))
+}
+
+/// The timeline out of the rows on disk: each host reduced and sorted
+/// alone into a run, the runs merged. What is printed and written is what
+/// [`build_dataframe`] gives for the same rows all at once.
+fn write_by_host(spill: &HostSpill, names: &UidNames, outgoing: Vec<(String, String)>, output: Option<&String>) {
+    if spill.rows == 0 && outgoing.is_empty() {
+        eprintln!("[WARN] nothing matched lateral-movement filter");
+        write_empty_csv(output);
+        return;
+    }
+    let mut hosts: Vec<(&String, &PathBuf)> = spill.files.iter().collect();
+    hosts.sort();
+    let mut filtered = 0usize;
+    let (mut removed, mut session_dups, mut audit_dups) = (0usize, 0usize, 0usize);
+    let mut days = CoverageDays::new();
+    let mut runs: Vec<PathBuf> = Vec::new();
+    for (n, (host, path)) in hosts.iter().enumerate() {
+        let rows = match HostSpill::read(path) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::banner::print_warning(&format!("Could not read back the rows of {} ({}): they are missing from the timeline", host, e));
+                continue;
+            }
+        };
+        let (origins, mut rows): (Vec<RowOrigin>, Vec<RawEvt>) = rows.into_iter().unzip();
+        for r in rows.iter_mut() {
+            names.apply(r);
+        }
+        let red = reduce_rows(&rows);
+        filtered += red.filtered;
+        removed += red.duplicates;
+        session_dups += red.session_dups;
+        audit_dups += red.audit_dups;
+        let mut kept = red.kept;
+        // time, then rank and origin: the stable sort of the whole set
+        kept.sort_by(|&a, &b| rows[a].ts_rfc3339.cmp(&rows[b].ts_rfc3339).then(channel_rank(&rows[a].tty_or_proc).cmp(&channel_rank(&rows[b].tty_or_proc))).then(origins[a].cmp(&origins[b])));
+        let refs: Vec<&RawEvt> = kept.iter().map(|&i| &rows[i]).collect();
+        coverage_days(&refs, &mut days);
+        let run = spill.dir.join(format!("run-{}.rows", n));
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, File::create(&run)?);
+            for &i in &kept {
+                put_run_row(&mut w, &rows[i].ts_rfc3339, channel_rank(&rows[i].tty_or_proc), origins[i], &row_line(&rows[i]))?;
+            }
+            w.flush()
+        })();
+        match written {
+            Ok(()) => runs.push(run),
+            Err(e) => crate::banner::print_warning(&format!("Could not write the rows of {} ({}): is the temporary disk full? They are missing from the timeline", host, e)),
+        }
+        let _ = fs::remove_file(path);
+    }
+    if filtered == 0 {
+        eprintln!("[WARN] all rows filtered by --ignore-local / --exclude-* flags");
+        write_empty_csv(output);
+        return;
+    }
+    print_reduction(removed, session_dups, audit_dups);
+    print_coverage_days(days);
+    // the runs merged: the smallest (time, rank, origin) first
+    let mut readers: Vec<BufReader<File>> = runs.iter().filter_map(|p| File::open(p).ok().map(|f| BufReader::with_capacity(1 << 16, f))).collect();
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(String, u8, RowOrigin, usize, String)>> = std::collections::BinaryHeap::new();
+    for (k, r) in readers.iter_mut().enumerate() {
+        if let Some((ts, rank, o, line)) = get_run_row(r) {
+            heap.push(std::cmp::Reverse((ts, rank, o, k, line)));
+        }
+    }
+    let merged = std::iter::from_fn(|| {
+        let std::cmp::Reverse((ts, _, _, k, line)) = heap.pop()?;
+        if let Some((t2, r2, o2, l2)) = get_run_row(&mut readers[k]) {
+            heap.push(std::cmp::Reverse((t2, r2, o2, k, l2)));
+        }
+        Some((ts, line))
+    });
+    let mut sink: Box<dyn std::io::Write> = match output {
+        Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p).unwrap())),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    write_rows(&mut sink, merged, outgoing);
+    drop(sink);
+    for r in runs {
+        let _ = fs::remove_file(r);
+    }
 }
 
 // ────────────────────────── main entry point ─────────────────────────────────
@@ -2948,7 +3256,15 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     if !quiet { crate::banner::print_processing_start(); }
     let pb = crate::banner::create_progress_bar(targets.len() as u64);
 
-    let mut collected = Vec::<RawEvt>::new();
+    // the rows go to disk, a file per host, as each log is read; what the
+    // uids resolve to is gathered on the way (see HostSpill)
+    let mut spill = HostSpill::new(temp_dir.join("_rows"));
+    let mut uid_votes = UidVotes::default();
+    archive_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+    let prefixes: Vec<(String, String)> = archive_dirs
+        .iter()
+        .map(|(d, n)| (d.to_string_lossy().replace('\\', "/"), n.clone()))
+        .collect();
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
     // (source_label, artifact_short_name, vss_index, count) — same structure
@@ -2957,7 +3273,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
     let mut year_cache: HashMap<PathBuf, i32> = HashMap::new();
 
-    for path in &targets {
+    for (log_no, path) in targets.iter().enumerate() {
         let path_str = path.to_string_lossy().to_string();
 
         // Find the root dir the hostname heuristics should scan. UAC lays
@@ -3131,7 +3447,27 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             // Linux logs never come from VSS; always None.
             artifact_details.push((source, short, None, count));
         }
-        collected.extend(parsed);
+        // the log's own name instead of the temporary folder it was unpacked
+        // into: `<archive>:<path inside>` (longest prefix: nested archives
+        // unpack inside their wrapper's folder)
+        if !prefixes.is_empty() {
+            for evt in parsed.iter_mut() {
+                let norm = evt.filename.replace('\\', "/");
+                if let Some((prefix, name)) = prefixes.iter().find(|(pfx, _)| norm.starts_with(pfx.as_str())) {
+                    let inside = norm[prefix.len()..].trim_start_matches('/');
+                    evt.filename = format!("{}:{}", name, inside);
+                }
+            }
+        }
+        for evt in &parsed {
+            uid_votes.note(evt);
+        }
+        if let Err(e) = spill.add(&parsed, log_no as u32) {
+            crate::banner::print_warning(&format!(
+                "Could not write the rows of {} to the temporary folder ({}): is the disk full? They are missing from the timeline.",
+                path_str, e
+            ));
+        }
 
         if is_debug_mode() {
             println!(
@@ -3150,31 +3486,21 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     if is_debug_mode() {
         println!(
             "[DEBUG] SUMMARY  total {:>6}",
-            collected.len()
+            spill.rows
         );
     }
 
-    // Rewrite temp-extract paths in log_filename to `<archive>:<path inside>`
-    // so the CSV points at evidence the analyst actually holds. Longest
-    // prefix wins: nested archives extract inside their wrapper's dir.
-    if !archive_dirs.is_empty() {
-        archive_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
-        let prefixes: Vec<(String, String)> = archive_dirs
-            .iter()
-            .map(|(d, n)| (d.to_string_lossy().replace('\\', "/"), n.clone()))
-            .collect();
-        for evt in collected.iter_mut() {
-            let norm = evt.filename.replace('\\', "/");
-            if let Some((prefix, name)) = prefixes.iter().find(|(pfx, _)| norm.starts_with(pfx.as_str())) {
-                let inside = norm[prefix.len()..].trim_start_matches('/');
-                evt.filename = format!("{}:{}", name, inside);
-            }
-        }
-    }
 
     // Phase 3: Generate output
     if !quiet { crate::banner::print_output_start(); }
-    resolve_audit_uids(&mut collected);
+    let uid_names = uid_votes.resolve();
+    let changed = uid_votes.changed(&uid_names);
+    drop(uid_votes);
+    if changed > 0 {
+        crate::banner::print_info(&format!(
+            "{} audit records: uid resolved to account name via sshd/wtmp coincidence", changed
+        ));
+    }
     // what the login sessions connected to, by the audit logs' own records
     #[cfg(test)]
     let _audit_lists = AUDIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3192,8 +3518,8 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     if !outgoing.is_empty() && !quiet {
         crate::banner::print_info(&format!("{} outgoing connection(s) of login sessions (auditd connect records): each is a row written from its origin, with the logon ID of the session's login", outgoing.len()));
     }
-    let total_events = collected.len() + outgoing.len();
-    build_dataframe(&collected, outgoing, output);
+    let total_events = spill.rows + outgoing.len();
+    write_by_host(&spill, &uid_names, outgoing, output);
 
     if !quiet {
         crate::banner::print_summary(total_events, parsed_count, skipped, output.map(|s| s.as_str()), start_time);
@@ -3813,5 +4139,101 @@ Nov 16 07:33:45 LEO-LNX01 sshd[32172]: Connection closed by invalid user masstin
             ]
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+
+#[cfg(test)]
+mod host_spill_tests {
+    use super::*;
+
+    fn ev(ts: &str, host: &str, user: &str, remote: &str, chan: &str, evt: &str, file: &str, pid: u32) -> RawEvt {
+        RawEvt {
+            ts_rfc3339: ts.into(),
+            user: user.into(),
+            remote: remote.into(),
+            tty_or_proc: chan.into(),
+            evt: evt.into(),
+            filename: file.into(),
+            dst_host: host.into(),
+            pid,
+            conn: 0,
+        }
+    }
+
+    /// The rows written host by host through the disk are the rows the whole
+    /// set gives at once, byte for byte: duplicates across channels dropped
+    /// per host, a directory uid named from another host's login, rows of
+    /// the same second in the same order (rank, then the order read), the
+    /// outgoing connections in their place.
+    #[test]
+    fn host_by_host_writes_what_all_at_once_writes() {
+        let t1 = "2026-11-10T10:00:00+00:00";
+        let t2 = "2026-11-10T10:00:01+00:00";
+        let t3 = "2026-11-10T11:30:00+00:00";
+        // logs in the order read; each log is one host's
+        let logs: Vec<Vec<RawEvt>> = vec![
+            vec![
+                ev(t1, "web01", "alice", "10.0.0.5", "ssh", "SSH_SUCCESS", "a.tgz:[root]/var/log/auth.log", 100),
+                ev(t1, "web01", "root", "203.0.113.9", "ssh", "SSH_FAILED", "a.tgz:[root]/var/log/auth.log", 101),
+                ev(t2, "web01", "root", "203.0.113.9", "ssh", "SSH_FAILED", "a.tgz:[root]/var/log/auth.log", 102),
+                ev(t3, "web01", "bob", "10.0.0.6", "ssh", "SSH_SUCCESS", "a.tgz:[root]/var/log/auth.log", 103),
+            ],
+            vec![
+                // journald's copies of web01's lines: one event each, dropped
+                ev(t1, "web01", "alice", "10.0.0.5", "journal-ssh", "SSH_SUCCESS", "a.tgz:[root]/var/log/journal/x/system.journal", 100),
+                ev(t2, "web01", "root", "203.0.113.9", "journal-ssh", "SSH_FAILED", "a.tgz:[root]/var/log/journal/x/system.journal", 102),
+                // only the journal has this one
+                ev(t1, "web01", "carol", "10.0.0.7", "journal-ssh", "SSH_SUCCESS", "a.tgz:[root]/var/log/journal/x/system.journal", 104),
+            ],
+            vec![
+                // the same second on another host, read later
+                ev(t1, "db01", "root", "203.0.113.9", "ssh", "SSH_FAILED", "b.tgz:[root]/var/log/secure", 200),
+                ev(t1, "db01", "alice", "10.0.0.5", "ssh", "SSH_SUCCESS", "b.tgz:[root]/var/log/secure", 201),
+                // a directory user's uid, named by db01's own login a second before
+                ev(t2, "db01", "uid:15001", "10.0.0.5", "audit", "SSH_SUCCESS", "b.tgz:[root]/var/log/audit/audit.log", 0),
+            ],
+            vec![
+                // the same uid on a host with no login to name it: the pool does
+                ev(t3, "app01", "uid:15001", "10.0.0.5", "audit", "SSH_SUCCESS", "c.tgz:[root]/var/log/audit/audit.log", 0),
+                ev(t1, "app01", "root", "203.0.113.9", "ssh", "SSH_FAILED", "c.tgz:[root]/var/log/auth.log", 300),
+            ],
+            vec![
+                // web01 again, from a second package: read after the others
+                ev(t1, "web01", "dave", "10.0.0.8", "ssh", "SSH_SUCCESS", "d.tgz:[root]/var/log/auth.log", 105),
+            ],
+        ];
+        let outgoing = vec![(t2.to_string(), format!("{},web01,CONNECT,AUDIT_CONNECT,SSH,alice,\"\",\"\",10.0.0.9,\"\",\"\",\"\",audit,x{}\n", t2, crate::csv_out::EMPTY_TAIL))];
+        let dir = std::env::temp_dir().join(format!("masstin_spill_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let whole = dir.join("whole.csv").to_string_lossy().to_string();
+        let by_host = dir.join("by_host.csv").to_string_lossy().to_string();
+
+        let mut all: Vec<RawEvt> = logs.iter().flatten().cloned().collect();
+        resolve_audit_uids(&mut all);
+        build_dataframe(&all, outgoing.clone(), Some(&whole));
+
+        let mut spill = HostSpill::new(dir.join("_rows"));
+        let mut votes = UidVotes::default();
+        for (n, log) in logs.iter().enumerate() {
+            for r in log {
+                votes.note(r);
+            }
+            spill.add(log, n as u32).unwrap();
+        }
+        let names = votes.resolve();
+        assert_eq!(votes.changed(&names), 2, "both uids named");
+        assert_eq!(spill.rows, 13);
+        write_by_host(&spill, &names, outgoing, Some(&by_host));
+
+        let a = fs::read_to_string(&whole).unwrap();
+        let b = fs::read_to_string(&by_host).unwrap();
+        assert_eq!(a, b);
+        // and the reduction did its work
+        assert_eq!(a.lines().count(), 1 + 13 - 2 + 1, "{}", a);
+        assert_eq!(a.matches("uid:15001").count(), 0, "{}", a);
+        assert!(a.lines().nth(1).unwrap().contains(",web01,") && a.lines().nth(1).unwrap().contains("alice"), "{}", a);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
