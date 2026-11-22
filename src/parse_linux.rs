@@ -2613,6 +2613,23 @@ fn is_tar_archive(lower: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar")
 }
 
+/// What the Linux pass reads, in order: an archive (unpacked into `dir`,
+/// read, then deleted) or a log lying loose.
+enum LinuxUnit {
+    Archive { path: PathBuf, display: String, zip: bool, dir: PathBuf },
+    Log(PathBuf),
+}
+
+impl LinuxUnit {
+    /// The path its logs sort by: an archive's are all under its folder.
+    fn key(&self) -> &PathBuf {
+        match self {
+            LinuxUnit::Archive { dir, .. } => dir,
+            LinuxUnit::Log(p) => p,
+        }
+    }
+}
+
 /// One tar archive (outer or nested) met while walking an archive tree.
 /// `display_path` is what the analyst sees as the source
 /// (`outer.tar.gz -> inner/uac-host-linux-2026.tar.gz` for nested ones);
@@ -2635,6 +2652,17 @@ pub(crate) struct TarExtract {
 /// Every entry name is recorded so the caller can run triage detection on
 /// the listing exactly as it does for zips.
 fn extract_tar_recursive(tar_path: &Path, dest_base: &Path, display_path: &str, out: &mut Vec<TarExtract>) {
+    extract_tar_into(tar_path, dest_base, None, display_path, out)
+}
+
+/// The folder a tar archive is unpacked into is named after it: this stem.
+fn tar_stem(archive_name: &str) -> String {
+    crate::parse::archive_stem(archive_name).unwrap_or_else(|| "extracted".to_string())
+}
+
+/// [`extract_tar_recursive`] into `into` when given (the folder the run
+/// chose for it beforehand), a fresh folder under `dest_base` otherwise.
+fn extract_tar_into(tar_path: &Path, dest_base: &Path, into: Option<&Path>, display_path: &str, out: &mut Vec<TarExtract>) {
     let archive_name = tar_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -2657,8 +2685,13 @@ fn extract_tar_recursive(tar_path: &Path, dest_base: &Path, display_path: &str, 
     };
     let mut archive = tar::Archive::new(reader);
 
-    let stem = crate::parse::archive_stem(&archive_name).unwrap_or_else(|| "extracted".to_string());
-    let extract_dir = fresh_extract_dir(dest_base, &stem);
+    let extract_dir = match into {
+        Some(d) => {
+            let _ = fs::create_dir_all(d);
+            d.to_path_buf()
+        }
+        None => fresh_extract_dir(dest_base, &tar_stem(&archive_name)),
+    };
 
     let mut entries: Vec<String> = Vec::new();
     let mut matched: usize = 0;
@@ -2815,6 +2848,11 @@ fn fresh_extract_dir(base: &Path, stem: &str) -> PathBuf {
 /// Recursively extract ZIPs (including password-protected with common forensic passwords)
 /// and return paths to extracted directories
 fn extract_zips_recursive(zip_path: &Path, dest_base: &Path, tar_out: &mut Vec<TarExtract>) -> Vec<PathBuf> {
+    extract_zips_into(zip_path, dest_base, None, tar_out)
+}
+
+/// [`extract_zips_recursive`] into `into` when given.
+fn extract_zips_into(zip_path: &Path, dest_base: &Path, into: Option<&Path>, tar_out: &mut Vec<TarExtract>) -> Vec<PathBuf> {
     let mut extracted_dirs: Vec<PathBuf> = Vec::new();
     let passwords: &[&[u8]] = &[b"", b"cyberdefenders.org", b"infected", b"malware", b"password"];
 
@@ -2837,7 +2875,13 @@ fn extract_zips_recursive(zip_path: &Path, dest_base: &Path, tar_out: &mut Vec<T
     };
 
     let zip_name = zip_path.file_stem().and_then(|s| s.to_str()).unwrap_or("extracted");
-    let extract_dir = fresh_extract_dir(dest_base, zip_name);
+    let extract_dir = match into {
+        Some(d) => {
+            let _ = fs::create_dir_all(d);
+            d.to_path_buf()
+        }
+        None => fresh_extract_dir(dest_base, zip_name),
+    };
 
     // Try each password — test with the first actual file (not directory)
     let entry_count = archive.len();
@@ -2991,6 +3035,7 @@ fn register_zip_extract(
     p: &Path,
     lower: &str,
     temp_dir: &Path,
+    into: Option<&Path>,
     archives_scanned: &mut usize,
     triage_dirs: &mut Vec<(PathBuf, crate::parse::TriageInfo)>,
     triages: &mut Vec<crate::parse::TriageInfo>,
@@ -3012,7 +3057,7 @@ fn register_zip_extract(
         .and_then(|entries| crate::parse::detect_triage_type(&zip_path_str, &entries));
 
     let mut tar_out: Vec<TarExtract> = Vec::new();
-    let extracted = extract_zips_recursive(p, temp_dir, &mut tar_out);
+    let extracted = extract_zips_into(p, temp_dir, into, &mut tar_out);
 
     // extract_zips_recursive lists nested-zip dirs first and
     // the outer zip's own dir LAST; that last one is the root
@@ -3117,7 +3162,6 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // Phase 1: Search for artifacts (with ZIP support)
     if !quiet { crate::banner::print_search_start(); }
 
-    let mut targets: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     let mut archives_scanned: usize = 0;
 
     // Create temp dir for ZIP extraction
@@ -3125,9 +3169,6 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // deleted the other's files
     let temp_dir = std::env::temp_dir().join(format!("masstin_linux_extract_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
-
-    // Collect additional dirs from ZIP extraction
-    let mut all_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
 
     // Triage tracking: maps each extraction directory to the TriageInfo of
     // the source ZIP, so the per-source breakdown can label artifacts as
@@ -3140,109 +3181,95 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // instead of a masstin temp path that is gone once the run finishes.
     let mut archive_dirs: Vec<(PathBuf, String)> = Vec::new();
 
-    // First pass: find archives (zip / tar / tar.gz / tgz), detect triage,
-    // extract them. Tar archives are what Unix collectors such as UAC
-    // produce; they are streamed selectively (see extract_tar_recursive)
-    // and may nest (UAC wrapped in a zip, tar.gz wrapped in a tar.gz).
+    // The archives (zip / tar / tar.gz / tgz) and the loose logs, found
+    // first; nothing is unpacked yet. Tar archives are what Unix collectors
+    // such as UAC produce; they are streamed selectively (see
+    // extract_tar_recursive) and may nest (UAC wrapped in a zip, tar.gz
+    // wrapped in a tar.gz). Each archive is then unpacked, its logs read
+    // and its folder deleted before the next one: unpacking every package
+    // first held all of them on the temporary disk at once (19 GB for a
+    // few dozen UAC packages, on the system drive). The folder each one
+    // goes to is chosen here, as unpacking them all in this order named
+    // them, and archives and loose logs are read in the order of those
+    // paths: the logs are read in the order they always were.
+    let mut units: Vec<LinuxUnit> = Vec::new();
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut claim = |stem: &str| -> PathBuf {
+        let mut name = stem.to_string();
+        let mut n = 2;
+        while claimed.contains(&name) || temp_dir.join(&name).exists() {
+            name = format!("{}-{}", stem, n);
+            n += 1;
+        }
+        claimed.insert(name.clone());
+        temp_dir.join(name)
+    };
+    let mut archive_unit = |p: &Path, display: String, units: &mut Vec<LinuxUnit>| {
+        let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if lower.ends_with(".zip") {
+            // (a zip that does not open is passed over, as the extraction did)
+            if File::open(p).ok().and_then(|f| ZipArchive::new(f).ok()).is_none() {
+                return;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("extracted").to_string();
+            units.push(LinuxUnit::Archive { path: p.to_path_buf(), display, zip: true, dir: claim(&stem) });
+        } else if is_tar_archive(&lower) {
+            if File::open(p).is_err() {
+                return;
+            }
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("archive").to_string();
+            units.push(LinuxUnit::Archive { path: p.to_path_buf(), display, zip: false, dir: claim(&tar_stem(&name)) });
+        }
+    };
     for root in dirs {
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let p = entry.into_path();
             if !p.is_file() { continue; }
             let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-            if lower.ends_with(".zip") {
-                register_zip_extract(&p, &lower, &temp_dir, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut all_dirs, &mut archive_dirs);
-            } else if is_tar_archive(&lower) {
-                if is_debug_mode() {
+            if lower.ends_with(".zip") || is_tar_archive(&lower) {
+                if is_debug_mode() && !lower.ends_with(".zip") {
                     println!("[DEBUG] TAR detected: {}", p.display());
                 }
-                let mut tar_out: Vec<TarExtract> = Vec::new();
-                extract_tar_recursive(&p, &temp_dir, &p.to_string_lossy(), &mut tar_out);
-                register_tar_extracts(
-                    tar_out, &mut archives_scanned, &mut triage_dirs,
-                    &mut triages, &mut all_dirs, &mut archive_dirs,
-                );
+                let display = p.to_string_lossy().to_string();
+                archive_unit(&p, display, &mut units);
             }
         }
     }
-    // Tarballs named one by one (parse-massive's loose Linux evidence). Each
-    // is read whole before the first log is parsed: a bar says which one,
-    // of how many, or a folder of packages is minutes of nothing to see.
-    let pb_archives = if archives.len() > 1 { Some(crate::banner::create_progress_bar(archives.len() as u64)) } else { None };
     for a in archives {
         let p = Path::new(a);
-        let lower = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        if let Some(pb) = &pb_archives {
-            pb.set_message(format!("Reading {}", p.file_name().and_then(|s| s.to_str()).unwrap_or(a)));
-        }
-        if p.is_file() && lower.ends_with(".zip") {
-            register_zip_extract(p, &lower, &temp_dir, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut all_dirs, &mut archive_dirs);
-        } else if p.is_file() && is_tar_archive(&lower) {
-            let mut tar_out: Vec<TarExtract> = Vec::new();
-            extract_tar_recursive(p, &temp_dir, a, &mut tar_out);
-            register_tar_extracts(
-                tar_out, &mut archives_scanned, &mut triage_dirs,
-                &mut triages, &mut all_dirs, &mut archive_dirs,
-            );
-        }
-        // counted once read: 3/12 is three packages done
-        if let Some(pb) = &pb_archives {
-            pb.inc(1);
+        if p.is_file() {
+            archive_unit(p, a.clone(), &mut units);
         }
     }
-    if let Some(pb) = pb_archives {
-        pb.finish_and_clear();
-    }
-    // Nested triages live INSIDE their wrapper's extract dir: match the
-    // most specific (longest) dir first when labelling sources.
-    triage_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
-
-    // Print triage detections right after the discovery walk, before the
-    // overall count summary. Same formatting helper as parse-windows — we
-    // pass the full zip path so the analyst can tell two physically
-    // distinct copies of the same host's triage apart.
-    if !quiet {
-        for t in &triages {
-            crate::banner::print_triage_found(
-                t.kind.label(),
-                t.hostname.as_deref(),
-                &t.zip_path,
-                t.artifact_count,
-            );
-        }
-    }
-    if is_debug_mode() {
-        println!("[DEBUG] {} archive(s) opened during discovery", archives_scanned);
-    }
-
-    // Second pass: find Linux artifacts in all dirs (original + extracted)
-    for root in &all_dirs {
+    let archive_count = units.len();
+    // the loose logs: given one by one, or lying in the folders given
+    let mut loose: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    for root in dirs {
         for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let p = entry.into_path();
             if !p.is_file() { continue; }
             let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if is_linux_artifact(fname) && !is_config_not_log(&p) {
-                targets.push(p);
+                loose.push(p);
             }
         }
     }
+    loose.sort();
+    loose.dedup();
+    let loose_count = loose.len();
+    units.extend(loose.into_iter().map(LinuxUnit::Log));
+    units.sort_by(|a, b| a.key().cmp(b.key()));
 
-    if targets.is_empty() {
+    if archive_count == 0 && loose_count == 0 {
         eprintln!("[WARN] no candidate logs found");
-        // Cleanup temp dir
         let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
-    targets.sort();
-    targets.dedup();
-
     if !quiet {
-        // Artifacts that came out of an archive live under our temp dir.
-        let inside_archives = targets.iter().filter(|p| p.starts_with(&temp_dir)).count();
-        crate::banner::print_search_results_labeled(targets.len(), inside_archives, dirs.len(), files.len(), "Linux log artifacts");
-    }
-
-    if is_debug_mode() {
-        println!("[DEBUG] {} candidate files", targets.len());
+        crate::banner::print_info(&format!(
+            "{} archive(s) to open one at a time (each unpacked, read and deleted before the next), {} log file(s) outside archives",
+            archive_count, loose_count
+        ));
     }
 
     // 2) hostname cache
@@ -3254,17 +3281,13 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
     // Phase 2: Process artifacts
     if !quiet { crate::banner::print_processing_start(); }
-    let pb = crate::banner::create_progress_bar(targets.len() as u64);
+    let pb = crate::banner::create_progress_bar(units.len() as u64);
 
     // the rows go to disk, a file per host, as each log is read; what the
     // uids resolve to is gathered on the way (see HostSpill)
-    let mut spill = HostSpill::new(temp_dir.join("_rows"));
+    let mut spill = HostSpill::new(temp_dir.join("_masstin_rows"));
     let mut uid_votes = UidVotes::default();
-    archive_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
-    let prefixes: Vec<(String, String)> = archive_dirs
-        .iter()
-        .map(|(d, n)| (d.to_string_lossy().replace('\\', "/"), n.clone()))
-        .collect();
+    let mut prefixes: Vec<(String, String)> = Vec::new();
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
     // (source_label, artifact_short_name, vss_index, count) — same structure
@@ -3272,8 +3295,61 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // Linux logs never come from VSS snapshots, so vss_index is always None.
     let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
     let mut year_cache: HashMap<PathBuf, i32> = HashMap::new();
+    let mut log_no: usize = 0;
+    let mut logs_found: usize = 0;
+    let mut logs_in_archives: usize = 0;
 
-    for (log_no, path) in targets.iter().enumerate() {
+    for unit in &units {
+    let unit_logs: Vec<PathBuf> = match unit {
+        LinuxUnit::Log(p) => vec![p.clone()],
+        LinuxUnit::Archive { path, display, zip, dir } => {
+            pb.set_message(format!("Reading {}", path.file_name().and_then(|s| s.to_str()).unwrap_or(display)));
+            let mut unit_dirs: Vec<PathBuf> = Vec::new();
+            let before = triages.len();
+            if *zip {
+                let lower = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                if is_debug_mode() {
+                    println!("[DEBUG] ZIP detected: {}", path.display());
+                }
+                register_zip_extract(path, &lower, &temp_dir, Some(dir.as_path()), &mut archives_scanned, &mut triage_dirs, &mut triages, &mut unit_dirs, &mut archive_dirs);
+            } else {
+                let mut tar_out: Vec<TarExtract> = Vec::new();
+                extract_tar_into(path, &temp_dir, Some(dir.as_path()), display, &mut tar_out);
+                register_tar_extracts(tar_out, &mut archives_scanned, &mut triage_dirs, &mut triages, &mut unit_dirs, &mut archive_dirs);
+            }
+            // Nested triages live INSIDE their wrapper's extract dir: match the
+            // most specific (longest) dir first when labelling sources.
+            triage_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+            archive_dirs.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+            prefixes = archive_dirs.iter().map(|(d, n)| (d.to_string_lossy().replace('\\', "/"), n.clone())).collect();
+            // the triages found in it, as they are (the full archive path, so
+            // two copies of the same host's triage can be told apart)
+            if !quiet {
+                for t in &triages[before..] {
+                    pb.suspend(|| crate::banner::print_triage_found(t.kind.label(), t.hostname.as_deref(), &t.zip_path, t.artifact_count));
+                }
+            }
+            let mut logs: Vec<PathBuf> = Vec::new();
+            for root in &unit_dirs {
+                for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                    let p = entry.into_path();
+                    if !p.is_file() { continue; }
+                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if is_linux_artifact(fname) && !is_config_not_log(&p) {
+                        logs.push(p);
+                    }
+                }
+            }
+            logs.sort();
+            logs.dedup();
+            logs_in_archives += logs.len();
+            logs
+        }
+    };
+    logs_found += unit_logs.len();
+    for path in &unit_logs {
+        let log_no_now = log_no;
+        log_no += 1;
         let path_str = path.to_string_lossy().to_string();
 
         // Find the root dir the hostname heuristics should scan. UAC lays
@@ -3462,7 +3538,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
         for evt in &parsed {
             uid_votes.note(evt);
         }
-        if let Err(e) = spill.add(&parsed, log_no as u32) {
+        if let Err(e) = spill.add(&parsed, log_no_now as u32) {
             crate::banner::print_warning(&format!(
                 "Could not write the rows of {} to the temporary folder ({}): is the disk full? They are missing from the timeline.",
                 path_str, e
@@ -3477,10 +3553,26 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             );
         }
 
-        pb.inc(1);
+    }
+    // the archive's folder is deleted before the next one is unpacked
+    if let LinuxUnit::Archive { dir, .. } = unit {
+        let _ = fs::remove_dir_all(dir);
+    }
+    pb.inc(1);
     }
 
     pb.finish_and_clear();
+    if logs_found == 0 {
+        eprintln!("[WARN] no candidate logs found");
+        let _ = fs::remove_dir_all(&temp_dir);
+        return;
+    }
+    if !quiet {
+        crate::banner::print_search_results_labeled(logs_found, logs_in_archives, dirs.len(), files.len(), "Linux log artifacts");
+    }
+    if is_debug_mode() {
+        println!("[DEBUG] {} archive(s) opened, {} candidate files", archives_scanned, logs_found);
+    }
     crate::banner::print_artifact_detail_grouped(&artifact_details);
 
     if is_debug_mode() {
