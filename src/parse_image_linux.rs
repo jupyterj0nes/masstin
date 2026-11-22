@@ -617,10 +617,11 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
 ) -> usize {
     let mut total = 0;
 
-    let mut lvm_reader = OffsetReaderLinux::new(reader, lvm_offset);
+    // the physical volume, as a view of the image's reader (see PtrView)
+    let pv = PtrView { reader: reader as *mut R, offset: lvm_offset, pos: 0 };
 
-    let lvm = match lvm2::Lvm2::open(&mut lvm_reader) {
-        Ok(l) => l,
+    let lvm = match lvm2::Lvm2::open(pv.clone()) {
+        Ok(l) => Arc::new(l),
         Err(e) => {
             if is_debug_mode() {
                 eprintln!("[DEBUG] LVM at offset {:#x}: {:?}", lvm_offset, e);
@@ -635,74 +636,37 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
     for lv_name in &lv_names {
         crate::banner::print_info(&format!("  LV '{}' found in LVM partition {}", lv_name, lvm_index));
 
-        // Find this LV again and dump to temp file
         let lv = match lvm.lvs().find(|l| l.name() == lv_name.as_str()) {
             Some(l) => l,
             None => continue,
         };
-
-        let mut olv = lvm.open_lv(lv, &mut lvm_reader);
+        let lv_size = lv.size_in_extents() * lvm.extent_size();
 
         // ext4 or XFS?
-        let kind = match sniff_linux_fs(&mut olv, 0) {
-            Some(k) => k,
-            None => {
-                crate::banner::print_info("    Not ext4 or XFS (swap or a data volume?), skipping");
-                continue;
+        let kind = {
+            let mut olv = lvm.open_lv(lv, pv.clone());
+            match sniff_linux_fs(&mut olv, 0) {
+                Some(k) => k,
+                None => {
+                    crate::banner::print_info("    Not ext4 or XFS (swap or a data volume?), skipping");
+                    continue;
+                }
             }
         };
 
         crate::banner::print_info(&format!("    {} confirmed — extracting logs...", kind.label()));
 
-        // Dump LV to temp file so we can pass it to the volume reader
-        // A name of its own: the process, the image's folder and a count.
-        // Two images read at once (or two runs) used to dump their volumes
-        // to the same file whenever index and name matched (`lv_root` of
-        // partition 2 is on almost every disk).
-        static DUMPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let tmp_path = std::env::temp_dir().join(format!(
-            "masstin_lvm_{}_{}_{}_{}.raw",
-            std::process::id(),
-            DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            lvm_index,
-            crate::parse_image_windows::one_component(lv_name)
-        ));
-        let mut cut: Option<std::io::Error> = None;
-        {
-            if olv.seek(SeekFrom::Start(0)).is_err() { continue; }
-            let mut tmp_file = match crate::space::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
-            // on the heap: a 1 MiB array on the stack overflowed the main thread on Windows
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                match olv.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Err(e) = tmp_file.write_all(&buf[..n]) {
-                            cut = Some(e);
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        if let Some(e) = cut {
-            // a volume cut short is not read as if it were whole
-            crate::banner::print_warning(&format!(
-                "    LV '{}': its copy could not be written ({}): is the temporary disk full? The volume is skipped and its logs are missing from the timeline.",
-                lv_name, e
-            ));
-            crate::mark_failed();
-            let _ = fs::remove_file(&tmp_path);
-            continue;
-        }
+        // The volume is read where it is: each read of the volume goes to
+        // the place of the image its extents map it to. (It used to be
+        // copied whole to a temporary file first: a 600 GB volume was 600
+        // GB written to read a few logs.) What is read is what the file
+        // system reader asks for, through its own small cache.
+        let mut device = LvDevice { lvm: Arc::clone(&lvm), name: lv_name.clone(), pv: pv.clone(), pos: 0, size: lv_size };
 
-        // Now process the temp file as a regular ext4 partition
         let partition_dir = output_dir.join(format!("lvm_{}_lv_{}", lvm_index, lv_name));
         let _ = fs::create_dir_all(&partition_dir);
 
-        let mut tmp_file = match File::open(&tmp_path) { Ok(f) => f, Err(_) => continue };
-        match extract_logs_from_linux_partition(&mut tmp_file, 0, kind, &partition_dir) {
+        match extract_logs_from_linux_partition(&mut device, 0, kind, &partition_dir) {
             Ok(count) if count > 0 => {
                 total += count;
                 crate::banner::print_info(&format!("    {} log files extracted from LV '{}'", count, lv_name));
@@ -711,20 +675,101 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
                 crate::banner::print_info(&format!("    No log files found in LV '{}'", lv_name));
             }
             Err(e) => {
-                if is_debug_mode() {
-                    eprintln!("[DEBUG] LV '{}' {} error: {}", lv_name, kind.label(), e);
-                }
+                // a layout read in place cannot follow (striped, mirrored,
+                // thin) is said, not passed over
+                crate::banner::print_warning(&format!("    LV '{}' could not be read ({}): its logs are missing from the timeline", lv_name, e));
             }
         }
-
-        // Cleanup temp file
-        let _ = fs::remove_file(&tmp_path);
     }
 
     total
 }
 
+/// A view of the image's reader from `offset` on, with a position of its
+/// own, that can be cloned: what the LVM reader wants (it owns its reader,
+/// once for the metadata and once for every read of a volume). The same
+/// raw-pointer bridge as `UnsafeReaderWrapper`: every view is made and
+/// dropped inside `extract_logs_from_lvm`, while the reader it points to is
+/// borrowed there and used by nothing else.
+struct PtrView<R: Read + Seek> {
+    reader: *mut R,
+    offset: u64,
+    pos: u64,
+}
+
+impl<R: Read + Seek> Clone for PtrView<R> {
+    fn clone(&self) -> Self {
+        PtrView { reader: self.reader, offset: self.offset, pos: self.pos }
+    }
+}
+
+// Safety: as above; one thread at a time reads through it.
+unsafe impl<R: Read + Seek> Send for PtrView<R> {}
+unsafe impl<R: Read + Seek> Sync for PtrView<R> {}
+
+impl<R: Read + Seek> Read for PtrView<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = unsafe { &mut *self.reader };
+        r.seek(SeekFrom::Start(self.offset + self.pos))?;
+        let n = r.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for PtrView<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| std::io::Error::other("seek before start"))?,
+            SeekFrom::End(d) => {
+                let end = unsafe { &mut *self.reader }.seek(SeekFrom::End(0))?;
+                end.saturating_sub(self.offset).checked_add_signed(d).ok_or_else(|| std::io::Error::other("seek before start"))?
+            }
+        };
+        Ok(self.pos)
+    }
+}
+
+/// A logical volume read where it lies: a reader whose every read is
+/// mapped through the volume's extents (the `lvm2` crate, no I/O for the
+/// map) to the physical volume. Linear volumes; a striped, mirrored or
+/// thin one fails at its first read and is reported.
+struct LvDevice<R: Read + Seek> {
+    lvm: Arc<lvm2::Lvm2>,
+    name: String,
+    pv: PtrView<R>,
+    pos: u64,
+    size: u64,
+}
+
+impl<R: Read + Seek> Read for LvDevice<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = buf.len().min((self.size - self.pos) as usize);
+        let mut lv = self.lvm.open_lv_by_name(&self.name, self.pv.clone()).ok_or_else(|| std::io::Error::other(format!("LV {} vanished", self.name)))?;
+        lv.seek(SeekFrom::Start(self.pos)).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let n = lv.read(&mut buf[..want]).map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for LvDevice<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| std::io::Error::other("seek before start"))?,
+            SeekFrom::End(d) => self.size.checked_add_signed(d).ok_or_else(|| std::io::Error::other("seek before start"))?,
+        };
+        Ok(self.pos)
+    }
+}
+
 /// Simple offset reader for LVM partition access
+#[allow(dead_code)]
 struct OffsetReaderLinux<'a, R: Read + Seek> {
     inner: &'a mut R,
     offset: u64,
