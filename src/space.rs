@@ -344,6 +344,15 @@ fn same_volume(a: &Path, b: &Path) -> bool {
     cfg!(windows) && volume_key(a) == volume_key(b)
 }
 
+/// `MASSTIN_TIMING=1`: how long each stage of a parse took, on stderr
+/// (`[timing] what: 12.3 s`), for measuring a run on a slow machine.
+pub fn timing(what: &str, since: Instant) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("MASSTIN_TIMING").is_some()) {
+        eprintln!("[timing] {}: {:.2} s", what, since.elapsed().as_secs_f64());
+    }
+}
+
 /// `18.2 GB`, `640 MB`, `12 KB`.
 pub fn human(b: u64) -> String {
     if b < 1 << 20 {

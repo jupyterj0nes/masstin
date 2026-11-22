@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **`MASSTIN_TIMING=1`** prints how long each stage of a parse took (each batch of images extracted, its EVTX read and deleted, the UAL, the reduction and the merge). Measured with it on a two-core cloud VM over remote desktop, with twelve disk images, five triages and three Linux packages: the same time as 1.4.11 (173 to 175 s, three rounds each, alternated; a first run of either is faster while the VM's CPU burst lasts), the same timeline, the temporary disk at 0.2 GB instead of 1.1 GB and half the memory.
+
 ## v1.4.12 — 2026-11-22
 
 - **The window shows a parse that waits for room, and nothing a stopped run unpacked is left behind.** While a parse started from the window waits for room on its temporary disk, the progress says so in an amber box above the phases (until there is room again, or the files that find none are left out); the temporary folder and its room are a note of the run. *Stop* kills the parse and now deletes what it had unpacked, and every parse deletes, as it starts, the temporary folders of runs that no longer exist (killed, or cut short by a machine switched off), an hour old at least, saying how much it freed. A failed write of rows to the temporary folder is said once, the rest named at the end with the other files left out.

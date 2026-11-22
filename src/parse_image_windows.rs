@@ -480,7 +480,9 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     let mut outcomes: Vec<ImageOutcome> = Vec::new();
     for (b, chunk) in all_image_files.chunks(batch).enumerate() {
         let before = extracted_dirs.len();
+        let t_extract = std::time::Instant::now();
         let got = extract_images(chunk, b * batch, total_images, &base_temp, medium);
+        crate::space::timing(&format!("batch {} extract", b), t_extract);
         for out in got {
             if let Ok(artifacts) = &out.result {
                 if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
@@ -497,10 +499,14 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
                     let _ = names_of(&a.evtx_dir);
                 }
             }
+            let t_read = std::time::Instant::now();
             win_pass.get_or_insert_with(crate::parse::WinPass::new).read(&[], &new_dirs);
+            crate::space::timing(&format!("batch {} read", b), t_read);
+            let t_del = std::time::Instant::now();
             for d in &new_dirs {
                 delete_evtx_under(Path::new(d));
             }
+            crate::space::timing(&format!("batch {} delete", b), t_del);
         }
     }
 

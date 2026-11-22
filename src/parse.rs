@@ -3457,6 +3457,8 @@ impl WinPass {
         if first {
             crate::banner::print_processing_start();
         }
+        crate::space::timing("read: search", self.start_time);
+        let t_parse = std::time::Instant::now();
         let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
         let base = self.next_file;
         self.next_file += vec_filenames.len() as u32;
@@ -3503,6 +3505,7 @@ impl WinPass {
         });
         self.skipped_no_events += skipped;
         self.parsed_files += parsed;
+        crate::space::timing("read: parse + rows to disk", t_parse);
 
         pb.finish_and_clear();
     }
@@ -3526,6 +3529,7 @@ impl WinPass {
             crate::banner::print_search_result_line(extra_task_events.len(), "remote Scheduled Task events");
         }
 
+        let t_ual = std::time::Instant::now();
         // Parse UAL databases (detected earlier during artifact search)
         let all_ual_files = ual_files_in(files, directories);
         if !all_ual_files.is_empty() {
@@ -3548,6 +3552,7 @@ impl WinPass {
             }
         }
 
+        crate::space::timing("finish: UAL", t_ual);
         crate::banner::print_artifact_detail_grouped(&self.artifact_details);
 
         if is_debug_mode() {
@@ -3574,7 +3579,9 @@ impl WinPass {
         // (counted where they are dropped: the difference between what went in
         // and what was written also holds the rows --ignore-local and the
         // --exclude lists left out, and those were reported as duplicates)
+        let t_write = std::time::Instant::now();
         let (total_after_dedup, deduped) = write_rows_by_computer(&self.spill, output);
+        crate::space::timing("finish: reduce + merge + write", t_write);
         let _ = std::fs::remove_dir_all(&self.spill_dir);
         if deduped > 0 {
             crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
