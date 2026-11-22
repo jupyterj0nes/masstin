@@ -2511,10 +2511,19 @@ fn time_sort_key(raw: &str) -> Option<chrono::NaiveDateTime> {
 /// masstin row needs one: it is not written. Returns the rows, how many
 /// logoffs were given an origin and how many were dropped.
 pub(crate) fn pair_logoffs(rows: Vec<LogData>) -> (Vec<LogData>, usize, usize) {
+    let mut rows = rows;
+    let (keep, filled, dropped) = pair_logoffs_in_place(&mut rows);
+    let out = rows.into_iter().zip(keep).filter_map(|(r, k)| k.then_some(r)).collect();
+    (out, filled, dropped)
+}
+
+/// [`pair_logoffs`] on the rows where they are: the logoffs given their
+/// logon's origin in place, and which rows are kept.
+fn pair_logoffs_in_place(rows: &mut [LogData]) -> (Vec<bool>, usize, usize) {
     let blank = |v: &str| { let t = v.trim(); t.is_empty() || t == "-" };
     let key = |r: &LogData| (r.computer.to_ascii_lowercase(), r.logon_id.to_ascii_lowercase());
     let mut logons: HashMap<(String, String), Vec<(Option<chrono::NaiveDateTime>, String, String, String)>> = HashMap::new();
-    for r in &rows {
+    for r in rows.iter() {
         if r.event_id == "4624" && !blank(&r.logon_id) {
             logons.entry(key(r)).or_default().push((
                 time_sort_key(&r.time_created),
@@ -2528,11 +2537,10 @@ pub(crate) fn pair_logoffs(rows: Vec<LogData>) -> (Vec<LogData>, usize, usize) {
         v.sort_by(|a, b| a.0.cmp(&b.0));
     }
     let (mut filled, mut dropped) = (0usize, 0usize);
-    let mut out = Vec::with_capacity(rows.len());
-    for mut r in rows {
+    let mut keep = vec![true; rows.len()];
+    for (i, r) in rows.iter_mut().enumerate() {
         let is_logoff = r.event_id == "4634" || r.event_id == "4647";
         if !is_logoff || !blank(&r.workstation_name) || !blank(&r.ip_address) {
-            out.push(r);
             continue;
         }
         let t = time_sort_key(&r.time_created);
@@ -2551,12 +2559,14 @@ pub(crate) fn pair_logoffs(rows: Vec<LogData>) -> (Vec<LogData>, usize, usize) {
                     r.logon_type = lt.clone();
                 }
                 filled += 1;
-                out.push(r);
             }
-            None => dropped += 1,
+            None => {
+                dropped += 1;
+                keep[i] = false;
+            }
         }
     }
-    (out, filled, dropped)
+    (keep, filled, dropped)
 }
 
 /// The summary line for `pair_logoffs`.
@@ -2571,6 +2581,7 @@ pub(crate) fn report_logoff_pairing(filled: usize, dropped: usize) {
 
 /// Returns (rows written, events left out because the same event had
 /// already been taken).
+#[allow(dead_code)]
 fn write_rows(mut log_data: Vec<LogData>, output: Option<&String>) -> (usize, usize) {
     // a file taken out of an image names the image, not the temp folder it
     // sat in; live before shadow copies still holds (`live` is shorter)
@@ -3171,31 +3182,39 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
 /// pool, and a wave holds no more bytes of EVTX than the memory budget
 /// allows (a file bigger than the budget is a wave of its own), so a laptop
 /// is never asked for more than it has. No task ever waits inside the pool.
+#[allow(dead_code)]
 fn parse_files(files: &[EvtxLocation], pb: &indicatif::ProgressBar) -> Vec<Vec<LogData>> {
+    let mut out: Vec<Vec<LogData>> = Vec::with_capacity(files.len());
+    parse_files_each(files, pb, |_, rows| out.push(rows));
+    out
+}
+
+/// [`parse_files`], each file's rows handed to `each` (with the file's
+/// place) in the files' order as soon as the wave that read it is done:
+/// the rows of a wave are all that is held at once.
+fn parse_files_each(files: &[EvtxLocation], pb: &indicatif::ProgressBar, mut each: impl FnMut(usize, Vec<LogData>)) {
     let workers = crate::threads::workers();
     let progress_name = |f: &EvtxLocation| match f {
         EvtxLocation::File(path) => path.clone(),
         EvtxLocation::ZipEntry { evtx_name, .. } => evtx_name.clone(),
     };
     if workers <= 1 || files.len() <= 1 {
-        return files
-            .iter()
-            .map(|f| {
-                crate::banner::progress_set_message(pb, &progress_name(f));
-                let rows = parselog(f.clone());
-                pb.inc(1);
-                rows
-            })
-            .collect();
+        for (i, f) in files.iter().enumerate() {
+            crate::banner::progress_set_message(pb, &progress_name(f));
+            let rows = parselog(f.clone());
+            pb.inc(1);
+            each(i, rows);
+        }
+        return;
     }
     let budget = crate::threads::file_budget();
     let sizes: Vec<u64> = files.iter().map(file_bytes).collect();
-    let mut out: Vec<Vec<LogData>> = Vec::with_capacity(files.len());
     // each wave as wide as the machine is idle when it starts
     let mut start = 0usize;
     while start < files.len() {
         let width = crate::threads::available_now() * 2;
         let wave = plan_waves(&sizes[start..], budget, width).into_iter().next().map(|w| start + w.start..start + w.end).unwrap_or(start..files.len());
+        let first = wave.start;
         start = wave.end;
         if let Some(f) = files[wave.clone()].last() {
             crate::banner::progress_set_message(pb, &progress_name(f));
@@ -3208,9 +3227,10 @@ fn parse_files(files: &[EvtxLocation], pb: &indicatif::ProgressBar) -> Vec<Vec<L
                 rows
             })
             .collect();
-        out.extend(rows);
+        for (k, r) in rows.into_iter().enumerate() {
+            each(first + k, r);
+        }
     }
-    out
 }
 
 /// The waves `parse_files` takes: files in order, a wave closed when the
@@ -3308,8 +3328,10 @@ pub fn parse_events_ex(
         println!("[INFO] Starting event processing...");
     }
 
-    let mut log_data: Vec<LogData> = vec![];
     let mut vec_filenames: Vec<EvtxLocation> = vec![];
+    // the rows go to disk, a file per computer, as each file is read (see WinSpill)
+    let spill_dir = crate::space::temp_root().join(format!("masstin_rows_{}_{}", std::process::id(), SPILL_RUN.fetch_add(1, Ordering::SeqCst)));
+    let mut spill = WinSpill::new(spill_dir.clone());
 
     // Detect drive root paths and suggest parse-image-windows for VSS
     // parse-windows passes "X:\" (normalized), parse-image-windows passes "X:" (no trailing \)
@@ -3435,9 +3457,8 @@ pub fn parse_events_ex(
     // the files, read and parsed: one after another on one thread, as always;
     // on several, in waves that fit the memory budget, each wave's files
     // spread over the pool and their rows kept in the files' order
-    let parsed_per_file: Vec<Vec<LogData>> = parse_files(&vec_filenames, &pb);
-
-    for (evtxfile, parsed_logs) in vec_filenames.iter().zip(parsed_per_file) {
+    parse_files_each(&vec_filenames, &pb, |file_no, parsed_logs| {
+        let evtxfile = &vec_filenames[file_no];
         let short_name = match &evtxfile {
             EvtxLocation::File(path) => std::path::Path::new(path)
                 .file_name()
@@ -3468,8 +3489,8 @@ pub fn parse_events_ex(
                 println!("[INFO] {} events from {}", count, short_name);
             }
         }
-        log_data.extend(parsed_logs);
-    }
+        spill.add(&parsed_logs, (0, file_no as u32));
+    });
 
     pb.finish_and_clear();
 
@@ -3490,14 +3511,14 @@ pub fn parse_events_ex(
                 let vss_idx = detect_vss_index(mdb_name);
                 artifact_details.push((src, short, vss_idx, *count));
             }
-            log_data.extend(ual_events);
+            spill.add(&ual_events, (1, 0));
         }
     }
 
     crate::banner::print_artifact_detail_grouped(&artifact_details);
 
     if is_debug_mode() {
-        println!("[INFO] Parsing finished. Total events collected: {}", log_data.len());
+        println!("[INFO] Parsing finished. Total events collected: {}", spill.rows);
     }
 
     // Add both extras streams (Scheduled Tasks + MountPoints2) to the final
@@ -3505,12 +3526,12 @@ pub fn parse_events_ex(
     // and are counted as "parsed_files" so the summary line reflects them.
     let extra_task_count = extra_task_events.len();
     if extra_task_count > 0 {
-        log_data.extend_from_slice(extra_task_events);
+        spill.add(extra_task_events, (2, 0));
         parsed_files += extra_task_count;
     }
     let extra_mp_count = extra_mountpoint_events.len();
     if extra_mp_count > 0 {
-        log_data.extend_from_slice(extra_mountpoint_events);
+        spill.add(extra_mountpoint_events, (3, 0));
         parsed_files += extra_mp_count;
     }
 
@@ -3519,7 +3540,8 @@ pub fn parse_events_ex(
     // (counted where they are dropped: the difference between what went in
     // and what was written also holds the rows --ignore-local and the
     // --exclude lists left out, and those were reported as duplicates)
-    let (total_after_dedup, deduped) = write_rows(log_data, output);
+    let (total_after_dedup, deduped) = write_rows_by_computer(&spill, output);
+    let _ = std::fs::remove_dir_all(&spill_dir);
     if deduped > 0 {
         crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
     }
@@ -3848,5 +3870,369 @@ mod tests {
         assert_eq!(details, vec![r"\\*\ADMIN$\System32\cmd.exe", r"\\*\IPC$\svcctl", r"\\*\ADMIN$\System32\cmd.exe"]);
         assert_eq!(share_of_detail(r"\\*\ADMIN$\System32\cmd.exe"), r"\\*\ADMIN$");
         assert_eq!(share_of_detail(r"\\*\IPC$"), r"\\*\IPC$");
+    }
+}
+
+// ─────────────── the Windows rows on disk, one file per computer ───────────────
+//
+// Every row of every EVTX was held until the timeline was written: a case of
+// many images or triages is millions of rows of fourteen strings. The rows of
+// each file go to a file of their computer as the file is read; each computer
+// is then read back alone, its logoffs given their logon's origin, its copies
+// (live and shadow copies) dropped (every key of both carries the computer),
+// sorted and written as a run; the runs are merged into the timeline in the
+// order the whole set gave: the instant, the time's text, the length of the
+// file's name (live before shadow copies), then the order the rows were read.
+
+static SPILL_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Where a row came from: (0 an EVTX, 1 UAL, 2 scheduled tasks, 3
+/// MountPoints2; the file's place; the row's place).
+type WinOrigin = (u8, u32, u32);
+
+fn spill_str(w: &mut impl std::io::Write, s: &str) -> std::io::Result<()> {
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())
+}
+
+fn spill_u32(r: &mut impl Read) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn spill_string(r: &mut impl Read) -> std::io::Result<String> {
+    let n = spill_u32(r)? as usize;
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    Ok(String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// The rows of each computer, on disk.
+struct WinSpill {
+    dir: std::path::PathBuf,
+    files: HashMap<String, std::path::PathBuf>,
+    rows: usize,
+}
+
+impl WinSpill {
+    fn new(dir: std::path::PathBuf) -> WinSpill {
+        let _ = std::fs::create_dir_all(&dir);
+        WinSpill { dir, files: HashMap::new(), rows: 0 }
+    }
+
+    /// The rows of one source (`at`: its kind and its place), appended to
+    /// their computers' files. A write that fails is said, loudly.
+    fn add(&mut self, rows: &[LogData], at: (u8, u32)) {
+        if let Err(e) = self.try_add(rows, at) {
+            crate::banner::print_warning(&format!("Could not write rows to the temporary folder ({}): is the disk full? They are missing from the timeline.", e));
+        }
+        self.rows += rows.len();
+    }
+
+    fn try_add(&mut self, rows: &[LogData], at: (u8, u32)) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut by: Vec<(String, Vec<usize>)> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            let k = r.computer.to_ascii_lowercase();
+            match by.iter_mut().find(|(c, _)| *c == k) {
+                Some((_, v)) => v.push(i),
+                None => by.push((k, vec![i])),
+            }
+        }
+        for (computer, idx) in by {
+            let next = self.dir.join(format!("computer-{}.rows", self.files.len()));
+            let path = self.files.entry(computer).or_insert(next).clone();
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::append(&path)?);
+            for i in idx {
+                let r = &rows[i];
+                w.write_all(&[at.0])?;
+                w.write_all(&at.1.to_le_bytes())?;
+                w.write_all(&(i as u32).to_le_bytes())?;
+                for s in [
+                    &r.time_created, &r.computer, &r.event_type, &r.event_id, &r.subject_user_name, &r.subject_domain_name, &r.target_user_name,
+                    &r.target_domain_name, &r.logon_type, &r.workstation_name, &r.ip_address, &r.logon_id, &r.filename, &r.detail,
+                ] {
+                    spill_str(&mut w, s)?;
+                }
+            }
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    /// A computer's rows, in the order they were read.
+    fn read(path: &std::path::Path) -> std::io::Result<Vec<(WinOrigin, LogData)>> {
+        let mut r = std::io::BufReader::with_capacity(1 << 20, File::open(path)?);
+        let mut out = Vec::new();
+        loop {
+            let mut kind = [0u8; 1];
+            match r.read_exact(&mut kind) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let file = spill_u32(&mut r)?;
+            let row = spill_u32(&mut r)?;
+            let mut s = || spill_string(&mut r);
+            let ld = LogData {
+                time_created: s()?,
+                computer: s()?,
+                event_type: s()?,
+                event_id: s()?,
+                subject_user_name: s()?,
+                subject_domain_name: s()?,
+                target_user_name: s()?,
+                target_domain_name: s()?,
+                logon_type: s()?,
+                workstation_name: s()?,
+                ip_address: s()?,
+                logon_id: s()?,
+                filename: s()?,
+                detail: s()?,
+            };
+            out.push(((kind[0], file, row), ld));
+        }
+        out.sort_by_key(|(o, _)| *o);
+        Ok(out)
+    }
+}
+
+/// The place of a row in the timeline: (instant known, instant, time's text,
+/// length of the file's name, where it came from).
+type WinKey = (u8, i64, u32, String, u32, WinOrigin);
+
+fn win_key(r: &LogData, origin: WinOrigin, name_len: usize) -> WinKey {
+    let (known, secs, nanos) = match time_sort_key(&r.time_created) {
+        Some(t) => {
+            let u = t.and_utc();
+            (1u8, u.timestamp(), u.timestamp_subsec_nanos())
+        }
+        None => (0u8, 0, 0),
+    };
+    (known, secs, nanos, r.time_created.clone(), name_len as u32, origin)
+}
+
+fn put_win_run_row(w: &mut impl std::io::Write, k: &WinKey, line: &str) -> std::io::Result<()> {
+    w.write_all(&[k.0])?;
+    w.write_all(&k.1.to_le_bytes())?;
+    w.write_all(&k.2.to_le_bytes())?;
+    spill_str(w, &k.3)?;
+    w.write_all(&k.4.to_le_bytes())?;
+    w.write_all(&[k.5 .0])?;
+    w.write_all(&k.5 .1.to_le_bytes())?;
+    w.write_all(&k.5 .2.to_le_bytes())?;
+    spill_str(w, line)
+}
+
+fn get_win_run_row(r: &mut impl Read) -> Option<(WinKey, String)> {
+    let mut b1 = [0u8; 1];
+    r.read_exact(&mut b1).ok()?;
+    let mut b8 = [0u8; 8];
+    r.read_exact(&mut b8).ok()?;
+    let nanos = spill_u32(r).ok()?;
+    let text = spill_string(r).ok()?;
+    let len = spill_u32(r).ok()?;
+    let mut k0 = [0u8; 1];
+    r.read_exact(&mut k0).ok()?;
+    let f = spill_u32(r).ok()?;
+    let row = spill_u32(r).ok()?;
+    let line = spill_string(r).ok()?;
+    Some(((b1[0], i64::from_le_bytes(b8), nanos, text, len, (k0[0], f, row)), line))
+}
+
+/// [`write_rows`] for the rows on disk: each computer reduced and sorted
+/// alone into a run, the runs merged. What is printed and written is what
+/// `write_rows` gives for the same rows all at once. Returns (rows written,
+/// copies left out).
+fn write_rows_by_computer(spill: &WinSpill, output: Option<&String>) -> (usize, usize) {
+    let mut computers: Vec<(&String, &std::path::PathBuf)> = spill.files.iter().collect();
+    computers.sort();
+    let (mut filled, mut dropped, mut duplicates, mut written) = (0usize, 0usize, 0usize, 0usize);
+    let mut runs: Vec<std::path::PathBuf> = Vec::new();
+    for (n, (computer, path)) in computers.iter().enumerate() {
+        let rows = match WinSpill::read(path) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::banner::print_warning(&format!("Could not read back the rows of {} ({}): they are missing from the timeline", computer, e));
+                continue;
+            }
+        };
+        let (origins, mut rows): (Vec<WinOrigin>, Vec<LogData>) = rows.into_iter().unzip();
+        for r in rows.iter_mut() {
+            if r.filename.contains("masstin_image_extract") || r.filename.contains("masstin_linux_image_extract") || r.filename.contains("masstin_carve_extract") {
+                r.filename = display_source(&r.filename);
+            }
+        }
+        // the origin of each row travels with it through the pairing (which
+        // keeps the order and drops the logoffs it cannot pair)
+        let tagged: Vec<(WinOrigin, LogData)> = origins.into_iter().zip(rows).collect();
+        let (paired, f, d) = pair_logoffs_tagged(tagged);
+        filled += f;
+        dropped += d;
+        let mut sorted = paired;
+        sorted.sort_by(|a, b| a.1.filename.len().cmp(&b.1.filename.len()));
+        let mut seen = std::collections::HashSet::new();
+        let mut kept: Vec<(WinKey, String)> = Vec::new();
+        for (origin, item) in sorted {
+            if !crate::filter::should_keep_record(&item) {
+                continue;
+            }
+            let key = format!("{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                item.time_created, item.computer, item.event_id,
+                item.event_type, item.target_user_name, item.ip_address,
+                item.workstation_name, item.logon_id, item.detail);
+            if seen.insert(key) {
+                kept.push((win_key(&item, origin, item.filename.len()), crate::csv_out::row_line_of(&item)));
+            } else {
+                duplicates += 1;
+            }
+        }
+        kept.sort_by(|a, b| a.0.cmp(&b.0));
+        written += kept.len();
+        let run = spill.dir.join(format!("run-{}.rows", n));
+        let wrote = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&run)?);
+            for (k, line) in &kept {
+                put_win_run_row(&mut w, k, line)?;
+            }
+            w.flush()
+        })();
+        match wrote {
+            Ok(()) => runs.push(run),
+            Err(e) => crate::banner::print_warning(&format!("Could not write the rows of {} ({}): is the temporary disk full? They are missing from the timeline", computer, e)),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    report_logoff_pairing(filled, dropped);
+    let mut readers: Vec<std::io::BufReader<File>> = runs.iter().filter_map(|p| File::open(p).ok().map(|f| std::io::BufReader::with_capacity(1 << 16, f))).collect();
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(WinKey, usize, String)>> = std::collections::BinaryHeap::new();
+    for (k, r) in readers.iter_mut().enumerate() {
+        if let Some((key, line)) = get_win_run_row(r) {
+            heap.push(std::cmp::Reverse((key, k, line)));
+        }
+    }
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut sink: Box<dyn std::io::Write> = match output {
+            Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, File::create(p)?)),
+            None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+        };
+        sink.write_all(crate::csv_out::HEADER.as_bytes())?;
+        sink.write_all(b"\n")?;
+        while let Some(std::cmp::Reverse((_, k, line))) = heap.pop() {
+            sink.write_all(line.as_bytes())?;
+            if let Some((key, l)) = get_win_run_row(&mut readers[k]) {
+                heap.push(std::cmp::Reverse((key, k, l)));
+            }
+        }
+        sink.flush()
+    })();
+    drop(readers);
+    for r in runs {
+        let _ = std::fs::remove_file(r);
+    }
+    if let Err(e) = result {
+        match output {
+            Some(p) => eprintln!("[ERROR] Cannot write output file {}: {}", p, e),
+            None => eprintln!("[ERROR] Cannot write output: {}", e),
+        }
+        crate::mark_failed();
+        return (0, duplicates);
+    }
+    (written, duplicates)
+}
+
+/// [`pair_logoffs`] for rows that carry where they came from.
+fn pair_logoffs_tagged(rows: Vec<(WinOrigin, LogData)>) -> (Vec<(WinOrigin, LogData)>, usize, usize) {
+    let (origins, mut plain): (Vec<WinOrigin>, Vec<LogData>) = rows.into_iter().unzip();
+    let (keep, filled, dropped) = pair_logoffs_in_place(&mut plain);
+    let out = origins.into_iter().zip(plain).zip(keep).filter_map(|((o, r), k)| k.then_some((o, r))).collect();
+    (out, filled, dropped)
+}
+
+
+#[cfg(test)]
+mod win_spill_tests {
+    use super::*;
+
+    fn row(time: &str, computer: &str, id: &str, user: &str, ip: &str, logon_id: &str, file: &str) -> LogData {
+        LogData {
+            time_created: time.into(),
+            computer: computer.into(),
+            event_type: if id == "4634" { "LOGOFF".into() } else { "SUCCESSFUL_LOGON".into() },
+            event_id: id.into(),
+            subject_user_name: String::new(),
+            subject_domain_name: String::new(),
+            target_user_name: user.into(),
+            target_domain_name: "LAB".into(),
+            logon_type: if id == "4624" { "3".into() } else { String::new() },
+            workstation_name: String::new(),
+            ip_address: ip.into(),
+            logon_id: logon_id.into(),
+            filename: file.into(),
+            detail: String::new(),
+        }
+    }
+
+    /// The rows written computer by computer through the disk are the rows
+    /// the whole set gives at once, byte for byte: the shadow copies' copies
+    /// dropped (the live file kept, its name is shorter), logoffs given their
+    /// logon's origin or left out, rows of the same instant in the same order
+    /// (the time's text, the file name's length, the order read), UAL and
+    /// MountPoints2 rows after the EVTX ones, a computer named in two cases.
+    #[test]
+    fn computer_by_computer_writes_what_all_at_once_writes() {
+        let t1 = "2026-11-10T10:00:00.000000Z";
+        let t1b = "2026-11-10T10:00:00+00:00";
+        let t2 = "2026-11-10T10:05:00.000000Z";
+        let live = "C:/T/masstin_run_1/masstin_image_extract/0_srv.vmdk/evtx_extracted/partition_0/Security.evtx";
+        let vss = "C:/T/masstin_run_1/masstin_image_extract/0_srv.vmdk/evtx_extracted/partition_0_vss_0/Security.evtx";
+        let files: Vec<Vec<LogData>> = vec![
+            vec![
+                row(t1, "SRV01", "4624", "alice", "10.0.0.5", "0x1", live),
+                row(t2, "SRV01", "4634", "alice", "", "0x1", live),
+                row(t2, "SRV01", "4634", "bob", "", "0x9", live),
+                row(t1, "DC01", "4624", "carol", "10.0.0.7", "0x2", "D:/triage/DC01/Security.evtx"),
+            ],
+            vec![
+                // the shadow copy's copy of SRV01's logon, read first by name order? no: read after
+                row(t1, "SRV01", "4624", "alice", "10.0.0.5", "0x1", vss),
+                row(t1, "srv01", "4624", "dave", "10.0.0.8", "0x3", vss),
+            ],
+            vec![row(t1, "WS01", "4624", "erin", "10.0.0.9", "0x4", "D:/triage/WS01/Security.evtx")],
+        ];
+        let ual = vec![row(t1b, "SRV01", "UAL", "frank", "10.0.0.10", "", "C:/T/Current.mdb")];
+        let mp = vec![row(t1, "WS01", "MP2", "erin", "10.0.0.11", "", "NTUSER.DAT")];
+
+        let dir = std::env::temp_dir().join(format!("masstin_winspill_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let whole = dir.join("whole.csv").to_string_lossy().to_string();
+        let by = dir.join("by.csv").to_string_lossy().to_string();
+
+        let mut all: Vec<LogData> = files.iter().flatten().cloned().collect();
+        all.extend(ual.iter().cloned());
+        all.extend(mp.iter().cloned());
+        let (w1, d1) = write_rows(all, Some(&whole));
+
+        let mut spill = WinSpill::new(dir.join("rows"));
+        for (n, f) in files.iter().enumerate() {
+            spill.add(f, (0, n as u32));
+        }
+        spill.add(&ual, (1, 0));
+        spill.add(&mp, (3, 0));
+        let (w2, d2) = write_rows_by_computer(&spill, Some(&by));
+
+        let a = std::fs::read_to_string(&whole).unwrap();
+        let b = std::fs::read_to_string(&by).unwrap();
+        assert_eq!(a, b);
+        assert_eq!((w1, d1), (w2, d2));
+        assert_eq!(d1, 1, "the shadow copy's copy");
+        assert_eq!(w1, 7, "{}", a);
+        assert!(!a.contains("bob"), "a logoff with no logon in the evidence is left out");
+        assert!(a.contains("srv.vmdk:live:Security.evtx") && !a.contains("masstin_image_extract"), "{}", a);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

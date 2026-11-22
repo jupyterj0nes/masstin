@@ -339,6 +339,11 @@ pub(crate) fn append_rows(path: &str, rows: &[LogData]) -> io::Result<()> {
     f.flush()
 }
 
+/// [`row_line`], for the writers that keep lines of their own.
+pub(crate) fn row_line_of(r: &LogData) -> String {
+    row_line(r)
+}
+
 /// One row as its line of the timeline, newline included.
 fn row_line(r: &LogData) -> String {
     format!(
