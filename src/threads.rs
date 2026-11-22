@@ -124,7 +124,20 @@ pub fn install(d: &Decision) {
     let _ = rayon::ThreadPoolBuilder::new().num_threads(d.workers).thread_name(|i| format!("masstin-{}", i)).build_global();
     if !keeps_normal_priority() {
         lower_priority();
+        if background_io() {
+            sys::background_io();
+        }
     }
+}
+
+/// Whether the run reads and writes the disk in the background
+/// (`MASSTIN_IO_PRIORITY=low`): its disk work, and on Windows its memory and
+/// CPU too, yield to everything else. With the disk to itself the run goes
+/// as fast as ever; it waits only when something else wants the disk. Off
+/// unless asked: measured while a 25 GB image was extracted, it made no
+/// difference to the desktop's own disk work (spinning disk and SSD alike).
+pub fn background_io() -> bool {
+    std::env::var("MASSTIN_IO_PRIORITY").map(|v| v.trim().eq_ignore_ascii_case("low")).unwrap_or(false)
 }
 
 /// The pool's size: one before `install`, and when one was chosen.
@@ -522,6 +535,16 @@ mod sys {
             SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
         }
     }
+
+    /// Windows' background mode: very low disk priority, low memory
+    /// priority (its pages are the first trimmed), low CPU priority.
+    pub fn background_io() {
+        const PROCESS_MODE_BACKGROUND_BEGIN: u32 = 0x0010_0000;
+        // SAFETY: a plain Win32 call on the current process's pseudo-handle.
+        unsafe {
+            SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -594,6 +617,17 @@ mod sys {
             nice(5);
         }
     }
+
+    /// The lowest best-effort disk priority (ioprio class 2, level 7) for
+    /// the whole process.
+    pub fn background_io() {
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        const IOPRIO_CLASS_BE: libc::c_long = 2;
+        // SAFETY: ioprio_set(2) on the calling process (who 0), with a priority value.
+        unsafe {
+            libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, (IOPRIO_CLASS_BE << 13) | 7);
+        }
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -636,6 +670,8 @@ mod sys {
             nice(5);
         }
     }
+
+    pub fn background_io() {}
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -652,6 +688,7 @@ mod sys {
         Medium::Unknown
     }
     pub fn lower_priority() {}
+    pub fn background_io() {}
 }
 
 /// Physical memory free right now, bytes, when the system tells.

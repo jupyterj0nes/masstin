@@ -684,7 +684,13 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
         crate::banner::print_info(&format!(
             "{}; priority {}{}",
             threads,
-            if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" },
+            if crate::threads::keeps_normal_priority() {
+                "normal (MASSTIN_PRIORITY)"
+            } else if crate::threads::background_io() {
+                "below normal, disk in the background (MASSTIN_IO_PRIORITY=low: the desktop's disk work comes first)"
+            } else {
+                "below normal (MASSTIN_PRIORITY=normal keeps it)"
+            },
             images
         ));
         crate::banner::print_info(&crate::space::choose(config.temp.as_deref(), config.output.as_deref()));
