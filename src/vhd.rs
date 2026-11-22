@@ -369,11 +369,14 @@ impl Seek for VhdxReader {
     }
 }
 
-/// Open a `.vhd` or `.vhdx` by extension as a boxed `Read + Seek`, with the
-/// virtual size, for the image walkers.
+/// Open a VHD or a VHDX as a boxed `Read + Seek`, with the virtual size, for
+/// the image walkers: a VHDX by its `vhdxfile` signature (whatever the file
+/// is called: a cloud snapshot has no extension), else by the extension.
 pub fn open_virtual_disk(path: &str) -> Result<(Box<dyn ReadSeek>, u64), String> {
     let ext = Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
-    if ext == "vhdx" {
+    let mut magic = [0u8; 8];
+    let is_vhdx = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).map(|_| &magic == b"vhdxfile").unwrap_or(ext == "vhdx");
+    if is_vhdx {
         let r = VhdxReader::open(path)?;
         let n = r.total_size();
         Ok((Box::new(r), n))

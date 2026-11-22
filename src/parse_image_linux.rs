@@ -378,27 +378,32 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
         let temp_dir = base_temp.join(&image_name);
         let _ = fs::create_dir_all(&temp_dir);
 
-        let result = match ext.as_str() {
-            "e01" | "ex01" => {
+        // the reader: what the content says, else the name
+        use crate::image_kind::ImageKind;
+        let kind = crate::image_kind::kind_of(Path::new(image_path.as_str()));
+        let sniffed = crate::image_kind::sniff(Path::new(image_path.as_str())).is_some();
+        let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img" | "001");
+        let result = match kind {
+            ImageKind::Ewf => {
                 crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
                 extract_logs_from_image_ewf(image_path, &temp_dir)
             }
-            "vmdk" => {
+            ImageKind::Vmdk => {
                 crate::banner::print_info(&format!("Image format: VMDK ({})", image_path));
                 extract_logs_from_image_vmdk(image_path, &temp_dir)
             }
-            "vhd" | "vhdx" => {
-                crate::banner::print_info(&format!("Image format: {} ({})", ext.to_uppercase(), image_path));
+            ImageKind::Vhd | ImageKind::Vhdx => {
+                crate::banner::print_info(&format!("Image format: {} ({})", kind.label(), image_path));
                 extract_logs_from_image_vhd(image_path, &temp_dir)
             }
-            "dd" | "raw" | "img" | "001" => {
-                crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
-                extract_logs_from_image_raw(image_path, &temp_dir)
-            }
-            _ => {
+            ImageKind::Raw if !sniffed && !named => {
                 crate::banner::print_info(&format!("Unknown extension, trying raw then E01 ({})", image_path));
                 extract_logs_from_image_raw(image_path, &temp_dir)
                     .or_else(|_| extract_logs_from_image_ewf(image_path, &temp_dir))
+            }
+            ImageKind::Raw => {
+                crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
+                extract_logs_from_image_raw(image_path, &temp_dir)
             }
         };
 
@@ -1038,10 +1043,10 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
             }
             scan_for_images(&path, extensions, results, depth + 1);
         } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
-                    results.push(path.to_string_lossy().to_string());
-                }
+            let by_name = path.extension().and_then(|e| e.to_str()).map_or(false, |ext| extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)));
+            // a disk image whose name says nothing is known by its content
+            if by_name || crate::image_kind::by_content(&path) {
+                results.push(path.to_string_lossy().to_string());
             }
         }
     }

@@ -3269,6 +3269,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
     if archive_count == 0 && loose_count == 0 {
         eprintln!("[WARN] no candidate logs found");
+        // an empty timeline, not none: the step that merges this one with
+        // the Windows half finds a file to read (it failed on a missing one)
+        write_empty_csv(output);
         let _ = fs::remove_dir_all(&temp_dir);
         return;
     }
@@ -3577,6 +3580,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     pb.finish_and_clear();
     if logs_found == 0 {
         eprintln!("[WARN] no candidate logs found");
+        // an empty timeline, not none: the step that merges this one with
+        // the Windows half finds a file to read (it failed on a missing one)
+        write_empty_csv(output);
         let _ = fs::remove_dir_all(&temp_dir);
         return;
     }

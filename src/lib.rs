@@ -7,6 +7,7 @@ use std::io::Read;
 mod parse;
 pub mod threads;
 pub mod space;
+pub mod image_kind;
 pub mod detect;
 use tokio;
 pub use crate::parse::*;

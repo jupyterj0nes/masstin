@@ -207,7 +207,7 @@ masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o inci
 
 ## Bulk evidence processing — one command, entire incident
 
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files. Each image is opened, partitions are auto-detected (NTFS, ext4 or XFS), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files, **and for disk images whose name says nothing**: a cloud snapshot exported with no extension (`snap-web01_os_disk-20261116`), a copy renamed `.bin`, a fixed VHD named `.dd`. A file of 64 KiB or more whose name names neither an image nor anything else (an EVTX, an archive, a log, a hive…) is known by its first 4 KiB and last 512 bytes: EWF, VHDX, VHD (its footer at the start or at the end), sparse VMDK, or a raw copy of a disk or a volume (a GPT header, an MBR with a partition, an NTFS boot sector, an ext or XFS superblock, an LVM label), and opened with the reader its content names before the one its name suggests. Each image is opened, partitions are auto-detected (NTFS, ext4 or XFS), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
 
 ```bash
 # Scan an entire evidence folder — finds all images, any OS

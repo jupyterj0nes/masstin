@@ -127,17 +127,24 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
         .unwrap_or(image_path)
         .to_string();
 
+    // the reader: what the content says, else the name (a cloud snapshot
+    // with no extension, a fixed VHD named .dd)
+    let kind = crate::image_kind::kind_of(Path::new(image_path));
+    let sniffed = crate::image_kind::sniff(Path::new(image_path)).is_some();
+    let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img" | "001");
+    let format_label = if named { ext.to_uppercase() } else { kind.label().to_string() };
+
     // For VMDK, the descriptor file is tiny (~1 KB) but the real virtual
     // disk lives in -flat / -s### extent files. Probe the descriptor for
     // the declared capacity so the header shows the real disk size.
-    let size_bytes: Option<u64> = if ext == "vmdk" {
+    let size_bytes: Option<u64> = if kind == crate::image_kind::ImageKind::Vmdk {
         crate::vmdk::VmdkReader::probe_size(image_path)
             .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
-    } else if ext == "vhd" {
+    } else if kind == crate::image_kind::ImageKind::Vhd {
         // a dynamic VHD's file size says nothing about the disk
         crate::vhd::VhdReader::probe_size(image_path)
             .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
-    } else if ext == "vhdx" {
+    } else if kind == crate::image_kind::ImageKind::Vhdx {
         crate::vhd::VhdxReader::probe_size(image_path)
             .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
     } else {
@@ -154,20 +161,22 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
 
     crate::banner::print_info("");
     crate::banner::print_phase_result(&format!(
-        "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, ext.to_uppercase(), file_size_str
+        "Image {}/{}: {} ({}, {})", img_idx + 1, total_images, image_name, format_label, file_size_str
     ));
     crate::banner::print_info(&format!("  {}", image_path));
 
     let temp_dir = base_temp.join(format!("{}_{}", img_idx, image_name));
     let _ = fs::create_dir_all(&temp_dir);
 
-    let result = match ext.as_str() {
-        "e01" | "ex01" => extract_evtx_from_image_ewf(image_path, &temp_dir),
-        "vmdk" => extract_evtx_from_image_vmdk(image_path, &temp_dir),
-        "vhd" | "vhdx" => extract_evtx_from_image_vhd(image_path, &temp_dir),
-        "dd" | "raw" | "img" | "001" => extract_evtx_from_image_raw(image_path, &temp_dir),
-        _ => extract_evtx_from_image_raw(image_path, &temp_dir)
-                .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
+    use crate::image_kind::ImageKind;
+    let result = match kind {
+        ImageKind::Ewf => extract_evtx_from_image_ewf(image_path, &temp_dir),
+        ImageKind::Vmdk => extract_evtx_from_image_vmdk(image_path, &temp_dir),
+        ImageKind::Vhd | ImageKind::Vhdx => extract_evtx_from_image_vhd(image_path, &temp_dir),
+        // nothing in the content and nothing in the name: raw, then E01
+        ImageKind::Raw if !sniffed && !named => extract_evtx_from_image_raw(image_path, &temp_dir)
+            .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
+        ImageKind::Raw => extract_evtx_from_image_raw(image_path, &temp_dir),
     };
 
     if let Err(e) = &result {
@@ -927,11 +936,11 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
             }
             scan_for_images(&path, extensions, results, depth + 1, spinner, dirs_scanned);
         } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
-                    results.push(path.to_string_lossy().to_string());
-                    spinner.set_message(format!("{} dirs scanned, {} images found", dirs_scanned, results.len()));
-                }
+            let by_name = path.extension().and_then(|e| e.to_str()).map_or(false, |ext| extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)));
+            // a disk image whose name says nothing is known by its content
+            if by_name || crate::image_kind::by_content(&path) {
+                results.push(path.to_string_lossy().to_string());
+                spinner.set_message(format!("{} dirs scanned, {} images found", dirs_scanned, results.len()));
             }
         }
     }
@@ -1022,7 +1031,8 @@ pub(crate) fn is_first_image_segment(p: &Path) -> bool {
     if let Some((_, ext)) = lower.rsplit_once('.') {
         if ext.len() == 3 && ext != "001" && ext.bytes().all(|b| b.is_ascii_digit()) { return false; }
     }
-    false
+    // a name that says nothing (a cloud snapshot, a renamed copy): its content
+    crate::image_kind::by_content(p)
 }
 
 /// Free bytes available to the caller on the volume containing `path`
