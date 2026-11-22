@@ -399,7 +399,7 @@ fn extract_logs_from_linux_volume<R: Read + Seek + 'static>(reader: &mut R, part
             LinuxFs::Ext4 => crate::vfs::VolumeFs::Ext4,
             LinuxFs::Xfs => crate::vfs::VolumeFs::Xfs,
         };
-        let volume = crate::vfs::Volume { image, fs, offset, lv };
+        let volume = crate::vfs::Volume { image, fs, offset, lv, vss: None };
         let before = LISTING.with(|l| l.replace(Some((volume, output_dir.to_path_buf()))));
         let out = extract_logs_from_linux_partition_now(reader, partition_offset, kind, output_dir);
         LISTING.with(|l| *l.borrow_mut() = before);

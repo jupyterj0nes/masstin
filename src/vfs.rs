@@ -18,6 +18,11 @@
 //! The time of a file is its time in the volume: the copies' was the time
 //! they were made, so a syslog with no year and no other clue took the year
 //! of the run; it now takes the year the file was last written.
+//!
+//! The EVTX of a Windows image are read the same way: listed under
+//! `.../evtx_extracted/partition_0` (and `partition_0_vss_2` for those of a
+//! shadow copy) when the image is looked at, and read from NTFS (through
+//! the shadow copy's store for those) when the Windows half opens them.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -35,12 +40,16 @@ pub struct Volume {
     pub offset: u64,
     /// the logical volume, for a volume inside LVM
     pub lv: Option<String>,
+    /// the shadow copy's store, for an NTFS volume as a shadow copy has it
+    pub vss: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VolumeFs {
     Ext4,
     Xfs,
+    /// a file is named by its record number in the MFT
+    Ntfs,
 }
 
 /// One file of a volume, under the folder it would have been copied to.
@@ -105,6 +114,18 @@ pub fn list(root: &Path, volume: &Volume, dest: &Path, src: &str, len: u64, modi
 pub fn forget(under: &Path) {
     PLACED.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| !p.root.starts_with(under));
     MOUNTED.with(|m| m.borrow_mut().retain(|(r, _)| !r.starts_with(under)));
+}
+
+/// The EVTX listed under `under` are no longer listed (they have been
+/// read); the Linux logs listed there stay.
+pub fn forget_evtx(under: &Path) {
+    PLACED.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| !(p.volume.fs == VolumeFs::Ntfs && p.root.starts_with(under)));
+    MOUNTED.with(|m| m.borrow_mut().retain(|(r, m)| !(matches!(**m, Mounted::Ntfs(_)) && r.starts_with(under))));
+}
+
+/// Is `p` a file listed from a volume (not a file on disk)?
+pub fn listed(p: &Path) -> bool {
+    placed_for(p).map_or(false, |(_, _, file, _)| file.is_some())
 }
 
 /// The listed volume a path falls under: its folder, the volume, and the
@@ -327,11 +348,113 @@ impl<T: Read + Seek + Clone> fs_core::BlockRead for Block<T> {
 enum Mounted {
     Ext4(ext4_view::Ext4),
     Xfs(Arc<fs_xfs::Filesystem>),
+    Ntfs(Rc<NtfsMount>),
+}
+
+/// An NTFS volume and what it is read through: the partition of the image,
+/// or a shadow copy's view of it.
+struct NtfsMount {
+    dev: RefCell<Box<dyn ReadSeek>>,
+    ntfs: ntfs::Ntfs,
+}
+
+/// A shadow copy's view of a volume, owning what it reads through.
+struct Store {
+    // (in the order they must go: the reader first, then what it borrows)
+    store: Option<vshadow::VssStoreReader<'static, View>>,
+    _vss: Box<vshadow::VssVolume>,
+    _view: Box<View>,
+}
+
+impl Store {
+    fn open(view: View, index: usize) -> io::Result<Store> {
+        let mut view = Box::new(view);
+        let vss = Box::new(vshadow::VssVolume::new(&mut *view).map_err(|e| io::Error::other(e.to_string()))?);
+        // Safety: the reader borrows the volume and the view, both boxed (so
+        // they do not move) and owned by the Store, which drops the reader
+        // before them; nothing else reaches them while the Store lives.
+        let (vss_ref, view_ref): (&'static vshadow::VssVolume, &'static mut View) = unsafe { (&*(&*vss as *const vshadow::VssVolume), &mut *(&mut *view as *mut View)) };
+        let store = vss_ref.store_reader(view_ref, index).map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(Store { store: Some(store), _vss: vss, _view: view })
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.store = None;
+    }
+}
+
+impl Read for Store {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.store.as_mut().expect("the store's reader").read(buf)
+    }
+}
+
+impl Seek for Store {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.store.as_mut().expect("the store's reader").seek(pos)
+    }
+}
+
+/// The unnamed data of an NTFS file, by the file's record number. Each
+/// read opens the record again (a kilobyte of the MFT) and goes to the
+/// place asked through the file's runs; with the megabyte pages above it,
+/// that is once a megabyte.
+struct NtfsData {
+    m: Rc<NtfsMount>,
+    record: u64,
+    pos: u64,
+    len: u64,
+}
+
+impl Read for NtfsData {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use ntfs::NtfsReadSeek;
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let err = |e: ntfs::NtfsError| io::Error::other(e.to_string());
+        let mut dev = self.m.dev.borrow_mut();
+        let file = self.m.ntfs.file(&mut *dev, self.record).map_err(err)?;
+        let item = file.data(&mut *dev, "").ok_or_else(|| io::Error::other("the file has no data"))?.map_err(err)?;
+        let attr = item.to_attribute().map_err(err)?;
+        let mut value = attr.value(&mut *dev).map_err(err)?;
+        value.seek(&mut *dev, SeekFrom::Start(self.pos)).map_err(err)?;
+        let want = buf.len().min((self.len - self.pos) as usize);
+        let n = value.read(&mut *dev, &mut buf[..want]).map_err(err)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for NtfsData {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| io::Error::other("seek before start"))?,
+            SeekFrom::End(d) => self.len.checked_add_signed(d).ok_or_else(|| io::Error::other("seek before start"))?,
+        };
+        Ok(self.pos)
+    }
 }
 
 impl Mounted {
     fn open(&self, src: &str) -> io::Result<Box<dyn ReadSeek>> {
         match self {
+            Mounted::Ntfs(m) => {
+                let record: u64 = src.parse().map_err(|_| io::Error::new(io::ErrorKind::NotFound, format!("not a file record: {}", src)))?;
+                let err = |e: ntfs::NtfsError| io::Error::new(io::ErrorKind::NotFound, e.to_string());
+                let len = {
+                    let mut dev = m.dev.borrow_mut();
+                    let file = m.ntfs.file(&mut *dev, record).map_err(err)?;
+                    let item = file.data(&mut *dev, "").ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the file has no data"))?.map_err(err)?;
+                    let attr = item.to_attribute().map_err(err)?;
+                    let value = attr.value(&mut *dev).map_err(err)?;
+                    value.len()
+                };
+                Ok(Box::new(NtfsData { m: Rc::clone(m), record, pos: 0, len }))
+            }
             Mounted::Ext4(fs) => Ok(Box::new(fs.open(src).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?)),
             Mounted::Xfs(fs) => {
                 let nf = |e: fs_xfs::Error| io::Error::new(io::ErrorKind::NotFound, e.to_string());
@@ -484,6 +607,16 @@ fn mount(root: &Path, volume: &Volume) -> io::Result<Rc<Mounted>> {
     let img = Arc::new(Image(Mutex::new(reader)));
     let view = View { img, offset: volume.offset, pos: 0 };
     let mounted = match &volume.lv {
+        None if volume.fs == VolumeFs::Ntfs => {
+            // the many small reads of the MFT go through a buffer; a file's
+            // megabytes pass it by
+            let mut dev: Box<dyn ReadSeek> = match volume.vss {
+                None => Box::new(io::BufReader::with_capacity(1 << 16, view)),
+                Some(s) => Box::new(io::BufReader::with_capacity(1 << 16, Store::open(view, s)?)),
+            };
+            let ntfs = ntfs::Ntfs::new(&mut dev).map_err(|e| io::Error::other(e.to_string()))?;
+            Mounted::Ntfs(Rc::new(NtfsMount { dev: RefCell::new(dev), ntfs }))
+        }
         None => {
             let size = view.clone().seek(SeekFrom::End(0))?;
             open_fs(volume.fs, At(view), size)?
@@ -515,6 +648,7 @@ fn open_fs<T: Read + Seek + Clone + 'static>(fs: VolumeFs, dev: At<T>, size: u64
             let device: Arc<dyn fs_core::BlockRead> = Arc::new(Block { dev, size });
             Ok(Mounted::Xfs(Arc::new(fs_xfs::Filesystem::mount(device).map_err(|e| io::Error::other(e.to_string()))?)))
         }
+        VolumeFs::Ntfs => Err(io::Error::other("NTFS is read from a partition, not from a logical volume")),
     }
 }
 
@@ -557,7 +691,7 @@ mod tests {
     #[test]
     fn listed_files_are_walked_and_described() {
         let root = std::env::temp_dir().join(format!("masstin_vfs_test_{}", std::process::id())).join("linux_logs_extracted").join("partition_0");
-        let v = Volume { image: "x.img".into(), fs: VolumeFs::Ext4, offset: 0, lv: None };
+        let v = Volume { image: "x.img".into(), fs: VolumeFs::Ext4, offset: 0, lv: None, vss: None };
         let t = time_of(1_700_000_000);
         list(&root, &v, &root.join("var").join("log").join("secure"), "/log/secure", 123, t);
         list(&root, &v, &root.join("etc").join("hostname"), "/etc/hostname", 9, t);

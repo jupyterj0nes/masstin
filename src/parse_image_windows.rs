@@ -497,7 +497,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         crate::space::timing(&format!("batch {} extract", b), t_extract);
         for out in got {
             if let Ok(artifacts) = &out.result {
-                if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                if artifacts.evtx_dir.exists() && (fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) || crate::vfs::walk(&artifacts.evtx_dir, None).iter().any(|(_, is_file)| *is_file)) {
                     extracted_dirs.push(artifacts.evtx_dir.to_string_lossy().to_string());
                 }
             }
@@ -794,6 +794,7 @@ fn names_of(evtx_dir: &Path) -> Vec<String> {
 /// what an image leaves on the temporary disk (with the shadow copies'
 /// copies). The rest (UAL databases) stays to be read at the end.
 fn delete_evtx_under(dir: &Path) {
+    crate::vfs::forget_evtx(dir);
     for e in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
         if e.file_type().is_file() && e.path().extension().map_or(false, |x| x.eq_ignore_ascii_case("evtx")) {
             let _ = fs::remove_file(e.path());
@@ -825,7 +826,7 @@ fn extract_hostnames_from_evtx_dir(evtx_dir: &Path) -> Vec<String> {
                 let path = entry.path();
                 if path.is_dir() {
                     let evtx_path = path.join(candidate);
-                    if evtx_path.exists() {
+                    if crate::vfs::exists(&evtx_path) {
                         for n in read_hostnames_from_evtx(&evtx_path) {
                             // the latest name seen ends up last
                             names.retain(|x| !x.eq_ignore_ascii_case(&n));
@@ -848,26 +849,27 @@ fn computer_of(xml: &str) -> Option<String> {
 }
 
 /// The Computer field of the first record of an EVTX file and of its last
-/// one (first, then last, when they differ). The last one is read from the
-/// file's last chunk alone, so a large log is not rendered whole for this.
+/// one (first, then last, when they differ). The file is read through, a
+/// chunk at a time, and never held: the first record is the first one
+/// rendered, the last one comes from the last chunk that holds any, looked
+/// for among the last chunks kept as the file goes by.
 fn read_hostnames_from_evtx(path: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut data = Vec::new();
-    match File::open(path) { Ok(mut f) => { if f.read_to_end(&mut data).is_err() { return out; } } Err(_) => return out }
+    let open = || crate::vfs::open(path).ok().and_then(|f| evtx::EvtxParser::from_read_seek(f).ok());
 
     // first record
-    if let Ok(mut parser) = evtx::EvtxParser::from_read_seek(std::io::Cursor::new(data.clone())) {
-        for record in parser.records() {
-            if let Ok(r) = record {
-                if let Some(h) = computer_of(&r.data) { out.push(h); break; }
-            }
+    let Some(mut parser) = open() else { return out };
+    for record in parser.records() {
+        if let Ok(r) = record {
+            if let Some(h) = computer_of(&r.data) { out.push(h); break; }
         }
     }
+    drop(parser);
+
     // last record: the last chunk that holds any
-    if let Ok(mut parser) = evtx::EvtxParser::from_read_seek(std::io::Cursor::new(data)) {
+    let last_of = |mut chunks: Vec<evtx::EvtxChunkData>| -> Option<String> {
         let settings = std::sync::Arc::new(evtx::ParserSettings::default());
         let mut last: Option<String> = None;
-        let mut chunks: Vec<evtx::EvtxChunkData> = parser.chunks().flatten().collect();
         while let Some(mut chunk_data) = chunks.pop() {
             if let Ok(mut chunk) = chunk_data.parse(settings.clone()) {
                 for rec in chunk.iter() {
@@ -880,12 +882,35 @@ fn read_hostnames_from_evtx(path: &Path) -> Vec<String> {
             }
             if last.is_some() { break; }
         }
-        if let Some(h) = last {
-            if !out.iter().any(|x| x.eq_ignore_ascii_case(&h)) { out.push(h); }
+        last
+    };
+    let mut last: Option<String> = None;
+    let mut passed_by = false;
+    if let Some(mut parser) = open() {
+        let mut tail: std::collections::VecDeque<evtx::EvtxChunkData> = std::collections::VecDeque::new();
+        for c in parser.chunks().flatten() {
+            if tail.len() == LAST_CHUNKS_KEPT {
+                tail.pop_front();
+                passed_by = true;
+            }
+            tail.push_back(c);
         }
+        last = last_of(tail.into());
+    }
+    // none of the last chunks kept holds a record with a name: every chunk then
+    if last.is_none() && passed_by {
+        if let Some(mut parser) = open() {
+            last = last_of(parser.chunks().flatten().collect());
+        }
+    }
+    if let Some(h) = last {
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(&h)) { out.push(h); }
     }
     out
 }
+
+/// The chunks of the end of an EVTX kept to find its last record (64 KiB each).
+const LAST_CHUNKS_KEPT: usize = 64;
 
 /// Extract the most common computer name from an existing CSV (dst_computer column).
 fn extract_computer_from_csv(csv_path: &str) -> Option<String> {
@@ -1440,7 +1465,7 @@ fn extract_vss_only_from_volume(drive: &str, temp_dir: &Path) -> Result<Option<P
                 crate::banner::print_info(&format!("    Extracting EVTX from VSS store {}...", s));
                 match vss.store_reader(&mut reader, s) {
                     Ok(mut store_reader) => {
-                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s) {
+                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s, None) {
                             Ok(count) => {
                                 total_evtx += count;
                                 crate::banner::print_info(&format!(
@@ -1553,7 +1578,7 @@ fn extract_evtx_from_volume(drive: &str, temp_dir: &Path) -> Result<PathBuf, Str
                 crate::banner::print_info(&format!("  Extracting EVTX from VSS store {}...", s));
                 match vss.store_reader(&mut reader, s) {
                     Ok(mut store_reader) => {
-                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s) {
+                        match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, 0, s, None) {
                             Ok(count) => {
                                 total_evtx += count;
                                 crate::banner::print_info(&format!(
@@ -1780,7 +1805,7 @@ fn extract_evtx_from_seekable<R: Read + Seek + 'static>(
 
                     match vss.store_reader(&mut offset_reader, s) {
                         Ok(mut store_reader) => {
-                            match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, i, s) {
+                            match extract_evtx_from_vss_store(&mut store_reader, &evtx_output_dir, i, s, Some(*partition_offset)) {
                                 Ok(count) => {
                                     total_evtx += count;
                                 }
@@ -2146,11 +2171,21 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
                 Err(_) => continue,
             };
 
+            // Write to output directory
+            let output_path = partition_dir.join(one_component(&name));
+
+            // of an image: listed, and read from the image when the Windows
+            // half opens it (crate::vfs); nothing is copied
+            if let Some(image) = crate::vfs::current_image() {
+                let volume = crate::vfs::Volume { image, fs: crate::vfs::VolumeFs::Ntfs, offset: partition_offset, lv: None, vss: None };
+                crate::vfs::list(&partition_dir, &volume, &output_path, &file_ref.file_record_number().to_string(), data_value.len(), None);
+                count += 1;
+                continue;
+            }
+
             // Attach the reader to get a std::io::Read implementation
             let mut attached = data_value.attach(&mut partition_reader);
 
-            // Write to output directory
-            let output_path = partition_dir.join(one_component(&name));
             let mut output_file = match crate::space::create(&output_path) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -2185,6 +2220,9 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
     output_dir: &Path,
     partition_index: usize,
     store_index: usize,
+    // the partition's place in the image being read, when its EVTX are to be
+    // listed and read in place (crate::vfs) instead of copied
+    in_image: Option<u64>,
 ) -> Result<usize, String> {
     let mut ntfs = ntfs::Ntfs::new(store_reader)
         .map_err(|e| format!("Cannot parse NTFS from VSS store: {}", e))?;
@@ -2242,9 +2280,15 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
             let data_item = match ntfs_file.data(store_reader, "") { Some(Ok(d)) => d, _ => continue };
             let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };
             let data_value = match data_attr.value(store_reader) { Ok(v) => v, Err(_) => continue };
+            let output_path = vss_dir.join(one_component(&name));
+            if let (Some(offset), Some(image)) = (in_image, crate::vfs::current_image()) {
+                let volume = crate::vfs::Volume { image, fs: crate::vfs::VolumeFs::Ntfs, offset, lv: None, vss: Some(store_index) };
+                crate::vfs::list(&vss_dir, &volume, &output_path, &file_ref.file_record_number().to_string(), data_value.len(), None);
+                count += 1;
+                continue;
+            }
             let mut attached = data_value.attach(store_reader);
 
-            let output_path = vss_dir.join(one_component(&name));
             let mut output_file = match crate::space::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];

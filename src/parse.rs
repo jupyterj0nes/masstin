@@ -1110,6 +1110,8 @@ fn rec_from_event2(event: &Event2) -> Option<WinRec> {
 pub(crate) enum EvtxSource {
     Disk(File),
     Mem(Cursor<Vec<u8>>),
+    /// a file of a disk image's volume, read where it is (crate::vfs)
+    Volume(Box<dyn crate::vfs::ReadSeek>),
 }
 
 impl Read for EvtxSource {
@@ -1117,6 +1119,7 @@ impl Read for EvtxSource {
         match self {
             EvtxSource::Disk(f) => f.read(buf),
             EvtxSource::Mem(c) => c.read(buf),
+            EvtxSource::Volume(v) => v.read(buf),
         }
     }
 }
@@ -1126,6 +1129,7 @@ impl Seek for EvtxSource {
         match self {
             EvtxSource::Disk(f) => f.seek(pos),
             EvtxSource::Mem(c) => c.seek(pos),
+            EvtxSource::Volume(v) => v.seek(pos),
         }
     }
 }
@@ -2308,6 +2312,11 @@ fn prep_parse(file: EvtxLocation) -> Result<(EvtxParser<EvtxSource>, usize), Box
             if is_debug_mode() {
                 println!("[DEBUG] Opening EVTX file in disk: {}", path);
             }
+            // an EVTX of a disk image: read from its volume, where it is
+            if crate::vfs::listed(Path::new(&path)) {
+                let bytes = crate::vfs::metadata(Path::new(&path))?.len();
+                return evtx_parser(EvtxSource::Volume(crate::vfs::open(Path::new(&path))?), bytes);
+            }
             // read from the disk a chunk at a time: a log of gigabytes is not loaded whole
             let file = File::open(&path)?;
             let bytes = file.metadata()?.len();
@@ -2731,6 +2740,21 @@ fn find_evtx_files(directories: &[String]) -> DiscoveryResult {
                 }
             }
         }
+
+        // the EVTX of a disk image listed under this folder, not copied to
+        // it (crate::vfs): in the order their copies were found in, the
+        // order of a folder on NTFS (names compared in upper case)
+        let mut listed: Vec<PathBuf> = crate::vfs::walk(path, None)
+            .into_iter()
+            .filter(|(p, is_file)| *is_file && p.extension().map_or(false, |x| x.eq_ignore_ascii_case("evtx")) && crate::vfs::listed(p))
+            .map(|(p, _)| p)
+            .collect();
+        listed.sort_by_cached_key(|p| p.components().map(|c| c.as_os_str().to_string_lossy().to_uppercase().encode_utf16().collect::<Vec<u16>>()).collect::<Vec<_>>());
+        for p in listed {
+            if let Some(s) = p.to_str() {
+                result.evtx_files.push(EvtxLocation::File(s.to_string()));
+            }
+        }
     }
 
     if is_debug_mode() {
@@ -2977,8 +3001,8 @@ fn unread_channel(file: &EvtxLocation, file_name: &str) -> Option<String> {
     }
     let settled = match file {
         EvtxLocation::File(path) if !path.contains(" -> ") => {
-            let mut f = File::open(path).ok()?;
-            let len = f.metadata().ok()?.len();
+            let len = crate::vfs::metadata(Path::new(path)).ok()?.len();
+            let mut f = crate::vfs::open(Path::new(path)).ok()?;
             let mut header = vec![0u8; EVTX_HEADER];
             f.read_exact(&mut header).ok()?;
             content_settles_channel(
@@ -3106,7 +3130,7 @@ pub fn parselog(file: EvtxLocation) -> Vec<LogData> {
 
     // Check existence only for disk files, not for ZIP entries
     if let EvtxLocation::File(ref path) = file {
-        if File::open(PathBuf::from(path)).is_err() {
+        if !crate::vfs::listed(Path::new(path)) && File::open(PathBuf::from(path)).is_err() {
             if is_debug_mode() {
                 println!("[ERROR] Could not access file: {}", path);
             }
@@ -3260,7 +3284,7 @@ fn plan_waves(sizes: &[u64], budget: u64, max_files: usize) -> Vec<std::ops::Ran
 /// entry of a zip inside a zip (opening those costs what reading them does).
 fn file_bytes(f: &EvtxLocation) -> u64 {
     match f {
-        EvtxLocation::File(path) if !path.contains(" -> ") => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        EvtxLocation::File(path) if !path.contains(" -> ") => crate::vfs::metadata(Path::new(path)).map(|m| m.len()).unwrap_or(0),
         EvtxLocation::ZipEntry { zip_path, evtx_name } if !zip_path.contains(" -> ") => {
             File::open(zip_path)
                 .ok()
