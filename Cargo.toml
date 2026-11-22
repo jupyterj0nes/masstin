@@ -42,7 +42,7 @@ ewf = "0.2"
 ntfs = "0.4"
 vshadow = "0.2"
 libesedb = "0.2"
-ext4-view = { version = "0.9", features = ["std"] }
+ext4-view = { version = "1", features = ["std"] }
 lvm2 = "0.0.3"
 rust-fs-xfs = { version = "0.14", default-features = false }
 rust-fs-core = { version = "0.3", default-features = false }

@@ -84,17 +84,42 @@ fn sniff_linux_fs<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<LinuxFs
 }
 
 /// What the log extraction needs from a file system: a file by its path,
-/// and a directory listing that says what each entry is. ext4 and XFS
-/// both give it, so the list of logs taken is one.
+/// copied out a piece at a time, and a directory listing that says what each
+/// entry is. ext4 and XFS both give it, so the list of logs taken is one.
+///
+/// A log is copied through a buffer of 1 MiB, never read whole: a journal is
+/// 128 MiB, an `audit.log` or a `messages` of a busy server several GiB, and
+/// reading each whole into memory before writing it (what was done) made
+/// the memory of an image's extraction that of its biggest log, times the
+/// images read at once.
 trait LogTree {
-    fn read_file(&self, path: &str) -> Option<Vec<u8>>;
+    /// `path` copied to `dest`; its size, or `None` when it cannot be read
+    /// (absent, or not a file) or written.
+    fn copy_file(&self, path: &str, dest: &Path) -> Option<u64>;
     /// `(name, is_dir, is_regular_file)`, without `.` and `..`
     fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)>;
 }
 
+/// The size of the piece a log is copied by.
+const COPY_PIECE: usize = 1 << 20;
+
+/// The destination of an extracted file, its folders made; the temporary
+/// disk's room checked as it is written (see crate::space).
+fn create_dest(dest: &Path) -> Option<crate::space::Guarded> {
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    crate::space::create(dest).ok()
+}
+
 impl LogTree for Ext4 {
-    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        self.read(path).ok()
+    fn copy_file(&self, path: &str, dest: &Path) -> Option<u64> {
+        let mut src = self.open(path).ok()?;
+        let out = create_dest(dest)?;
+        let mut w = std::io::BufWriter::with_capacity(COPY_PIECE, out);
+        let n = std::io::copy(&mut src, &mut w).ok()?;
+        w.flush().ok()?;
+        Some(n)
     }
     fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)> {
         let Ok(entries) = self.read_dir(path) else { return Vec::new() };
@@ -113,12 +138,32 @@ impl LogTree for Ext4 {
 }
 
 impl LogTree for XfsFilesystem {
-    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        match self.read_path(path) {
-            Ok(d) => Some(d),
+    fn copy_file(&self, path: &str, dest: &Path) -> Option<u64> {
+        let f = match self.open(path) {
+            Ok(f) => f,
             // /var/run is a link to /run on every current distribution
-            Err(_) => path.strip_prefix("/var/run/").and_then(|rest| self.read_path(&format!("/run/{}", rest)).ok()),
+            Err(_) => self.open(&format!("/run/{}", path.strip_prefix("/var/run/")?)).ok()?,
+        };
+        if !f.is_regular_file() {
+            return None;
         }
+        let out = create_dest(dest)?;
+        let mut w = std::io::BufWriter::with_capacity(COPY_PIECE, out);
+        let mut buf = vec![0u8; COPY_PIECE];
+        let mut off = 0u64;
+        loop {
+            let n = f.read_at(off, &mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n]).ok()?;
+            off += n as u64;
+            if n < buf.len() {
+                break;
+            }
+        }
+        w.flush().ok()?;
+        Some(off)
     }
     fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)> {
         let Ok(entries) = self.list_path(path) else { return Vec::new() };
@@ -136,7 +181,27 @@ impl LogTree for XfsFilesystem {
     }
 }
 
+/// One file of the image copied under `output_dir` at `linux_path` (its
+/// Linux path, mirrored), a piece at a time.
+fn copy_extracted(tree: &dyn LogTree, image_path: &str, linux_path: &str, output_dir: &Path) -> bool {
+    let dest = map_linux_path_to_local(linux_path, output_dir);
+    match tree.copy_file(image_path, &dest) {
+        Some(n) => {
+            if is_debug_mode() {
+                eprintln!("[DEBUG] Extracted: {} ({} bytes)", linux_path, n);
+            }
+            true
+        }
+        None => {
+            // a file begun and not finished is not left behind half-written
+            let _ = fs::remove_file(&dest);
+            false
+        }
+    }
+}
+
 /// Write one extracted file under `output_dir`, mirroring its Linux path.
+#[allow(dead_code)]
 fn save_extracted(linux_path: &str, data: &[u8], output_dir: &Path) -> bool {
     let dest = map_linux_path_to_local(linux_path, output_dir);
     if let Some(parent) = dest.parent() {
@@ -160,10 +225,8 @@ fn save_extracted(linux_path: &str, data: &[u8], output_dir: &Path) -> bool {
 fn extract_logs_from_tree(tree: &dyn LogTree, output_dir: &Path) -> usize {
     let mut count = 0;
     for path in EXACT_FILES {
-        if let Some(data) = tree.read_file(path) {
-            if save_extracted(path, &data, output_dir) {
-                count += 1;
-            }
+        if copy_extracted(tree, path, path, output_dir) {
+            count += 1;
         }
     }
     // Where /var/log is on THIS volume. On the root volume, `/var/log`. But
@@ -209,17 +272,10 @@ fn extract_log_dir(tree: &dyn LogTree, on_volume: &str, output_dir: &Path) -> us
                 continue;
             }
             let full = format!("{}/{}", dir, name);
-            match tree.read_file(&full) {
-                Some(data) => {
-                    if save_extracted(&format!("/var/log{}/{}", as_sub, name), &data, output_dir) {
-                        count += 1;
-                    }
-                }
-                None => {
-                    if is_debug_mode() {
-                        eprintln!("[DEBUG] Could not read {}", full);
-                    }
-                }
+            if copy_extracted(tree, &full, &format!("/var/log{}/{}", as_sub, name), output_dir) {
+                count += 1;
+            } else if is_debug_mode() {
+                eprintln!("[DEBUG] Could not read {}", full);
             }
         }
     }
@@ -235,10 +291,8 @@ fn extract_log_dir(tree: &dyn LogTree, on_volume: &str, output_dir: &Path) -> us
                 continue;
             }
             let full = format!("{}/{}", machine_dir, jname);
-            if let Some(data) = tree.read_file(&full) {
-                if save_extracted(&format!("/var/log/journal/{}/{}", machine, jname), &data, output_dir) {
-                    count += 1;
-                }
+            if copy_extracted(tree, &full, &format!("/var/log/journal/{}/{}", machine, jname), output_dir) {
+                count += 1;
             }
         }
     }
