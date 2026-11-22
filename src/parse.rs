@@ -3322,88 +3322,270 @@ pub fn parse_events_ex(
     extra_task_events: &[LogData],
     extra_mountpoint_events: &[LogData],
 ) {
-    let start_time = std::time::Instant::now();
+    let mut pass = WinPass::new();
+    pass.read(files, directories);
+    pass.finish(files, directories, output, extra_task_events, extra_mountpoint_events);
+}
 
-    if is_debug_mode() {
-        println!("[INFO] Starting event processing...");
-    }
+/// The Windows half in steps: the EVTX of some folders read, then of more
+/// (a disk image after another, its EVTX deleted in between), and at the
+/// end the UAL databases of all of them, the scheduled tasks and
+/// MountPoints2 added and the timeline written. The rows are those, and in
+/// the order, that one read of everything at once gives.
+pub(crate) struct WinPass {
+    start_time: std::time::Instant,
+    spill_dir: std::path::PathBuf,
+    spill: WinSpill,
+    next_file: u32,
+    skipped_no_events: usize,
+    parsed_files: usize,
+    artifact_details: Vec<(String, String, Option<u32>, usize)>,
+    reads: usize,
+}
 
-    let mut vec_filenames: Vec<EvtxLocation> = vec![];
-    // the rows go to disk, a file per computer, as each file is read (see WinSpill)
-    let spill_dir = crate::space::temp_root().join(format!("masstin_rows_{}_{}", std::process::id(), SPILL_RUN.fetch_add(1, Ordering::SeqCst)));
-    let mut spill = WinSpill::new(spill_dir.clone());
-
-    // Detect drive root paths and suggest parse-image-windows for VSS
-    // parse-windows passes "X:\" (normalized), parse-image-windows passes "X:" (no trailing \)
-    for dir in directories {
-        let d = dir.replace('/', "\\");
-        let is_drive_with_backslash = d.len() == 3
-            && d.as_bytes()[0].is_ascii_alphabetic()
-            && d.as_bytes()[1] == b':'
-            && d.as_bytes()[2] == b'\\';
-        if is_drive_with_backslash {
-            let letter = &d[..2];
-            crate::banner::print_info(&format!(
-                "Drive {} detected — scanning as filesystem (EVTX + UAL only).", letter
-            ));
-            crate::banner::print_info(&format!(
-                "Tip: use '-a parse-image-windows -d {}' to also recover events from VSS shadow copies.", letter
-            ));
+impl WinPass {
+    pub(crate) fn new() -> WinPass {
+        if is_debug_mode() {
+            println!("[INFO] Starting event processing...");
         }
+        // the rows go to disk, a file per computer, as each file is read (see WinSpill)
+        let spill_dir = crate::space::temp_root().join(format!("masstin_rows_{}_{}", std::process::id(), SPILL_RUN.fetch_add(1, Ordering::SeqCst)));
+        let spill = WinSpill::new(spill_dir.clone());
+        WinPass { start_time: std::time::Instant::now(), spill_dir, spill, next_file: 0, skipped_no_events: 0, parsed_files: 0, artifact_details: Vec::new(), reads: 0 }
     }
 
-    // Phase 1: Search for artifacts
-    crate::banner::print_search_start();
+    /// The EVTX of `files` and `directories` (loose, in folders, in zips),
+    /// found, parsed and their rows put on disk. The first read prints the
+    /// phases; a later one (the next batch of images) its own counts.
+    pub(crate) fn read(&mut self, files: &[String], directories: &[String]) {
+        let first = self.reads == 0;
+        self.reads += 1;
+        let mut vec_filenames: Vec<EvtxLocation> = vec![];
 
-    if is_debug_mode() {
-        println!("[INFO] Adding individual EVTX files...");
-    }
-    // a ZIP given as a file is walked like one found in a folder: its EVTX,
-    // nested ZIPs and triage layout alike
-    let is_zip = |s: &String| s.to_ascii_lowercase().ends_with(".zip");
-    vec_filenames.extend(files.iter().filter(|s| !is_zip(s)).map(|s| EvtxLocation::File(s.to_string())));
+        // Detect drive root paths and suggest parse-image-windows for VSS
+        // parse-windows passes "X:\" (normalized), parse-image-windows passes "X:" (no trailing \)
+        for dir in directories {
+            let d = dir.replace('/', "\\");
+            let is_drive_with_backslash = d.len() == 3
+                && d.as_bytes()[0].is_ascii_alphabetic()
+                && d.as_bytes()[1] == b':'
+                && d.as_bytes()[2] == b'\\';
+            if is_drive_with_backslash {
+                let letter = &d[..2];
+                crate::banner::print_info(&format!(
+                    "Drive {} detected — scanning as filesystem (EVTX + UAL only).", letter
+                ));
+                crate::banner::print_info(&format!(
+                    "Tip: use '-a parse-image-windows -d {}' to also recover events from VSS shadow copies.", letter
+                ));
+            }
+        }
 
-    if is_debug_mode() {
-        println!("[INFO] Searching for EVTX files in provided directories...");
-    }
-    let dir_count = directories.len();
-    let file_count = files.len();
-    let walked: Vec<String> = directories.iter().cloned().chain(files.iter().filter(|s| is_zip(s)).cloned()).collect();
-    let discovery = find_evtx_files(&walked);
-    let archives_scanned = discovery.archives_scanned;
-    let archives_with_evtx = discovery.archives_with_evtx;
-    let triages = discovery.triages;
-    vec_filenames.extend(discovery.evtx_files);
+        // Phase 1: Search for artifacts
+        if first {
+            crate::banner::print_search_start();
+        }
 
-    // Build the triage lookup map keyed by outer-zip path. Phase 2 grouping
-    // uses this to label EVTX rows with [TRIAGE: <type>] instead of [ARCHIVE].
-    let triage_map: std::collections::HashMap<String, TriageInfo> = triages
-        .iter()
-        .map(|t| (t.zip_path.clone(), t.clone()))
-        .collect();
+        if is_debug_mode() {
+            println!("[INFO] Adding individual EVTX files...");
+        }
+        // a ZIP given as a file is walked like one found in a folder: its EVTX,
+        // nested ZIPs and triage layout alike
+        let is_zip = |s: &String| s.to_ascii_lowercase().ends_with(".zip");
+        vec_filenames.extend(files.iter().filter(|s| !is_zip(s)).map(|s| EvtxLocation::File(s.to_string())));
 
-    // Print "Triage found" lines BEFORE the EVTX count summary so the analyst
-    // sees the high-value detections at the top of phase 1. We pass the FULL
-    // zip path (not just filename) because real cases often have duplicate
-    // copies of the same host's triage in different folders and the analyst
-    // needs to see they're physically different files.
-    for t in &triages {
-        crate::banner::print_triage_found(
-            t.kind.label(),
-            t.hostname.as_deref(),
-            &t.zip_path,
-            t.artifact_count,
+        if is_debug_mode() {
+            println!("[INFO] Searching for EVTX files in provided directories...");
+        }
+        let dir_count = directories.len();
+        let file_count = files.len();
+        let walked: Vec<String> = directories.iter().cloned().chain(files.iter().filter(|s| is_zip(s)).cloned()).collect();
+        let discovery = find_evtx_files(&walked);
+        let archives_scanned = discovery.archives_scanned;
+        let archives_with_evtx = discovery.archives_with_evtx;
+        let triages = discovery.triages;
+        vec_filenames.extend(discovery.evtx_files);
+
+        // Build the triage lookup map keyed by outer-zip path. Phase 2 grouping
+        // uses this to label EVTX rows with [TRIAGE: <type>] instead of [ARCHIVE].
+        let triage_map: std::collections::HashMap<String, TriageInfo> = triages
+            .iter()
+            .map(|t| (t.zip_path.clone(), t.clone()))
+            .collect();
+
+        // Print "Triage found" lines BEFORE the EVTX count summary so the analyst
+        // sees the high-value detections at the top of phase 1. We pass the FULL
+        // zip path (not just filename) because real cases often have duplicate
+        // copies of the same host's triage in different folders and the analyst
+        // needs to see they're physically different files.
+        for t in &triages {
+            crate::banner::print_triage_found(
+                t.kind.label(),
+                t.hostname.as_deref(),
+                &t.zip_path,
+                t.artifact_count,
+            );
+        }
+
+        // Count ZIPs vs direct files for the summary
+        let zip_entries_inside_archives = vec_filenames
+            .iter()
+            .filter(|f| matches!(f, EvtxLocation::ZipEntry { .. }))
+            .count();
+        let total_evtx = vec_filenames.len();
+
+        crate::banner::print_search_results_v2(
+            total_evtx,
+            zip_entries_inside_archives,
+            archives_scanned,
+            archives_with_evtx,
+            dir_count,
+            file_count,
+            "EVTX artifacts",
         );
+        // the UAL databases are read at the end, all together (see finish)
+        let ual = ual_files_in(files, directories);
+        if !ual.is_empty() {
+            crate::banner::print_search_result_line(ual.len(), "UAL databases");
+        }
+
+        if is_debug_mode() {
+            println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());
+        }
+
+        // Phase 2: Process artifacts
+        if first {
+            crate::banner::print_processing_start();
+        }
+        let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
+        let base = self.next_file;
+        self.next_file += vec_filenames.len() as u32;
+        let spill = &mut self.spill;
+        let details = &mut self.artifact_details;
+        let (mut skipped, mut parsed) = (0usize, 0usize);
+
+        // the files, read and parsed: one after another on one thread, as always;
+        // on several, in waves that fit the memory budget, each wave's files
+        // spread over the pool and their rows kept in the files' order
+        parse_files_each(&vec_filenames, &pb, |file_no, parsed_logs| {
+            let evtxfile = &vec_filenames[file_no];
+            let short_name = match &evtxfile {
+                EvtxLocation::File(path) => std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(path)
+                    .to_string(),
+                EvtxLocation::ZipEntry { evtx_name, .. } => std::path::Path::new(evtx_name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(evtx_name)
+                    .to_string(),
+            };
+            let count = parsed_logs.len();
+            if count == 0 {
+                skipped += 1;
+            } else {
+                parsed += 1;
+                let source = source_label_for_evtx(evtxfile, &triage_map);
+                // Detect VSS index from the underlying path (only applies to
+                // EvtxLocation::File paths that came from parse-image's temp
+                // extract dir; EvtxLocation::ZipEntry never has VSS).
+                let vss_idx = match evtxfile {
+                    EvtxLocation::File(path) => detect_vss_index(path),
+                    EvtxLocation::ZipEntry { .. } => None,
+                };
+                details.push((source, short_name.clone(), vss_idx, count));
+                if is_debug_mode() {
+                    println!("[INFO] {} events from {}", count, short_name);
+                }
+            }
+            spill.add(&parsed_logs, (0, base + file_no as u32));
+        });
+        self.skipped_no_events += skipped;
+        self.parsed_files += parsed;
+
+        pb.finish_and_clear();
     }
 
-    // Count ZIPs vs direct files for the summary
-    let zip_entries_inside_archives = vec_filenames
-        .iter()
-        .filter(|f| matches!(f, EvtxLocation::ZipEntry { .. }))
-        .count();
-    let total_evtx = vec_filenames.len();
+    /// The UAL databases of all the folders and files read, the scheduled
+    /// tasks and MountPoints2 added, and the timeline written.
+    pub(crate) fn finish(
+        mut self,
+        files: &[String],
+        directories: &[String],
+        output: Option<&String>,
+        extra_task_events: &[LogData],
+        extra_mountpoint_events: &[LogData],
+    ) {
+        // Both extras (scheduled tasks + MountPoints2) are counted with the
+        // other artifacts found
+        if !extra_mountpoint_events.is_empty() {
+            crate::banner::print_search_result_line(extra_mountpoint_events.len(), "MountPoints2 remote share events");
+        }
+        if !extra_task_events.is_empty() {
+            crate::banner::print_search_result_line(extra_task_events.len(), "remote Scheduled Task events");
+        }
 
-    // Detect UAL databases early so we can include them in the artifact count
+        // Parse UAL databases (detected earlier during artifact search)
+        let all_ual_files = ual_files_in(files, directories);
+        if !all_ual_files.is_empty() {
+            let source_dir = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
+            let (ual_events, mdb_details) = crate::parse_ual::parse_ual_databases(&all_ual_files, source_dir);
+            if !ual_events.is_empty() {
+                for (mdb_name, count) in &mdb_details {
+                    let src = source_label_for_path(mdb_name);
+                    let short = std::path::Path::new(mdb_name)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(mdb_name)
+                        .to_string();
+                    // UAL databases live in the same per-partition temp dir as
+                    // EVTX files, so the VSS detection applies here too.
+                    let vss_idx = detect_vss_index(mdb_name);
+                    self.artifact_details.push((src, short, vss_idx, *count));
+                }
+                self.spill.add(&ual_events, (1, 0));
+            }
+        }
+
+        crate::banner::print_artifact_detail_grouped(&self.artifact_details);
+
+        if is_debug_mode() {
+            println!("[INFO] Parsing finished. Total events collected: {}", self.spill.rows);
+        }
+
+        // Add both extras streams (Scheduled Tasks + MountPoints2) to the final
+        // timeline. They come from parse_image_windows's registry / XML parsing
+        // and are counted as "parsed_files" so the summary line reflects them.
+        let mut parsed_files = self.parsed_files;
+        let extra_task_count = extra_task_events.len();
+        if extra_task_count > 0 {
+            self.spill.add(extra_task_events, (2, 0));
+            parsed_files += extra_task_count;
+        }
+        let extra_mp_count = extra_mountpoint_events.len();
+        if extra_mp_count > 0 {
+            self.spill.add(extra_mountpoint_events, (3, 0));
+            parsed_files += extra_mp_count;
+        }
+
+        // Phase 3: Generate output
+        crate::banner::print_output_start();
+        // (counted where they are dropped: the difference between what went in
+        // and what was written also holds the rows --ignore-local and the
+        // --exclude lists left out, and those were reported as duplicates)
+        let (total_after_dedup, deduped) = write_rows_by_computer(&self.spill, output);
+        let _ = std::fs::remove_dir_all(&self.spill_dir);
+        if deduped > 0 {
+            crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
+        }
+
+        crate::banner::print_summary(total_after_dedup, parsed_files, self.skipped_no_events, output.map(|s| s.as_str()), self.start_time);
+    }
+}
+
+/// The UAL databases under these folders and among these files, sorted.
+fn ual_files_in(files: &[String], directories: &[String]) -> Vec<std::path::PathBuf> {
     let mut all_ual_files: Vec<std::path::PathBuf> = Vec::new();
     for dir in directories {
         all_ual_files.extend(crate::parse_ual::find_ual_databases(dir));
@@ -3415,138 +3597,7 @@ pub fn parse_events_ex(
     }
     all_ual_files.sort();
     all_ual_files.dedup();
-
-    crate::banner::print_search_results_v2(
-        total_evtx,
-        zip_entries_inside_archives,
-        archives_scanned,
-        archives_with_evtx,
-        dir_count,
-        file_count,
-        "EVTX artifacts",
-    );
-    if !all_ual_files.is_empty() {
-        crate::banner::print_search_result_line(all_ual_files.len(), "UAL databases");
-    }
-    // Both extras (scheduled tasks + MountPoints2) get printed here inside
-    // phase 1, with their own labels, so the analyst sees the full discovery
-    // summary in one block instead of having counters leak out before [1/3].
-    if !extra_mountpoint_events.is_empty() {
-        crate::banner::print_search_result_line(extra_mountpoint_events.len(), "MountPoints2 remote share events");
-    }
-    if !extra_task_events.is_empty() {
-        crate::banner::print_search_result_line(extra_task_events.len(), "remote Scheduled Task events");
-    }
-
-    if is_debug_mode() {
-        println!("[INFO] Total EVTX files to process: {}", vec_filenames.len());
-    }
-
-    // Phase 2: Process artifacts
-    crate::banner::print_processing_start();
-    let pb = crate::banner::create_progress_bar(vec_filenames.len() as u64);
-    let mut skipped_no_events: usize = 0;
-    let mut parsed_files: usize = 0;
-    // (source_label, evtx_short_name, vss_index, count)
-    //   vss_index = None for live artifacts, Some(N) for VSS snapshot N
-    // The phase-2 breakdown sorts each source's items live-first then by
-    // VSS index, and renders VSS entries with a "[VSS]" / "[VSS-N]" suffix
-    // so the analyst can see at a glance which events came from a snapshot.
-    let mut artifact_details: Vec<(String, String, Option<u32>, usize)> = Vec::new();
-
-    // the files, read and parsed: one after another on one thread, as always;
-    // on several, in waves that fit the memory budget, each wave's files
-    // spread over the pool and their rows kept in the files' order
-    parse_files_each(&vec_filenames, &pb, |file_no, parsed_logs| {
-        let evtxfile = &vec_filenames[file_no];
-        let short_name = match &evtxfile {
-            EvtxLocation::File(path) => std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path)
-                .to_string(),
-            EvtxLocation::ZipEntry { evtx_name, .. } => std::path::Path::new(evtx_name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(evtx_name)
-                .to_string(),
-        };
-        let count = parsed_logs.len();
-        if count == 0 {
-            skipped_no_events += 1;
-        } else {
-            parsed_files += 1;
-            let source = source_label_for_evtx(evtxfile, &triage_map);
-            // Detect VSS index from the underlying path (only applies to
-            // EvtxLocation::File paths that came from parse-image's temp
-            // extract dir; EvtxLocation::ZipEntry never has VSS).
-            let vss_idx = match evtxfile {
-                EvtxLocation::File(path) => detect_vss_index(path),
-                EvtxLocation::ZipEntry { .. } => None,
-            };
-            artifact_details.push((source, short_name.clone(), vss_idx, count));
-            if is_debug_mode() {
-                println!("[INFO] {} events from {}", count, short_name);
-            }
-        }
-        spill.add(&parsed_logs, (0, file_no as u32));
-    });
-
-    pb.finish_and_clear();
-
-    // Parse UAL databases (detected earlier during artifact search)
-    if !all_ual_files.is_empty() {
-        let source_dir = directories.first().map(|s| s.as_str()).unwrap_or("UAL");
-        let (ual_events, mdb_details) = crate::parse_ual::parse_ual_databases(&all_ual_files, source_dir);
-        if !ual_events.is_empty() {
-            for (mdb_name, count) in &mdb_details {
-                let src = source_label_for_path(mdb_name);
-                let short = std::path::Path::new(mdb_name)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(mdb_name)
-                    .to_string();
-                // UAL databases live in the same per-partition temp dir as
-                // EVTX files, so the VSS detection applies here too.
-                let vss_idx = detect_vss_index(mdb_name);
-                artifact_details.push((src, short, vss_idx, *count));
-            }
-            spill.add(&ual_events, (1, 0));
-        }
-    }
-
-    crate::banner::print_artifact_detail_grouped(&artifact_details);
-
-    if is_debug_mode() {
-        println!("[INFO] Parsing finished. Total events collected: {}", spill.rows);
-    }
-
-    // Add both extras streams (Scheduled Tasks + MountPoints2) to the final
-    // timeline. They come from parse_image_windows's registry / XML parsing
-    // and are counted as "parsed_files" so the summary line reflects them.
-    let extra_task_count = extra_task_events.len();
-    if extra_task_count > 0 {
-        spill.add(extra_task_events, (2, 0));
-        parsed_files += extra_task_count;
-    }
-    let extra_mp_count = extra_mountpoint_events.len();
-    if extra_mp_count > 0 {
-        spill.add(extra_mountpoint_events, (3, 0));
-        parsed_files += extra_mp_count;
-    }
-
-    // Phase 3: Generate output
-    crate::banner::print_output_start();
-    // (counted where they are dropped: the difference between what went in
-    // and what was written also holds the rows --ignore-local and the
-    // --exclude lists left out, and those were reported as duplicates)
-    let (total_after_dedup, deduped) = write_rows_by_computer(&spill, output);
-    let _ = std::fs::remove_dir_all(&spill_dir);
-    if deduped > 0 {
-        crate::banner::print_info(&format!("{} duplicate events removed (live + VSS overlap)", deduped));
-    }
-
-    crate::banner::print_summary(total_after_dedup, parsed_files, skipped_no_events, output.map(|s| s.as_str()), start_time);
+    all_ual_files
 }
 
 // ---------------------------------------------------------------------------------------

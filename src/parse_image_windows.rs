@@ -200,12 +200,12 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
 /// next image only while the images under way are fewer than the
 /// controller allows right then, each one's banner lines held back and
 /// printed in order as the earliest unfinished image completes.
-fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medium: crate::threads::Medium) -> Vec<ImageOutcome> {
+fn extract_images(images: &[String], first: usize, total_images: usize, base_temp: &Path, medium: crate::threads::Medium) -> Vec<ImageOutcome> {
     let readers = crate::threads::Readers::new(medium);
     let started = std::time::Instant::now();
     let at_once = readers.allowed(0);
     if (at_once <= 1 && crate::threads::asked_images().is_some()) || images.len() <= 1 || (at_once <= 1 && medium == crate::threads::Medium::Rotational && crate::threads::images_cap() <= 1) {
-        return images.iter().enumerate().map(|(i, p)| extract_one_image(i, total_images, p, base_temp)).collect();
+        return images.iter().enumerate().map(|(i, p)| extract_one_image(first + i, total_images, p, base_temp)).collect();
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -236,7 +236,7 @@ fn extract_images(images: &[String], total_images: usize, base_temp: &Path, medi
                     break;
                 }
                 crate::banner::capture_start();
-                let outcome = extract_one_image(i, total_images, &images[i], base_temp);
+                let outcome = extract_one_image(first + i, total_images, &images[i], base_temp);
                 let lines = crate::banner::capture_take();
                 under_way.fetch_sub(1, Ordering::SeqCst);
                 let mut d = done.lock().unwrap();
@@ -464,21 +464,56 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // order as each turn comes; the bookkeeping after, in the images' order,
     // the same whatever the count
     let medium = crate::threads::medium_of_paths(&all_image_files);
-    let outcomes: Vec<ImageOutcome> = extract_images(&all_image_files, total_images, &base_temp, medium);
+    // The images go in batches: each batch is extracted (its images at once,
+    // as the controller allows), its EVTX read into the Windows half's rows
+    // on disk, and its EVTX deleted before the next batch is extracted, so
+    // the temporary disk holds the EVTX of one batch, not of every image (the
+    // UAL databases, the scheduled tasks and the hives stay: they are read at
+    // the end, all together, as before). The rows are read in the order one
+    // read of every image gives, so the timeline is the same.
+    let mut win_pass: Option<crate::parse::WinPass> = None;
+    // a mounted volume's folders (given before the images) are read first, as they always were
+    if !extracted_dirs.is_empty() {
+        win_pass.get_or_insert_with(crate::parse::WinPass::new).read(&[], &extracted_dirs);
+    }
+    let batch = image_batch();
+    let mut outcomes: Vec<ImageOutcome> = Vec::new();
+    for (b, chunk) in all_image_files.chunks(batch).enumerate() {
+        let before = extracted_dirs.len();
+        let got = extract_images(chunk, b * batch, total_images, &base_temp, medium);
+        for out in got {
+            if let Ok(artifacts) = &out.result {
+                if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    extracted_dirs.push(artifacts.evtx_dir.to_string_lossy().to_string());
+                }
+            }
+            outcomes.push(out);
+        }
+        let new_dirs: Vec<String> = extracted_dirs[before..].to_vec();
+        if !new_dirs.is_empty() {
+            // the hosts' names come from their EVTX: read them before the EVTX go
+            for o in &outcomes[outcomes.len() - chunk.len().min(outcomes.len())..] {
+                if let Ok(a) = &o.result {
+                    let _ = names_of(&a.evtx_dir);
+                }
+            }
+            win_pass.get_or_insert_with(crate::parse::WinPass::new).read(&[], &new_dirs);
+            for d in &new_dirs {
+                delete_evtx_under(Path::new(d));
+            }
+        }
+    }
 
     for out in outcomes {
         match out.result {
             Ok(artifacts) => {
                 images_processed += 1;
-                // Only add EVTX dir if it actually contains extracted files
-                if artifacts.evtx_dir.exists() && fs::read_dir(&artifacts.evtx_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                    extracted_dirs.push(artifacts.evtx_dir.to_string_lossy().to_string());
-                }
                 if let Some(linux_dir) = artifacts.linux_logs_dir {
                     linux_log_dirs.push(linux_dir.to_string_lossy().to_string());
                 }
                 // every name the machine goes by in its logs, the latest last
-                let names = extract_hostnames_from_evtx_dir(&artifacts.evtx_dir);
+                // (read while the batch's EVTX were still there)
+                let names = names_of(&artifacts.evtx_dir);
                 let hostname = names.last().cloned().unwrap_or_default();
                 if let Some(tdir) = artifacts.tasks_dir {
                     task_dirs.push((tdir.to_string_lossy().to_string(), hostname.clone(), names.clone()));
@@ -604,13 +639,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         crate::banner::set_parse_part(true);
         if windows_present {
             crate::banner::print_info("Parsing Windows artifacts (EVTX + UAL)...");
-            crate::parse::parse_events_ex(
-                &empty_files,
-                &extracted_dirs,
-                Some(&win_tmp_str),
-                &all_task_events,
-                &all_mountpoint_events,
-            );
+            let mut pass = win_pass.take().unwrap_or_else(crate::parse::WinPass::new);
+            if extracted_dirs.len() > image_dirs {
+                pass.read(&empty_files, &extracted_dirs[image_dirs..]);
+            }
+            pass.finish(&empty_files, &extracted_dirs, Some(&win_tmp_str), &all_task_events, &all_mountpoint_events);
             all_task_events.clear();
             all_mountpoint_events.clear();
         }
@@ -662,13 +695,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     } else if has_windows {
         // Windows only — include task + mountpoint events in the same pipeline
-        crate::parse::parse_events_ex(
-            &empty_files,
-            &extracted_dirs,
-            output,
-            &all_task_events,
-            &all_mountpoint_events,
-        );
+        let mut pass = win_pass.take().unwrap_or_else(crate::parse::WinPass::new);
+        if extracted_dirs.len() > image_dirs {
+            pass.read(&empty_files, &extracted_dirs[image_dirs..]);
+        }
+        pass.finish(&empty_files, &extracted_dirs, output, &all_task_events, &all_mountpoint_events);
         all_task_events.clear();
         all_mountpoint_events.clear();
     } else {
@@ -712,6 +743,41 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     zip_img_temps.dedup();
     for t in &zip_img_temps {
         let _ = fs::remove_dir_all(t);
+    }
+}
+
+/// Images extracted per batch (see parse_image): the threads of the run,
+/// two at least and eight at most; `MASSTIN_IMAGE_BATCH` sets it.
+fn image_batch() -> usize {
+    std::env::var("MASSTIN_IMAGE_BATCH")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| crate::threads::workers().clamp(2, 8))
+}
+
+/// The names the machine of an image's EVTX folder goes by, read once and
+/// kept: the batch's EVTX are deleted after they are read, the names are
+/// asked for again afterwards.
+fn names_of(evtx_dir: &Path) -> Vec<String> {
+    static NAMES: std::sync::Mutex<Vec<(PathBuf, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
+    let mut cache = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, n)) = cache.iter().find(|(p, _)| p == evtx_dir) {
+        return n.clone();
+    }
+    let n = extract_hostnames_from_evtx_dir(evtx_dir);
+    cache.push((evtx_dir.to_path_buf(), n.clone()));
+    n
+}
+
+/// The EVTX under an image's folder deleted, once read: they are most of
+/// what an image leaves on the temporary disk (with the shadow copies'
+/// copies). The rest (UAL databases) stays to be read at the end.
+fn delete_evtx_under(dir: &Path) {
+    for e in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        if e.file_type().is_file() && e.path().extension().map_or(false, |x| x.eq_ignore_ascii_case("evtx")) {
+            let _ = fs::remove_file(e.path());
+        }
     }
 }
 
