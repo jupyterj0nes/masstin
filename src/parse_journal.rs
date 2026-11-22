@@ -39,7 +39,8 @@ use crate::parse_linux::{preauth_touch, RawEvt, SessionTracker, PAM_CLOSE_RE, SS
 pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
     let mut out = Vec::new();
 
-    let file = match File::open(path) {
+    // from disk, or from an image's volume (crate::vfs)
+    let file = match crate::vfs::open(path) {
         Ok(f) => f,
         Err(e) => {
             if is_debug_mode() {

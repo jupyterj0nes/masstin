@@ -95,7 +95,8 @@ impl<R: BufRead> EvidenceLines<R> {
 
 /// Open a plain or gzip-compressed (`.gz`) text log.
 pub fn open_plain_or_gzip(path: &Path) -> io::Result<EvidenceLines<Box<dyn BufRead>>> {
-    let f = File::open(path)?;
+    // from disk, or from an image's volume (crate::vfs)
+    let f = crate::vfs::open(path)?;
     let rdr: Box<dyn BufRead> = if path.extension().map(|e| e.eq_ignore_ascii_case("gz")).unwrap_or(false) {
         Box::new(BufReader::new(GzDecoder::new(f)))
     } else {

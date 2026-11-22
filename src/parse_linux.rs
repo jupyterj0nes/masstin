@@ -184,6 +184,116 @@ pub(crate) const INVALID_USER_EVT: &str = "SSH_INVALID_USER";
 /// the account, detail `invalid-user`, and the connection's pre-auth
 /// CONNECT rows are dropped: they are the same connection. Lines without
 /// a pid are taken one by one.
+/// [`invalid_users_as_failures`] as the rows go by, for a log too big to
+/// hold: the rows of a connection are kept only until the connection is
+/// over, and handed on in the order they came.
+///
+/// A connection is a pid whose lines are within ten minutes of one another
+/// (see below); it is over when the log has moved more than that past its
+/// last line, with two hours to spare for a clock set back. A log is in
+/// the order of time, so what is held is the rows of the last couple of
+/// hours; one that is not (lines of any day in any order) is held up to a
+/// million rows, the oldest connections then taken as over.
+pub(crate) struct ConnStream {
+    prefix: &'static str,
+    /// the rows not handed on yet, in the order they came: (row, connection, its number)
+    pending: std::collections::VecDeque<(RawEvt, (u32, u32), u64)>,
+    /// each pid: the time of its last line and the count of its connections
+    last: HashMap<u32, (i64, u32)>,
+    /// each connection with rows waiting: (it logged an outcome, its first
+    /// announcement, its last line, its rows waiting)
+    open: HashMap<(u32, u32), (bool, Option<u64>, i64, u32)>,
+    seq: u64,
+}
+
+const SAME_CONNECTION_SECS: i64 = 600;
+/// A clock set back (a time zone's hour, a correction) within a connection.
+const CLOCK_SLACK_SECS: i64 = 7200;
+const PENDING_ROWS: usize = 1_000_000;
+
+impl ConnStream {
+    pub(crate) fn new(prefix: &'static str) -> ConnStream {
+        ConnStream { prefix, pending: std::collections::VecDeque::new(), last: HashMap::new(), open: HashMap::new(), seq: 0 }
+    }
+
+    fn announced(e: &RawEvt) -> bool {
+        e.evt == INVALID_USER_EVT || (e.evt == "SSH_PREAUTH" && e.tty_or_proc.contains("invalid-user="))
+    }
+
+    /// A row of the log; the rows that are settled go to `out`.
+    pub(crate) fn push(&mut self, e: RawEvt, out: &mut Vec<RawEvt>) {
+        let t = DateTime::parse_from_rfc3339(&e.ts_rfc3339).map(|d| d.timestamp()).unwrap_or(0);
+        let entry = self.last.entry(e.pid).or_insert((t, 0));
+        if (t - entry.0).abs() > SAME_CONNECTION_SECS {
+            entry.1 += 1;
+        }
+        entry.0 = t;
+        let conn = (e.pid, entry.1);
+        let seq = self.seq;
+        self.seq += 1;
+        if e.pid != 0 {
+            let st = self.open.entry(conn).or_insert((false, None, t, 0));
+            st.2 = t;
+            st.3 += 1;
+            if e.evt == "SSH_FAILED" || e.evt == "SSH_SUCCESS" {
+                st.0 = true;
+            }
+            if Self::announced(&e) && st.1.is_none() {
+                st.1 = Some(seq);
+            }
+        }
+        self.pending.push_back((e, conn, seq));
+        self.settle(t, false, out);
+    }
+
+    /// The rest, at the end of the log.
+    pub(crate) fn finish(&mut self, out: &mut Vec<RawEvt>) {
+        self.settle(0, true, out);
+    }
+
+    fn settle(&mut self, now: i64, all: bool, out: &mut Vec<RawEvt>) {
+        let over = |st: &(bool, Option<u64>, i64, u32)| now - st.2 > SAME_CONNECTION_SECS + CLOCK_SLACK_SECS;
+        loop {
+            let crowded = self.pending.len() > PENDING_ROWS;
+            let Some((e, conn, _)) = self.pending.front() else { break };
+            let st = if e.pid != 0 { self.open.get(conn).copied() } else { None };
+            if !(all || crowded || e.pid == 0 || st.map_or(true, |s| over(&s))) {
+                break;
+            }
+            let (mut e, conn, seq) = self.pending.pop_front().unwrap();
+            let announced = Self::announced(&e);
+            // the connection became a failed logon: it logged no outcome and announced an invalid user
+            let converted = st.map_or(false, |s| !s.0 && s.1.is_some());
+            let is_first = st.map_or(false, |s| s.1 == Some(seq));
+            if (converted && is_first) || (announced && e.pid == 0) {
+                if e.evt == "SSH_PREAUTH" {
+                    // "ssh/preauth-closed invalid-user=admin"
+                    e.user = e.tty_or_proc.split("invalid-user=").nth(1).unwrap_or("").to_string();
+                }
+                e.evt = "SSH_FAILED".into();
+                e.tty_or_proc = format!("{}/invalid-user", self.prefix);
+                out.push(e);
+            } else if e.evt == INVALID_USER_EVT {
+                // the connection logged its own Failed line, or this is a later
+                // repeat of the announcement
+            } else if e.evt == "SSH_PREAUTH" && converted {
+                // the same connection, now a failed logon
+            } else {
+                out.push(e);
+            }
+            // a connection with no row left waiting is forgotten
+            if conn.0 != 0 {
+                if let Some(s) = self.open.get_mut(&conn) {
+                    s.3 = s.3.saturating_sub(1);
+                    if s.3 == 0 {
+                        self.open.remove(&conn);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn invalid_users_as_failures(out: &mut Vec<RawEvt>, prefix: &str) {
     use std::collections::{HashMap, HashSet};
     // One connection = one sshd pid, for as long as it lives. The system
@@ -193,7 +303,6 @@ pub(crate) fn invalid_users_as_failures(out: &mut Vec<RawEvt>, prefix: &str) {
     // gives an unauthenticated connection two minutes (LoginGraceTime).
     // With the pid alone, a failed password of one day cancelled the
     // "Invalid user" of another connection weeks later.
-    const SAME_CONNECTION_SECS: i64 = 600;
     let mut conn_of: Vec<(u32, u32)> = Vec::with_capacity(out.len());
     {
         let mut last: HashMap<u32, (i64, u32)> = HashMap::new();
@@ -479,7 +588,7 @@ fn latest_dated_record(dir: &Path) -> Option<NaiveDate> {
         }
     }
     let wtmp = dir.join("wtmp");
-    if fs::metadata(&wtmp).map(|m| m.len() > 0).unwrap_or(false) {
+    if crate::vfs::metadata(&wtmp).map(|m| m.len() > 0).unwrap_or(false) {
         for e in parse_utmp_file(&wtmp, "", false) {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&e.ts_rfc3339) {
                 take(dt.naive_utc().date());
@@ -516,7 +625,12 @@ impl Rfc3164Years {
         let mut prev: Option<u32> = None;
         let mut last: Option<(u32, u32)> = None;
         if let Ok(lines) = crate::textlines::open_plain_or_gzip(path) {
+            let mut n_lines = 0u64;
             for line in lines {
+                n_lines += 1;
+                if n_lines % 2_000_000 == 0 && std::env::var_os("MASSTIN_TIMING").is_some() {
+                    eprintln!("[timing] years of {}: {} lines, this one of {} bytes", fname, n_lines, line.len());
+                }
                 if let Some(cap) = RFC3164_RE.captures(&line) {
                     if let (Some(m), Ok(d)) = (month_number(&cap[1]), cap[2].trim().parse::<u32>()) {
                         if let Some(p) = prev {
@@ -531,7 +645,7 @@ impl Rfc3164Years {
         let (end, source): (Option<NaiveDate>, &'static str) = match rotation_date_from_name(fname) {
             Some(rot) => (Some(rot), "logrotate suffix"),
             None => {
-                let written = fs::metadata(path).ok().and_then(|m| m.modified().ok()).map(|t| DateTime::<Utc>::from(t).naive_utc().date() + chrono::Duration::days(1));
+                let written = crate::vfs::metadata(path).ok().and_then(|m| m.modified().ok()).map(|t| DateTime::<Utc>::from(t).naive_utc().date() + chrono::Duration::days(1));
                 let record = latest_dated_record(path.parent().unwrap_or(Path::new(".")));
                 match (written, record) {
                     (Some(w), Some(r)) if w > r + chrono::Duration::days(366) => (Some(r + chrono::Duration::days(31)), "last dated record of the system; the file's own date is over a year later"),
@@ -586,8 +700,8 @@ fn get_file_year(path: &Path) -> i32 {
     let dpkg_candidates = ["dpkg.log", "dpkg.log.1"];
     for name in &dpkg_candidates {
         let dpkg_path = dir.join(name);
-        if dpkg_path.exists() {
-            if let Ok(file) = File::open(&dpkg_path) {
+        if crate::vfs::exists(&dpkg_path) {
+            if let Ok(file) = crate::vfs::open(&dpkg_path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().flatten().take(5) {
                     if let Some(cap) = YEAR_RE.captures(&line) {
@@ -605,8 +719,8 @@ fn get_file_year(path: &Path) -> i32 {
 
     // 2) wtmp — binary with epoch timestamps, read first valid entry
     let wtmp_path = dir.join("wtmp");
-    if wtmp_path.exists() {
-        if let Ok(metadata) = fs::metadata(&wtmp_path) {
+    if crate::vfs::exists(&wtmp_path) {
+        if let Ok(metadata) = crate::vfs::metadata(&wtmp_path) {
             if metadata.len() > 0 {
                 // Parse first utmp entry to get the year from its epoch
                 let entries = parse_utmp_file(&wtmp_path, "", false);
@@ -624,7 +738,7 @@ fn get_file_year(path: &Path) -> i32 {
     }
 
     // 3) File modification time
-    if let Ok(metadata) = fs::metadata(path) {
+    if let Ok(metadata) = crate::vfs::metadata(path) {
         if let Ok(modified) = metadata.modified() {
             let dt: DateTime<Utc> = modified.into();
             let year = dt.year();
@@ -665,7 +779,7 @@ pub(crate) struct RawEvt {
 
 // ────────────────────────── hostname discovery ───────────────────────────────
 fn extract_hostname_txt(file: &Path) -> Option<String> {
-    let try_open = File::open(file).ok()?;
+    let try_open = crate::vfs::open(file).ok()?;
     let mut rdr = BufReader::new(try_open);
     let mut line = String::new();
     while rdr.read_line(&mut line).ok()? > 0 {
@@ -695,12 +809,12 @@ fn extract_hostname_txt(file: &Path) -> Option<String> {
 
 fn discover_hostname(root: &Path) -> String {
     // 1) /etc/hostname — most reliable on modern Linux
-    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(Result::ok) {
-        let path = entry.path().to_owned();
+    for (path, entry_is_file) in crate::vfs::walk(root, Some(4)) {
+        let _ = entry_is_file;
         if path.file_name() == Some(OsStr::new("hostname"))
             && path.parent().map(|p| p.ends_with("etc")).unwrap_or(false)
         {
-            if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(content) = crate::vfs::read_to_string(&path) {
                 let h = content.trim().to_string();
                 if !h.is_empty() {
                     crate::banner::print_info(&format!(
@@ -714,11 +828,11 @@ fn discover_hostname(root: &Path) -> String {
 
     // 1a) RHEL/CentOS 6 keep the name in /etc/sysconfig/network (HOSTNAME=)
     //     and have no /etc/hostname at all.
-    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(Result::ok) {
-        let path = entry.path().to_owned();
+    for (path, entry_is_file) in crate::vfs::walk(root, Some(4)) {
+        let _ = entry_is_file;
         if path.file_name() != Some(OsStr::new("network")) { continue; }
         if !path.parent().map(|p| p.ends_with("sysconfig")).unwrap_or(false) { continue; }
-        if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(content) = crate::vfs::read_to_string(&path) {
             for line in content.lines() {
                 if let Some(v) = line.trim().strip_prefix("HOSTNAME=") {
                     let h = v.trim().trim_matches('"').to_string();
@@ -737,10 +851,10 @@ fn discover_hostname(root: &Path) -> String {
     //     "Hostname: <name>" line. UAC writes "unknown" when it was pointed
     //     at a mounted image instead of a live system, so only a real value
     //     counts; otherwise fall through to the log-content heuristics.
-    for entry in WalkDir::new(root).max_depth(2).into_iter().filter_map(Result::ok) {
-        let path = entry.path().to_owned();
+    for (path, entry_is_file) in crate::vfs::walk(root, Some(2)) {
+        let _ = entry_is_file;
         if path.file_name() != Some(OsStr::new("uac.log")) { continue; }
-        if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(content) = crate::vfs::read_to_string(&path) {
             for line in content.lines().take(40) {
                 if let Some(rest) = line.trim().strip_prefix("Hostname:") {
                     let h = rest.trim();
@@ -756,8 +870,8 @@ fn discover_hostname(root: &Path) -> String {
     }
 
     // 2) dmesg
-    for entry in WalkDir::new(root).max_depth(3).into_iter().filter_map(Result::ok) {
-        let path = entry.path().to_owned();
+    for (path, entry_is_file) in crate::vfs::walk(root, Some(3)) {
+        let _ = entry_is_file;
         if path.file_name() == Some(OsStr::new("dmesg")) {
             if let Some(h) = extract_hostname_txt(&path) {
                 crate::banner::print_info(&format!(
@@ -779,12 +893,12 @@ fn discover_hostname(root: &Path) -> String {
     }
 
     // 3) Extract hostname from the first RFC3164 syslog line in any log file
-    for entry in WalkDir::new(root).max_depth(4).into_iter().filter_map(Result::ok) {
-        let path = entry.path().to_owned();
-        if !path.is_file() { continue; }
+    for (path, entry_is_file) in crate::vfs::walk(root, Some(4)) {
+        let _ = entry_is_file;
+        if !entry_is_file { continue; }
         let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
         if is_linux_artifact(&fname) {
-            if let Ok(file) = File::open(&path) {
+            if let Ok(file) = crate::vfs::open(&path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().flatten().take(20) {
                     if let Some(cap) = RFC3164_RE.captures(&line) {
@@ -811,7 +925,7 @@ fn discover_hostname(root: &Path) -> String {
 // ────────────────────────── utmp family parser ───────────────────────────────
 fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
     let mut res = Vec::new();
-    let file = match File::open(path) {
+    let file = match crate::vfs::open(path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
@@ -995,7 +1109,7 @@ fn load_passwd(root: &Path) -> HashMap<u32, String> {
     let mut candidates = vec![root.join("[root]"), root.to_path_buf()];
     if let Some(p) = root.parent() { candidates.push(p.to_path_buf()); }
     for fr in candidates {
-        if let Ok(s) = fs::read_to_string(fr.join("etc/passwd")) {
+        if let Ok(s) = crate::vfs::read_to_string(&fr.join("etc/passwd")) {
             for l in s.lines() {
                 let mut it = l.split(':');
                 if let (Some(name), Some(_), Some(uid)) = (it.next(), it.next(), it.next()) {
@@ -1010,7 +1124,7 @@ fn load_passwd(root: &Path) -> HashMap<u32, String> {
 
 fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
     let mut out = Vec::new();
-    let data = match fs::read(path) {
+    let data = match crate::vfs::read(path) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
@@ -1111,7 +1225,61 @@ fn parse_secure_or_messages(
     year_hint: Option<i32>,
     tz: &crate::linux_tz::LocalTz,
 ) -> Vec<RawEvt> {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
+    parse_secure_or_messages_to(path, dst_host, filter_ip, year_hint, tz, &mut |batch| all.extend(batch));
+    all
+}
+
+/// The rows of a syslog file as they are settled, a batch at a time.
+struct SyslogRows<'a> {
+    conns: ConnStream,
+    batch: Vec<RawEvt>,
+    sink: &'a mut dyn FnMut(Vec<RawEvt>),
+}
+
+/// Rows handed on at once.
+const SYSLOG_BATCH: usize = 50_000;
+
+impl SyslogRows<'_> {
+    fn push(&mut self, e: RawEvt) {
+        self.conns.push(e, &mut self.batch);
+        if self.conns.seq % 1_000_000 == 0 && std::env::var_os("MASSTIN_TIMING").is_some() {
+            eprintln!("[timing] syslog rows {}: {} waiting, {} connections open, {} pids, {} in the batch", self.conns.seq, self.conns.pending.len(), self.conns.open.len(), self.conns.last.len(), self.batch.len());
+        }
+        if self.batch.len() >= SYSLOG_BATCH {
+            self.flush();
+        }
+    }
+    /// The connections still open are settled: the end of the log.
+    fn end_connections(&mut self) {
+        self.conns.finish(&mut self.batch);
+    }
+    /// Rows that go after all the others, as they are.
+    fn extend(&mut self, rows: Vec<RawEvt>) {
+        self.batch.extend(rows);
+        if self.batch.len() >= SYSLOG_BATCH {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        if !self.batch.is_empty() {
+            (self.sink)(std::mem::take(&mut self.batch));
+        }
+    }
+}
+
+/// [`parse_secure_or_messages`], its rows handed to `sink` a batch at a
+/// time, in the file's order: a log of gigabytes (a server that took
+/// millions of attempts) is never held whole.
+fn parse_secure_or_messages_to(
+    path: &Path,
+    dst_host: &str,
+    filter_ip: bool,
+    year_hint: Option<i32>,
+    tz: &crate::linux_tz::LocalTz,
+    sink: &mut dyn FnMut(Vec<RawEvt>),
+) {
+    let mut out = SyslogRows { conns: ConnStream::new("ssh"), batch: Vec::new(), sink };
     // pam_unix(sshd:auth) failures are collected separately: on SSSD / LDAP
     // hosts pam_unix fails for EVERY directory user before pam_sss succeeds,
     // so counting them as failed logons is wrong whenever sshd's own
@@ -1143,7 +1311,7 @@ fn parse_secure_or_messages(
         Ok(l) => l,
         Err(e) => {
             eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
-            return Vec::new();
+            return;
         }
     };
     for line in (&mut lines).flat_map(expand_repeated) {
@@ -1370,7 +1538,11 @@ fn parse_secure_or_messages(
             if let Some(cap) = SSH_DISCONNECT_RE.captures(&msg) {
                 let user = cap[1].to_string();
                 let src  = cap[2].to_string();
-                if !filter_ip || !src.is_empty() {
+                // (used only for a file with no pam session line: once one
+                // is seen they are not kept)
+                if tracker.pam_closes > 0 {
+                    disconnect_fallback = Vec::new();
+                } else if !filter_ip || !src.is_empty() {
                     disconnect_fallback.push(RawEvt {
                         ts_rfc3339:  when.clone(),
                         user,
@@ -1393,7 +1565,11 @@ fn parse_secure_or_messages(
             if let Some(cap) = PAM_FAIL_RE.captures(&msg) {
                 let src  = cap[1].to_string();
                 let user = cap.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
-                if !filter_ip || !src.is_empty() {
+                // (used only for a file where sshd logged no outcome: once
+                // one is seen they are not kept)
+                if sshd_outcomes > 0 {
+                    pam_fallback = Vec::new();
+                } else if !filter_ip || !src.is_empty() {
                     pam_fallback.push(RawEvt {
                         ts_rfc3339:  when.clone(),
                         user,
@@ -1413,7 +1589,7 @@ fn parse_secure_or_messages(
     if let Some(p) = lines.problem(path) {
         crate::banner::print_warning(&format!("  {}", p));
     }
-    invalid_users_as_failures(&mut out, "ssh");
+    out.end_connections();
     if tracker.pam_closes == 0 && !disconnect_fallback.is_empty() {
         if is_debug_mode() {
             println!("    {}: no pam session lines, using {} 'Disconnected from user' lines as session ends",
@@ -1435,7 +1611,7 @@ fn parse_secure_or_messages(
         out.extend(pam_fallback);
     }
 
-    out
+    out.flush();
 }
 
 // ───────────────────── auditd: what a login session connected to ─────────────────────
@@ -2010,7 +2186,13 @@ fn coverage_days(rows: &[&RawEvt], days: &mut CoverageDays) {
             None => continue,
         };
         let h = r.dst_host.split('.').next().unwrap_or(&r.dst_host).to_string();
-        days.entry((h, log_family(&r.filename))).or_default().push(d);
+        let v = days.entry((h, log_family(&r.filename))).or_default();
+        v.push(d);
+        // (a row a day at most is what counts: millions of rows are not kept)
+        if v.len() > 8192 {
+            v.sort();
+            v.dedup();
+        }
     }
 }
 
@@ -2110,17 +2292,42 @@ fn channel_rank(t: &str) -> u8 {
 /// carries the host (a log file is one host's), so a set of rows reduced
 /// host by host keeps exactly what the whole set reduced at once keeps.
 fn reduce_rows(rows: &[RawEvt]) -> Reduced {
+    let first = reduce_first(rows);
+    let mut spans = FileSpans::new();
+    add_spans(rows, &first.deduped, &mut spans);
+    let (kept, audit_dups) = reduce_second(rows, first.deduped, &spans);
+    Reduced { kept, filtered: first.filtered, duplicates: first.removed, session_dups: first.session_dups, audit_dups }
+}
 
+/// The channel class of a row, for the reduction's keys.
+fn channel_class(t: &str) -> &'static str {
+    if t.starts_with("ssh") || t.starts_with("journal-ssh") { "ssh" }
+    else if t.starts_with("audit") { "audit" }
+    else if t == "pam" { "pam" }
+    else { "other" }
+}
+
+/// What the first step of the reduction leaves: the rows kept (by index, in
+/// the order of the channel's rank, then of reading) and what it dropped.
+struct FirstStep {
+    deduped: Vec<usize>,
+    filtered: usize,
+    removed: usize,
+    session_dups: usize,
+}
+
+/// The first step: the noise filter, the copies of one event through two
+/// channels of a kind, the further channels of an audit session. Every key
+/// carries the host and the source of the row, so a set of rows split by
+/// host and source keeps, piece by piece, what the whole set keeps.
+fn reduce_first(rows: &[RawEvt]) -> FirstStep {
     // Apply noise filter (--ignore-local / --exclude-*). We build a minimal
     // LogData view of each RawEvt just for the filter check — RawEvt's
     // `remote` field can be either an IP or a hostname, so we route it to
     // both src_ip and workstation_name for the classifier.
-    // Everything below works on indices / references: at 1.5M+ rows (a
-    // 28-host UAC folder) cloning the row set twice and keying HashMaps
-    // with five owned Strings per row ran the process out of memory.
-    let filtered: Vec<&RawEvt> = rows
-        .iter()
-        .filter(|r| {
+    let filtered: Vec<usize> = (0..rows.len())
+        .filter(|&i| {
+            let r = &rows[i];
             let (src_ip, src_computer) = if r.remote.parse::<std::net::IpAddr>().is_ok() {
                 (r.remote.clone(), String::new())
             } else {
@@ -2145,7 +2352,6 @@ fn reduce_rows(rows: &[RawEvt]) -> Reduced {
             crate::filter::should_keep_record(&ld)
         })
         .collect();
-    let index_of = |r: &RawEvt| -> usize { (r as *const RawEvt as usize - rows.as_ptr() as usize) / std::mem::size_of::<RawEvt>().max(1) };
     // Same event seen through two channels of the SAME kind is one event:
     // on RHEL 7+ rsyslog's imjournal copies every sshd line from journald
     // into /var/log/secure, so a login parsed from both would appear twice.
@@ -2154,14 +2360,8 @@ fn reduce_rows(rows: &[RawEvt]) -> Reduced {
     // resolution timestamp (journald has µs, syslog has seconds), host,
     // event, user, source, channel class. Preference within a class:
     // rsyslog text over journal (the file the analyst can open).
-    let channel_class = |t: &str| -> &'static str {
-        if t.starts_with("ssh") || t.starts_with("journal-ssh") { "ssh" }
-        else if t.starts_with("audit") { "audit" }
-        else if t == "pam" { "pam" }
-        else { "other" }
-    };
-    let mut ordered: Vec<&RawEvt> = filtered.clone();
-    ordered.sort_by_key(|r| channel_rank(&r.tty_or_proc));
+    let mut ordered: Vec<usize> = filtered.clone();
+    ordered.sort_by_key(|&i| channel_rank(&rows[i].tty_or_proc));
     // Keys are 64-bit hashes of the tuple instead of owned tuples.
     fn key_hash(parts: &[&str], sec: i64) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -2184,13 +2384,14 @@ fn reduce_rows(rows: &[RawEvt]) -> Reduced {
     // scp) legitimately opens several sessions per second from the same
     // account and source, and those are distinct logins, not duplicates.
     let mut owner: HashMap<u64, u32> = HashMap::with_capacity(ordered.len());
-    let mut deduped: Vec<&RawEvt> = Vec::with_capacity(ordered.len());
-    for r in ordered {
+    let mut deduped: Vec<usize> = Vec::with_capacity(ordered.len());
+    for i in ordered {
+        let r = &rows[i];
         let sec = ts_secs(&r.ts_rfc3339).unwrap_or(0);
         let key = key_hash(&[&r.dst_host, &r.evt, &r.user, &r.remote, channel_class(&r.tty_or_proc)], sec);
         let fid = file_id(&r.filename, &mut file_ids);
         let claimant = owner.entry(key).or_insert(fid);
-        if *claimant == fid { deduped.push(r); }
+        if *claimant == fid { deduped.push(i); }
     }
     let removed = filtered.len() - deduped.len();
     drop(owner);
@@ -2201,77 +2402,105 @@ fn reduce_rows(rows: &[RawEvt]) -> Reduced {
         // logins keep the earliest record of the session, session ends
         // (USER_END, one per channel) the latest
         let mut first: HashMap<(&str, u32, u64, &str, bool), (i64, usize)> = HashMap::new();
-        for (i, r) in deduped.iter().enumerate() {
+        for (k, &i) in deduped.iter().enumerate() {
+            let r = &rows[i];
             if r.conn == 0 { continue; }
             let is_end = r.evt == "LOGOUT";
             let sec = ts_secs(&r.ts_rfc3339).unwrap_or(if is_end { i64::MIN } else { i64::MAX });
-            let e = first.entry((r.dst_host.as_str(), r.pid, r.conn, r.remote.as_str(), is_end)).or_insert((sec, i));
-            if (is_end && sec > e.0) || (!is_end && sec < e.0) { *e = (sec, i); }
+            let e = first.entry((r.dst_host.as_str(), r.pid, r.conn, r.remote.as_str(), is_end)).or_insert((sec, k));
+            if (is_end && sec > e.0) || (!is_end && sec < e.0) { *e = (sec, k); }
         }
         let keep: std::collections::HashSet<usize> = first.values().map(|v| v.1).collect();
         let before = deduped.len();
         let mut k = 0usize;
-        deduped.retain(|r| { let ok = r.conn == 0 || keep.contains(&k); k += 1; ok });
+        deduped.retain(|&i| { let ok = rows[i].conn == 0 || keep.contains(&k); k += 1; ok });
         before - deduped.len()
     };
-    // auditd's USER_LOGIN is the same connection sshd already wrote to
-    // secure/auth.log/journald. The two are paired by the identifier they
-    // share — the sshd process id — never by time proximity or account
-    // (auditd names successful logins by uid, failed ones as "(unknown)"):
-    //   * same host, same pid, same source, same outcome (an audit failure
-    //     pairs with an sshd refusal or pre-authentication close);
-    //   * the sshd line comes from a log file whose time span covers the
-    //     audit record, so a pid reused on a day the sshd log does not
-    //     cover cannot be paired with a different connection;
-    //   * one-to-one, closest in time first (a pid is reused only after
-    //     the previous connection has ended).
-    // Audit rows left unpaired — hosts whose text logs rotated away,
-    // connections sshd did not log — are kept.
-    let audit_dups = {
-        let class = |evt: &str| -> u8 {
-            match evt { "SSH_SUCCESS" => 1, "SSH_FAILED" | "SSH_PREAUTH" => 2, "LOGOUT" => 3, _ => 0 }
-        };
-        let mut span: HashMap<&str, (i64, i64)> = HashMap::new();
-        let mut by_key: HashMap<(&str, u32, &str, u8), Vec<(i64, &str)>> = HashMap::new();
-        for r in deduped.iter() {
-            if channel_class(&r.tty_or_proc) != "ssh" { continue; }
-            let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
-            let e = span.entry(r.filename.as_str()).or_insert((sec, sec));
-            if sec < e.0 { e.0 = sec; }
-            if sec > e.1 { e.1 = sec; }
-            let c = class(&r.evt);
-            if r.pid != 0 && c != 0 {
-                by_key.entry((r.dst_host.as_str(), r.pid, r.remote.as_str(), c)).or_default().push((sec, r.filename.as_str()));
+    FirstStep { deduped, filtered: filtered.len(), removed, session_dups }
+}
+
+/// The time each log file's sshd rows span, after the first step: what the
+/// second step checks an audit record against. Of the whole set, whatever
+/// the pieces it is reduced in.
+type FileSpans = HashMap<String, (i64, i64)>;
+
+fn add_spans(rows: &[RawEvt], deduped: &[usize], spans: &mut FileSpans) {
+    for &i in deduped {
+        let r = &rows[i];
+        if channel_class(&r.tty_or_proc) != "ssh" { continue; }
+        let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
+        match spans.get_mut(r.filename.as_str()) {
+            Some(e) => {
+                if sec < e.0 { e.0 = sec; }
+                if sec > e.1 { e.1 = sec; }
+            }
+            None => {
+                spans.insert(r.filename.clone(), (sec, sec));
             }
         }
-        // candidate pairs (|dt|, audit index, sshd slot)
-        let mut slots: HashMap<(&str, u32, &str, u8, usize), ()> = HashMap::new();
-        let mut pairs: Vec<(i64, usize, (&str, u32, &str, u8, usize))> = Vec::new();
-        for (i, r) in deduped.iter().enumerate() {
-            if channel_class(&r.tty_or_proc) != "audit" || r.pid == 0 { continue; }
-            let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
-            let key = (r.dst_host.as_str(), r.pid, r.remote.as_str(), class(&r.evt));
-            if let Some(v) = by_key.get(&key) {
-                for (j, (t, f)) in v.iter().enumerate() {
-                    let (lo, hi) = span[f];
-                    if sec < lo || sec > hi { continue; }
-                    pairs.push(((sec - t).abs(), i, (key.0, key.1, key.2, key.3, j)));
-                }
-            }
-        }
-        pairs.sort_by_key(|p| p.0);
-        let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (_, i, slot) in pairs {
-            if drop_idx.contains(&i) || slots.contains_key(&slot) { continue; }
-            slots.insert(slot, ());
-            drop_idx.insert(i);
-        }
-        let n = drop_idx.len();
-        let mut k = 0usize;
-        deduped.retain(|_| { let keep = !drop_idx.contains(&k); k += 1; keep });
-        n
+    }
+}
+
+/// The second step: the audit records whose connection the sshd log
+/// already has. Returns the rows kept (by index) and how many were dropped.
+// auditd's USER_LOGIN is the same connection sshd already wrote to
+// secure/auth.log/journald. The two are paired by the identifier they
+// share — the sshd process id — never by time proximity or account
+// (auditd names successful logins by uid, failed ones as "(unknown)"):
+//   * same host, same pid, same source, same outcome (an audit failure
+//     pairs with an sshd refusal or pre-authentication close);
+//   * the sshd line comes from a log file whose time span covers the
+//     audit record, so a pid reused on a day the sshd log does not
+//     cover cannot be paired with a different connection;
+//   * one-to-one, closest in time first (a pid is reused only after
+//     the previous connection has ended).
+// Audit rows left unpaired — hosts whose text logs rotated away,
+// connections sshd did not log — are kept.
+fn reduce_second(rows: &[RawEvt], mut deduped: Vec<usize>, spans: &FileSpans) -> (Vec<usize>, usize) {
+    let class = |evt: &str| -> u8 {
+        match evt { "SSH_SUCCESS" => 1, "SSH_FAILED" | "SSH_PREAUTH" => 2, "LOGOUT" => 3, _ => 0 }
     };
-    Reduced { kept: deduped.iter().map(|r| index_of(r)).collect(), filtered: filtered.len(), duplicates: removed, session_dups, audit_dups }
+    // nothing to pair without an audit record: the sshd rows are not indexed
+    if !deduped.iter().any(|&i| channel_class(&rows[i].tty_or_proc) == "audit" && rows[i].pid != 0) {
+        return (deduped, 0);
+    }
+    let mut by_key: HashMap<(&str, u32, &str, u8), Vec<(i64, &str)>> = HashMap::new();
+    for &i in deduped.iter() {
+        let r = &rows[i];
+        if channel_class(&r.tty_or_proc) != "ssh" { continue; }
+        let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
+        let c = class(&r.evt);
+        if r.pid != 0 && c != 0 {
+            by_key.entry((r.dst_host.as_str(), r.pid, r.remote.as_str(), c)).or_default().push((sec, r.filename.as_str()));
+        }
+    }
+    // candidate pairs (|dt|, audit position, sshd slot)
+    let mut slots: HashMap<(&str, u32, &str, u8, usize), ()> = HashMap::new();
+    let mut pairs: Vec<(i64, usize, (&str, u32, &str, u8, usize))> = Vec::new();
+    for (k, &i) in deduped.iter().enumerate() {
+        let r = &rows[i];
+        if channel_class(&r.tty_or_proc) != "audit" || r.pid == 0 { continue; }
+        let sec = match ts_secs(&r.ts_rfc3339) { Some(x) => x, None => continue };
+        let key = (r.dst_host.as_str(), r.pid, r.remote.as_str(), class(&r.evt));
+        if let Some(v) = by_key.get(&key) {
+            for (j, (t, f)) in v.iter().enumerate() {
+                let Some(&(lo, hi)) = spans.get(*f) else { continue };
+                if sec < lo || sec > hi { continue; }
+                pairs.push(((sec - t).abs(), k, (key.0, key.1, key.2, key.3, j)));
+            }
+        }
+    }
+    pairs.sort_by_key(|p| p.0);
+    let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (_, k, slot) in pairs {
+        if drop_idx.contains(&k) || slots.contains_key(&slot) { continue; }
+        slots.insert(slot, ());
+        drop_idx.insert(k);
+    }
+    let n = drop_idx.len();
+    let mut k = 0usize;
+    deduped.retain(|_| { let keep = !drop_idx.contains(&k); k += 1; keep });
+    (deduped, n)
 }
 
 // Written directly, row by row, instead of through a polars DataFrame:
@@ -2376,6 +2605,51 @@ fn get_str(r: &mut impl Read) -> std::io::Result<String> {
     Ok(String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
+/// One row of the spill: where it came from, then the row.
+fn put_spill_row(w: &mut impl std::io::Write, origin: RowOrigin, r: &RawEvt) -> std::io::Result<()> {
+    w.write_all(&origin.0.to_le_bytes())?;
+    w.write_all(&origin.1.to_le_bytes())?;
+    w.write_all(&r.pid.to_le_bytes())?;
+    w.write_all(&r.conn.to_le_bytes())?;
+    for s in [&r.ts_rfc3339, &r.user, &r.remote, &r.tty_or_proc, &r.evt, &r.filename, &r.dst_host] {
+        put_str(w, s)?;
+    }
+    Ok(())
+}
+
+/// The bytes of rows on disk a piece of a host may hold to be reduced in
+/// memory (a row in memory is some eight times its bytes on disk): a 32nd of
+/// the memory free, 32 MiB at least and 512 MiB at most;
+/// `MASSTIN_ROW_BUDGET_MB` sets it.
+fn row_budget() -> u64 {
+    if let Some(mb) = std::env::var("MASSTIN_ROW_BUDGET_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&m| m >= 1) {
+        return mb << 20;
+    }
+    crate::threads::available_memory().map(|m| (m / 32).clamp(32 << 20, 512 << 20)).unwrap_or(256 << 20)
+}
+
+/// A host's rows split in `pieces` files by the source of each row: every
+/// key of the reduction carries the source, so each piece is reduced alone.
+fn split_by_source(path: &Path, pieces: usize, dir: &Path, tag: usize) -> std::io::Result<Vec<PathBuf>> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Write as _;
+    let paths: Vec<PathBuf> = (0..pieces).map(|k| dir.join(format!("piece-{}-{}.rows", tag, k))).collect();
+    let mut ws = Vec::with_capacity(pieces);
+    for p in &paths {
+        ws.push(std::io::BufWriter::with_capacity(1 << 16, crate::space::create(p)?));
+    }
+    HostSpill::each(path, |origin, r| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        r.remote.hash(&mut h);
+        let k = (h.finish() % pieces as u64) as usize;
+        put_spill_row(&mut ws[k], origin, &r)
+    })?;
+    for w in ws.iter_mut() {
+        w.flush()?;
+    }
+    Ok(paths)
+}
+
 /// The rows of each host, on disk.
 struct HostSpill {
     dir: PathBuf,
@@ -2391,6 +2665,12 @@ impl HostSpill {
 
     /// The rows of log `log`, appended to their hosts' files.
     fn add(&mut self, rows: &[RawEvt], log: u32) -> std::io::Result<()> {
+        self.add_from(rows, log, 0)
+    }
+
+    /// [`add`](Self::add) for a batch of a log's rows: `base` is the place
+    /// in the log of the batch's first row.
+    fn add_from(&mut self, rows: &[RawEvt], log: u32, base: u32) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut by_host: Vec<(&str, Vec<usize>)> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
@@ -2405,14 +2685,7 @@ impl HostSpill {
             let f = crate::space::append(&path)?;
             let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
             for i in idx {
-                let r = &rows[i];
-                w.write_all(&log.to_le_bytes())?;
-                w.write_all(&(i as u32).to_le_bytes())?;
-                w.write_all(&r.pid.to_le_bytes())?;
-                w.write_all(&r.conn.to_le_bytes())?;
-                for s in [&r.ts_rfc3339, &r.user, &r.remote, &r.tty_or_proc, &r.evt, &r.filename, &r.dst_host] {
-                    put_str(&mut w, s)?;
-                }
+                put_spill_row(&mut w, (log, base + i as u32), &rows[i])?;
             }
             w.flush()?;
         }
@@ -2422,8 +2695,24 @@ impl HostSpill {
 
     /// A host's rows, in the order they were read.
     fn read(path: &Path) -> std::io::Result<Vec<(RowOrigin, RawEvt)>> {
-        let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
+        let mut out = HostSpill::read_as_written(path)?;
+        out.sort_by_key(|(o, _)| *o);
+        Ok(out)
+    }
+
+    /// The rows of a file, in the file's order.
+    fn read_as_written(path: &Path) -> std::io::Result<Vec<(RowOrigin, RawEvt)>> {
         let mut out = Vec::new();
+        HostSpill::each(path, |o, r| {
+            out.push((o, r));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every row of a file handed to `f`, one at a time.
+    fn each(path: &Path, mut f: impl FnMut(RowOrigin, RawEvt) -> std::io::Result<()>) -> std::io::Result<()> {
+        let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
         loop {
             let log = match get_u32(&mut r) {
                 Ok(v) => v,
@@ -2442,10 +2731,9 @@ impl HostSpill {
             let evt = get_str(&mut r)?;
             let filename = get_str(&mut r)?;
             let dst_host = get_str(&mut r)?;
-            out.push(((log, idx), RawEvt { ts_rfc3339, user, remote, tty_or_proc, evt, filename, dst_host, pid, conn }));
+            f((log, idx), RawEvt { ts_rfc3339, user, remote, tty_or_proc, evt, filename, dst_host, pid, conn })?;
         }
-        out.sort_by_key(|(o, _)| *o);
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -2473,6 +2761,22 @@ fn get_run_row(r: &mut impl Read) -> Option<(String, u8, RowOrigin, String)> {
 /// alone into a run, the runs merged. What is printed and written is what
 /// [`build_dataframe`] gives for the same rows all at once.
 fn write_by_host(spill: &HostSpill, names: &UidNames, outgoing: Vec<(String, String)>, output: Option<&String>) {
+    write_by_host_within(spill, names, outgoing, output, row_budget())
+}
+
+/// One piece of a host, after the reduction's first step: its rows in the
+/// order that step left them, in memory or back on disk.
+enum Piece {
+    Held(Vec<RowOrigin>, Vec<RawEvt>, Vec<usize>),
+    Stored(PathBuf),
+}
+
+/// [`write_by_host`] with the bytes of rows a piece may hold. A host whose
+/// rows are more than that is split by the source of its rows and reduced
+/// a piece at a time (a server that took sixteen million attempts held
+/// 23 GB reduced whole): the first step of each piece, then, with the time
+/// every log file spans known, the second step of each.
+fn write_by_host_within(spill: &HostSpill, names: &UidNames, outgoing: Vec<(String, String)>, output: Option<&String>, budget: u64) {
     if spill.rows == 0 && outgoing.is_empty() {
         eprintln!("[WARN] nothing matched lateral-movement filter");
         write_empty_csv(output);
@@ -2485,39 +2789,105 @@ fn write_by_host(spill: &HostSpill, names: &UidNames, outgoing: Vec<(String, Str
     let mut days = CoverageDays::new();
     let mut runs: Vec<PathBuf> = Vec::new();
     for (n, (host, path)) in hosts.iter().enumerate() {
-        let rows = match HostSpill::read(path) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::banner::print_warning(&format!("Could not read back the rows of {} ({}): they are missing from the timeline", host, e));
-                continue;
+        let lost = |e: std::io::Error| crate::banner::print_warning(&format!("Could not read back the rows of {} ({}): they are missing from the timeline", host, e));
+        let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let pieces: Vec<PathBuf> = if len <= budget.max(1) {
+            vec![(*path).clone()]
+        } else {
+            let k = (len.div_ceil(budget.max(1)) as usize).clamp(2, 512);
+            crate::banner::print_info(&format!("  {}: {} of rows, reduced in {} pieces (by source) to stay within memory", host, crate::space::human(len), k));
+            match split_by_source(path, k, &spill.dir, n) {
+                Ok(v) => {
+                    let _ = fs::remove_file(path);
+                    v
+                }
+                Err(e) => {
+                    lost(e);
+                    continue;
+                }
             }
         };
-        let (origins, mut rows): (Vec<RowOrigin>, Vec<RawEvt>) = rows.into_iter().unzip();
-        for r in rows.iter_mut() {
-            names.apply(r);
-        }
-        let red = reduce_rows(&rows);
-        filtered += red.filtered;
-        removed += red.duplicates;
-        session_dups += red.session_dups;
-        audit_dups += red.audit_dups;
-        let mut kept = red.kept;
-        // time, then rank and origin: the stable sort of the whole set
-        kept.sort_by(|&a, &b| rows[a].ts_rfc3339.cmp(&rows[b].ts_rfc3339).then(channel_rank(&rows[a].tty_or_proc).cmp(&channel_rank(&rows[b].tty_or_proc))).then(origins[a].cmp(&origins[b])));
-        let refs: Vec<&RawEvt> = kept.iter().map(|&i| &rows[i]).collect();
-        coverage_days(&refs, &mut days);
-        let run = spill.dir.join(format!("run-{}.rows", n));
-        let written = (|| -> std::io::Result<()> {
-            use std::io::Write as _;
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&run)?);
-            for &i in &kept {
-                put_run_row(&mut w, &rows[i].ts_rfc3339, channel_rank(&rows[i].tty_or_proc), origins[i], &row_line(&rows[i]))?;
+        let several = pieces.len() > 1;
+        // the first step of every piece; the files' spans over all of them
+        let mut spans = FileSpans::new();
+        let mut firsts: Vec<Piece> = Vec::new();
+        for (k, piece) in pieces.iter().enumerate() {
+            let rows = match HostSpill::read(piece) {
+                Ok(v) => v,
+                Err(e) => {
+                    lost(e);
+                    continue;
+                }
+            };
+            let _ = fs::remove_file(piece);
+            let (origins, mut rows): (Vec<RowOrigin>, Vec<RawEvt>) = rows.into_iter().unzip();
+            for r in rows.iter_mut() {
+                names.apply(r);
             }
-            w.flush()
-        })();
-        match written {
-            Ok(()) => runs.push(run),
-            Err(e) => crate::banner::print_warning(&format!("Could not write the rows of {} ({}): is the temporary disk full? They are missing from the timeline", host, e)),
+            let first = reduce_first(&rows);
+            filtered += first.filtered;
+            removed += first.removed;
+            session_dups += first.session_dups;
+            add_spans(&rows, &first.deduped, &mut spans);
+            if !several {
+                firsts.push(Piece::Held(origins, rows, first.deduped));
+                continue;
+            }
+            // back to disk, in the order the first step left them
+            let stored = spill.dir.join(format!("first-{}-{}.rows", n, k));
+            let wrote = (|| -> std::io::Result<()> {
+                use std::io::Write as _;
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&stored)?);
+                for &i in &first.deduped {
+                    put_spill_row(&mut w, origins[i], &rows[i])?;
+                }
+                w.flush()
+            })();
+            match wrote {
+                Ok(()) => firsts.push(Piece::Stored(stored)),
+                Err(e) => crate::banner::print_warning(&format!("Could not write the rows of {} ({}): is the temporary disk full? They are missing from the timeline", host, e)),
+            }
+        }
+        // the second step of every piece, sorted into a run
+        for (k, piece) in firsts.into_iter().enumerate() {
+            let (origins, rows, deduped) = match piece {
+                Piece::Held(o, r, d) => (o, r, d),
+                Piece::Stored(p) => {
+                    let got = HostSpill::read_as_written(&p);
+                    let _ = fs::remove_file(&p);
+                    match got {
+                        Ok(v) => {
+                            let (o, r): (Vec<RowOrigin>, Vec<RawEvt>) = v.into_iter().unzip();
+                            let d = (0..r.len()).collect();
+                            (o, r, d)
+                        }
+                        Err(e) => {
+                            lost(e);
+                            continue;
+                        }
+                    }
+                }
+            };
+            let (mut kept, dropped) = reduce_second(&rows, deduped, &spans);
+            audit_dups += dropped;
+            // time, then rank and origin: the stable sort of the whole set
+            kept.sort_by(|&a, &b| rows[a].ts_rfc3339.cmp(&rows[b].ts_rfc3339).then(channel_rank(&rows[a].tty_or_proc).cmp(&channel_rank(&rows[b].tty_or_proc))).then(origins[a].cmp(&origins[b])));
+            let refs: Vec<&RawEvt> = kept.iter().map(|&i| &rows[i]).collect();
+            coverage_days(&refs, &mut days);
+            drop(refs);
+            let run = spill.dir.join(format!("run-{}-{}.rows", n, k));
+            let written = (|| -> std::io::Result<()> {
+                use std::io::Write as _;
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&run)?);
+                for &i in &kept {
+                    put_run_row(&mut w, &rows[i].ts_rfc3339, channel_rank(&rows[i].tty_or_proc), origins[i], &row_line(&rows[i]))?;
+                }
+                w.flush()
+            })();
+            match written {
+                Ok(()) => runs.push(run),
+                Err(e) => crate::banner::print_warning(&format!("Could not write the rows of {} ({}): is the temporary disk full? They are missing from the timeline", host, e)),
+            }
         }
         let _ = fs::remove_file(path);
     }
@@ -3252,9 +3622,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // the loose logs: given one by one, or lying in the folders given
     let mut loose: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     for root in dirs {
-        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            let p = entry.into_path();
-            if !p.is_file() { continue; }
+        // (a disk image's volume is walked through its listing: crate::vfs)
+        for (p, is_file) in crate::vfs::walk(Path::new(root), None) {
+            if !is_file { continue; }
             let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if is_linux_artifact(fname) && !is_config_not_log(&p) {
                 loose.push(p);
@@ -3408,7 +3778,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
         // Fallback: if hostname is still unknown/generic, extract from the log's RFC3164 header
         if dst_host == "unknown" || dst_host == "C:" || dst_host.len() <= 2 {
-            if let Ok(file) = File::open(path) {
+            if let Ok(file) = crate::vfs::open(path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().flatten().take(20) {
                     if let Some(cap) = RFC3164_RE.captures(&line) {
@@ -3480,30 +3850,63 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
         }
         let tz = root2tz.get(&root).unwrap();
 
-        let mut parsed: Vec<RawEvt> = Vec::new();
-        if fname == "lastlog" {
-            let passwd = root2passwd
-                .entry(root.clone())
-                .or_insert_with(|| load_passwd(&root));
-            parsed = parse_lastlog(path, &dst_host, passwd);
-        } else if fname == "utmp"
-            || is_rotated_name(&fname, "wtmp") || is_rotated_name(&fname, "btmp")
+        // the log's rows, a batch at a time (a syslog of gigabytes hands
+        // them on as it is read): renamed, counted for the uids, to disk
+        let mut count = 0usize;
         {
-            parsed = parse_utmp_file(path, &dst_host, true);
-        } else if fname.starts_with("secure") || fname.starts_with("auth.log") {
-            parsed = parse_secure_or_messages(path, &dst_host, true, cached_year, tz);
-        } else if fname.starts_with("messages") {
-            parsed = parse_secure_or_messages(path, &dst_host, true, cached_year, tz);
-        } else if fname.starts_with("audit.log") {
-            let passwd = root2passwd
-                .entry(root.clone())
-                .or_insert_with(|| load_passwd(&root));
-            parsed = parse_audit(path, &dst_host, true, passwd);
-        } else if fname.ends_with(".journal") || fname.ends_with(".journal~") {
-            parsed = crate::parse_journal::parse_journal_file(path, &dst_host);
+            let mut take = |mut parsed: Vec<RawEvt>| {
+                if parsed.is_empty() {
+                    return;
+                }
+                // the log's own name instead of the temporary folder it was unpacked
+                // into: `<archive>:<path inside>` (longest prefix: nested archives
+                // unpack inside their wrapper's folder)
+                if !prefixes.is_empty() {
+                    for evt in parsed.iter_mut() {
+                        let norm = evt.filename.replace('\\', "/");
+                        if let Some((prefix, name)) = prefixes.iter().find(|(pfx, _)| norm.starts_with(pfx.as_str())) {
+                            let inside = norm[prefix.len()..].trim_start_matches('/');
+                            evt.filename = format!("{}:{}", name, inside);
+                        }
+                    }
+                }
+                for evt in &parsed {
+                    uid_votes.note(evt);
+                }
+                if let Err(e) = spill.add_from(&parsed, log_no_now as u32, count as u32) {
+                    // named with the others at the end of the run; said once here
+                    crate::space::left_out(&format!("the rows of {}", path_str), &e.to_string());
+                    if !spill_failed {
+                        spill_failed = true;
+                        crate::banner::print_warning(&format!(
+                            "Could not write the rows of {} to the temporary folder ({}): they are missing from the timeline, and so are the next ones that find no room (all named at the end).",
+                            path_str, e
+                        ));
+                    }
+                }
+                count += parsed.len();
+            };
+            if fname == "lastlog" {
+                let passwd = root2passwd
+                    .entry(root.clone())
+                    .or_insert_with(|| load_passwd(&root));
+                take(parse_lastlog(path, &dst_host, passwd));
+            } else if fname == "utmp"
+                || is_rotated_name(&fname, "wtmp") || is_rotated_name(&fname, "btmp")
+            {
+                take(parse_utmp_file(path, &dst_host, true));
+            } else if fname.starts_with("secure") || fname.starts_with("auth.log") || fname.starts_with("messages") {
+                parse_secure_or_messages_to(path, &dst_host, true, cached_year, tz, &mut take);
+            } else if fname.starts_with("audit.log") {
+                let passwd = root2passwd
+                    .entry(root.clone())
+                    .or_insert_with(|| load_passwd(&root));
+                take(parse_audit(path, &dst_host, true, passwd));
+            } else if fname.ends_with(".journal") || fname.ends_with(".journal~") {
+                take(crate::parse_journal::parse_journal_file(path, &dst_host));
+            }
         }
 
-        let count = parsed.len();
         if count == 0 {
             skipped += 1;
         } else {
@@ -3533,32 +3936,6 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 .to_string();
             // Linux logs never come from VSS; always None.
             artifact_details.push((source, short, None, count));
-        }
-        // the log's own name instead of the temporary folder it was unpacked
-        // into: `<archive>:<path inside>` (longest prefix: nested archives
-        // unpack inside their wrapper's folder)
-        if !prefixes.is_empty() {
-            for evt in parsed.iter_mut() {
-                let norm = evt.filename.replace('\\', "/");
-                if let Some((prefix, name)) = prefixes.iter().find(|(pfx, _)| norm.starts_with(pfx.as_str())) {
-                    let inside = norm[prefix.len()..].trim_start_matches('/');
-                    evt.filename = format!("{}:{}", name, inside);
-                }
-            }
-        }
-        for evt in &parsed {
-            uid_votes.note(evt);
-        }
-        if let Err(e) = spill.add(&parsed, log_no_now as u32) {
-            // named with the others at the end of the run; said once here
-            crate::space::left_out(&format!("the rows of {}", path_str), &e.to_string());
-            if !spill_failed {
-                spill_failed = true;
-                crate::banner::print_warning(&format!(
-                    "Could not write the rows of {} to the temporary folder ({}): they are missing from the timeline, and so are the next ones that find no room (all named at the end).",
-                    path_str, e
-                ));
-            }
         }
 
         if is_debug_mode() {
@@ -4336,15 +4713,82 @@ mod host_spill_tests {
         let names = votes.resolve();
         assert_eq!(votes.changed(&names), 2, "both uids named");
         assert_eq!(spill.rows, 13);
-        write_by_host(&spill, &names, outgoing, Some(&by_host));
+        write_by_host(&spill, &names, outgoing.clone(), Some(&by_host));
 
         let a = fs::read_to_string(&whole).unwrap();
         let b = fs::read_to_string(&by_host).unwrap();
         assert_eq!(a, b);
+        // and with every host split in pieces by the source of its rows
+        let in_pieces = dir.join("in_pieces.csv").to_string_lossy().to_string();
+        let mut spill2 = HostSpill::new(dir.join("_rows2"));
+        for (n, log) in logs.iter().enumerate() {
+            spill2.add(log, n as u32).unwrap();
+        }
+        write_by_host_within(&spill2, &names, outgoing, Some(&in_pieces), 64);
+        assert_eq!(a, fs::read_to_string(&in_pieces).unwrap(), "a host reduced in pieces");
         // and the reduction did its work
         assert_eq!(a.lines().count(), 1 + 13 - 2 + 1, "{}", a);
         assert_eq!(a.matches("uid:15001").count(), 0, "{}", a);
         assert!(a.lines().nth(1).unwrap().contains(",web01,") && a.lines().nth(1).unwrap().contains("alice"), "{}", a);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod conn_stream_tests {
+    use super::*;
+
+    fn ev(secs: i64, pid: u32, evt: &str, chan: &str, user: &str) -> RawEvt {
+        let ts = DateTime::<Utc>::from_timestamp(1_790_000_000 + secs, 0).unwrap().to_rfc3339();
+        RawEvt { ts_rfc3339: ts, user: user.into(), remote: "203.0.113.9".into(), tty_or_proc: chan.into(), evt: evt.into(), filename: "auth.log".into(), dst_host: "web01".into(), pid, conn: 0 }
+    }
+
+    /// The connections resolved as the rows go by give what the whole file
+    /// resolved at once gives, row for row: an announcement with its own
+    /// failed line, one alone with its pre-auth close, a pid used again
+    /// later, rows with no pid, and thousands of connections in between.
+    #[test]
+    fn as_the_rows_go_by_is_what_the_whole_file_gives() {
+        let mut rows: Vec<RawEvt> = Vec::new();
+        let mut t = 0i64;
+        for k in 0..6000u32 {
+            let pid = 1000 + (k % 500); // pids come back every 500 connections
+            t += 7;
+            match k % 5 {
+                0 => {
+                    // announced, then its own Failed line: the announcement goes
+                    rows.push(ev(t, pid, INVALID_USER_EVT, "ssh/invalid-user", "admin"));
+                    rows.push(ev(t + 1, pid, "SSH_FAILED", "ssh/password", "admin"));
+                }
+                1 => {
+                    // announced and closed before any outcome: one failed logon
+                    rows.push(ev(t, pid, INVALID_USER_EVT, "ssh/invalid-user", "oracle"));
+                    rows.push(ev(t + 2, pid, "SSH_PREAUTH", "ssh/preauth-closed invalid-user=oracle", ""));
+                }
+                2 => rows.push(ev(t, pid, "SSH_PREAUTH", "ssh/preauth-closed invalid-user=git", "")),
+                3 => rows.push(ev(t, 0, INVALID_USER_EVT, "ssh/invalid-user", "nopid")),
+                _ => {
+                    rows.push(ev(t, pid, "SSH_SUCCESS", "ssh/publickey", "alice"));
+                    rows.push(ev(t + 3, pid, "SSH_PREAUTH", "ssh/preauth-closed", ""));
+                }
+            }
+        }
+        let mut whole = rows.clone();
+        invalid_users_as_failures(&mut whole, "ssh");
+        let mut stream = ConnStream::new("ssh");
+        let mut by = Vec::new();
+        let mut held = 0usize;
+        for r in rows {
+            stream.push(r, &mut by);
+            held = held.max(stream.pending.len());
+        }
+        stream.finish(&mut by);
+        let show = |v: &[RawEvt]| v.iter().map(|e| format!("{} {} {} {} {}", e.ts_rfc3339, e.pid, e.evt, e.tty_or_proc, e.user)).collect::<Vec<_>>();
+        assert_eq!(show(&whole), show(&by));
+        assert!(whole.len() > 6000 && whole.iter().any(|e| e.tty_or_proc == "ssh/invalid-user"));
+        // what waits is the last couple of hours, not the file
+        assert!(held < 2500, "{} rows held", held);
+        assert!(stream.open.is_empty() && stream.pending.is_empty());
     }
 }

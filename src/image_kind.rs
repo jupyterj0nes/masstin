@@ -53,6 +53,12 @@ const NTFS_SIGNATURE: &[u8] = b"NTFS    ";
 /// The kind of disk image the first 4 KiB and the last 512 bytes of a file
 /// show. `None` when nothing says disk image.
 pub fn image_kind_from_bytes(head: &[u8], tail: &[u8]) -> Option<ImageKind> {
+    image_kind_from_bytes_of(head, tail, u64::MAX)
+}
+
+/// [`image_kind_from_bytes`] for a file of `len` bytes: a partition of an
+/// MBR has to start inside the file.
+pub fn image_kind_from_bytes_of(head: &[u8], tail: &[u8], len: u64) -> Option<ImageKind> {
     if head.len() < 4096 {
         return None;
     }
@@ -79,7 +85,7 @@ pub fn image_kind_from_bytes(head: &[u8], tail: &[u8]) -> Option<ImageKind> {
             let e = &head[446 + 16 * i..446 + 16 * (i + 1)];
             let start = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
             let sectors = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
-            (e[0] == 0x00 || e[0] == 0x80) && e[4] != 0 && start != 0 && sectors != 0
+            (e[0] == 0x00 || e[0] == 0x80) && e[4] != 0 && start != 0 && sectors != 0 && (start as u64) * 512 < len
         });
         if valid_entry {
             return Some(ImageKind::Raw);
@@ -88,8 +94,14 @@ pub fn image_kind_from_bytes(head: &[u8], tail: &[u8]) -> Option<ImageKind> {
     if &head[3..11] == NTFS_SIGNATURE {
         return Some(ImageKind::Raw);
     }
+    // an ext2/3/4 superblock: its magic, and fields that only a superblock
+    // has in range (two bytes alone are in one file out of 65,536)
     if head[1080] == 0x53 && head[1081] == 0xEF {
-        return Some(ImageKind::Raw);
+        let le32 = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        let (inodes, blocks, log_block, per_group, inodes_per_group, rev) = (le32(1024), le32(1028), le32(1024 + 24), le32(1024 + 32), le32(1024 + 40), le32(1024 + 76));
+        if inodes > 0 && blocks > 0 && log_block <= 6 && per_group > 0 && inodes_per_group > 0 && rev <= 1 {
+            return Some(ImageKind::Raw);
+        }
     }
     if head.starts_with(b"XFSB") || &head[512..520] == b"LABELONE" {
         return Some(ImageKind::Raw);
@@ -110,7 +122,7 @@ pub fn sniff(path: &Path) -> Option<ImageKind> {
     let mut tail = vec![0u8; 512];
     f.seek(SeekFrom::End(-512)).ok()?;
     f.read_exact(&mut tail).ok()?;
-    image_kind_from_bytes(&head, &tail)
+    image_kind_from_bytes_of(&head, &tail, meta.len())
 }
 
 /// Extensions of the files the content check leaves alone: they are
@@ -129,6 +141,12 @@ const NOT_IMAGES: &[&str] = &[
 pub fn worth_sniffing(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
     if name.ends_with(".journal~") {
+        return false;
+    }
+    // a Linux log by its own name (`secure-20261101`, `wtmp.1`, `lastlog`,
+    // `messages`): binary ones hold any bytes
+    let family = crate::parse_linux::log_family(&name);
+    if family != "other" && crate::detect::is_rotated_log_name(&name, family) {
         return false;
     }
     let ext = match name.rsplit_once('.') {
@@ -217,6 +235,9 @@ mod tests {
         h[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
         h[446 + 12..446 + 16].copy_from_slice(&100_000u32.to_le_bytes());
         assert_eq!(image_kind_from_bytes(&h, &tail), Some(ImageKind::Raw));
+        // the same table in a file the partition does not fit in is not a disk
+        assert_eq!(image_kind_from_bytes_of(&h, &tail, 512 * 1024), None);
+        assert_eq!(image_kind_from_bytes_of(&h, &tail, 64 << 20), Some(ImageKind::Raw));
         // a boot signature and no partition is not a disk
         let mut h = block();
         h[510] = 0x55;
@@ -229,6 +250,13 @@ mod tests {
         let mut h = block();
         h[1080] = 0x53;
         h[1081] = 0xEF;
+        assert_eq!(image_kind_from_bytes(&h, &tail), None, "the magic alone is not a superblock");
+        h[1024..1028].copy_from_slice(&65_536u32.to_le_bytes()); // inodes
+        h[1028..1032].copy_from_slice(&262_144u32.to_le_bytes()); // blocks
+        h[1048..1052].copy_from_slice(&2u32.to_le_bytes()); // 4 KiB blocks
+        h[1056..1060].copy_from_slice(&32_768u32.to_le_bytes()); // blocks per group
+        h[1064..1068].copy_from_slice(&8_192u32.to_le_bytes()); // inodes per group
+        h[1100..1104].copy_from_slice(&1u32.to_le_bytes()); // revision
         assert_eq!(image_kind_from_bytes(&h, &tail), Some(ImageKind::Raw));
         let mut h = block();
         h[..4].copy_from_slice(b"XFSB");
@@ -247,7 +275,7 @@ mod tests {
         for n in ["snap-web01_os_disk-20261116", "disk.bin", "server.disk", "copy.2026-11-16", "x.dd.renamed"] {
             assert!(worth_sniffing(Path::new(n)), "{}", n);
         }
-        for n in ["Security.evtx", "triage.zip", "uac.tar.gz", "auth.log", "system@x.journal", "system@x.journal~", "case.E02", "case.Ex02", "split.002", "NTUSER.DAT", "t.csv"] {
+        for n in ["Security.evtx", "triage.zip", "uac.tar.gz", "auth.log", "system@x.journal", "system@x.journal~", "case.E02", "case.Ex02", "split.002", "NTUSER.DAT", "t.csv", "wtmp", "btmp-20261101", "lastlog", "secure", "messages-20261101", "auth.log.1"] {
             assert!(!worth_sniffing(Path::new(n)), "{}", n);
         }
     }

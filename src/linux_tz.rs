@@ -407,7 +407,7 @@ fn zone_from_path(p: &str) -> Option<String> {
 /// "/" means a live host; anything else ("/mnt/sysroot") is a mounted image
 /// whose live_response/ output describes the COLLECTOR, not the evidence.
 pub(crate) fn uac_mount_point(root: &Path) -> Option<String> {
-    let content = fs::read_to_string(root.join("uac.log")).ok()?;
+    let content = crate::vfs::read_to_string(&root.join("uac.log")).ok()?;
     content.lines().take(40).find_map(|l| l.trim().strip_prefix("Mount Point:").map(|v| v.trim().to_string()))
 }
 
@@ -425,13 +425,13 @@ fn fs_roots(root: &Path) -> Vec<PathBuf> {
 pub(crate) fn discover_timezone(root: &Path) -> (LocalTz, String) {
     for fr in fs_roots(root) {
         // 1. Debian / Ubuntu
-        if let Ok(s) = fs::read_to_string(fr.join("etc/timezone")) {
+        if let Ok(s) = crate::vfs::read_to_string(&fr.join("etc/timezone")) {
             if let Some(tz) = s.lines().next().and_then(named) {
                 return (tz, format!("{} (from /etc/timezone)", s.trim()));
             }
         }
         // 2. RHEL / CentOS 6
-        if let Ok(s) = fs::read_to_string(fr.join("etc/sysconfig/clock")) {
+        if let Ok(s) = crate::vfs::read_to_string(&fr.join("etc/sysconfig/clock")) {
             for l in s.lines() {
                 if let Some(v) = l.trim().strip_prefix("ZONE=") {
                     if let Some(tz) = named(v) {
@@ -441,7 +441,7 @@ pub(crate) fn discover_timezone(root: &Path) -> (LocalTz, String) {
             }
         }
         // 3. /etc/localtime symlink target, recorded by the tar extractor
-        if let Ok(s) = fs::read_to_string(fr.join("etc/localtime.masstin-link")) {
+        if let Ok(s) = crate::vfs::read_to_string(&fr.join("etc/localtime.masstin-link")) {
             if let Some(z) = zone_from_path(&s) {
                 if let Some(tz) = named(&z) {
                     return (tz, format!("{} (from /etc/localtime symlink)", z));
@@ -449,7 +449,7 @@ pub(crate) fn discover_timezone(root: &Path) -> (LocalTz, String) {
             }
         }
         // 4. /etc/localtime as a regular TZif file
-        if let Ok(b) = fs::read(fr.join("etc/localtime")) {
+        if let Ok(b) = crate::vfs::read(&fr.join("etc/localtime")) {
             if let Some(t) = TzifTable::parse(&b) {
                 let now_off = t.offset_at(chrono::Utc::now().timestamp());
                 return (LocalTz::Table(t), format!("TZif table, current offset {:+}h (from /etc/localtime)", now_off as f64 / 3600.0));
@@ -459,7 +459,7 @@ pub(crate) fn discover_timezone(root: &Path) -> (LocalTz, String) {
     // 5. Live collection only: timedatectl output
     let live = uac_mount_point(root).map(|m| m == "/").unwrap_or(false);
     if live {
-        if let Ok(s) = fs::read_to_string(root.join("live_response/system/timedatectl_status.txt")) {
+        if let Ok(s) = crate::vfs::read_to_string(&root.join("live_response/system/timedatectl_status.txt")) {
             for l in s.lines() {
                 if let Some(v) = l.trim().strip_prefix("Time zone:") {
                     let z = v.trim().split_whitespace().next().unwrap_or("");

@@ -36,6 +36,187 @@ fn parse_time(raw: &str) -> Option<NaiveDateTime> {
 }
 
 use crate::csv_out::{Layout, Marks, HEADER};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+
+/// The bytes of rows held to be sorted before they go to disk as a sorted
+/// run (a row in memory is several times its text): a 32nd of the memory
+/// free, 32 MiB at least and 512 MiB at most; `MASSTIN_ROW_BUDGET_MB` sets
+/// it. A merge that fits is sorted in memory, as it always was.
+fn merge_budget() -> u64 {
+    if let Some(mb) = std::env::var("MASSTIN_ROW_BUDGET_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&m| m >= 1) {
+        return mb << 20;
+    }
+    crate::threads::available_memory().map(|m| (m / 32).clamp(32 << 20, 512 << 20)).unwrap_or(256 << 20)
+}
+
+/// A row waiting to be sorted: its instant, its place in what was read, its 19 columns.
+type Held = (NaiveDateTime, u64, Vec<String>);
+
+/// The rows of a merge, sorted on (instant, place read) without holding
+/// them all: past the budget they go to disk as sorted runs, read back
+/// together at the end.
+struct Sorter {
+    budget: u64,
+    held: Vec<Held>,
+    held_bytes: u64,
+    runs: Vec<PathBuf>,
+    dir: PathBuf,
+    seq: u64,
+}
+
+fn put_row(w: &mut impl Write, row: &Held) -> std::io::Result<()> {
+    w.write_all(&row.0.and_utc().timestamp().to_le_bytes())?;
+    w.write_all(&row.0.and_utc().timestamp_subsec_nanos().to_le_bytes())?;
+    w.write_all(&row.1.to_le_bytes())?;
+    w.write_all(&(row.2.len() as u32).to_le_bytes())?;
+    for f in &row.2 {
+        w.write_all(&(f.len() as u32).to_le_bytes())?;
+        w.write_all(f.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn get_row(r: &mut impl Read) -> std::io::Result<Option<Held>> {
+    let mut b8 = [0u8; 8];
+    let mut b4 = [0u8; 4];
+    match r.read_exact(&mut b8) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let secs = i64::from_le_bytes(b8);
+    r.read_exact(&mut b4)?;
+    let nanos = u32::from_le_bytes(b4);
+    r.read_exact(&mut b8)?;
+    let seq = u64::from_le_bytes(b8);
+    r.read_exact(&mut b4)?;
+    let n = u32::from_le_bytes(b4) as usize;
+    let mut fields = Vec::with_capacity(n);
+    for _ in 0..n {
+        r.read_exact(&mut b4)?;
+        let mut s = vec![0u8; u32::from_le_bytes(b4) as usize];
+        r.read_exact(&mut s)?;
+        fields.push(String::from_utf8(s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?);
+    }
+    let t = DateTime::<Utc>::from_timestamp(secs, nanos).map(|d| d.naive_utc()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "a time out of range in a sorted run"))?;
+    Ok(Some((t, seq, fields)))
+}
+
+impl Sorter {
+    fn new(budget: u64) -> Sorter {
+        let dir = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id())).join(format!("merge_runs_{:?}", std::thread::current().id()).replace(['(', ')'], "_"));
+        Sorter { budget, held: Vec::new(), held_bytes: 0, runs: Vec::new(), dir, seq: 0 }
+    }
+
+    fn push(&mut self, t: NaiveDateTime, fields: Vec<String>) -> std::io::Result<()> {
+        self.held_bytes += fields.iter().map(|f| f.len() as u64).sum::<u64>() + 64;
+        self.held.push((t, self.seq, fields));
+        self.seq += 1;
+        if self.held_bytes > self.budget {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    fn spill(&mut self) -> std::io::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        self.held.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let path = self.dir.join(format!("run-{}.rows", self.runs.len()));
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&path)?);
+        for row in &self.held {
+            put_row(&mut w, row)?;
+        }
+        w.flush()?;
+        self.runs.push(path);
+        self.held = Vec::new();
+        self.held_bytes = 0;
+        Ok(())
+    }
+
+    /// The rows in order, each handed to `each`.
+    fn drain(&mut self, each: &mut dyn FnMut(Held) -> Result<(), Box<dyn Error>>) -> Result<(), Box<dyn Error>> {
+        if self.runs.is_empty() {
+            self.held.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for row in std::mem::take(&mut self.held) {
+                each(row)?;
+            }
+            return Ok(());
+        }
+        self.spill()?;
+        let mut readers = Vec::with_capacity(self.runs.len());
+        for p in &self.runs {
+            readers.push(std::io::BufReader::with_capacity(1 << 18, std::fs::File::open(p)?));
+        }
+        // the next row of each run; the smallest (instant, place) goes first
+        let mut heads: Vec<Option<Held>> = Vec::with_capacity(readers.len());
+        let mut heap = std::collections::BinaryHeap::new();
+        for (i, r) in readers.iter_mut().enumerate() {
+            let h = get_row(r)?;
+            if let Some(row) = &h {
+                heap.push(std::cmp::Reverse((row.0, row.1, i)));
+            }
+            heads.push(h);
+        }
+        while let Some(std::cmp::Reverse((_, _, i))) = heap.pop() {
+            let row = heads[i].take().expect("a run's head");
+            let next = get_row(&mut readers[i])?;
+            if let Some(n) = &next {
+                heap.push(std::cmp::Reverse((n.0, n.1, i)));
+            }
+            heads[i] = next;
+            each(row)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Sorter {
+    fn drop(&mut self) {
+        if !self.runs.is_empty() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            // the run's folder, when this made it and nothing else is in it
+            if let Some(parent) = self.dir.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+/// The rows of one instant, one copy of each event: the first read is
+/// kept, with the analysis tail a later copy has and it lacks. (Two copies
+/// of an event have the same time text, so the same instant: nothing
+/// further apart is ever a duplicate.)
+fn one_copy_each(group: &mut Vec<Vec<String>>, dups: &mut usize) {
+    if group.len() < 2 {
+        return;
+    }
+    let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
+    let mut kept: Vec<Vec<String>> = Vec::with_capacity(group.len());
+    for fields in group.drain(..) {
+        let base: Vec<String> = fields[..14].to_vec();
+        match seen.get(&base) {
+            None => {
+                seen.insert(base, kept.len());
+                kept.push(fields);
+            }
+            Some(&i) => {
+                // the same event again: keep the tail the kept row lacks
+                let k0 = &mut kept[i];
+                for k in 14..fields.len() {
+                    if k0[k].is_empty() && !fields[k].is_empty() {
+                        k0[k] = fields[k].clone();
+                    }
+                }
+                *dups += 1;
+            }
+        }
+    }
+    *group = kept;
+}
 
 /// Merge timelines into one, sorted on the instant, without duplicates.
 /// Every layout is read (12, 14 or 19 columns, see `csv_out::Layout`) and
@@ -51,9 +232,20 @@ pub fn merge_files(
     end_time: Option<&String>,
     carry_marks: Option<&String>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut merged: Vec<(NaiveDateTime, Vec<String>)> = Vec::new();
-    // the 14 event columns of every row kept -> its position in `merged`
-    let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
+    merge_files_within(files, output, start_time, end_time, carry_marks, merge_budget())
+}
+
+/// [`merge_files`] holding at most `budget` bytes of rows at a time: a
+/// merge of any size gives the same timeline, the big ones sorted on disk.
+pub(crate) fn merge_files_within(
+    files: &Vec<String>,
+    output: Option<&String>,
+    start_time: Option<&String>,
+    end_time: Option<&String>,
+    carry_marks: Option<&String>,
+    budget: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut sorter = Sorter::new(budget);
     let start_dt = start_time.and_then(|s| parse_window(s));
     let end_dt = end_time.and_then(|s| parse_window(s));
     let marks = match carry_marks {
@@ -123,46 +315,67 @@ pub fn merge_files(
                     }
                 }
             }
-            let base: Vec<String> = fields[..14].to_vec();
-            match seen.get(&base) {
-                None => {
-                    seen.insert(base, merged.len());
-                    merged.push((t, fields));
-                }
-                Some(&i) => {
-                    // the same event again: keep the tail the kept row lacks
-                    let kept = &mut merged[i].1;
-                    for k in 14..fields.len() {
-                        if kept[k].is_empty() && !fields[k].is_empty() {
-                            kept[k] = fields[k].clone();
-                        }
-                    }
-                    dups += 1;
-                }
-            }
+            sorter.push(t, fields)?;
         }
     }
 
-    // Sort on the parsed UTC instant, never on the text: sources write
-    // different formats (`T` vs space, `Z` vs `+00:00`, fractions).
-    merged.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(Vec::new());
+    // Sorted on the parsed UTC instant, never on the text (sources write
+    // different formats: `T` vs space, `Z` vs `+00:00`, fractions), the
+    // rows of one instant in the order they were read. The timeline is
+    // written beside its place and put there at the end: the output may be
+    // one of the files merged.
+    let part = output.map(|p| format!("{}.part", p));
+    let sink: Box<dyn Write> = match &part {
+        Some(p) => Box::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p)?)),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(sink);
     wtr.write_record(HEADER.split(','))?;
-    for (_, f) in &merged {
-        wtr.write_record(f)?;
+    let mut written = 0usize;
+    let mut group: Vec<Vec<String>> = Vec::new();
+    let mut group_t: Option<NaiveDateTime> = None;
+    let wrote = (|| -> Result<(), Box<dyn Error>> {
+        sorter.drain(&mut |(t, _, fields)| {
+            if group_t != Some(t) {
+                one_copy_each(&mut group, &mut dups);
+                for f in group.drain(..) {
+                    wtr.write_record(&f)?;
+                    written += 1;
+                }
+                group_t = Some(t);
+            }
+            group.push(fields);
+            Ok(())
+        })?;
+        one_copy_each(&mut group, &mut dups);
+        for f in group.drain(..) {
+            wtr.write_record(&f)?;
+            written += 1;
+        }
+        wtr.flush()?;
+        Ok(())
+    })();
+    drop(wtr);
+    drop(sorter);
+    if let Err(e) = wrote {
+        if let Some(p) = &part {
+            let _ = std::fs::remove_file(p);
+        }
+        return Err(e);
     }
-    let bytes = wtr.into_inner().map_err(|e| e.to_string())?;
-    match output {
-        Some(p) => std::fs::write(p, &bytes)?,
-        None => print!("{}", String::from_utf8_lossy(&bytes)),
+    if let (Some(p), Some(out)) = (&part, output) {
+        if std::fs::rename(p, out).is_err() {
+            // (another disk's rules, a file held open: copied then)
+            std::fs::copy(p, out)?;
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     let dropped = bad_cols + bad_time;
     if dropped > 0 || out_window > 0 || filtered > 0 || dups > 0 {
         crate::banner::print_info(&format!(
             "Merge: {} rows written; skipped {} malformed (wrong column count), {} unparseable time, {} outside window, {} filtered, {} duplicate",
-            merged.len(), bad_cols, bad_time, out_window, filtered, dups
+            written, bad_cols, bad_time, out_window, filtered, dups
         ));
     }
     if let Some(m) = &marks {
@@ -214,6 +427,40 @@ mod tests {
         assert_eq!(rows[3][5], "carol");
         assert_eq!(rows[3][12], "proc");
         assert_eq!(rows[3][4], "3");
+    }
+
+    /// A merge too big for its budget (sorted on disk, in many runs) is,
+    /// byte for byte, the merge done in memory: same order within an
+    /// instant, same copy kept of a duplicate, same tail.
+    #[test]
+    fn sorted_on_disk_is_what_sorted_in_memory_gives() {
+        let mut a = format!("{}\n", HEADER_14);
+        let mut b = format!("{}\n", HEADER);
+        for i in 0..4000u32 {
+            let sec = (i * 7919) % 600; // many rows share an instant, in no order
+            let row = format!("2026-01-05T10:{:02}:{:02}Z,SRV{:02},SUCCESSFUL_LOGON,4624,3,user{},CORP,WS{},10.0.{}.{},,,0x{:x},\"a, b\",Security.evtx", sec / 60, sec % 60, i % 7, i % 90, i % 40, i % 5, i % 200, i % 300);
+            a.push_str(&row);
+            a.push('\n');
+            if i % 3 == 0 {
+                // the same event again in the other file, with a tail
+                b.push_str(&format!("{},,,,suspicious,note {}\n", row, i));
+            }
+            if i % 11 == 0 {
+                b.push_str(&format!("2026-01-05 10:{:02}:{:02},SRV99,SUCCESSFUL_LOGON,4624,10,other{},CORP,WS,10.9.9.9,,,0x1,,Security.evtx,,,,,\n", sec / 60, sec % 60, i));
+            }
+        }
+        let (fa, fb) = (tmp("big-a.csv", &a), tmp("big-b.csv", &b));
+        let (whole, pieces) = (tmp("big-whole.csv", ""), tmp("big-pieces.csv", ""));
+        merge_files_within(&vec![fa.clone(), fb.clone()], Some(&whole), None, None, None, u64::MAX).unwrap();
+        merge_files_within(&vec![fa, fb], Some(&pieces), None, None, None, 20_000).unwrap();
+        let (w, p) = (std::fs::read(&whole).unwrap(), std::fs::read(&pieces).unwrap());
+        assert!(w == p, "the two merges differ");
+        let rows = read(&whole);
+        assert!(rows.len() > 1000 && rows.len() < 4000 + 400 + 1);
+        assert!(rows.iter().any(|r| r[17] == "suspicious"));
+        // the output may be one of the files merged
+        merge_files_within(&vec![whole.clone()], Some(&whole), None, None, None, 20_000).unwrap();
+        assert!(std::fs::read(&whole).unwrap() == p);
     }
 
     #[test]

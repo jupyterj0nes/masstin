@@ -169,7 +169,8 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
     let _ = fs::create_dir_all(&temp_dir);
 
     use crate::image_kind::ImageKind;
-    let result = match kind {
+    // its Linux volumes' logs are listed and read in place later (crate::vfs)
+    let result = crate::vfs::with_image(image_path, || match kind {
         ImageKind::Ewf => extract_evtx_from_image_ewf(image_path, &temp_dir),
         ImageKind::Vmdk => extract_evtx_from_image_vmdk(image_path, &temp_dir),
         ImageKind::Vhd | ImageKind::Vhdx => extract_evtx_from_image_vhd(image_path, &temp_dir),
@@ -177,7 +178,7 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
         ImageKind::Raw if !sniffed && !named => extract_evtx_from_image_raw(image_path, &temp_dir)
             .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
         ImageKind::Raw => extract_evtx_from_image_raw(image_path, &temp_dir),
-    };
+    });
 
     if let Err(e) = &result {
         let msg = e.to_string();
@@ -321,6 +322,8 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     // each emptied it under the other when it started
     let run_temp = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id()));
     let base_temp = run_temp.join("masstin_image_extract");
+    // (and what was listed of its images' volumes: crate::vfs)
+    crate::vfs::forget(&base_temp);
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
     // Temp dirs where parse-massive extracts forensic images found INSIDE zip
@@ -751,6 +754,8 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     }
 
     // Cleanup temp directories
+    // (and what was listed of its images' volumes: crate::vfs)
+    crate::vfs::forget(&base_temp);
     let _ = fs::remove_dir_all(&base_temp);
     let _ = fs::remove_dir(&run_temp);
     // Cleanup any temp dirs where images were extracted out of zips (massive mode)

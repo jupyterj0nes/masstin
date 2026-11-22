@@ -96,6 +96,9 @@ trait LogTree {
     /// `path` copied to `dest`; its size, or `None` when it cannot be read
     /// (absent, or not a file) or written.
     fn copy_file(&self, path: &str, dest: &Path) -> Option<u64>;
+    /// A regular file at `path`: the path it is read by (a link followed
+    /// where the driver does not), its size and its time.
+    fn stat(&self, path: &str) -> Option<(String, u64, Option<std::time::SystemTime>)>;
     /// `(name, is_dir, is_regular_file)`, without `.` and `..`
     fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)>;
 }
@@ -113,6 +116,16 @@ fn create_dest(dest: &Path) -> Option<crate::space::Guarded> {
 }
 
 impl LogTree for Ext4 {
+    fn stat(&self, path: &str) -> Option<(String, u64, Option<std::time::SystemTime>)> {
+        let m = self.metadata(path).ok()?;
+        if !m.file_type().is_regular_file() {
+            return None;
+        }
+        // (open follows the links the metadata follows, and refuses the rest)
+        self.open(path).ok()?;
+        Some((path.to_string(), m.len(), crate::vfs::time_of(m.modified().seconds())))
+    }
+
     fn copy_file(&self, path: &str, dest: &Path) -> Option<u64> {
         let mut src = self.open(path).ok()?;
         let out = create_dest(dest)?;
@@ -138,6 +151,22 @@ impl LogTree for Ext4 {
 }
 
 impl LogTree for XfsFilesystem {
+    fn stat(&self, path: &str) -> Option<(String, u64, Option<std::time::SystemTime>)> {
+        let (f, at) = match self.open(path) {
+            Ok(f) => (f, path.to_string()),
+            // /var/run is a link to /run on every current distribution
+            Err(_) => {
+                let alt = format!("/run/{}", path.strip_prefix("/var/run/")?);
+                (self.open(&alt).ok()?, alt)
+            }
+        };
+        if !f.is_regular_file() {
+            return None;
+        }
+        let t = f.inode().mtime;
+        Some((at, f.len(), crate::vfs::time_of(t.sec)))
+    }
+
     fn copy_file(&self, path: &str, dest: &Path) -> Option<u64> {
         let f = match self.open(path) {
             Ok(f) => f,
@@ -185,6 +214,17 @@ impl LogTree for XfsFilesystem {
 /// Linux path, mirrored), a piece at a time.
 fn copy_extracted(tree: &dyn LogTree, image_path: &str, linux_path: &str, output_dir: &Path) -> bool {
     let dest = map_linux_path_to_local(linux_path, output_dir);
+    // an image's volume: the file is listed where its copy would be, and
+    // read from the volume when the Linux half asks for it (see crate::vfs)
+    if let Some((volume, root)) = LISTING.with(|l| l.borrow().clone()) {
+        return match tree.stat(image_path) {
+            Some((src, len, modified)) => {
+                crate::vfs::list(&root, &volume, &dest, &src, len, modified);
+                true
+            }
+            None => false,
+        };
+    }
     match tree.copy_file(image_path, &dest) {
         Some(n) => {
             if is_debug_mode() {
@@ -339,8 +379,36 @@ fn extract_logs_from_xfs_partition<R: Read + Seek + 'static>(reader: &mut R, par
     Ok(count)
 }
 
-/// One Linux volume, whatever it is in.
+thread_local! {
+    /// The volume whose files are being listed, and the folder its copies
+    /// would have gone to (set while an image is read; see crate::vfs).
+    static LISTING: std::cell::RefCell<Option<(crate::vfs::Volume, PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One Linux volume, whatever it is in. `place` is where it lies in the
+/// image (the partition's offset, or the LVM physical volume's and the
+/// logical volume): with it, while an image is read, its files are listed
+/// to be read in place instead of copied.
 fn extract_logs_from_linux_partition<R: Read + Seek + 'static>(reader: &mut R, partition_offset: u64, kind: LinuxFs, output_dir: &Path) -> Result<usize, String> {
+    extract_logs_from_linux_volume(reader, partition_offset, kind, output_dir, Some((partition_offset, None)))
+}
+
+fn extract_logs_from_linux_volume<R: Read + Seek + 'static>(reader: &mut R, partition_offset: u64, kind: LinuxFs, output_dir: &Path, place: Option<(u64, Option<String>)>) -> Result<usize, String> {
+    if let (Some(image), Some((offset, lv))) = (crate::vfs::current_image(), place) {
+        let fs = match kind {
+            LinuxFs::Ext4 => crate::vfs::VolumeFs::Ext4,
+            LinuxFs::Xfs => crate::vfs::VolumeFs::Xfs,
+        };
+        let volume = crate::vfs::Volume { image, fs, offset, lv };
+        let before = LISTING.with(|l| l.replace(Some((volume, output_dir.to_path_buf()))));
+        let out = extract_logs_from_linux_partition_now(reader, partition_offset, kind, output_dir);
+        LISTING.with(|l| *l.borrow_mut() = before);
+        return out;
+    }
+    extract_logs_from_linux_partition_now(reader, partition_offset, kind, output_dir)
+}
+
+fn extract_logs_from_linux_partition_now<R: Read + Seek + 'static>(reader: &mut R, partition_offset: u64, kind: LinuxFs, output_dir: &Path) -> Result<usize, String> {
     match kind {
         LinuxFs::Ext4 => extract_logs_from_ext4_partition(reader, partition_offset, output_dir),
         LinuxFs::Xfs => extract_logs_from_xfs_partition(reader, partition_offset, output_dir),
@@ -408,6 +476,8 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     // Phase 2: Extract logs from each image
     let run_temp = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id()));
     let base_temp = run_temp.join("masstin_linux_image_extract");
+    // (and what was listed of its images' volumes: crate::vfs)
+    crate::vfs::forget(&base_temp);
     let _ = fs::remove_dir_all(&base_temp);
     let _ = fs::remove_dir(&run_temp);
     let _ = fs::create_dir_all(&base_temp);
@@ -429,7 +499,14 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
 
         crate::banner::print_phase("1", "3", &format!("Opening forensic image: {}...", image_name));
 
-        let temp_dir = base_temp.join(&image_name);
+        // a folder of its own: two images of the same name (one a folder
+        // each) shared one, and the second's logs were read as the first's
+        let mut temp_dir = base_temp.join(&image_name);
+        let mut n = 2;
+        while temp_dir.exists() {
+            temp_dir = base_temp.join(format!("{} ({})", image_name, n));
+            n += 1;
+        }
         let _ = fs::create_dir_all(&temp_dir);
 
         // the reader: what the content says, else the name
@@ -437,7 +514,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
         let kind = crate::image_kind::kind_of(Path::new(image_path.as_str()));
         let sniffed = crate::image_kind::sniff(Path::new(image_path.as_str())).is_some();
         let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img" | "001");
-        let result = match kind {
+        let result = crate::vfs::with_image(image_path, || match kind {
             ImageKind::Ewf => {
                 crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
                 extract_logs_from_image_ewf(image_path, &temp_dir)
@@ -459,7 +536,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
                 crate::banner::print_info(&format!("Image format: raw/dd ({})", image_path));
                 extract_logs_from_image_raw(image_path, &temp_dir)
             }
-        };
+        });
 
         match result {
             Ok(dir) => {
@@ -487,6 +564,8 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     }
 
     // Cleanup
+    // (and what was listed of its images' volumes: crate::vfs)
+    crate::vfs::forget(&base_temp);
     let _ = fs::remove_dir_all(&base_temp);
     let _ = fs::remove_dir(&run_temp);
 }
@@ -494,6 +573,33 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
 // -----------------------------------------------------------------------------
 //  Image format openers
 // -----------------------------------------------------------------------------
+
+/// An image opened for reading, by what its content says it is: for the
+/// volumes read in place after the image was looked at (crate::vfs).
+pub(crate) fn open_image_reader(image_path: &str) -> Result<(Box<dyn crate::vfs::ReadSeek>, u64), String> {
+    use crate::image_kind::ImageKind;
+    match crate::image_kind::kind_of(Path::new(image_path)) {
+        ImageKind::Ewf => {
+            let r = ewf::EwfReader::open(image_path).map_err(|e| format!("Cannot open E01: {}", e))?;
+            let n = r.total_size();
+            Ok((Box::new(BufReader::new(r)), n))
+        }
+        ImageKind::Vmdk => {
+            let r = crate::vmdk::VmdkReader::open(image_path).map_err(|e| format!("Cannot open VMDK: {}", e))?;
+            let n = r.total_size();
+            Ok((Box::new(BufReader::new(r)), n))
+        }
+        ImageKind::Vhd | ImageKind::Vhdx => {
+            let (r, n) = crate::vhd::open_virtual_disk(image_path).map_err(|e| format!("Cannot open virtual disk: {}", e))?;
+            Ok((Box::new(BufReader::new(r)), n))
+        }
+        ImageKind::Raw => {
+            let f = File::open(image_path).map_err(|e| format!("Cannot open raw image: {}", e))?;
+            let n = f.metadata().map_err(|e| e.to_string())?.len();
+            Ok((Box::new(BufReader::new(f)), n))
+        }
+    }
+}
 
 fn extract_logs_from_image_ewf(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
     let reader = ewf::EwfReader::open(image_path)
@@ -666,7 +772,7 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
         let partition_dir = output_dir.join(format!("lvm_{}_lv_{}", lvm_index, lv_name));
         let _ = fs::create_dir_all(&partition_dir);
 
-        match extract_logs_from_linux_partition(&mut device, 0, kind, &partition_dir) {
+        match extract_logs_from_linux_volume(&mut device, 0, kind, &partition_dir, Some((lvm_offset, Some(lv_name.clone())))) {
             Ok(count) if count > 0 => {
                 total += count;
                 crate::banner::print_info(&format!("    {} log files extracted from LV '{}'", count, lv_name));
@@ -735,15 +841,27 @@ impl<R: Read + Seek> Seek for PtrView<R> {
 /// mapped through the volume's extents (the `lvm2` crate, no I/O for the
 /// map) to the physical volume. Linear volumes; a striped, mirrored or
 /// thin one fails at its first read and is reported.
-struct LvDevice<R: Read + Seek> {
+pub(crate) struct LvDevice<V: Read + Seek + Clone> {
     lvm: Arc<lvm2::Lvm2>,
     name: String,
-    pv: PtrView<R>,
+    pv: V,
     pos: u64,
     size: u64,
 }
 
-impl<R: Read + Seek> Read for LvDevice<R> {
+impl<V: Read + Seek + Clone> Clone for LvDevice<V> {
+    fn clone(&self) -> Self {
+        LvDevice { lvm: Arc::clone(&self.lvm), name: self.name.clone(), pv: self.pv.clone(), pos: self.pos, size: self.size }
+    }
+}
+
+impl<V: Read + Seek + Clone> LvDevice<V> {
+    pub(crate) fn new(lvm: Arc<lvm2::Lvm2>, name: String, pv: V, size: u64) -> Self {
+        LvDevice { lvm, name, pv, pos: 0, size }
+    }
+}
+
+impl<V: Read + Seek + Clone> Read for LvDevice<V> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.size || buf.is_empty() {
             return Ok(0);
@@ -757,7 +875,7 @@ impl<R: Read + Seek> Read for LvDevice<R> {
     }
 }
 
-impl<R: Read + Seek> Seek for LvDevice<R> {
+impl<V: Read + Seek + Clone> Seek for LvDevice<V> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         self.pos = match pos {
             SeekFrom::Start(p) => p,
@@ -1160,36 +1278,47 @@ fn scan_for_images(dir: &Path, extensions: &[&str], results: &mut Vec<String>, d
 /// or ".../masstin_image_extract/server.e01/linux_logs_extracted/partition_0/var/log/auth.log"
 /// with "server.e01:partition_0:/var/log/auth.log"
 pub fn rewrite_log_filenames_linux(csv_path: &str) {
-    let content = match fs::read_to_string(csv_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    if !content.contains("masstin_linux_image_extract") && !content.contains("linux_logs_extracted") {
-        return;
-    }
-    let mut lines = content.lines();
-    let Some(header) = lines.next() else { return };
+    use std::io::{BufRead, Write};
+    // a line at a time: the timeline of an image may be gigabytes
+    let Ok(f) = fs::File::open(csv_path) else { return };
+    let mut lines = std::io::BufReader::with_capacity(1 << 20, f).lines();
+    let Some(Ok(header)) = lines.next() else { return };
     // the column by its name: the row carries a tail after `log_filename`
     let Some(col) = header.split(',').position(|h| h == "log_filename") else { return };
-    let mut output = String::with_capacity(content.len());
-    output.push_str(header);
-    output.push('\n');
-    for line in lines {
-        let mut fields = split_csv_line(line);
-        let renamed = match fields.get(col) {
-            Some(f) if f.contains("masstin_linux_image_extract") || f.contains("linux_logs_extracted") => Some(crate::csv_out::q(&crate::parse::display_source(f))),
-            _ => None,
-        };
-        match renamed {
-            Some(name) => {
-                fields[col] = name;
-                output.push_str(&fields.join(","));
+    let part = format!("{}.part", csv_path);
+    let Ok(out) = fs::File::create(&part) else { return };
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, out);
+    let mut changed = false;
+    let done = (|| -> std::io::Result<()> {
+        w.write_all(header.as_bytes())?;
+        w.write_all(b"\n")?;
+        for line in lines {
+            let line = line?;
+            if line.contains("masstin_linux_image_extract") || line.contains("linux_logs_extracted") {
+                let mut fields = split_csv_line(&line);
+                let renamed = match fields.get(col) {
+                    Some(f) if f.contains("masstin_linux_image_extract") || f.contains("linux_logs_extracted") => Some(crate::csv_out::q(&crate::parse::display_source(f))),
+                    _ => None,
+                };
+                if let Some(name) = renamed {
+                    fields[col] = name;
+                    w.write_all(fields.join(",").as_bytes())?;
+                    w.write_all(b"\n")?;
+                    changed = true;
+                    continue;
+                }
             }
-            None => output.push_str(line),
+            w.write_all(line.as_bytes())?;
+            w.write_all(b"\n")?;
         }
-        output.push('\n');
+        w.flush()
+    })();
+    drop(w);
+    // nothing to rename (or it could not be read through): the file stays as it is
+    if done.is_ok() && changed && fs::rename(&part, csv_path).is_ok() {
+        return;
     }
-    let _ = fs::write(csv_path, output);
+    let _ = fs::remove_file(&part);
 }
 
 /// A CSV line as its fields, each kept exactly as written (quotes and
