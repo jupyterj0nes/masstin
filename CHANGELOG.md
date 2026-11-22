@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.4.12 — 2026-11-22
 
 - **The window shows a parse that waits for room, and nothing a stopped run unpacked is left behind.** While a parse started from the window waits for room on its temporary disk, the progress says so in an amber box above the phases (until there is room again, or the files that find none are left out); the temporary folder and its room are a note of the run. *Stop* kills the parse and now deletes what it had unpacked, and every parse deletes, as it starts, the temporary folders of runs that no longer exist (killed, or cut short by a machine switched off), an hour old at least, saying how much it freed. A failed write of rows to the temporary folder is said once, the rest named at the end with the other files left out.
 - **`MASSTIN_IO_PRIORITY=low`** puts a run's disk work in the background (Windows' background mode, its memory and CPU too; on Linux the lowest best-effort I/O priority). It is an option, not the default: measured while a 25 GB image was extracted, with the temporary files on the image's spinning disk and on the system SSD, it made no difference to how fast the desktop's own disk work went (the variation between runs was bigger than any effect), and the run took the same time.
