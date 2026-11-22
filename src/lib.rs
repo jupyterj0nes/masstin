@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::Read;
 mod parse;
 pub mod threads;
+pub mod space;
 pub mod detect;
 use tokio;
 pub use crate::parse::*;
@@ -473,6 +474,18 @@ pub struct Cli {
     #[arg(long)]
     parallel_images: Option<usize>,
 
+    /// Where the temporary files of a parse go: the logs unpacked from disk
+    /// images and packages, the rows sorted on disk. Left out, the system's
+    /// temporary folder, or, when its disk has less than 20 GB free and the
+    /// disk of the timeline written has twice as much, a `masstin-temp`
+    /// folder beside the timeline. Whatever the folder, masstin keeps 5 GB
+    /// of its disk free (a quarter of a small disk; `MASSTIN_TEMP_RESERVE_MB`
+    /// sets it): a file that would eat into that waits for room, up to
+    /// `MASSTIN_SPACE_WAIT_MIN` minutes (30), and is then left out, named at
+    /// the end of the run. `MASSTIN_TEMP` does the same as this option.
+    #[arg(long, value_name = "DIR")]
+    temp: Option<String>,
+
     /// For `view`: the case file (`.masstin`) to open, or to start with the
     /// timelines given by `-f`. The saved views, the style, the merged hosts,
     /// the subnets, the presentation and the notes are kept in it instead of
@@ -674,6 +687,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             if crate::threads::keeps_normal_priority() { "normal (MASSTIN_PRIORITY)" } else { "below normal (MASSTIN_PRIORITY=normal keeps it)" },
             images
         ));
+        crate::banner::print_info(&crate::space::choose(config.temp.as_deref(), config.output.as_deref()));
     }
 
     // Match the selected action and call the corresponding function
@@ -995,6 +1009,7 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    crate::space::report();
     Ok(())
 }
 
@@ -1316,7 +1331,7 @@ fn carve_skip_offsets(config: &Cli) -> Vec<u64> {
 /// temporary folder, and the parts are merged (sorted, without duplicates)
 /// into the output. Timelines given as evidence are merged as they are.
 fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Error>> {
-    let tmp = std::env::temp_dir().join(format!("masstin_parse_{}", std::process::id()));
+    let tmp = crate::space::temp_root().join(format!("masstin_parse_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp)?;
     let mut parts: Vec<String> = Vec::new();

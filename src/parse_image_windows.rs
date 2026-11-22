@@ -310,7 +310,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     }
     // of this run: two masstin at a time used to share the folder, and
     // each emptied it under the other when it started
-    let run_temp = std::env::temp_dir().join(format!("masstin_run_{}", std::process::id()));
+    let run_temp = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id()));
     let base_temp = run_temp.join("masstin_image_extract");
     let _ = fs::remove_dir_all(&base_temp); // Clean previous runs
     let _ = fs::create_dir_all(&base_temp);
@@ -1036,7 +1036,7 @@ fn extract_images_from_zip(zip_path: &Path, temps: &mut Vec<PathBuf>) -> Result<
         if let Some(parent) = out_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let mut out_file = File::create(&out_path).map_err(|er| format!("create {} ({})", out_path.display(), er))?;
+        let mut out_file = crate::space::create(&out_path).map_err(|er| format!("create {} ({})", out_path.display(), er))?;
         std::io::copy(&mut e, &mut out_file).map_err(|er| format!("extract {} ({})", out_path.display(), er))?;
         extracted.push(out_path);
     }
@@ -2064,7 +2064,7 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
 
             // Write to output directory
             let output_path = partition_dir.join(one_component(&name));
-            let mut output_file = match File::create(&output_path) {
+            let mut output_file = match crate::space::create(&output_path) {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -2158,7 +2158,7 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
             let mut attached = data_value.attach(store_reader);
 
             let output_path = vss_dir.join(one_component(&name));
-            let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+            let mut output_file = match crate::space::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];
             loop {
@@ -2248,7 +2248,7 @@ fn extract_files_from_ntfs_path<R: Read + Seek>(
             let mut attached = data_value.attach(&mut partition_reader);
 
             let output_path = output_dir.join(one_component(&name));
-            let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+            let mut output_file = match crate::space::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
             let mut buf = [0u8; 65536];
             loop {
@@ -2357,7 +2357,7 @@ fn extract_files_recursive<R: Read + Seek>(
                 let mut attached = data_value.attach(reader);
 
                 let output_path = output_dir.join(one_component(&name));
-                let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+                let mut output_file = match crate::space::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
                 let mut buf = [0u8; 65536];
                 loop {
@@ -2547,7 +2547,7 @@ fn extract_ntuser_dat_files<R: Read + Seek>(
 
                     // Save as username_NTUSER.DAT
                     let output_path = output_dir.join(format!("{}_NTUSER.DAT{}", one_component(&username), suffix));
-                    let mut output_file = match File::create(&output_path) { Ok(f) => f, Err(_) => continue };
+                    let mut output_file = match crate::space::create(&output_path) { Ok(f) => f, Err(_) => continue };
 
                     let mut buf = [0u8; 65536];
                     loop {

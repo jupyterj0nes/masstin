@@ -1037,7 +1037,7 @@ pub async fn parse_cortex_sources(
     }
     let names: Vec<&str> = sources.iter().map(|s| s.name()).collect();
     crate::banner::print_info(&format!("Cortex sources: {} -> one timeline", names.join(", ")));
-    let tmp = std::env::temp_dir().join(format!("masstin_cortex_{}", std::process::id()));
+    let tmp = crate::space::temp_root().join(format!("masstin_cortex_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let mut parts: Vec<String> = Vec::new();

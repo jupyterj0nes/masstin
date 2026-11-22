@@ -2520,6 +2520,7 @@ dependencies = [
  "image",
  "indicatif",
  "ipnet",
+ "libc",
  "libesedb",
  "lvm2",
  "macos-unifiedlogs",

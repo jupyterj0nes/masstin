@@ -142,7 +142,7 @@ fn save_extracted(linux_path: &str, data: &[u8], output_dir: &Path) -> bool {
     if let Some(parent) = dest.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    match File::create(&dest).and_then(|mut f| f.write_all(data)) {
+    match crate::space::create(&dest).and_then(|mut f| f.write_all(data)) {
         Ok(()) => {
             if is_debug_mode() {
                 eprintln!("[DEBUG] Extracted: {} ({} bytes)", linux_path, data.len());
@@ -352,7 +352,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     }
 
     // Phase 2: Extract logs from each image
-    let run_temp = std::env::temp_dir().join(format!("masstin_run_{}", std::process::id()));
+    let run_temp = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id()));
     let base_temp = run_temp.join("masstin_linux_image_extract");
     let _ = fs::remove_dir_all(&base_temp);
     let _ = fs::remove_dir(&run_temp);
@@ -611,7 +611,7 @@ fn extract_logs_from_lvm<R: Read + Seek + 'static>(
         let mut cut: Option<std::io::Error> = None;
         {
             if olv.seek(SeekFrom::Start(0)).is_err() { continue; }
-            let mut tmp_file = match File::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
+            let mut tmp_file = match crate::space::create(&tmp_path) { Ok(f) => f, Err(_) => continue };
             // on the heap: a 1 MiB array on the stack overflowed the main thread on Windows
             let mut buf = vec![0u8; 1 << 20];
             loop {

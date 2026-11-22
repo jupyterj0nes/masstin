@@ -124,7 +124,7 @@ pub fn carve_image(files: &[String], output: Option<&String>, unalloc_only: bool
     }
     crate::banner::print_info("  Mode: full disk scan");
 
-    let run_temp = std::env::temp_dir().join(format!("masstin_run_{}", std::process::id()));
+    let run_temp = crate::space::temp_root().join(format!("masstin_run_{}", std::process::id()));
     let base_temp = run_temp.join("masstin_carve_extract");
     let _ = fs::remove_dir_all(&base_temp);
     let _ = fs::create_dir_all(&base_temp);

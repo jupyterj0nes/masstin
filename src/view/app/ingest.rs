@@ -90,13 +90,15 @@ pub(super) struct Ingest {
     /// advanced: `--threads`, `--parallel-images`, `--skip-offsets`, `--debug`
     pub threads: String,
     pub parallel_images: String,
+    /// `--temp`: where the temporary files of the parse go
+    pub temp: String,
     pub skip_offsets: String,
     pub debug: bool,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan_cancel: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), skip_offsets: String::new(), debug: false }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan_cancel: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), temp: String::new(), skip_offsets: String::new(), debug: false }
     }
 }
 
@@ -225,7 +227,7 @@ impl Ingest {
         args
     }
 
-    /// `--threads`, `--parallel-images`, `--debug`, when set.
+    /// `--threads`, `--parallel-images`, `--temp`, `--debug`, when set.
     fn push_advanced(&self, args: &mut Vec<String>) {
         if let Ok(n) = self.threads.trim().parse::<usize>() {
             if n > 0 {
@@ -240,6 +242,10 @@ impl Ingest {
                     args.push(n.to_string());
                 }
             }
+        }
+        if !self.temp.trim().is_empty() {
+            args.push("--temp".into());
+            args.push(self.temp.trim().to_string());
         }
         if self.debug {
             args.push("--debug".into());
@@ -294,6 +300,7 @@ impl Viewer {
         self.ingest.carve_only = false;
         self.ingest.threads.clear();
         self.ingest.parallel_images.clear();
+        self.ingest.temp.clear();
         self.ingest.skip_offsets.clear();
         self.ingest.debug = false;
         self.start_scan();
@@ -655,6 +662,7 @@ impl Viewer {
                 self.ingest.exclude_ips.clear();
                 self.ingest.threads.clear();
                 self.ingest.parallel_images.clear();
+                self.ingest.temp.clear();
                 self.ingest.skip_offsets.clear();
                 self.ingest.debug = false;
                 self.ingest.step = 0;
@@ -972,7 +980,7 @@ impl Viewer {
             field(ui, "Addresses", &mut self.ingest.exclude_ips, "10.0.0.5, 10.0.0.0/24, fe80::/10, @scanners.txt", "--exclude-ips: the origin address; single addresses or CIDR ranges; @file reads one per line");
             ui.label(egui::RichText::new("Commas between entries; * matches anything; @file.txt reads a list from a file, one entry a line. The console says how many rows each rule dropped.").color(theme::DIM).small());
         });
-        let advanced = self.ingest.debug || !(self.ingest.threads.trim().is_empty() && self.ingest.parallel_images.trim().is_empty() && self.ingest.skip_offsets.trim().is_empty());
+        let advanced = self.ingest.debug || !(self.ingest.threads.trim().is_empty() && self.ingest.parallel_images.trim().is_empty() && self.ingest.skip_offsets.trim().is_empty() && self.ingest.temp.trim().is_empty());
         egui::CollapsingHeader::new(theme::semibold(if advanced { "Advanced (on)" } else { "Advanced (optional)" }, 12.5)).id_salt("ingest-advanced").default_open(advanced).show(ui, |ui| {
             ui.label(egui::RichText::new("Left empty, masstin decides by itself; these are for a slow disk, a busy machine or an image that hangs.").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
@@ -987,6 +995,16 @@ impl Viewer {
                     ui.label(egui::RichText::new("1 for a spinning disk or a network share; measured by default (--parallel-images)").color(theme::DIM).small());
                 });
             }
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Temporary folder").color(TEXT)));
+                ui.add(egui::TextEdit::singleline(&mut self.ingest.temp).desired_width(260.0).hint_text("the system's (beside the timeline if its disk is short)"));
+                if ui.small_button(format!("{}  Pick…", ic::FOLDER_OPEN)).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().set_title("Folder for the temporary files").pick_folder() {
+                        self.ingest.temp = p.to_string_lossy().to_string();
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("Where the logs unpacked from images and packages go while they are read; 5 GB of that disk always stay free, a file that would eat into them waits for room (--temp).").color(theme::DIM).small());
             if self.ingest.carve_on() {
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Skip these offsets").color(TEXT)));
@@ -1807,5 +1825,8 @@ mod tests {
         let s = i.command().join(" ");
         assert!(s.contains("--threads 4 --parallel-images 1 --debug -o out.csv"));
         assert!(!s.contains("--skip-offsets"));
+        i.temp = " E:/scratch ".into();
+        let s = i.command().join(" ");
+        assert!(s.contains("--parallel-images 1 --temp E:/scratch --debug -o out.csv"), "{}", s);
     }
 }

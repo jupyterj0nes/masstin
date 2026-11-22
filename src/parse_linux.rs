@@ -2402,7 +2402,7 @@ impl HostSpill {
         for (host, idx) in by_host {
             let next = self.dir.join(format!("host-{}.rows", self.files.len()));
             let path = self.files.entry(host.to_string()).or_insert(next).clone();
-            let f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            let f = crate::space::append(&path)?;
             let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
             for i in idx {
                 let r = &rows[i];
@@ -2509,7 +2509,7 @@ fn write_by_host(spill: &HostSpill, names: &UidNames, outgoing: Vec<(String, Str
         let run = spill.dir.join(format!("run-{}.rows", n));
         let written = (|| -> std::io::Result<()> {
             use std::io::Write as _;
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, File::create(&run)?);
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, crate::space::create(&run)?);
             for &i in &kept {
                 put_run_row(&mut w, &rows[i].ts_rfc3339, channel_rank(&rows[i].tty_or_proc), origins[i], &row_line(&rows[i]))?;
             }
@@ -2772,6 +2772,13 @@ fn extract_tar_into(tar_path: &Path, dest_base: &Path, into: Option<&Path>, disp
             && (is_tar_archive(&fname_lower) || fname_lower.ends_with(".zip"));
         if !wanted && !is_nested { continue; }
 
+        // room for it on the temporary disk first (see crate::space)
+        let size = entry.header().size().unwrap_or(0);
+        if let Err(e) = crate::space::make_room(&extract_dir, size) {
+            // named at the end of the run, with the others
+            crate::space::left_out(&format!("{} -> {}", display_path, name), &e.to_string());
+            continue;
+        }
         // unpack_in() refuses paths that escape `extract_dir` (`..`,
         // absolute) and creates the parent directories itself.
         match entry.unpack_in(&extract_dir) {
@@ -2959,7 +2966,7 @@ fn extract_zips_into(zip_path: &Path, dest_base: &Path, into: Option<&Path>, tar
 
         // Extract file — streamed, so a multi-GB tarball inside the zip
         // never has to fit in memory.
-        let mut out_file = match File::create(&out_path) {
+        let mut out_file = match crate::space::create(&out_path) {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -3167,7 +3174,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // Create temp dir for ZIP extraction
     // one per run: two masstin at a time shared the folder and each
     // deleted the other's files
-    let temp_dir = std::env::temp_dir().join(format!("masstin_linux_extract_{}", std::process::id()));
+    let temp_dir = crate::space::temp_root().join(format!("masstin_linux_extract_{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
 
     // Triage tracking: maps each extraction directory to the TriageInfo of
