@@ -3964,19 +3964,26 @@ struct WinSpill {
     dir: std::path::PathBuf,
     files: HashMap<String, std::path::PathBuf>,
     rows: usize,
+    /// a write failed already (said once)
+    failed: bool,
 }
 
 impl WinSpill {
     fn new(dir: std::path::PathBuf) -> WinSpill {
         let _ = std::fs::create_dir_all(&dir);
-        WinSpill { dir, files: HashMap::new(), rows: 0 }
+        WinSpill { dir, files: HashMap::new(), rows: 0, failed: false }
     }
 
     /// The rows of one source (`at`: its kind and its place), appended to
     /// their computers' files. A write that fails is said, loudly.
     fn add(&mut self, rows: &[LogData], at: (u8, u32)) {
         if let Err(e) = self.try_add(rows, at) {
-            crate::banner::print_warning(&format!("Could not write rows to the temporary folder ({}): is the disk full? They are missing from the timeline.", e));
+            // named with the others at the end of the run; said once here
+            crate::space::left_out(&format!("{} row(s) of the timeline", rows.len()), &e.to_string());
+            if !self.failed {
+                self.failed = true;
+                crate::banner::print_warning(&format!("Could not write rows to the temporary folder ({}): they are missing from the timeline, and so are the next ones that find no room (all named at the end).", e));
+            }
         }
         self.rows += rows.len();
     }

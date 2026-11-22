@@ -239,6 +239,82 @@ impl Write for Guarded {
     }
 }
 
+/// The temporary folders of run `pid` (any kind masstin makes) under the
+/// temporary folders it may have used, deleted; the bytes freed. For a run
+/// that was stopped: killed, it could not clean up after itself.
+pub fn clean_run(pid: u32) -> u64 {
+    let mut freed = 0u64;
+    for root in roots() {
+        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if run_pid(&name) == Some(pid) {
+                freed += size_of(&e.path());
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    freed
+}
+
+/// The temporary folders left by runs that are no longer running (a run
+/// killed, a machine switched off mid-run), deleted; the bytes freed. Only
+/// folders masstin names after its runs, an hour old at least, of a process
+/// that does not exist.
+pub fn clean_stale() -> u64 {
+    let mut freed = 0u64;
+    let me = std::process::id();
+    for root in roots() {
+        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(pid) = run_pid(&name) else { continue };
+            if pid == me || sys::alive(pid) {
+                continue;
+            }
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map_or(false, |a| a >= Duration::from_secs(3600));
+            if !old || !e.file_type().map_or(false, |t| t.is_dir()) {
+                continue;
+            }
+            freed += size_of(&e.path());
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    freed
+}
+
+/// The folders masstin's temporary files go under: this run's, the
+/// system's, `MASSTIN_TEMP`.
+fn roots() -> Vec<PathBuf> {
+    let mut v = vec![temp_root(), std::env::temp_dir()];
+    if let Some(t) = std::env::var_os("MASSTIN_TEMP").filter(|t| !t.is_empty()) {
+        v.push(PathBuf::from(t));
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The run a temporary folder belongs to: `masstin_run_<pid>`,
+/// `masstin_linux_extract_<pid>`, `masstin_rows_<pid>_<n>`,
+/// `masstin_parse_<pid>`, `masstin_cortex_<pid>`.
+pub fn run_pid(name: &str) -> Option<u32> {
+    for prefix in ["masstin_run_", "masstin_linux_extract_", "masstin_rows_", "masstin_parse_", "masstin_cortex_"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let tail = &rest[digits.len()..];
+            if !digits.is_empty() && (tail.is_empty() || (prefix == "masstin_rows_" && tail.starts_with('_'))) {
+                return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn size_of(p: &Path) -> u64 {
+    walkdir::WalkDir::new(p).into_iter().filter_map(Result::ok).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
+}
+
 /// `C:`, `\\server\share`, or the path itself where there are no drives.
 fn volume_key(p: &Path) -> String {
     let s = p.to_string_lossy().replace('/', "\\");
@@ -293,6 +369,26 @@ mod sys {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetExitCodeProcess(process: isize, code: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    /// Whether process `pid` runs (when the system cannot say, it does).
+    pub fn alive(pid: u32) -> bool {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: plain Win32 calls; the handle is closed.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h == 0 {
+                // no such process (or no right to ask: then it is not ours to clean)
+                return std::io::Error::last_os_error().raw_os_error() != Some(87);
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok == 0 || code == STILL_ACTIVE
+        }
     }
     pub fn free_and_total(p: &Path) -> Option<(u64, u64)> {
         let w: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
@@ -306,6 +402,12 @@ mod sys {
 #[cfg(unix)]
 mod sys {
     use std::path::Path;
+    /// Whether process `pid` runs.
+    pub fn alive(pid: u32) -> bool {
+        // SAFETY: kill(2) with signal 0 only asks whether the process exists.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
     pub fn free_and_total(p: &Path) -> Option<(u64, u64)> {
         use std::os::unix::ffi::OsStrExt;
         let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
@@ -327,6 +429,9 @@ mod sys {
     pub fn free_and_total(_p: &std::path::Path) -> Option<(u64, u64)> {
         None
     }
+    pub fn alive(_pid: u32) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +446,29 @@ mod tests {
         assert_eq!(human(1500), "2 KB");
         assert_eq!(human(3 << 20), "3 MB");
         assert_eq!(human(5 << 30), "5.0 GB");
+    }
+
+    #[test]
+    fn a_run_is_known_by_its_folders() {
+        assert_eq!(run_pid("masstin_run_4242"), Some(4242));
+        assert_eq!(run_pid("masstin_linux_extract_77"), Some(77));
+        assert_eq!(run_pid("masstin_rows_12_3"), Some(12));
+        assert_eq!(run_pid("masstin_parse_9"), Some(9));
+        assert_eq!(run_pid("masstin_run_"), None);
+        assert_eq!(run_pid("masstin_run_12x"), None);
+        assert_eq!(run_pid("masstin_wizard_tar_5"), None, "a test's folder");
+        assert_eq!(run_pid("masstin-temp"), None);
+        assert!(sys::alive(std::process::id()));
+        // a stopped run's folders go, another's stay
+        let me = std::process::id();
+        let a = std::env::temp_dir().join(format!("masstin_rows_{}_999", me));
+        std::fs::create_dir_all(a.join("x")).unwrap();
+        std::fs::write(a.join("x").join("f"), b"12345").unwrap();
+        let b = std::env::temp_dir().join(format!("masstin_rows_{}_999", me + 1));
+        std::fs::create_dir_all(&b).unwrap();
+        assert!(clean_run(me) >= 5);
+        assert!(!a.exists() && b.exists());
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]

@@ -694,6 +694,11 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             images
         ));
         crate::banner::print_info(&crate::space::choose(config.temp.as_deref(), config.output.as_deref()));
+        // what runs killed or cut short left behind
+        let freed = crate::space::clean_stale();
+        if freed > 0 {
+            crate::banner::print_info(&format!("Deleted {} of temporary files left by runs that were stopped", crate::space::human(freed)));
+        }
     }
 
     // Match the selected action and call the corresponding function

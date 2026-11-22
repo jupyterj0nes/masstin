@@ -1389,6 +1389,13 @@ pub(super) fn progress_ui(ui: &mut egui::Ui, job: &Job) {
         }
     });
     ui.add_space(4.0);
+    // a run that waits for room on its temporary disk says so where it is seen
+    if let (Some(w), None) = (&pr.waiting, &job.done) {
+        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(CANDIDATE.r(), CANDIDATE.g(), CANDIDATE.b(), 22)).stroke(Stroke::new(1.0, CANDIDATE)).corner_radius(CornerRadius::same(7)).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+            ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, w)).color(CANDIDATE).size(12.5));
+        });
+        ui.add_space(4.0);
+    }
     if pr.phases.is_empty() && job.done.is_none() {
         ui.horizontal(|ui| {
             ui.add_space(22.0);

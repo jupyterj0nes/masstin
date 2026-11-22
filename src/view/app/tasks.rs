@@ -41,6 +41,9 @@ pub(super) struct Progress {
     pub notes: Vec<String>,
     /// the closing summary: `Events collected`, `Completed in`…
     pub summary: Vec<(String, String)>,
+    /// the run waits for room on its temporary disk (what it said), until
+    /// it says there is room again
+    pub waiting: Option<String>,
 }
 
 impl Progress {
@@ -75,6 +78,21 @@ impl Progress {
             return true;
         }
         let t = line.trim();
+        // the temporary disk: a wait for room, its end, what was left out
+        if t.starts_with("Waiting for room on disk") {
+            self.waiting = Some(t.to_string());
+            return false;
+        }
+        if t.starts_with("Room on disk") {
+            self.waiting = None;
+            self.notes.push(t.to_string());
+            return false;
+        }
+        if t.contains("left out for lack of room") || (t.starts_with("Could not write") && t.contains("missing from the timeline")) {
+            self.waiting = None;
+            self.notes.push(t.to_string());
+            return false;
+        }
         if t.starts_with('[') {
             if let Some(end) = t.find(']') {
                 let tag = &t[..=end];
@@ -114,7 +132,8 @@ impl Progress {
 /// them, the duplicates between the live volume and the copies) and the
 /// parts of a `parse`.
 fn is_fact(t: &str) -> bool {
-    t.starts_with("Partitions:")
+    t.starts_with("Temporary files:")
+        || t.starts_with("Partitions:")
         || t.starts_with("Extracted:")
         || t.starts_with("Extracting EVTX from VSS store")
         || t.contains("duplicate events removed")
@@ -231,7 +250,14 @@ impl Job {
         self.stopped = true;
         if let Ok(mut c) = self.child.lock() {
             if let Some(child) = c.as_mut() {
+                let pid = child.id();
                 let _ = child.kill();
+                // what it unpacked goes with it (it cannot clean up after a kill)
+                let _ = child.wait();
+                let freed = crate::space::clean_run(pid);
+                if freed > 0 {
+                    self.log.push(format!("Stopped: {} of its temporary files deleted", crate::space::human(freed)));
+                }
             }
         }
     }
@@ -721,6 +747,23 @@ mod tests {
                 "Carving: 13755 event(s), 13753 already in the live logs, 2 recovered",
             ]
         );
+    }
+
+    #[test]
+    fn a_wait_for_room_is_shown_until_there_is_room() {
+        let mut p = read(&["        Temporary files: C:\\Temp (the system's; --temp chooses another, 23.5 GB free, 5.0 GB kept free)"]);
+        assert_eq!(p.notes.len(), 1);
+        p.absorb("        Waiting for room on disk C: (8 KB to write, 4.9 GB free, 5.0 GB kept free for the system). Free some space there");
+        assert!(p.waiting.as_deref().unwrap().starts_with("Waiting for room on disk C:"));
+        p.absorb("        Room on disk C: again (6.1 GB free): going on");
+        assert!(p.waiting.is_none());
+        p.absorb("        Waiting for room on disk C: (8 KB to write)");
+        p.absorb("        3 file(s) left out for lack of room on the temporary disk; their events are missing from the timeline.");
+        assert!(p.waiting.is_none());
+        assert_eq!(p.notes.len(), 3);
+        p.absorb("        Waiting for room on disk C: (2 KB to write)");
+        p.absorb("        Could not write rows to the temporary folder (no room on disk C: (2 KB to write)): they are missing from the timeline, and so are the next ones");
+        assert!(p.waiting.is_none(), "the wait is over: the rows are left out");
     }
 
     #[test]

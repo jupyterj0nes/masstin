@@ -3294,6 +3294,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     // uids resolve to is gathered on the way (see HostSpill)
     let mut spill = HostSpill::new(temp_dir.join("_masstin_rows"));
     let mut uid_votes = UidVotes::default();
+    let mut spill_failed = false;
     let mut prefixes: Vec<(String, String)> = Vec::new();
     let mut parsed_count: usize = 0;
     let mut skipped: usize = 0;
@@ -3546,10 +3547,15 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             uid_votes.note(evt);
         }
         if let Err(e) = spill.add(&parsed, log_no_now as u32) {
-            crate::banner::print_warning(&format!(
-                "Could not write the rows of {} to the temporary folder ({}): is the disk full? They are missing from the timeline.",
-                path_str, e
-            ));
+            // named with the others at the end of the run; said once here
+            crate::space::left_out(&format!("the rows of {}", path_str), &e.to_string());
+            if !spill_failed {
+                spill_failed = true;
+                crate::banner::print_warning(&format!(
+                    "Could not write the rows of {} to the temporary folder ({}): they are missing from the timeline, and so are the next ones that find no room (all named at the end).",
+                    path_str, e
+                ));
+            }
         }
 
         if is_debug_mode() {
