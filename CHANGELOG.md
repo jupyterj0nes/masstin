@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.4.16 — 2026-11-24
 
 - **A triage gives what an image gives: UAL, scheduled tasks and MountPoints2 from folders, zips and tarballs.** Scheduled tasks and the users' NTUSER.DAT were read from disk images only, and UAL not from a zip. Every Windows tree found under the folders given (a folder holding `Windows\System32`: the `C` of a KAPE triage, a volume's root) now gives its tasks and its hives, and what a zip or a tarball holds of UAL, tasks and NTUSER.DAT is taken out to the temporary folder and read the same way. The machine's name comes from its own logs (from the zip's, for a zip); where no log names it the tasks are not read and the run says so, since a task is a row only when another machine's account registered it. On a triage with a UAL database and a task registered from another machine, as a folder, a zip and a tarball: the same rows from the three (2,573 of EVTX, 6 of UAL, the task), where the zip gave no UAL and none gave the task.
 - **Scheduled tasks: only an account is an author.** A task whose `Author` held a backslash was a row of a logon from the machine before it: Windows' own tasks name a resource there (`$(@%systemRoot%\System32\msdrm.dll,-6001)`), and each was a row from a machine called `$(@%systemRoot%`. An author is now `MACHINE\user` made of the characters names are made of. A task's row from a folder is named by the folder of its tasks (it said `System32`).
