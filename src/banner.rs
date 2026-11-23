@@ -963,6 +963,7 @@ pub fn doing(what: &str) {
 /// place in its source, nothing of the evidence), masstin says its version
 /// and the file it was reading: what is needed to know which file did it.
 pub fn say_faults() {
+    let _ = RUN_START.set(Instant::now());
     let before = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         before(info);
@@ -973,4 +974,51 @@ pub fn say_faults() {
             eprintln!("masstin {} hit this fault while reading: {}", env!("CARGO_PKG_VERSION"), what);
         }
     }));
+}
+
+static RUN_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// The closing lines of a parse whose halves (Windows, Linux) were merged
+/// into one timeline: the rows of the timeline as it was written and the
+/// time of the whole run. Each half says its own count as it ends (the
+/// Linux one only when it runs alone), and the window showed the first of
+/// them as the run's: 2,423 events for a timeline of tens of thousands.
+pub fn print_timeline_total(output_path: &str) {
+    if is_silent() { return; }
+    // the rows: the lines of the file less its header
+    let rows = match std::fs::File::open(output_path) {
+        Ok(f) => {
+            use std::io::Read;
+            let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+            let mut buf = vec![0u8; 1 << 20];
+            let (mut lines, mut last) = (0u64, b'\n');
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+                        last = buf[n - 1];
+                    }
+                }
+            }
+            if last != b'\n' { lines += 1; }
+            lines.saturating_sub(1)
+        }
+        Err(_) => return,
+    };
+    eprintln!();
+    eprintln!("{}", style("  ──────────────────────────────────────────────────").dim());
+    eprintln!("  {} {} {}",
+        style("Events in the timeline:").bold(),
+        style(rows).green().bold(),
+        style("(every source, one copy of each)").dim(),
+    );
+    eprintln!("  {} {}", style("Output:").bold(), style(output_label(output_path)).green());
+    if let Some(start) = RUN_START.get() {
+        eprintln!("  {} {:.2}s",
+            style("Completed in:").bold(),
+            style(start.elapsed().as_secs_f64()).cyan(),
+        );
+    }
+    eprintln!();
 }

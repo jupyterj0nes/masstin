@@ -115,6 +115,13 @@ impl Progress {
             self.notes.push(t.to_string());
             return false;
         }
+        // the count of the whole timeline, said after the halves' own: it is
+        // the run's, and what the halves said goes
+        if let Some(v) = t.strip_prefix("Events in the timeline:") {
+            self.summary.clear();
+            self.summary.push(("Events in the timeline".to_string(), v.trim().to_string()));
+            return false;
+        }
         for key in ["Artifacts parsed", "Events collected", "Skipped", "Output", "Completed in", "Connections loaded", "Rows written", "Rows"] {
             if let Some(rest) = t.strip_prefix(key) {
                 if let Some(v) = rest.strip_prefix(':') {

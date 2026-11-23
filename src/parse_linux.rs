@@ -75,6 +75,11 @@ fn printable(s: &str) -> bool {
 /// the size that divides the file, then to the x86_64 one. None when the
 /// file reads as neither.
 pub(crate) fn utmp_layout(data: &[u8]) -> Option<(usize, bool)> {
+    utmp_layout_of(data, data.len() as u64)
+}
+
+/// The same from the first records of a file of `file_len` bytes.
+fn utmp_layout_of(data: &[u8], file_len: u64) -> Option<(usize, bool)> {
     let score = |size: usize, time64: bool| -> usize {
         let mut ok = 0usize;
         for rec in data.chunks_exact(size).take(32) {
@@ -89,7 +94,7 @@ pub(crate) fn utmp_layout(data: &[u8]) -> Option<(usize, bool)> {
     let candidates = [(UTMP_SIZE_COMPAT32, false), (UTMP_SIZE_TIME64, true)];
     let best = candidates
         .iter()
-        .map(|&(size, t64)| (score(size, t64), data.len() % size == 0, size, t64))
+        .map(|&(size, t64)| (score(size, t64), file_len % size as u64 == 0, size, t64))
         .max_by_key(|&(s, divides, size, _)| (s, divides, std::cmp::Reverse(size)))?;
     if best.0 == 0 { None } else { Some((best.2, best.3)) }
 }
@@ -924,40 +929,86 @@ fn discover_hostname(root: &Path) -> String {
 
 // ────────────────────────── utmp family parser ───────────────────────────────
 fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> {
+    let mut all = Vec::new();
+    parse_utmp_to(path, dst_host, filter_ip, &mut |mut rows| all.append(&mut rows));
+    all
+}
+
+/// The records of a utmp file read at a time (some 1.5 MB).
+const UTMP_READ_RECORDS: usize = 4096;
+
+/// A wtmp, btmp or utmp read a piece at a time, its rows handed on in
+/// batches. A btmp of a server under a brute force for months is gigabytes
+/// (a record a failed logon), and rotated ones are gzipped ten times
+/// smaller: read whole, the file and all its rows were in memory at once,
+/// outside what the run is given.
+fn parse_utmp_to(path: &Path, dst_host: &str, filter_ip: bool, sink: &mut dyn FnMut(Vec<RawEvt>)) {
     let mut res = Vec::new();
-    let file = match crate::vfs::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
-            return res;
-        }
-    };
     // Rotated wtmp/btmp are routinely gzipped by logrotate
     // (`btmp-20260901.gz`); the fixed-size record layout is identical once
     // inflated, so just swap the reader.
     let is_gz = path.extension().map(|e| e == "gz").unwrap_or(false);
-    let mut rdr: Box<dyn Read> = if is_gz {
-        Box::new(GzDecoder::new(BufReader::new(file)))
-    } else {
-        Box::new(BufReader::new(file))
+    let open = || -> std::io::Result<Box<dyn Read>> {
+        let file = crate::vfs::open(path)?;
+        Ok(if is_gz { Box::new(GzDecoder::new(BufReader::new(file))) } else { Box::new(BufReader::new(file)) })
     };
-    let mut data = Vec::new();
-    if let Err(e) = rdr.read_to_end(&mut data) {
-        eprintln!("[ERROR] cannot read {}: {}", path.display(), e);
-        if data.is_empty() {
-            return res;
+    // the length of the records, inflated: it tells the two layouts apart
+    // when the first records read as both
+    let file_len = if is_gz {
+        match open() {
+            Ok(mut r) => {
+                let mut n = 0u64;
+                let mut b = vec![0u8; 1 << 16];
+                loop {
+                    match r.read(&mut b) {
+                        Ok(0) | Err(_) => break,
+                        Ok(k) => n += k as u64,
+                    }
+                }
+                n
+            }
+            Err(_) => 0,
         }
-    }
-    let (rec_size, time64) = match utmp_layout(&data) {
+    } else {
+        crate::vfs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    };
+    let mut rdr = match open() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
+            return;
+        }
+    };
+    // as much as `buf` takes, or what there is; false once a read failed
+    let mut fill = |rdr: &mut Box<dyn Read>, buf: &mut [u8]| -> (usize, bool) {
+        let mut n = 0;
+        while n < buf.len() {
+            match rdr.read(&mut buf[n..]) {
+                Ok(0) => return (n, true),
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    eprintln!("[ERROR] cannot read {}: {}", path.display(), e);
+                    return (n, false);
+                }
+            }
+        }
+        (n, true)
+    };
+    // the first 32 records of the bigger layout tell which it is
+    let mut head = vec![0u8; UTMP_SIZE_TIME64 * 32];
+    let (got, sound) = fill(&mut rdr, &mut head);
+    head.truncate(got);
+    let (rec_size, time64) = match utmp_layout_of(&head, if sound { file_len.max(got as u64) } else { got as u64 }) {
         Some(l) => l,
         None => {
-            if !data.is_empty() {
+            if !head.is_empty() {
                 crate::banner::print_warning(&format!(
                     "  {}: not a utmp record layout masstin knows ({} bytes), skipped",
-                    path.display(), data.len()
+                    path.display(), file_len.max(got as u64)
                 ));
             }
-            return res;
+            return;
         }
     };
     if is_debug_mode() && time64 {
@@ -974,7 +1025,12 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
     // so that the DEAD_PROCESS record (which carries neither) becomes a
     // logout of that session
     let mut open: HashMap<String, (String, String, u32)> = HashMap::new();
-    for rec in data.chunks_exact(rec_size) {
+    // what is read and not yet a whole record goes before the next piece
+    let mut data = head;
+    let mut more = sound && got == UTMP_SIZE_TIME64 * 32;
+    loop {
+    let whole = data.len() / rec_size * rec_size;
+    for rec in data[..whole].chunks_exact(rec_size) {
         let (ut_type, pid, line, user, host, secs) = utmp_record(rec, time64);
         // A boot ends every session of the file so far: none of them wrote
         // its logout, and the terminal names start again from pts/0, so
@@ -1049,7 +1105,25 @@ fn parse_utmp_file(path: &Path, dst_host: &str, filter_ip: bool) -> Vec<RawEvt> 
             conn: 0,
         });
     }
-    res
+    if res.len() >= SYSLOG_BATCH {
+        sink(std::mem::take(&mut res));
+    }
+    if !more {
+        break;
+    }
+    data.drain(..whole);
+    let kept = data.len();
+    data.resize(kept + rec_size * UTMP_READ_RECORDS, 0);
+    let (got, sound) = fill(&mut rdr, &mut data[kept..]);
+    data.truncate(kept + got);
+    more = sound && got == rec_size * UTMP_READ_RECORDS;
+    if got == 0 {
+        break;
+    }
+    }
+    if !res.is_empty() {
+        sink(res);
+    }
 }
 
 // ────────────────────────── lastlog ──────────────────────────────────────────
@@ -4053,7 +4127,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             } else if fname == "utmp"
                 || is_rotated_name(&fname, "wtmp") || is_rotated_name(&fname, "btmp")
             {
-                take(parse_utmp_file(path, &dst_host, true));
+                parse_utmp_to(path, &dst_host, true, &mut take);
             } else if fname.starts_with("secure") || fname.starts_with("auth.log") || fname.starts_with("messages") {
                 parse_secure_or_messages_to(path, &dst_host, true, cached_year, tz, &mut take);
             } else if fname.starts_with("audit.log") {

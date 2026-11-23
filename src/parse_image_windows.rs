@@ -692,6 +692,10 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         match crate::merge::merge_files(&merge_files_list, output, None, None, None) {
             Ok(()) => {
                 crate::banner::print_phase_result(if windows_present { "Merged Windows + Linux timeline generated" } else { "Timeline generated" });
+                // the run's own count: the halves said theirs, not the timeline's
+                if let Some(out) = output {
+                    crate::banner::print_timeline_total(out);
+                }
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to merge timelines: {}", e);

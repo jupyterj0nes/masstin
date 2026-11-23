@@ -197,14 +197,29 @@ pub fn open(p: &Path) -> io::Result<Box<dyn ReadSeek>> {
     if let Some((root, volume, file, _)) = placed_for(p) {
         let f = file.ok_or_else(|| not_found(p))?;
         let m = mount(&root, &volume)?;
+        if let Mounted::Ext4(_, raw) = &*m {
+            let map = ext4_map(&mut **raw.borrow_mut(), &f.src);
+            if let Some((bs, extents, true)) = map {
+                if std::env::var_os("MASSTIN_VFS_DEBUG").is_some() {
+                    eprintln!("[vfs] {}: has room set aside and never written, read by its map (zeros there)", f.src);
+                }
+                return Ok(Box::new(Paged::new(Box::new(Ext4Mapped { m: Rc::clone(&m), bs, extents, pos: 0, len: f.len }), f.len)));
+            }
+        }
         return Ok(Box::new(Paged::new(m.open(&f.src)?, f.len)));
     }
     Ok(Box::new(std::fs::File::open(p)?))
 }
 
+/// The most `read` and `read_to_string` take of a file. They are for the
+/// small files read whole (a host name, a passwd, a time zone, the log of
+/// a collection): one that says it is far bigger (holes, damage) is cut
+/// there instead of filling the memory.
+const WHOLE_MOST: u64 = 64 << 20;
+
 pub fn read(p: &Path) -> io::Result<Vec<u8>> {
     let mut v = Vec::new();
-    open(p)?.read_to_end(&mut v)?;
+    open(p)?.take(WHOLE_MOST).read_to_end(&mut v)?;
     Ok(v)
 }
 
@@ -225,7 +240,7 @@ pub fn data_pieces(p: &Path, most: u64) -> io::Result<Option<(Vec<(u64, Vec<u8>)
     match &*m {
         Mounted::Ext4(_, raw) => {
             let mut raw = raw.borrow_mut();
-            let Some((bs, extents)) = ext4_map(&mut **raw, &f.src) else { return Ok(None) };
+            let Some((bs, extents, _)) = ext4_map(&mut **raw, &f.src) else { return Ok(None) };
             for (logical, len, physical) in extents {
                 let start = logical.saturating_mul(bs);
                 if start >= f.len {
@@ -282,7 +297,7 @@ pub fn data_pieces(p: &Path, most: u64) -> io::Result<Option<(Vec<(u64, Vec<u8>)
 /// included, and says nothing of where they are. None for what this does
 /// not read (no extents, meta_bg, a link on the way, anything that does
 /// not look as it should).
-fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(u64, u64, u64)>)> {
+fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(u64, u64, u64)>, bool)> {
     fn rd(dev: &mut dyn ext4_view::Ext4Read, at: u64, len: usize) -> Option<Vec<u8>> {
         let mut b = vec![0u8; len];
         dev.read(at, &mut b).ok()?;
@@ -322,7 +337,7 @@ fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(
     };
 
     // the extents under a node of the tree, into `out`
-    fn walk(dev: &mut dyn ext4_view::Ext4Read, node: &[u8], bs: u64, level: u32, out: &mut Vec<(u64, u64, u64)>) -> Option<()> {
+    fn walk(dev: &mut dyn ext4_view::Ext4Read, node: &[u8], bs: u64, level: u32, out: &mut Vec<(u64, u64, u64)>, unwritten: &mut bool) -> Option<()> {
         let le16 = |b: &[u8], at: usize| u64::from(u16::from_le_bytes([b[at], b[at + 1]]));
         let le32 = |b: &[u8], at: usize| u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]));
         if node.len() < 12 || le16(node, 0) != 0xF30A || level > 6 {
@@ -339,12 +354,14 @@ fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(
                 // over 32768: set aside and never written, zeros
                 if len <= 32768 {
                     out.push((le32(node, e), len, le32(node, e + 8) | (le16(node, e + 6) << 32)));
+                } else {
+                    *unwritten = true;
                 }
             } else {
                 let child = le32(node, e + 4) | (le16(node, e + 8) << 32);
                 let mut b = vec![0u8; bs as usize];
                 dev.read(child.checked_mul(bs)?, &mut b).ok()?;
-                walk(dev, &b, bs, level + 1, out)?;
+                walk(dev, &b, bs, level + 1, out, unwritten)?;
             }
             if out.len() > 1_000_000 {
                 return None;
@@ -362,7 +379,7 @@ fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(
             return None; // not a folder (a link), or one kept another way
         }
         let mut extents = Vec::new();
-        walk(dev, &map, bs, 0, &mut extents)?;
+        walk(dev, &map, bs, 0, &mut extents, &mut false)?;
         let mut found = None;
         'dir: for (_, len, physical) in extents {
             for b in 0..len.min(1 << 16) {
@@ -388,9 +405,10 @@ fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(
                 return None;
             }
             let mut extents = Vec::new();
-            walk(dev, &map, bs, 0, &mut extents)?;
+            let mut unwritten = false;
+            walk(dev, &map, bs, 0, &mut extents, &mut unwritten)?;
             extents.sort();
-            return Some((bs, extents));
+            return Some((bs, extents, unwritten));
         }
     }
     None
@@ -398,7 +416,7 @@ fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(
 
 pub fn read_to_string(p: &Path) -> io::Result<String> {
     let mut s = String::new();
-    open(p)?.read_to_string(&mut s)?;
+    open(p)?.take(WHOLE_MOST).read_to_string(&mut s)?;
     Ok(s)
 }
 
@@ -662,6 +680,62 @@ impl Mounted {
                 Ok(Box::new(XfsFile { fs: Arc::clone(fs), inode, raw, pos: 0, len }))
             }
         }
+    }
+}
+
+/// An ext4 file that has room set aside and never written (fallocate: the
+/// journals of systemd, eight megabytes ahead of what is written), read by
+/// its own map: what is written from the volume, zeros everywhere else, as
+/// Linux reads it. The driver takes such an extent for a written one and
+/// gives what the disk held there before, whatever file it was of: after
+/// the last object of a journal came not the zeros that end it but old
+/// bytes, read as objects of any size, and the run ended on one of them.
+struct Ext4Mapped {
+    m: Rc<Mounted>,
+    bs: u64,
+    /// (block of the file, blocks, block of the volume), in the file's order
+    extents: Vec<(u64, u64, u64)>,
+    pos: u64,
+    len: u64,
+}
+
+impl Read for Ext4Mapped {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(self.len - self.pos);
+        // the extent the place is in, or the next one after it
+        let i = self.extents.partition_point(|&(logical, blocks, _)| (logical + blocks) * self.bs <= self.pos);
+        let n = match self.extents.get(i) {
+            Some(&(logical, blocks, physical)) if logical * self.bs <= self.pos => {
+                let within = self.pos - logical * self.bs;
+                let n = want.min(blocks * self.bs - within) as usize;
+                let Mounted::Ext4(_, raw) = &*self.m else { return Err(io::Error::other("not an ext4 volume")) };
+                raw.borrow_mut().read(physical * self.bs + within, &mut buf[..n]).map_err(io::Error::other)?;
+                n
+            }
+            next => {
+                // a hole, or room never written: zeros up to what comes next
+                let until = next.map_or(self.len, |&(logical, _, _)| (logical * self.bs).min(self.len));
+                let n = want.min(until - self.pos) as usize;
+                buf[..n].fill(0);
+                n
+            }
+        };
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Ext4Mapped {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(|| io::Error::other("seek before start"))?,
+            SeekFrom::End(d) => self.len.checked_add_signed(d).ok_or_else(|| io::Error::other("seek before start"))?,
+        };
+        Ok(self.pos)
     }
 }
 
