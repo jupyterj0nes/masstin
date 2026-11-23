@@ -644,14 +644,16 @@ impl Viewer {
             Some("close") => {
                 if self.job.as_ref().map_or(false, |j| j.kind == JobKind::Ingest && j.done.is_some()) {
                     let j = self.job.take().unwrap();
-                    self.last_log = Some((j.command, j.log));
+                    self.last_log_path = j.log_path.clone();
+                    self.last_log = Some((j.command, j.full));
                 }
                 self.ingest.open = false;
             }
             Some("more") => {
                 if self.job.as_ref().map_or(false, |j| j.kind == JobKind::Ingest && j.done.is_some()) {
                     let j = self.job.take().unwrap();
-                    self.last_log = Some((j.command, j.log));
+                    self.last_log_path = j.log_path.clone();
+                    self.last_log = Some((j.command, j.full));
                 }
                 self.ingest.sources.clear();
                 self.ingest.scan = None;
@@ -1035,7 +1037,7 @@ impl Viewer {
                 });
                 ui.label(egui::RichText::new("For a damaged E01 whose carving hangs: each offset (hex) skips 32 MB there (--skip-offsets).").color(theme::DIM).small());
             }
-            ui.checkbox(&mut self.ingest.debug, "Say more in the parser's log (--debug)");
+            ui.checkbox(&mut self.ingest.debug, "Say more in the parser's log (--debug)").on_hover_text("Each file as it is opened, what was found in it and what was left out and why. The log of the run (below the progress, or Tools > Log of the last run) has every line; it can be copied whole and is also written to a file as the run goes.");
             if !self.ingest.threads.trim().is_empty() && self.ingest.threads.trim().parse::<usize>().map_or(true, |n| n == 0) {
                 ui.label(egui::RichText::new(format!("{}  threads is a whole number, 1 or more; it is left out", ic::WARNING)).color(CANDIDATE).small());
             }
@@ -1064,11 +1066,11 @@ impl Viewer {
                 egui::Frame::new().fill(Color32::from_rgba_unmultiplied(236, 72, 96, 22)).stroke(Stroke::new(1.0, draw::fade(SIGNIFICANT, 0.7))).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.label(egui::RichText::new(format!("{}  {}", ic::WARNING, e)).color(SIGNIFICANT));
-                    let said: Vec<&String> = job.log.iter().filter(|l| l.contains("Error") || l.contains("error") || l.contains("ERROR")).take(3).collect();
-                    for l in said {
-                        ui.add(egui::Label::new(egui::RichText::new(l).color(TEXT).size(12.5)).wrap());
-                    }
-                    ui.label(egui::RichText::new("The log below says what the parser saw.").color(theme::MUTED).small());
+                    // the last the run said, where a fault says what it was
+                    let from = job.full.len().saturating_sub(12);
+                    let mut last: &str = &job.full[from..].join("\n");
+                    ui.add(egui::TextEdit::multiline(&mut last).font(egui::FontId::monospace(11.0)).desired_width(f32::INFINITY).frame(egui::Frame::NONE));
+                    ui.label(egui::RichText::new("These are the last lines the parser wrote. The log below has them all: it can be copied whole, saved, or opened in a window of its own.").color(theme::MUTED).small());
                 });
             }
         }
@@ -1114,13 +1116,14 @@ impl Viewer {
             });
         }
         ui.add_space(6.0);
-        let n = job.log.len();
-        egui::CollapsingHeader::new(egui::RichText::new(format!("{}  The parser's log ({} lines)", ic::TERMINAL_WINDOW, n)).color(theme::MUTED)).id_salt("ingest-log").default_open(false).show(ui, |ui| {
-            egui::ScrollArea::vertical().stick_to_bottom(true).max_height(200.0).auto_shrink([false, true]).show(ui, |ui| {
-                for l in &job.log {
-                    ui.add(egui::Label::new(egui::RichText::new(l).monospace().size(11.0)).wrap());
-                }
-            });
+        let n = job.full.len() + job.full_dropped;
+        let failed = matches!(job.done, Some(Err(_))) && !job.stopped;
+        // open by itself when the run failed: that is when it is read
+        egui::CollapsingHeader::new(egui::RichText::new(format!("{}  The parser's log ({} lines)", ic::TERMINAL_WINDOW, n)).color(theme::MUTED)).id_salt(("ingest-log", failed)).default_open(failed).show(ui, |ui| {
+            if ui.button(format!("{}  Open in a window", ic::APP_WINDOW)).on_hover_text("The log in a window of its own, that can be moved and made as big as the screen").clicked() {
+                *action = Some("log-window");
+            }
+            super::tasks::log_box(ui, "ingest-log-box", &job.full, job.full_dropped, job.log_path.as_deref(), 320.0);
         });
         // the buttons of the done card act after the borrow of the job ends
         let outs = job.open.clone();
@@ -1155,6 +1158,7 @@ impl Viewer {
                     }
                 }
             }
+            Some("log-window") => self.show_last_log = true,
             other => *action = other,
         }
     }

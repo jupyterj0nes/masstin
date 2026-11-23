@@ -174,6 +174,14 @@ pub(super) struct Job {
     /// when it ended, so the clock stops
     pub ended: Option<std::time::Instant>,
     pub log: Vec<String>,
+    /// every line the run wrote, the ones the progress shows as phases and
+    /// notes too: what *Copy all*, *Save as* and the log window give
+    pub full: Vec<String>,
+    /// the lines of a very long run no longer in `full` (all are in the file)
+    pub full_dropped: usize,
+    /// the file the lines go to as they come, in the window's own folder
+    pub log_path: Option<std::path::PathBuf>,
+    log_file: Option<std::io::BufWriter<std::fs::File>>,
     pub rx: Receiver<JobMsg>,
     pub done: Option<Result<(), String>>,
     pub progress: Progress,
@@ -310,13 +318,13 @@ impl Viewer {
             let tx2 = tx.clone();
             let t_err = std::thread::spawn(move || {
                 if let Some(err) = err {
-                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                    for line in lossy_lines(err) {
                         let _ = tx2.send(JobMsg::Line(line));
                     }
                 }
             });
             if let Some(out) = out {
-                for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                for line in lossy_lines(out) {
                     let _ = tx.send(JobMsg::Line(line));
                 }
             }
@@ -338,7 +346,8 @@ impl Viewer {
                 Err(e) => Err(e.to_string()),
             }));
         });
-        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), ended: None, log: Vec::new(), rx, done: None, progress: Progress::default(), child: handle, open, add, past_banner: false, prelude: Vec::new(), stopped: false, autoclose_at: None });
+        let (log_path, log_file) = open_run_log(&command);
+        self.job = Some(Job { kind, title, command, started: std::time::Instant::now(), ended: None, log: Vec::new(), full: Vec::new(), full_dropped: 0, log_path, log_file, rx, done: None, progress: Progress::default(), child: handle, open, add, past_banner: false, prelude: Vec::new(), stopped: false, autoclose_at: None });
     }
 
     /// Drain the running job's output; on its end, read the timeline again.
@@ -347,6 +356,11 @@ impl Viewer {
         if job.done.is_some() {
             return;
         }
+        // what came since the last look is on disk before anything else can go wrong
+        if let Some(f) = job.log_file.as_mut() {
+            use std::io::Write;
+            let _ = f.flush();
+        }
         while let Ok(m) = job.rx.try_recv() {
             match m {
                 JobMsg::Line(l) => {
@@ -354,6 +368,18 @@ impl Viewer {
                     let l = l.trim_end().to_string();
                     if l.is_empty() {
                         continue;
+                    }
+                    // everything but the bars' own ticks is kept, and written
+                    if !l.starts_with("@@pb") {
+                        if let Some(f) = job.log_file.as_mut() {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{:8.1}  {}", job.started.elapsed().as_secs_f32(), l);
+                        }
+                        job.full.push(l.clone());
+                        if job.full.len() > FULL_LOG_MOST {
+                            job.full.drain(..FULL_LOG_MOST / 10);
+                            job.full_dropped += FULL_LOG_MOST / 10;
+                        }
                     }
                     if !job.past_banner {
                         if l.contains('─') {
@@ -385,6 +411,11 @@ impl Viewer {
                     }
                     if r.is_ok() && job.kind == JobKind::Hunt {
                         job.autoclose_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(1800));
+                    }
+                    if let Some(mut f) = job.log_file.take() {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{:8.1}  -- {}", job.started.elapsed().as_secs_f32(), match &r { Ok(()) => "ended well".to_string(), Err(e) => format!("ended badly: {}", e) });
+                        let _ = f.flush();
                     }
                     job.done = Some(r);
                     job.ended = Some(std::time::Instant::now());
@@ -618,7 +649,8 @@ impl Viewer {
         if let Some(job) = self.job.as_ref() {
             if job.autoclose_at.map_or(false, |t| std::time::Instant::now() >= t) {
                 let j = self.job.take().unwrap();
-                self.last_log = Some((j.command, j.log));
+                self.last_log_path = j.log_path.clone();
+                    self.last_log = Some((j.command, j.full));
                 return;
             }
         }
@@ -666,35 +698,137 @@ impl Viewer {
         });
         if (!open || close) && self.job.as_ref().map_or(false, |j| j.done.is_some()) {
             let j = self.job.take().unwrap();
-            self.last_log = Some((j.command, j.log));
+            self.last_log_path = j.log_path.clone();
+                    self.last_log = Some((j.command, j.full));
         }
     }
 
-    /// The log of the last run, reopened from the Tools menu.
+    /// The log of the run under way, or of the last one: every line it
+    /// wrote, in a window that moves and takes the size it is given.
     pub(super) fn last_log_window(&mut self, ctx: &egui::Context) {
         if !self.show_last_log {
             return;
         }
         let mut open = true;
-        egui::Window::new(format!("{}  Last run", ic::TERMINAL_WINDOW)).open(&mut open).collapsible(true).resizable(true).default_width(720.0).max_width(900.0).max_height(420.0).anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-14.0, -104.0)).show(ctx, |ui| {
-            ui.set_max_width(880.0);
-            match &self.last_log {
+        let running = self.job.as_ref().map_or(false, |j| j.done.is_none());
+        let title = if running { "The run's log" } else { "Log of the last run" };
+        egui::Window::new(format!("{}  {}", ic::TERMINAL_WINDOW, title)).id(egui::Id::new("run-log-window")).open(&mut open).collapsible(true).resizable(true).default_size([920.0, 560.0]).min_width(420.0).min_height(220.0).show(ctx, |ui| {
+            let shown: Option<(&str, &[String], usize, Option<&std::path::Path>)> = match (&self.job, &self.last_log) {
+                (Some(j), _) => Some((j.command.as_str(), j.full.as_slice(), j.full_dropped, j.log_path.as_deref())),
+                (None, Some((command, log))) => Some((command.as_str(), log.as_slice(), 0, self.last_log_path.as_deref())),
+                (None, None) => None,
+            };
+            match shown {
                 None => {
                     ui.label(egui::RichText::new("Nothing has run from this window yet.").color(theme::MUTED));
                 }
-                Some((command, log)) => {
+                Some((command, lines, dropped, path)) => {
                     ui.add(egui::Label::new(egui::RichText::new(command).monospace().size(11.0).color(theme::MUTED)).wrap());
                     theme::hairline(ui);
-                    egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                        for l in log {
-                            ui.add(egui::Label::new(egui::RichText::new(l).monospace().size(11.0)).wrap());
-                        }
-                    });
+                    log_box(ui, "run-log-window-box", lines, dropped, path, 0.0);
                 }
             }
         });
         self.show_last_log = open;
     }
+}
+
+/// The lines of a very long run kept in memory (the file has them all).
+const FULL_LOG_MOST: usize = 200_000;
+/// The last lines drawn in the box (all are copied and saved).
+const LOG_BOX_SHOWN: usize = 3000;
+/// The run logs kept in the window's folder.
+const RUN_LOGS_KEPT: usize = 30;
+
+/// The lines of a pipe, each as it is: one that is not UTF-8 is read with
+/// its odd bytes replaced, not taken for the end of the output.
+fn lossy_lines<R: std::io::Read>(r: R) -> impl Iterator<Item = String> {
+    let mut r = std::io::BufReader::new(r);
+    std::iter::from_fn(move || {
+        let mut b = Vec::new();
+        match std::io::BufRead::read_until(&mut r, b'\n', &mut b) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                while matches!(b.last(), Some(b'\n') | Some(b'\r')) {
+                    b.pop();
+                }
+                Some(String::from_utf8_lossy(&b).into_owned())
+            }
+        }
+    })
+}
+
+/// The file a run's lines go to as they come: `logs/run-<date>-<time>.log`
+/// in the window's own folder, its command line first. It is there
+/// whatever becomes of the run or of the window; the oldest go once there
+/// are thirty.
+fn open_run_log(command: &str) -> (Option<std::path::PathBuf>, Option<std::io::BufWriter<std::fs::File>>) {
+    use std::io::Write;
+    let Some(dir) = super::ingest::config_file("logs") else { return (None, None) };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return (None, None);
+    }
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let mut old: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("run-") && n.ends_with(".log"))).collect();
+        old.sort();
+        while old.len() >= RUN_LOGS_KEPT {
+            let _ = std::fs::remove_file(old.remove(0));
+        }
+    }
+    let path = dir.join(format!("run-{}.log", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    match std::fs::File::create(&path) {
+        Ok(f) => {
+            let mut w = std::io::BufWriter::new(f);
+            let _ = writeln!(w, "masstin {}  {}", env!("CARGO_PKG_VERSION"), chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+            let _ = writeln!(w, "{}", command);
+            let _ = writeln!(w, "(seconds since the start, then each line the run wrote)");
+            let _ = w.flush();
+            (Some(path), Some(w))
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// A run's lines as text that is selected and copied like any text, with
+/// *Copy all*, *Save as* and the file they are kept in. `height` 0 takes
+/// the room there is (a window).
+pub(super) fn log_box(ui: &mut egui::Ui, salt: &str, lines: &[String], dropped: usize, path: Option<&std::path::Path>, height: f32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if ui.button("Copy all").on_hover_text("Every line of the run to the clipboard, not only the ones shown").clicked() {
+            ui.ctx().copy_text(lines.join("\n"));
+        }
+        if ui.button(format!("{}  Save as…", ic::FLOPPY_DISK)).on_hover_text("Every line of the run to a text file").clicked() {
+            if let Some(p) = rfd::FileDialog::new().set_title("Save the run's log").set_file_name("masstin-run.log").save_file() {
+                let _ = std::fs::write(p, lines.join("\n"));
+            }
+        }
+        if let Some(p) = path {
+            if ui.button(format!("{}  Show the log file", ic::FOLDER_OPEN)).on_hover_text(format!("{}\nWritten as the run goes, so it is there whatever becomes of the run: each line with the seconds since the start", p.display())).clicked() {
+                let _ = super::ingest::reveal_in_folder(&p.display().to_string());
+            }
+        }
+        let n = lines.len() + dropped;
+        let note = if lines.len() > LOG_BOX_SHOWN { format!("{} lines, the last {} shown; Copy all and Save as give them all", n, LOG_BOX_SHOWN) } else { format!("{} lines", n) };
+        ui.label(egui::RichText::new(note).color(theme::DIM).small());
+    });
+    let from = lines.len().saturating_sub(LOG_BOX_SHOWN);
+    // the text is put together when a line comes, not at each frame
+    let id = ui.id().with(salt);
+    let cached: Option<(usize, usize, Arc<String>)> = ui.data(|d| d.get_temp(id));
+    let text = match cached {
+        Some((n, f, s)) if n == lines.len() && f == from => s,
+        _ => {
+            let s = Arc::new(lines[from..].join("\n"));
+            ui.data_mut(|d| d.insert_temp(id, (lines.len(), from, Arc::clone(&s))));
+            s
+        }
+    };
+    let h = if height > 0.0 { height } else { ui.available_height().max(120.0) };
+    egui::ScrollArea::both().id_salt(salt).stick_to_bottom(true).max_height(h).auto_shrink([false, height > 0.0]).show(ui, |ui| {
+        let mut shown: &str = text.as_str();
+        ui.add(egui::TextEdit::multiline(&mut shown).font(egui::FontId::monospace(11.0)).desired_width(f32::INFINITY).frame(egui::Frame::NONE));
+    });
 }
 
 /// Seconds the reveal takes to go through every finding of the view.

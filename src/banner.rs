@@ -197,8 +197,12 @@ pub fn print_banner(action: &str) {
     }
 
     eprintln!();
-    for line in BANNER_ART {
-        print_art_line(line);
+    // the window reads these lines into the run's log: the drawing is for a
+    // terminal, in a log it is forty lines before the first that says something
+    if std::env::var_os("MASSTIN_PROGRESS_PIPE").is_none() {
+        for line in BANNER_ART {
+            print_art_line(line);
+        }
     }
 
     eprintln!();
@@ -942,4 +946,31 @@ pub(crate) fn normalize_display_path(p: &str) -> String {
         }
         Err(_) => p.replace('\\', "/"),
     }
+}
+
+static DOING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The file the run reads now: said if a fault comes while it is read (see
+/// `say_faults`). Empty: nothing in particular.
+pub fn doing(what: &str) {
+    if let Ok(mut d) = DOING.lock() {
+        d.clear();
+        d.push_str(what);
+    }
+}
+
+/// After a fault's own words (a line of the standard library that names a
+/// place in its source, nothing of the evidence), masstin says its version
+/// and the file it was reading: what is needed to know which file did it.
+pub fn say_faults() {
+    let before = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        before(info);
+        let what = DOING.lock().map(|d| d.clone()).unwrap_or_default();
+        if what.is_empty() {
+            eprintln!("masstin {} hit this fault.", env!("CARGO_PKG_VERSION"));
+        } else {
+            eprintln!("masstin {} hit this fault while reading: {}", env!("CARGO_PKG_VERSION"), what);
+        }
+    }));
 }

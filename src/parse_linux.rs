@@ -4043,6 +4043,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
             };
             // a fault while one file is read (a damaged file that a reader
             // takes at its word) costs that file, said, not the run
+            crate::banner::doing(&path_str);
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if fname == "lastlog" {
                 let passwd = root2passwd
@@ -4064,6 +4065,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 take(crate::parse_journal::parse_journal_file(path, &dst_host));
             }
             }));
+            crate::banner::doing("");
             if let Err(fault) = read {
                 let why = fault.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| fault.downcast_ref::<String>().cloned()).unwrap_or_else(|| "no reason given".to_string());
                 crate::banner::print_warning(&format!(

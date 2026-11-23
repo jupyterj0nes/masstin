@@ -524,6 +524,8 @@ pub struct Viewer {
     show_merges: bool,
     merge_add: (String, String),
     last_log: Option<(String, Vec<String>)>,
+    /// the file the last run's lines were written to
+    last_log_path: Option<std::path::PathBuf>,
     show_last_log: bool,
 }
 
@@ -1323,6 +1325,7 @@ impl Viewer {
             show_merges: false,
             merge_add: (String::new(), String::new()),
             last_log: None,
+            last_log_path: None,
             show_last_log: false,
         };
         v.requery(true);
@@ -5625,7 +5628,8 @@ impl Viewer {
                 }
                 if self.job.as_ref().map_or(false, |j| j.done.is_some()) {
                     let j = self.job.take().unwrap();
-                    self.last_log = Some((j.command, j.log));
+                    self.last_log_path = j.log_path.clone();
+                    self.last_log = Some((j.command, j.full));
                 }
                 if self.overlay.is_some() {
                     self.overlay = None;
@@ -5816,6 +5820,9 @@ impl Viewer {
             "when" => self.show_when = true,
             other if other.starts_with("when-cal=") => self.when_open_cal = Some(other["when-cal=".len()..].to_string()),
             "ingest" => self.ingest.open = true,
+            // for tests: the log window, and the wizard's --debug
+            "log-window" => self.show_last_log = true,
+            "ingest-debug" => self.ingest.debug = true,
             "ingest-go" => {
                 if self.ingest.output.trim().is_empty() {
                     self.ingest.output = self.ingest.default_output();

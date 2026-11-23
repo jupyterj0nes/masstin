@@ -589,6 +589,7 @@ enum ActionType {
 //   Main library function called from main.rs
 // -----------------------------------------------------------------------------
 pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
+    crate::banner::say_faults();
     let ingest_started = chrono::Utc::now();
     // Clean and normalize paths
     config.directory = {
