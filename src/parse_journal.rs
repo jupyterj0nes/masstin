@@ -36,6 +36,50 @@ use crate::parse_linux::{preauth_touch, RawEvt, SessionTracker, PAM_CLOSE_RE, SS
 
 /// Parse a single journal file, returning SSH lateral-movement events.
 /// `dst_host` is the hostname of the machine the journal came from.
+/// How far a journal file can be read, and whether it is damaged there.
+/// Its objects lie one after the other, each saying its own size; the
+/// reader takes that size at its word and asks for as much memory, so one
+/// object with a size of garbage (a journal copied while journald wrote to
+/// it: a snapshot of a running machine) ended the whole run, with
+/// `capacity overflow` or with a failed allocation of a hundred gigabytes.
+/// The objects are walked first, by their headers alone: the first one
+/// whose size is under a header's or runs past the end of the file is
+/// where the reading stops. The zeros journald leaves at the end of the
+/// file it has set aside are its end, not damage.
+pub(crate) fn journal_sound_len<F: std::io::Read + std::io::Seek + ?Sized>(f: &mut F) -> std::io::Result<(u64, bool)> {
+    use std::io::SeekFrom;
+    let le64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let len = f.seek(SeekFrom::End(0))?;
+    f.seek(SeekFrom::Start(0))?;
+    let mut head = [0u8; 104];
+    if f.read_exact(&mut head).is_err() {
+        // no header: the reader says what it is not
+        f.seek(SeekFrom::Start(0))?;
+        return Ok((len, false));
+    }
+    let (header_size, arena_size) = (le64(&head[88..96]), le64(&head[96..104]));
+    let end = header_size.saturating_add(arena_size).min(len);
+    let (mut at, mut damaged) = (header_size, false);
+    let mut object = [0u8; 16];
+    while at.saturating_add(16) <= end {
+        f.seek(SeekFrom::Start(at))?;
+        if f.read_exact(&mut object).is_err() {
+            break;
+        }
+        let size = le64(&object[8..16]);
+        if size == 0 && object[0] == 0 {
+            break; // the room set aside and not written yet
+        }
+        if size < 16 || size > end - at {
+            damaged = true;
+            break;
+        }
+        at += (size + 7) & !7;
+    }
+    f.seek(SeekFrom::Start(0))?;
+    Ok((at.min(len), damaged))
+}
+
 pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
     let mut out = Vec::new();
 
@@ -49,6 +93,24 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
             return out;
         }
     };
+
+    // the journal is read up to its last sound object: past an object that
+    // says a size it cannot have, the reader would ask for that much memory
+    let mut file = file;
+    let (sound, damaged) = match journal_sound_len(&mut file) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::banner::print_warning(&format!("  {}: cannot be read ({}), skipped", path.display(), e));
+            return out;
+        }
+    };
+    if damaged {
+        crate::banner::print_warning(&format!(
+            "  {}: the journal is damaged at byte {} (an object there says a size it cannot have, as in a journal copied while it was being written); it is read up to there",
+            path.display(), sound
+        ));
+    }
+    let file = std::io::Read::take(file, sound);
 
     let mut reader = match systemd_journal_reader::JournalReader::new(file) {
         Ok(r) => r,
@@ -226,4 +288,42 @@ pub fn parse_journal_file(path: &Path, dst_host: &str) -> Vec<RawEvt> {
 
     crate::parse_linux::invalid_users_as_failures(&mut out, "journal-ssh");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_journal_is_read_up_to_its_last_sound_object() {
+        use super::journal_sound_len;
+        use std::io::Cursor;
+        // a header of 272 bytes, then objects of 40, 24 and 64 bytes and the zeros set aside
+        let build = |sizes: &[u64], tail: usize| {
+            let mut b = vec![0u8; 272];
+            b[..8].copy_from_slice(b"LPKSHHRH");
+            let arena: u64 = sizes.iter().map(|s| (s + 7) & !7).sum::<u64>() + tail as u64;
+            b[88..96].copy_from_slice(&272u64.to_le_bytes());
+            b[96..104].copy_from_slice(&arena.to_le_bytes());
+            for s in sizes {
+                let at = b.len();
+                b.resize(at + ((*s + 7) & !7) as usize, 0);
+                b[at] = 1;
+                b[at + 8..at + 16].copy_from_slice(&s.to_le_bytes());
+            }
+            b.resize(b.len() + tail, 0);
+            b
+        };
+        let sound = build(&[40, 24, 64], 4096);
+        assert_eq!(journal_sound_len(&mut Cursor::new(&sound)).unwrap(), (272 + 40 + 24 + 64, false));
+        // the second object says a size of garbage: read up to it
+        for garbage in [0xFFFF_FFFF_FFFF_FFF0u64, 0x20_0000_0000, 8] {
+            let mut bad = sound.clone();
+            bad[272 + 40 + 8..272 + 40 + 16].copy_from_slice(&garbage.to_le_bytes());
+            assert_eq!(journal_sound_len(&mut Cursor::new(&bad)).unwrap(), (272 + 40, true), "{:#x}", garbage);
+        }
+        // a file cut in the middle of its last object
+        let cut = &sound[..272 + 40 + 24 + 30];
+        assert_eq!(journal_sound_len(&mut Cursor::new(cut)).unwrap(), (272 + 40 + 24, true));
+        // too short for a header: left to the reader
+        assert_eq!(journal_sound_len(&mut Cursor::new(&sound[..50])).unwrap(), (50, false));
+    }
 }
