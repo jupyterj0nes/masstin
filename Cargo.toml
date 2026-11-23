@@ -1,6 +1,6 @@
 [package]
 name = "masstin"
-version = "1.4.12"
+version = "1.4.13"
 edition = "2021"
 description = "Lateral movement tracker for anything: every login from Windows event logs, Linux and macOS logs, forensic images (E01, VMDK, VHDX, raw; no mounting) and triage packages in one timeline, a statistical hunt over it and a graph viewer. One binary for Windows, Linux and macOS."
 authors = ["Tono Diaz (@jupyterj0nes)"]
