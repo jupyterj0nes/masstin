@@ -208,6 +208,194 @@ pub fn read(p: &Path) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
+/// The pieces of the file at `p` that hold something, each with where it
+/// starts in the file, and whether there was more than `most` bytes of them
+/// (the rest is then not read). A file may be all holes around a few
+/// blocks (a lastlog has a slot per uid: 500 GB of nothing with the uids
+/// of a directory): read from start to end that is minutes of zeros, read
+/// by the file's own map it is its few blocks. None for a file that is not
+/// of a volume, and where the map is not one this reads (the caller then
+/// reads the file as any other).
+pub fn data_pieces(p: &Path, most: u64) -> io::Result<Option<(Vec<(u64, Vec<u8>)>, bool)>> {
+    let Some((root, volume, file, _)) = placed_for(p) else { return Ok(None) };
+    let f = file.ok_or_else(|| not_found(p))?;
+    let m = mount(&root, &volume)?;
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut held = 0u64;
+    match &*m {
+        Mounted::Ext4(_, raw) => {
+            let mut raw = raw.borrow_mut();
+            let Some((bs, extents)) = ext4_map(&mut **raw, &f.src) else { return Ok(None) };
+            for (logical, len, physical) in extents {
+                let start = logical.saturating_mul(bs);
+                if start >= f.len {
+                    continue;
+                }
+                let n = len.saturating_mul(bs).min(f.len - start);
+                if held + n > most {
+                    return Ok(Some((out, true)));
+                }
+                let mut buf = vec![0u8; n as usize];
+                raw.read(physical * bs, &mut buf).map_err(io::Error::other)?;
+                held += n;
+                out.push((start, buf));
+            }
+            Ok(Some((out, false)))
+        }
+        Mounted::Xfs(fs) => {
+            let Ok(file) = fs.open(&f.src) else { return Ok(None) };
+            let (inode, raw) = (file.inode().clone(), file.raw().to_vec());
+            let Ok(extents) = fs.data_extents(&inode, &raw) else { return Ok(None) };
+            let bs = u64::from(fs.superblock().blocksize);
+            for e in extents {
+                let start = e.startoff.saturating_mul(bs);
+                if e.unwritten || start >= f.len {
+                    continue;
+                }
+                let n = e.blockcount.saturating_mul(bs).min(f.len - start);
+                if held + n > most {
+                    return Ok(Some((out, true)));
+                }
+                let mut buf = vec![0u8; n as usize];
+                let mut got = 0usize;
+                while got < buf.len() {
+                    let k = fs.read_at(&inode, &raw, start + got as u64, &mut buf[got..]).map_err(|e| io::Error::other(e.to_string()))?;
+                    if k == 0 {
+                        break;
+                    }
+                    got += k;
+                }
+                buf.truncate(got);
+                held += n;
+                out.push((start, buf));
+            }
+            Ok(Some((out, false)))
+        }
+        Mounted::Ntfs(_) => Ok(None),
+    }
+}
+
+/// The map of the ext4 file at `path` (from the root of its volume): the
+/// size of a block and, for each extent written, the block of the file it
+/// starts at, its blocks and the block of the volume it lies at. Read from
+/// the volume itself: the driver gives a file block after block, holes
+/// included, and says nothing of where they are. None for what this does
+/// not read (no extents, meta_bg, a link on the way, anything that does
+/// not look as it should).
+fn ext4_map(dev: &mut dyn ext4_view::Ext4Read, path: &str) -> Option<(u64, Vec<(u64, u64, u64)>)> {
+    fn rd(dev: &mut dyn ext4_view::Ext4Read, at: u64, len: usize) -> Option<Vec<u8>> {
+        let mut b = vec![0u8; len];
+        dev.read(at, &mut b).ok()?;
+        Some(b)
+    }
+    let le16 = |b: &[u8], at: usize| u64::from(u16::from_le_bytes([b[at], b[at + 1]]));
+    let le32 = |b: &[u8], at: usize| u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]));
+
+    let sb = rd(dev, 1024, 1024)?;
+    if le16(&sb, 0x38) != 0xEF53 {
+        return None;
+    }
+    let log_bs = le32(&sb, 0x18);
+    if log_bs > 6 {
+        return None;
+    }
+    let bs = 1024u64 << log_bs;
+    let first_data_block = le32(&sb, 0x14);
+    let inodes_per_group = le32(&sb, 0x28);
+    let inode_size = if le32(&sb, 0x4C) >= 1 { le16(&sb, 0x58) } else { 128 };
+    let incompat = le32(&sb, 0x60);
+    if incompat & 0x10 != 0 || inodes_per_group == 0 || inode_size < 128 || inode_size > bs {
+        return None; // meta_bg: the group descriptors are elsewhere
+    }
+    let desc_size = if incompat & 0x80 != 0 { le16(&sb, 0xFE).max(32) } else { 32 };
+
+    // the inode `n`: (mode, flags, its 60 bytes of map)
+    let inode = |dev: &mut dyn ext4_view::Ext4Read, n: u64| -> Option<(u64, u64, Vec<u8>)> {
+        if n == 0 {
+            return None;
+        }
+        let (group, index) = ((n - 1) / inodes_per_group, (n - 1) % inodes_per_group);
+        let d = rd(dev, (first_data_block + 1) * bs + group * desc_size, desc_size as usize)?;
+        let table = le32(&d, 8) | if desc_size >= 64 { le32(&d, 0x28) << 32 } else { 0 };
+        let i = rd(dev, table.checked_mul(bs)? + index * inode_size, 128)?;
+        Some((le16(&i, 0), le32(&i, 0x20), i[0x28..0x28 + 60].to_vec()))
+    };
+
+    // the extents under a node of the tree, into `out`
+    fn walk(dev: &mut dyn ext4_view::Ext4Read, node: &[u8], bs: u64, level: u32, out: &mut Vec<(u64, u64, u64)>) -> Option<()> {
+        let le16 = |b: &[u8], at: usize| u64::from(u16::from_le_bytes([b[at], b[at + 1]]));
+        let le32 = |b: &[u8], at: usize| u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]));
+        if node.len() < 12 || le16(node, 0) != 0xF30A || level > 6 {
+            return None;
+        }
+        let (entries, depth) = (le16(node, 2) as usize, le16(node, 6));
+        if 12 + entries * 12 > node.len() {
+            return None;
+        }
+        for i in 0..entries {
+            let e = 12 + i * 12;
+            if depth == 0 {
+                let len = le16(node, e + 4);
+                // over 32768: set aside and never written, zeros
+                if len <= 32768 {
+                    out.push((le32(node, e), len, le32(node, e + 8) | (le16(node, e + 6) << 32)));
+                }
+            } else {
+                let child = le32(node, e + 4) | (le16(node, e + 8) << 32);
+                let mut b = vec![0u8; bs as usize];
+                dev.read(child.checked_mul(bs)?, &mut b).ok()?;
+                walk(dev, &b, bs, level + 1, out)?;
+            }
+            if out.len() > 1_000_000 {
+                return None;
+            }
+        }
+        Some(())
+    }
+    const EXTENTS: u64 = 0x8_0000;
+
+    let mut at = 2u64; // the root
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for (k, name) in parts.iter().enumerate() {
+        let (mode, flags, map) = inode(dev, at)?;
+        if mode & 0xF000 != 0x4000 || flags & EXTENTS == 0 {
+            return None; // not a folder (a link), or one kept another way
+        }
+        let mut extents = Vec::new();
+        walk(dev, &map, bs, 0, &mut extents)?;
+        let mut found = None;
+        'dir: for (_, len, physical) in extents {
+            for b in 0..len.min(1 << 16) {
+                let block = rd(dev, (physical + b) * bs, bs as usize)?;
+                let mut off = 0usize;
+                while off + 8 <= block.len() {
+                    let (ino, rec, nlen) = (le32(&block, off), le16(&block, off + 4) as usize, block[off + 6] as usize);
+                    if rec < 8 || off + rec > block.len() {
+                        break;
+                    }
+                    if ino != 0 && off + 8 + nlen <= block.len() && &block[off + 8..off + 8 + nlen] == name.as_bytes() {
+                        found = Some(ino);
+                        break 'dir;
+                    }
+                    off += rec;
+                }
+            }
+        }
+        at = found?;
+        if k + 1 == parts.len() {
+            let (mode, flags, map) = inode(dev, at)?;
+            if mode & 0xF000 != 0x8000 || flags & EXTENTS == 0 {
+                return None;
+            }
+            let mut extents = Vec::new();
+            walk(dev, &map, bs, 0, &mut extents)?;
+            extents.sort();
+            return Some((bs, extents));
+        }
+    }
+    None
+}
+
 pub fn read_to_string(p: &Path) -> io::Result<String> {
     let mut s = String::new();
     open(p)?.read_to_string(&mut s)?;
@@ -346,7 +534,9 @@ impl<T: Read + Seek + Clone> fs_core::BlockRead for Block<T> {
 }
 
 enum Mounted {
-    Ext4(ext4_view::Ext4),
+    /// the file system, and its device again for what is read by the
+    /// file's own map (see `data_pieces`)
+    Ext4(ext4_view::Ext4, RefCell<Box<dyn ext4_view::Ext4Read>>),
     Xfs(Arc<fs_xfs::Filesystem>),
     Ntfs(Rc<NtfsMount>),
 }
@@ -455,7 +645,7 @@ impl Mounted {
                 };
                 Ok(Box::new(NtfsData { m: Rc::clone(m), record, pos: 0, len }))
             }
-            Mounted::Ext4(fs) => Ok(Box::new(fs.open(src).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?)),
+            Mounted::Ext4(fs, _) => Ok(Box::new(fs.open(src).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?)),
             Mounted::Xfs(fs) => {
                 let nf = |e: fs_xfs::Error| io::Error::new(io::ErrorKind::NotFound, e.to_string());
                 let f = match fs.open(src) {
@@ -643,7 +833,10 @@ fn mount(root: &Path, volume: &Volume) -> io::Result<Rc<Mounted>> {
 
 fn open_fs<T: Read + Seek + Clone + 'static>(fs: VolumeFs, dev: At<T>, size: u64) -> io::Result<Mounted> {
     match fs {
-        VolumeFs::Ext4 => Ok(Mounted::Ext4(ext4_view::Ext4::load(Box::new(dev)).map_err(|e| io::Error::other(e.to_string()))?)),
+        VolumeFs::Ext4 => {
+            let raw: Box<dyn ext4_view::Ext4Read> = Box::new(dev.clone());
+            Ok(Mounted::Ext4(ext4_view::Ext4::load(Box::new(dev)).map_err(|e| io::Error::other(e.to_string()))?, RefCell::new(raw)))
+        }
         VolumeFs::Xfs => {
             let device: Arc<dyn fs_core::BlockRead> = Arc::new(Block { dev, size });
             Ok(Mounted::Xfs(Arc::new(fs_xfs::Filesystem::mount(device).map_err(|e| io::Error::other(e.to_string()))?)))

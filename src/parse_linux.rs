@@ -1080,6 +1080,12 @@ fn lastlog_record(rec: &[u8]) -> (i64, String, String) {
 /// line and host); ties go to the size that divides the file, then to the
 /// x86_64 one. None when the file reads as neither.
 pub(crate) fn lastlog_layout(data: &[u8]) -> Option<usize> {
+    lastlog_layout_of(data, data.len() as u64)
+}
+
+/// The same for the slots kept of a file of `file_len` bytes (see
+/// `lastlog_slots`).
+fn lastlog_layout_of(data: &[u8], file_len: u64) -> Option<usize> {
     let score = |size: usize| -> usize {
         let mut ok = 0usize;
         for rec in data.chunks_exact(size) {
@@ -1099,7 +1105,7 @@ pub(crate) fn lastlog_layout(data: &[u8]) -> Option<usize> {
     };
     let best = [LASTLOG_RECORD_COMPAT32, LASTLOG_RECORD_TIME64]
         .iter()
-        .map(|&size| (score(size), data.len() % size == 0, size))
+        .map(|&size| (score(size), file_len % size as u64 == 0, size))
         .max_by_key(|&(s, divides, size)| (s, divides, std::cmp::Reverse(size)))?;
     if best.0 == 0 && !best.1 { None } else { Some(best.2) }
 }
@@ -1122,22 +1128,118 @@ fn load_passwd(root: &Path) -> HashMap<u32, String> {
     map
 }
 
+/// A stretch of a lastlog that both slot sizes divide (74 slots of 292
+/// bytes, 73 of 296): the file is read and kept by these.
+const LASTLOG_STRETCH: usize = 21_608;
+/// The stretches read at a time (a megabyte).
+const LASTLOG_READ: usize = LASTLOG_STRETCH * 48;
+/// The most kept of one lastlog: some 900,000 accounts side by side, or
+/// 12,000 each alone in its stretch.
+const LASTLOG_KEPT_MOST: usize = 256 << 20;
+/// The most read of a lastlog whose holes cannot be told from its map
+/// (one unpacked to disk, a volume this does not read the map of): the
+/// accounts up to uid 235 million.
+const LASTLOG_READ_MOST: u64 = 64 << 30;
+
+/// The stretches of a lastlog that hold something, from the pieces its
+/// volume holds of it (blocks, each with where it starts in the file).
+fn lastlog_stretches(pieces: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
+    let mut by: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
+    for (start, bytes) in pieces {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = start + done as u64;
+            let (k, within) = (at / LASTLOG_STRETCH as u64, (at % LASTLOG_STRETCH as u64) as usize);
+            let n = (LASTLOG_STRETCH - within).min(bytes.len() - done);
+            if bytes[done..done + n].iter().any(|&b| b != 0) {
+                by.entry(k).or_insert_with(|| vec![0u8; LASTLOG_STRETCH])[within..within + n].copy_from_slice(&bytes[done..done + n]);
+            }
+            done += n;
+        }
+    }
+    by.into_iter().map(|(k, v)| (k * LASTLOG_STRETCH as u64, v)).collect()
+}
+
+/// What a lastlog holds: its stretches that are not all zeros, each with
+/// where it starts, and the length of the file. The file has a slot per
+/// uid, and the uids of a directory (SSSD, winbind: 200,000 to 2,000
+/// million) make it hundreds of gigabytes of holes around a few slots; read
+/// whole it took the machine's memory and ended the run. It is read a
+/// megabyte at a time and only what holds something is kept. The third
+/// value says the file held more than is kept of one (it is no lastlog).
+fn lastlog_slots<R: Read>(mut r: R) -> std::io::Result<(Vec<(u64, Vec<u8>)>, u64, bool)> {
+    let mut kept: Vec<(u64, Vec<u8>)> = Vec::new();
+    let (mut held, mut at) = (0usize, 0u64);
+    let mut buf = vec![0u8; LASTLOG_READ];
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            match r.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            for (i, stretch) in buf[..n].chunks(LASTLOG_STRETCH).enumerate() {
+                if stretch.iter().any(|&b| b != 0) {
+                    if held + stretch.len() > LASTLOG_KEPT_MOST {
+                        return Ok((kept, at + n as u64, true));
+                    }
+                    held += stretch.len();
+                    kept.push((at + (i * LASTLOG_STRETCH) as u64, stretch.to_vec()));
+                }
+            }
+        }
+        at += n as u64;
+        if n < buf.len() {
+            break;
+        }
+        if at >= LASTLOG_READ_MOST {
+            return Ok((kept, at, true));
+        }
+    }
+    Ok((kept, at, false))
+}
+
 fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
     let mut out = Vec::new();
-    let data = match crate::vfs::read(path) {
-        Ok(d) => d,
+    // by the map of the file where its volume gives one (its few blocks),
+    // else from start to end
+    let read = match crate::vfs::data_pieces(path, LASTLOG_KEPT_MOST as u64) {
+        Ok(Some((pieces, cut))) => crate::vfs::metadata(path).map(|m| (lastlog_stretches(pieces), m.len(), cut)),
+        Ok(None) => crate::vfs::open(path).and_then(lastlog_slots),
+        Err(e) => Err(e),
+    };
+    let (kept, file_len, cut) = match read {
+        Ok(x) => x,
         Err(e) => {
             eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
             return out;
         }
     };
-    let rec_size = match lastlog_layout(&data) {
+    if cut {
+        crate::banner::print_warning(&format!(
+            "  {}: too much of it to read whole ({} bytes); the accounts past what was read are not in the timeline",
+            path.display(), file_len
+        ));
+    }
+    // the first slots that hold something tell the layout
+    let mut head: Vec<u8> = Vec::new();
+    for (_, s) in kept.iter().take(64) {
+        head.extend_from_slice(s);
+    }
+    let rec_size = match lastlog_layout_of(&head, file_len) {
         Some(s) => s,
         None => {
-            if !data.is_empty() {
+            if file_len > 0 {
                 crate::banner::print_warning(&format!(
                     "  {}: not a lastlog slot layout masstin knows ({} bytes), skipped",
-                    path.display(), data.len()
+                    path.display(), file_len
                 ));
             }
             return out;
@@ -1147,7 +1249,11 @@ fn parse_lastlog(path: &Path, dst_host: &str, passwd: &HashMap<u32, String>) -> 
         println!("    {}: 296-byte slots (64-bit time, aarch64 / riscv64 / ppc64le layout)", path.display());
     }
     let fname = path.display().to_string();
-    for (uid, rec) in data.chunks_exact(rec_size).enumerate() {
+    let slots = kept.iter().flat_map(|(at, s)| {
+        let first = *at / rec_size as u64;
+        s.chunks_exact(rec_size).enumerate().map(move |(i, rec)| (first + i as u64, rec))
+    });
+    for (uid, rec) in slots {
         let (secs, line, host) = lastlog_record(rec);
         if secs == 0 { continue; }
         // Console logins carry no host; nothing to plot on the graph.
@@ -3678,7 +3784,11 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 LinuxUnit::Log(p) => {
                     let len = crate::vfs::metadata(p).map(|m| m.len()).unwrap_or(0);
                     let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                    if name.ends_with(".journal") || name.ends_with(".journal~") || name.contains("wtmp") || name.contains("btmp") || name == "utmp" || name == "lastlog" {
+                    if name == "lastlog" {
+                        // a slot a uid: hundreds of gigabytes of holes with
+                        // the uids of a directory, and a row an account
+                        text += len.min(1 << 20);
+                    } else if name.ends_with(".journal") || name.ends_with(".journal~") || name.contains("wtmp") || name.contains("btmp") || name == "utmp" {
                         // binary: a small share of it becomes rows
                         text += len / 10;
                     } else {
@@ -4284,6 +4394,67 @@ mod repeated_tests {
         assert_eq!((t, pid, line.as_str(), user.as_str(), host.as_str(), secs), (7, 4242, "pts/0", "alice", "10.0.0.5", 1_767_254_400));
         assert_eq!(utmp_layout(b"not a utmp file at all, just text that is long enough to try"), None);
         assert_eq!(utmp_layout(&[]), None);
+    }
+
+    #[test]
+    fn a_lastlog_of_holes_is_read_without_holding_it() {
+        use super::{lastlog_layout_of, lastlog_slots, LASTLOG_STRETCH};
+        use std::io::Read;
+        // over a gigabyte of zeros with a slot at uid 3 and one at uid 4,000,000
+        // (a directory account), never in memory
+        struct Holes { pos: u64, len: u64, slots: Vec<(u64, Vec<u8>)> }
+        impl Read for Holes {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (buf.len() as u64).min(self.len - self.pos) as usize;
+                buf[..n].fill(0);
+                for (at, s) in &self.slots {
+                    for (i, b) in s.iter().enumerate() {
+                        let p = at + i as u64;
+                        if p >= self.pos && p < self.pos + n as u64 { buf[(p - self.pos) as usize] = *b; }
+                    }
+                }
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+        let slot = |secs: u32, host: &str| {
+            let mut s = vec![0u8; 292];
+            s[0..4].copy_from_slice(&secs.to_le_bytes());
+            s[4..9].copy_from_slice(b"pts/0");
+            s[36..36 + host.len()].copy_from_slice(host.as_bytes());
+            s
+        };
+        let far = 4_000_000u64;
+        let len = (far + 1) * 292;
+        let r = Holes { pos: 0, len, slots: vec![(3 * 292, slot(1_760_000_000, "10.0.0.5")), (far * 292, slot(1_770_000_000, "10.0.0.9"))] };
+        let (kept, file_len, cut) = lastlog_slots(r).unwrap();
+        assert!(!cut);
+        assert_eq!(file_len, len);
+        assert_eq!(kept.len(), 2, "two stretches hold something");
+        assert!(kept.iter().map(|(_, s)| s.len()).sum::<usize>() <= 2 * LASTLOG_STRETCH);
+        let head: Vec<u8> = kept.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        assert_eq!(lastlog_layout_of(&head, file_len), Some(292));
+        // the uid of each slot is where it lies in the file
+        let uids: Vec<u64> = kept.iter().flat_map(|(at, s)| {
+            let first = *at / 292;
+            s.chunks_exact(292).enumerate().filter(|(_, rec)| rec.iter().any(|&b| b != 0)).map(move |(i, _)| first + i as u64)
+        }).collect();
+        assert_eq!(uids, vec![3, far]);
+
+        // the same from the blocks a volume holds of it: 4 KiB blocks, the
+        // far slot across two of them
+        let (b0, far_at) = (vec![0u8; 4096], far * 292);
+        let mut first = b0.clone();
+        first[3 * 292..4 * 292].copy_from_slice(&slot(1_760_000_000, "10.0.0.5"));
+        let block = far_at / 4096 * 4096;
+        let mut two = vec![0u8; 8192];
+        two[(far_at - block) as usize..(far_at - block) as usize + 292].copy_from_slice(&slot(1_770_000_000, "10.0.0.9"));
+        let st = super::lastlog_stretches(vec![(0, first), (block, two), (block + 40960, b0)]);
+        assert_eq!(st.len(), kept.len());
+        for ((a, x), (b, y)) in st.iter().zip(kept.iter()) {
+            assert_eq!(a, b);
+            assert_eq!(&x[..y.len()], &y[..]);
+        }
     }
 
     #[test]
