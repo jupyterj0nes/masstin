@@ -794,8 +794,8 @@ pub fn set_memory(asked: Option<&str>) -> Result<String, String> {
         _ => "the machine does not say what it has".to_string(),
     };
     Ok(match parsed {
-        Some(b) => format!("Memory: up to {} (asked with {}; {}); never more than what is free when a stage starts, the rest is sorted on disk", human_bytes(b), source, machine),
-        None => format!("Memory: up to {} ({}% of the machine's; {}; --memory sets it); never more than what is free when a stage starts, the rest is sorted on disk", human_bytes(memory_limit()), MEMORY_SHARE_PERCENT, machine),
+        Some(b) => format!("Memory: up to {} (asked with {}; {}); never more than half of what is free when a stage starts, the rest is sorted on disk", human_bytes(b), source, machine),
+        None => format!("Memory: up to {} ({}% of the machine's; {}; --memory sets it); never more than half of what is free when a stage starts, the rest is sorted on disk", human_bytes(memory_limit()), MEMORY_SHARE_PERCENT, machine),
     })
 }
 
