@@ -13,6 +13,17 @@ pub(super) const SLOW_FRAME_MS: f32 = 150.0;
 /// For this long, frame after frame, before the drawing is reduced.
 pub(super) const SLOW_FOR: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// A part of the drawing that costs: the motion (lights and dots along the
+/// connections, the sheen, pulses: the window is drawn again all the time)
+/// and every host with its figure and its name (hundreds of figures and
+/// texts a frame). They are two things: a window that had its motion
+/// turned off keeps its names, and the other way round.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Costly {
+    Motion,
+    Names,
+}
+
 /// The drawing reduced, and what it was before.
 pub(super) struct Safeguard {
     /// the style before: what Restore brings back, and what is saved meanwhile
@@ -67,7 +78,7 @@ impl Viewer {
             return;
         }
         let cost = self.inside_ms + self.outside_ms;
-        let declined = self.safeguard_declined == Some(self.graph_id);
+        let declined = self.keep_as_asked || self.safeguard_declined == Some(self.graph_id);
         if should_reduce(cost, now, &mut self.slow_since, declined) {
             self.slow_since = None;
             let why = format!("{:.0} ms a frame with {} hosts and {} connections", cost, group_digits(self.graph.nodes.len()), group_digits(self.graph.edges.len()));
@@ -88,6 +99,120 @@ impl Viewer {
         if by_hand {
             self.safeguard_declined = Some(self.graph_id);
             self.status = "Drawing restored: the safeguard leaves this view alone".to_string();
+        }
+    }
+
+    /// Why turning `what` on may slow this window now, if it may: the
+    /// renderer, the size of the view, what a frame costs already.
+    pub(super) fn cost_of(&self, what: Costly) -> Option<String> {
+        let hosts = self.graph.nodes.len();
+        let mut why: Vec<String> = Vec::new();
+        if self.light_mode {
+            why.push("this window is drawn by the CPU (a remote desktop, or no graphics driver), where each frame costs many times what it costs a graphics card".to_string());
+        }
+        if self.safeguard.is_some() {
+            why.push("the safeguard turned the drawing of this view down because its frames were slow".to_string());
+        }
+        match what {
+            Costly::Motion => {
+                if hosts >= 300 {
+                    why.push(format!("the view has {} hosts and {} connections, and with motion the window is drawn again all the time instead of when something changes", group_digits(hosts), group_digits(self.graph.edges.len())));
+                }
+            }
+            Costly::Names => {
+                if hosts >= 150 {
+                    why.push(format!("the view has {} hosts: that many figures and names are drawn at every frame, where a plain disc costs a hundredth", group_digits(hosts)));
+                }
+            }
+        }
+        let frame = self.inside_ms + self.outside_ms;
+        if !why.is_empty() && frame > 1.0 {
+            why.push(format!("a frame takes {:.0} ms now", frame));
+        }
+        if why.is_empty() { None } else { Some(why.join("; ")) }
+    }
+
+    /// Turn `what` on: at once where it costs nothing to speak of, after
+    /// the analyst has read what it may cost where it may.
+    pub(super) fn ask_costly(&mut self, what: Costly) {
+        if self.cost_of(what).is_some() {
+            self.confirm_cost = Some(what);
+        } else {
+            self.turn_on(what);
+        }
+    }
+
+    /// `what` on, as asked: it stays on, and the safeguard no longer turns
+    /// the drawing down by itself in this window (it was told).
+    pub(super) fn turn_on(&mut self, what: Costly) {
+        let warned = self.cost_of(what).is_some();
+        // the style under a reduced drawing is the analyst's: both take it
+        match what {
+            Costly::Motion => {
+                self.style.motion = true;
+                if let Some(sg) = self.safeguard.as_mut() {
+                    sg.saved.motion = true;
+                }
+            }
+            Costly::Names => {
+                self.style.names_always = true;
+                if let Some(sg) = self.safeguard.as_mut() {
+                    sg.saved.names_always = true;
+                }
+            }
+        }
+        self.confirm_cost = None;
+        // the first frames' own check of the renderer does not undo it either
+        self.light_checked = true;
+        if warned {
+            self.keep_as_asked = true;
+            self.status = match what {
+                Costly::Motion => "Motion on, as asked: it stays on. The toolbar's motion button turns it off if the window drags.".to_string(),
+                Costly::Names => "Every host with its figure and its name, as asked. The chip over the graph (or View > Names and figures always) turns it off if the window drags.".to_string(),
+            };
+        }
+        self.persist();
+    }
+
+    /// What it may cost, said before it is turned on; the analyst decides.
+    pub(super) fn confirm_cost_window(&mut self, ctx: &egui::Context) {
+        let Some(what) = self.confirm_cost else { return };
+        let why = self.cost_of(what).unwrap_or_default();
+        let (title, does, gives) = match what {
+            Costly::Motion => (
+                "Turn the motion on?",
+                "Motion is the lights and dots that travel along the connections, the sheen on the hosts and the pulses.",
+                "The window may answer late to the pointer and to the keys while it is on. Nothing is lost: the motion button of the toolbar turns it off again.",
+            ),
+            Costly::Names => (
+                "Show every host's figure and name?",
+                "Every host is drawn with its figure and its name, whatever the zoom and how many there are, instead of plain discs with no name when they are small or many.",
+                "Panning and zooming may get slow, and names may sit on one another. Nothing is lost: the chip over the graph, or View > Names and figures always, turns it off again.",
+            ),
+        };
+        let mut open = true;
+        let mut done = false;
+        egui::Window::new(format!("{}  {}", crate::view::icons::WARNING, title)).id(egui::Id::new("confirm-cost")).open(&mut open).collapsible(false).resizable(false).default_width(460.0).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(egui::RichText::new(does).color(TEXT).size(12.5));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("It may slow this window: {}.", why)).color(CANDIDATE).size(12.5));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(gives).color(crate::view::theme::MUTED).size(12.0));
+            ui.label(egui::RichText::new("Once you turn it on masstin leaves it on: it will not turn the drawing down by itself in this window.").color(crate::view::theme::DIM).size(11.5));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(crate::view::theme::semibold("Turn it on", 13.0).color(TEXT)).min_size(Vec2::new(110.0, 30.0))).clicked() {
+                    self.turn_on(what);
+                    done = true;
+                }
+                if ui.add(egui::Button::new("Leave it off").min_size(Vec2::new(110.0, 30.0))).clicked() {
+                    done = true;
+                }
+            });
+        });
+        if done || !open {
+            self.confirm_cost = None;
         }
     }
 

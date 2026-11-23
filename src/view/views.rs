@@ -277,6 +277,12 @@ pub struct Style {
     /// significant host, the hover ring
     #[serde(default = "yes")]
     pub motion: bool,
+    /// every host with its figure and its name, whatever the zoom and the
+    /// crowd. Off, a host that is small on screen or one of a crowd is a
+    /// plain disc and the names go under 30 % of zoom: that keeps a window
+    /// of hundreds of hosts fluid, and is not what stops the motion
+    #[serde(default)]
+    pub names_always: bool,
     /// a host's size grows with its traffic in the view; off, every host is the same
     #[serde(default = "yes")]
     pub size_by_traffic: bool,
@@ -346,7 +352,7 @@ fn yes() -> bool {
 
 impl Default for Style {
     fn default() -> Self {
-        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 0.8, font_scale: 1.0, rules: Vec::new(), motion: true, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Realistic, show_subnets: false, subnets_auto: true, edge_opacity: edge_opacity(), caption_hover: false, caption_show: CaptionShow::Auto, caption_crowd: caption_crowd(), curves: true, arrows: true, edge_glow: true, grid: true, vignette: true, auto_size: true }
+        Style { color_by: ColorBy::Result, caption: Caption::User, shapes_by_role: false, node_scale: 1.0, edge_scale: 0.8, font_scale: 1.0, rules: Vec::new(), motion: true, names_always: false, size_by_traffic: true, label_pos: LabelPos::Auto, label_bg: false, label_bg_color: label_box(), node_style: NodeStyle::Realistic, show_subnets: false, subnets_auto: true, edge_opacity: edge_opacity(), caption_hover: false, caption_show: CaptionShow::Auto, caption_crowd: caption_crowd(), curves: true, arrows: true, edge_glow: true, grid: true, vignette: true, auto_size: true }
     }
 }
 

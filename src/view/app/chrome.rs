@@ -218,6 +218,25 @@ impl Viewer {
                     }
                 }
                 ui.separator();
+                if ui.add(egui::Button::selectable(self.style.names_always, format!("{}  Names and figures always", ic::EYE))).on_hover_text("Every host with its figure and its name, whatever the zoom and how many there are. Off, a host that is small on screen or one of a crowd is a plain disc and the names go when the view is far: that keeps a big view fluid. Where it may slow the window masstin says so first and you decide").clicked() {
+                    ui.close();
+                    if self.style.names_always {
+                        self.style.names_always = false;
+                        self.persist();
+                    } else {
+                        self.ask_costly(safeguard::Costly::Names);
+                    }
+                }
+                if ui.add(egui::Button::selectable(self.style.motion, format!("{}  Motion", ic::WAVEFORM))).on_hover_text("Lights and dots along the connections, the sheen on the hosts, pulses. It is not what draws the figures and the names: each is turned on and off by itself. Where it may slow the window masstin says so first and you decide").clicked() {
+                    ui.close();
+                    if self.style.motion {
+                        self.style.motion = false;
+                        self.persist();
+                    } else {
+                        self.ask_costly(safeguard::Costly::Motion);
+                    }
+                }
+                ui.separator();
                 if icon_button(ui, ic::CORNERS_OUT, "Fill the window").on_hover_text("Zoom and centre so every host on the canvas is in sight").clicked() {
                     ui.close();
                     self.layout.stop();
@@ -432,9 +451,13 @@ impl Viewer {
                 self.draft = f;
                 self.requery(true);
             }
-            if tool(ui, ic::WAVEFORM, "Motion: dots along the connections that matter, the sheen on the hosts, pulses, glides", self.style.motion).clicked() {
-                self.style.motion = !self.style.motion;
-                self.persist();
+            if tool(ui, ic::WAVEFORM, "Motion: dots along the connections that matter, the sheen on the hosts, pulses, glides. Where it may slow the window (a remote desktop, a view the safeguard turned down) masstin says so first and you decide", self.style.motion).clicked() {
+                if self.style.motion {
+                    self.style.motion = false;
+                    self.persist();
+                } else {
+                    self.ask_costly(safeguard::Costly::Motion);
+                }
             }
             if tool(ui, ic::HEXAGON, "Shapes by role: hexagon domain controller, square server, circle workstation, diamond external", self.style.shapes_by_role).clicked() {
                 self.style.shapes_by_role = !self.style.shapes_by_role;
@@ -1485,6 +1508,25 @@ impl Viewer {
                         if r.clicked() {
                             self.color_pick = Some(ColorPick { field: Field::User, pattern: format!("={}", text), color: c, title: format!("Colour of {}", text) });
                         }
+                    }
+                }
+                // hosts drawn plain or with no name: said here, with the way to see them all
+                let (plain, no_names) = self.drawn_reduced;
+                if self.style.names_always {
+                    ui.add_space(6.0);
+                    if legend_chip(ui, format!("{}  every figure and name  {}", ic::EYE, ic::X), CANDIDATE, true).on_hover_text("Every host is drawn with its figure and its name, as you asked. Click to go back to the automatic drawing: plain discs for the hosts that are small or many, names gone when the view is far").clicked() {
+                        self.style.names_always = false;
+                        self.persist();
+                    }
+                } else if plain > 0 || no_names {
+                    ui.add_space(6.0);
+                    let what = match (plain > 0, no_names) {
+                        (true, true) => format!("{} hosts as plain discs, names hidden", plain),
+                        (true, false) => format!("{} hosts as plain discs", plain),
+                        _ => "names hidden at this zoom".to_string(),
+                    };
+                    if legend_chip(ui, format!("{}  {}  ·  Show all", ic::EYE_SLASH, what), CANDIDATE, true).on_hover_text("To keep a big view fluid, a host that is small on screen or one of a crowd is drawn as a plain disc, and the names go when the view is far. Click to draw every host with its figure and its name; where that may slow the window masstin says so first and you decide. Zooming in also brings them back").clicked() {
+                        self.ask_costly(safeguard::Costly::Names);
                     }
                 }
             });

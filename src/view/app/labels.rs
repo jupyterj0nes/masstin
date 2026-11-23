@@ -343,7 +343,24 @@ impl Viewer {
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui.checkbox(&mut self.style.grid, "grid").changed();
                     changed |= ui.checkbox(&mut self.style.vignette, "spotlight").on_hover_text("The lighter middle of the canvas").changed();
-                    changed |= ui.checkbox(&mut self.style.motion, "motion").on_hover_text("Lights, dots along the connections, the sheen; off for a still picture").changed();
+                    let mut motion = self.style.motion;
+                    if ui.checkbox(&mut motion, "motion").on_hover_text("Lights, dots along the connections, the sheen; off for a still picture. Where it may slow the window masstin says so first").changed() {
+                        if motion {
+                            self.ask_costly(safeguard::Costly::Motion);
+                        } else {
+                            self.style.motion = false;
+                            changed = true;
+                        }
+                    }
+                    let mut names = self.style.names_always;
+                    if ui.checkbox(&mut names, "names and figures always").on_hover_text("Every host with its figure and its name, whatever the zoom and how many there are. Off, a host that is small on screen or one of a crowd is a plain disc and the names go when the view is far. Where it may slow the window masstin says so first").changed() {
+                        if names {
+                            self.ask_costly(safeguard::Costly::Names);
+                        } else {
+                            self.style.names_always = false;
+                            changed = true;
+                        }
+                    }
                 });
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Right-click a host or a connection for its own style; those are kept as rules and win over these. All of this is saved with the view.").color(theme::DIM).small());

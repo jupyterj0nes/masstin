@@ -272,6 +272,15 @@ pub struct Viewer {
     save_places: bool,
     /// a saved filter asked for: delete it once the analyst confirms
     confirm_delete: Option<String>,
+    /// a costly part of the drawing asked for where it may slow the window:
+    /// said, with what it may cost, before it is turned on
+    confirm_cost: Option<safeguard::Costly>,
+    /// the hosts of the last frame drawn as plain discs, and whether the
+    /// names were left out for the zoom: what the chip over the graph says
+    drawn_reduced: (usize, bool),
+    /// the analyst turned a costly part on knowing what it may cost: the
+    /// safeguard no longer turns the drawing down by itself in this window
+    keep_as_asked: bool,
     /// places to give the hosts on the next query (a saved view picked)
     restore_places: Option<Vec<(String, f32, f32)>>,
     // presentation and recording
@@ -1156,6 +1165,9 @@ impl Viewer {
             save_name: String::new(),
             save_places: true,
             confirm_delete: None,
+            confirm_cost: None,
+            drawn_reduced: (0, false),
+            keep_as_asked: false,
             restore_places: None,
             story,
             story_path,
@@ -3480,7 +3492,10 @@ impl Viewer {
         let ring_w = (1.6 * z.sqrt()).clamp(1.0, 3.0);
         let node_slot = painter.add(egui::Shape::Noop);
         let mut node_mesh = egui::epaint::Mesh::default();
-        let crowd_nodes = lod || self.graph.nodes.len() > 700;
+        // asked for by the analyst: every host its figure and its name
+        let full = self.style.names_always;
+        let crowd_nodes = !full && (lod || self.graph.nodes.len() > 700);
+        let (mut drawn_plain, mut names_left_out) = (0usize, false);
         // pinned hosts carry a pin, unless the whole picture is (a saved arrangement, the hops)
         let show_pins = !self.presenting && self.layout.fixed.iter().any(|&f| !f);
         for i in 0..self.graph.nodes.len() {
@@ -3543,7 +3558,7 @@ impl Viewer {
             } else {
                 0.0
             };
-            let small = (r < 10.0 || crowd_nodes) && matches!(look.shape, Shape::Circle) && !selected && !hovered && !lit;
+            let small = (r < if full { 2.5 } else { 10.0 } || crowd_nodes) && matches!(look.shape, Shape::Circle) && !selected && !hovered && !lit;
             if glow_strength > 0.0 && r > 4.0 && (significant || lit || look.glow || (r > 7.0 && !lod)) {
                 let gc = if significant { SIGNIFICANT } else if n.hunt_rank == 1 { CANDIDATE } else { fill };
                 if small {
@@ -3571,6 +3586,7 @@ impl Viewer {
                 painter.circle_stroke(p, r + 5.0, Stroke::new(2.0, draw::fade(ACCENT, 0.95)));
             }
             if small {
+                drawn_plain += 1;
                 draw::disc(&mut node_mesh, p, r, draw::fade(fill, alpha));
                 if r >= 5.0 {
                     draw::ring(&mut node_mesh, p, r, ring_w.min(1.5) * if significant { 1.6 } else { 1.0 }, draw::fade(draw::lighten(ring, 0.25), alpha * 0.95));
@@ -3634,11 +3650,16 @@ impl Viewer {
                 painter.text(at, Align2::CENTER_CENTER, super::icons::PUSH_PIN, FontId::proportional(px), draw::fade(ACCENT, alpha));
             }
             nodes_drawn += 1;
+            self.drawn_reduced = (drawn_plain, names_left_out);
             let anonym = self.presenting && self.story.anonymise;
             let shown: Cow<str> = if anonym { Cow::Owned(self.anon.host(n.host, look.is_ip)) } else { Cow::Borrowed(look.name.as_str()) };
             let shown_name: &str = &shown;
-            if z > 0.3 || lit || look.label_pos != LabelPos::Auto {
-                let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(6.5, 40.0);
+            if !(full || z > 0.3 || lit || look.label_pos != LabelPos::Auto) {
+                names_left_out = true;
+            }
+            if full || z > 0.3 || lit || look.label_pos != LabelPos::Auto {
+                // asked for: a name that is read, however far the view is
+                let base_px = (11.0 * z.sqrt() * fs * look.label_size).clamp(if full { 9.0 } else { 6.5 }, 40.0);
                 let pos = self.drawn_label_pos(look);
                 labels::paint_host_label(&painter, shown_name, p, r, pos, base_px, look.label_bg, ring, alpha, lit, crowd_nodes || lod, self.style.node_style == NodeStyle::Arcade);
             }
@@ -5822,6 +5843,9 @@ impl Viewer {
             "ingest" => self.ingest.open = true,
             // for tests: the log window, and the wizard's --debug
             "log-window" => self.show_last_log = true,
+            "names-always" => self.ask_costly(safeguard::Costly::Names),
+            "names-always-yes" => self.turn_on(safeguard::Costly::Names),
+            "motion-ask" => self.ask_costly(safeguard::Costly::Motion),
             "ingest-debug" => self.ingest.debug = true,
             "ingest-go" => {
                 if self.ingest.output.trim().is_empty() {
@@ -6635,6 +6659,7 @@ impl Viewer {
         self.rules_window(&ctx);
         self.save_popup(&ctx);
         self.confirm_delete_window(&ctx);
+        self.confirm_cost_window(&ctx);
         self.story_window(&ctx);
         self.export_window(&ctx);
         self.paths_window(&ctx);
