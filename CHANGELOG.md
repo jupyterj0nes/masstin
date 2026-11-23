@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.4.14 — 2026-11-23
 
 - **The window keeps and shows everything a run wrote.** The log under the progress of an ingest held only the lines the progress did not show as phases and notes, drew them as labels (one line selected at a time), in a box 200 points tall, and a run that failed showed three of them. It now holds every line the run wrote, as text that is selected and copied like any text, with *Copy all*, *Save as…* and *Open in a window*: a window that moves and takes any size, and follows the run while it goes (also *Tools > Log of the last run…*). A run that fails shows its last twelve lines in the red box and opens the log by itself. Each run's lines are also written as they come to a file in the window's own folder (`logs/run-<date>-<time>.log`, the command line first, each line with the seconds since the start; the last thirty runs are kept; *Show the log file*): it is there whatever becomes of the run or of the window. `--debug` is *Say more in the parser's log* in the wizard's advanced options, as before. The logo is left out of what the window reads, and a line of output that is not UTF-8 no longer ends the reading of the run's output.
 - **A fault says which file it came with.** After the fault's own line (a place in the standard library's source, nothing of the evidence), masstin writes its version and the Linux log it was reading.
