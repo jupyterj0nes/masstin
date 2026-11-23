@@ -605,6 +605,37 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
     } else {
         (Vec::new(), Vec::new())
     };
+    if include_loose_artifacts {
+        // a triage of a Windows host packed as a tarball: its EVTX, SYSTEM
+        // hive and UAL are taken out for the Windows walk (the Linux half
+        // takes only Linux logs from a tarball)
+        let mut k = 0usize;
+        for a in &loose_linux_archives {
+            let p = Path::new(a);
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("archive").to_string();
+            if !crate::parse_linux::is_tar_archive(&name.to_lowercase()) {
+                continue;
+            }
+            let dest = base_temp.join(format!("{}_{}", k, name)).join("tar_extracted");
+            let taken = crate::parse_linux::windows_artifacts_of_tar(p, &dest);
+            if taken > 0 {
+                crate::banner::print_info(&format!("  {}: {} Windows artefact file(s) inside the tarball, read too", name, taken));
+                extracted_dirs.push(dest.to_string_lossy().to_string());
+                k += 1;
+            }
+        }
+        // archives of a kind masstin does not open: said, not passed by
+        let unopened = crate::parse_linux::find_unopened_archives(&real_dirs);
+        if !unopened.is_empty() {
+            let names: Vec<String> = unopened.iter().take(8).map(|p| Path::new(p).file_name().and_then(|n| n.to_str()).unwrap_or(p).to_string()).collect();
+            crate::banner::print_warning(&format!(
+                "{} archive(s) of a kind masstin does not open (7z, rar, tar.xz, tar.bz2, tar.zst, cab): nothing inside them is read. Unpack them and give the folder. {}{}",
+                unopened.len(),
+                names.join(", "),
+                if unopened.len() > names.len() { format!(" and {} more", unopened.len() - names.len()) } else { String::new() }
+            ));
+        }
+    }
     if !loose_linux_archives.is_empty() || !loose_linux_logs.is_empty() {
         crate::banner::print_phase_result(&format!(
             "Linux evidence found: {} archive(s), {} log file(s)",

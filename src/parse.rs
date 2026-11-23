@@ -934,6 +934,10 @@ pub(crate) fn display_source(path: &str) -> String {
         out.push_str(name);
         return out;
     }
+    // a tarball's Windows artefacts: <tarball>/tar_extracted/<path inside>
+    if let Some(inside) = rest.strip_prefix("tar_extracted/") {
+        return format!("{} -> {}", image, inside);
+    }
     // Windows: <image>/ntuser_extracted/partition_N/<user>/NTUSER.DAT
     if let Some(rest) = rest.strip_prefix("ntuser_extracted/") {
         let inside = rest.split_once('/').map(|(_, i)| i).unwrap_or(rest);
@@ -965,6 +969,8 @@ mod source_tests {
         let t = r"C:\Users\someone\AppData\Local\Temp\masstin_image_extract\0_HRServer.e01";
         assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0\Security.evtx", t)), "HRServer.e01:live:Security.evtx");
         assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0_vss_2\Security.evtx", t)), "HRServer.e01:vss_2:Security.evtx");
+        // the Windows artefacts of a tarball: the tarball and the path inside it
+        assert_eq!(display_source(r"C:\Temp\masstin_run_7\masstin_image_extract\0_dc01-triage.tgz\tar_extracted\C\Windows\System32\winevt\Logs\Security.evtx"), "dc01-triage.tgz -> C/Windows/System32/winevt/Logs/Security.evtx");
         assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_1\Microsoft-Windows-WinRM%4Operational.evtx", t)), "HRServer.e01:partition_1:live:Microsoft-Windows-WinRM%4Operational.evtx");
         assert_eq!(display_source(&format!(r"{}\evtx_extracted\partition_0\Sum\Current.mdb", t)), "HRServer.e01:UAL:Current.mdb");
         assert_eq!(display_source(&format!(r"{}\ntuser_extracted\partition_0\Administrator\NTUSER.DAT", t)), "HRServer.e01:ntuser:Administrator/NTUSER.DAT");
@@ -2791,6 +2797,16 @@ fn list_evtx_in_zip(zip_path: &Path, parent_chain: Option<String>) -> Option<Vec
             Ok(f)  => f,
             Err(e) => {
                 if is_debug_mode() { eprintln!("[DEBUG] Reading file {} in {:?}: {}", i, zip_path, e); }
+                // entries under a password: said once a zip, not passed by
+                if e.to_string().to_lowercase().contains("password") {
+                    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                    let z = zip_path.to_string_lossy().to_string();
+                    let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+                    if !said.contains(&z) {
+                        said.push(z.clone());
+                        crate::banner::print_warning(&format!("{}: its entries are under a password, and its Windows logs are not read. Unpack it with its password and give the folder.", z));
+                    }
+                }
                 continue;
             }
         };

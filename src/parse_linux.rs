@@ -3155,7 +3155,7 @@ fn is_log_rotation(lower: &str, base: &str) -> bool {
 /// `base` itself or a logrotate variant of it: `wtmp`, `wtmp.1`,
 /// `wtmp-20231119`, `btmp-20260901.gz`. Deliberately NOT a bare prefix
 /// match so `wtmpx` (Solaris, different record layout) stays out.
-fn is_rotated_name(lower: &str, base: &str) -> bool {
+pub(crate) fn is_rotated_name(lower: &str, base: &str) -> bool {
     lower == base
         || lower.starts_with(&format!("{}-", base))
         || lower.starts_with(&format!("{}.", base))
@@ -3169,7 +3169,7 @@ fn is_context_file(lower: &str) -> bool {
     matches!(lower, "hostname" | "hosts" | "dmesg" | "dpkg.log" | "dpkg.log.1" | "uac.log" | "os-release")
 }
 
-fn is_tar_archive(lower: &str) -> bool {
+pub(crate) fn is_tar_archive(lower: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar")
 }
 
@@ -3699,6 +3699,11 @@ pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) 
                 let entries = crate::parse::read_zip_top_entries(entry.path()).unwrap_or_default();
                 if crate::parse::is_cortex_online_layout(&entries) && crate::parse::cortex_online_is_linux(&entries) {
                     archives.push(path);
+                } else if zip_holds_linux_evidence(&entries) {
+                    // a zip of /var/log, a UAC collection made as a zip, a
+                    // zip with a tarball inside: the Windows walk takes only
+                    // the EVTX of a zip, and these gave no row at all
+                    archives.push(path);
                 }
             } else if is_linux_artifact(&name) && !is_config_not_log(entry.path()) {
                 logs.push(path);
@@ -3710,6 +3715,87 @@ pub fn find_loose_linux_evidence(dirs: &[String]) -> (Vec<String>, Vec<String>) 
     logs.sort();
     logs.dedup();
     (archives, logs)
+}
+
+/// Whether a zip with these entries holds Linux evidence: a log under a
+/// `log` folder (`var/log/auth.log`, `[root]/var/log/wtmp`, a journal), or
+/// a tarball (a UAC collection zipped with other things).
+pub(crate) fn zip_holds_linux_evidence(entries: &[String]) -> bool {
+    entries.iter().any(|e| {
+        let lower = e.replace('\\', "/").to_lowercase();
+        let base = lower.rsplit('/').next().unwrap_or(&lower);
+        if base.is_empty() {
+            return false;
+        }
+        is_tar_archive(base) || (is_linux_artifact(base) && (lower.contains("log/") || lower.contains("/run/")))
+    })
+}
+
+/// The archives under `dirs` of a kind masstin does not open: nothing in
+/// them is read, and the run says so instead of passing them by.
+pub fn find_unopened_archives(dirs: &[String]) -> Vec<String> {
+    const KINDS: &[&str] = &[".7z", ".rar", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar.zst", ".tzst", ".tar.lz4", ".tar.lzma", ".cab"];
+    let mut out = Vec::new();
+    for root in dirs {
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if entry.file_type().is_file() {
+                let lower = entry.file_name().to_string_lossy().to_lowercase();
+                if KINDS.iter().any(|k| lower.ends_with(k)) {
+                    out.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The Windows artefacts of a tarball (a triage of a Windows host packed
+/// as `.tar` or `.tgz`), written under `dest` with their paths: its EVTX,
+/// its SYSTEM hive with its logs, its UAL databases, and the zips inside
+/// it (the Windows walk opens those). The Linux half, which opens every
+/// tarball, takes only Linux logs from it, and the Windows walk opened no
+/// tarball: such a triage gave no row. Returns how many files were taken.
+pub fn windows_artifacts_of_tar(tar_path: &Path, dest: &Path) -> usize {
+    let lower = tar_path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let Ok(file) = File::open(tar_path) else { return 0 };
+    let reader: Box<dyn Read> = if lower.ends_with(".tar") { Box::new(BufReader::new(file)) } else { Box::new(GzDecoder::new(BufReader::new(file))) };
+    let mut archive = tar::Archive::new(reader);
+    let Ok(entries) = archive.entries() else { return 0 };
+    let mut taken = 0usize;
+    for entry in entries {
+        // a tarball cut short: what came before it is kept
+        let Ok(mut entry) = entry else { break };
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let name = match entry.path() {
+            Ok(p) => p.to_string_lossy().replace('\\', "/").to_lowercase(),
+            Err(_) => continue,
+        };
+        let wanted = name.ends_with(".evtx")
+            || name.ends_with("/config/system")
+            || name.ends_with("/config/system.log1")
+            || name.ends_with("/config/system.log2")
+            || (name.ends_with(".mdb") && name.contains("logfiles/sum/"))
+            || name.ends_with(".zip");
+        if !wanted {
+            continue;
+        }
+        let size = entry.header().size().unwrap_or(0);
+        if taken == 0 {
+            let _ = fs::create_dir_all(dest);
+        }
+        if let Err(e) = crate::space::make_room(dest, size) {
+            crate::space::left_out(&format!("{} -> {}", tar_path.display(), name), &e.to_string());
+            continue;
+        }
+        if let Ok(true) = entry.unpack_in(dest) {
+            taken += 1;
+        }
+    }
+    taken
 }
 
 /// What the bar of the Linux pass says for a log: `host: file`, cut to 80
@@ -3828,7 +3914,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
     units.sort_by(|a, b| a.key().cmp(b.key()));
 
     if archive_count == 0 && loose_count == 0 {
-        eprintln!("[WARN] no candidate logs found");
+        if !quiet {
+            eprintln!("[WARN] no candidate logs found");
+        }
         // an empty timeline, not none: the step that merges this one with
         // the Windows half finds a file to read (it failed on a missing one)
         write_empty_csv(output);
@@ -4198,7 +4286,9 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
 
     pb.finish_and_clear();
     if logs_found == 0 {
-        eprintln!("[WARN] no candidate logs found");
+        if !quiet {
+            eprintln!("[WARN] no candidate logs found");
+        }
         // an empty timeline, not none: the step that merges this one with
         // the Windows half finds a file to read (it failed on a missing one)
         write_empty_csv(output);
@@ -4468,6 +4558,21 @@ mod repeated_tests {
             r[340..344].copy_from_slice(&(secs as u32).to_le_bytes());
         }
         r
+    }
+
+    #[test]
+    fn a_zip_of_linux_logs_is_linux_evidence() {
+        use super::zip_holds_linux_evidence as holds;
+        let v = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // a zip of /var/log, a UAC collection made as a zip, a tarball inside a zip
+        assert!(holds(&v(&["var/log/auth.log", "etc/hostname"])));
+        assert!(holds(&v(&["uac-host-linux-20261120/[root]/var/log/wtmp"])));
+        assert!(holds(&v(&[r"var\log\journal\abc\system.journal"])));
+        assert!(holds(&v(&["collection/uac-web01-linux-20261120101010.tar.gz"])));
+        // a Windows triage, and files that only share a name
+        assert!(!holds(&v(&["C/Windows/System32/winevt/Logs/Security.evtx", "C/Windows/System32/config/SYSTEM"])));
+        assert!(!holds(&v(&["docs/messages", "notes/secure"])));
+        assert!(!holds(&v(&[])));
     }
 
     #[test]

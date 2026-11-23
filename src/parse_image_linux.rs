@@ -307,7 +307,11 @@ fn extract_log_dir(tree: &dyn LogTree, on_volume: &str, output_dir: &Path) -> us
                 continue;
             }
             let lower = name.to_lowercase();
-            let wanted = LOG_PREFIXES.iter().any(|p| lower.starts_with(&p.to_lowercase())) || lower == "wtmp" || lower == "btmp" || lower == "lastlog";
+            // the rotated ones too, as in a triage: `wtmp.1`, `btmp-20260901.gz`
+            let wanted = LOG_PREFIXES.iter().any(|p| lower.starts_with(&p.to_lowercase()))
+                || crate::parse_linux::is_rotated_name(&lower, "wtmp")
+                || crate::parse_linux::is_rotated_name(&lower, "btmp")
+                || lower == "lastlog";
             if !wanted {
                 continue;
             }

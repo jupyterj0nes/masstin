@@ -44,13 +44,31 @@ Two things that cannot be guessed are options, merged into the same timeline (ea
 
 When nothing it knows is there, `parse` stops and says so; when no part gives an event, it writes nothing and says that too.
 
+## What `parse` reads from each container
+
+The same artefact can reach masstin in a disk image, in a folder (a triage unpacked, logs copied out), in a zip or in a tarball. This is what is read from each, as the code stands; a "no" is evidence masstin does not take from that container, not evidence that is absent.
+
+| Artefact | Disk image | Folder | Zip | Tarball (`.tar`, `.tar.gz`, `.tgz`) |
+|---|---|---|---|---|
+| EVTX | yes, from NTFS in place, the live volume and every shadow copy; the files of `winevt\Logs`, not its subfolders | yes, at any depth | yes, at any depth, zips inside zips too | yes |
+| UAL (`LogFiles\Sum\*.mdb`) | yes, live volume | yes, up to five folders deep | no | yes |
+| SYSTEM hive (the machine's own addresses) | no | yes | yes | yes |
+| Scheduled tasks, MountPoints2 (NTUSER.DAT) | yes, live volume | no | no | no |
+| Linux logs (`auth.log`, `secure`, `messages`, `audit.log`, `wtmp`, `btmp`, `utmp`, `lastlog`, journals), rotated ones too | yes, from ext4 or XFS in place (LVM too); `/var/log`, `/var/log/audit` and the journal folder | yes, at any depth | yes | yes |
+| Linux host name | `/etc/hostname` | `etc/hostname`, `sysconfig/network`, `uac.log`, the logs' own header | as a folder | as a folder |
+| Linux time zone and `passwd` | no: syslog times are taken as UTC, uids of `lastlog` and `audit.log` are not named | yes | yes | yes |
+
+Disk images: E01, VMDK, VHD and VHDX, raw (`dd`, `img`, `.001`) and images with no extension (cloud snapshots), known by their content; GPT and MBR, LVM volumes; NTFS, ext4 and XFS. A BitLocker volume is said and skipped. Other file systems are not read.
+
+Archives of a kind masstin does not open (7z, rar, `tar.xz`, `tar.bz2`, `tar.zst`, cab) are named in a warning: nothing inside them is read. A zip whose entries are under a password is named too; the Linux half tries the passwords malware samples are usually packed with.
+
 ## Advanced: naming the parser yourself
 
 `parse` is the one to use. The actions below are the parsers it is made of. They are for a caller that already knows what the evidence is and does not want the look first (a workbench that classified it, a script that always gets the same kind), and for the options of one parser. One difference to keep in mind: `carve-image` on its own gives every carved event, the ones the live logs hold too; `parse --carve` keeps only what was recovered.
 
 ## Choosing the right action — what each one actually processes
 
-Quick reference. The three Windows actions differ by **what you feed them**, not by the parser underneath — EVTX dispatch is the same in all of them (Provider.Name routing, unknown providers silently skipped).
+Quick reference. The three Windows actions differ by **what you feed them**, not by the parser underneath — EVTX dispatch is the same in all of them (a known file name goes to its parser; any other is read record by record, each routed by its channel).
 
 | Source | `parse-windows` | `parse-image` | `parse-massive` |
 |---|:---:|:---:|:---:|
