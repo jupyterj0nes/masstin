@@ -92,6 +92,54 @@ pub fn reserve_of(total: u64) -> u64 {
     (5u64 << 30).min(total / 4)
 }
 
+/// What a parse of Linux evidence may write to the temporary folder, said
+/// before it starts from what it found: `likely` for logs as they usually
+/// are (a few lines in a hundred are logons), `at_most` for the worst
+/// there is (every line a logon: a server under a brute force for weeks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Need {
+    pub likely: u64,
+    pub at_most: u64,
+}
+
+/// `biggest_package`: the biggest package once unpacked (they are unpacked
+/// one at a time); `log_text`: the bytes of text logs outside packages
+/// (inflated, for the gzipped ones). A row on disk is a little more than
+/// its line, and it is there up to three times at the end (its host's
+/// file, the pieces or the sorted runs, the timeline before the merge):
+/// measured, 5.6 times the log for a log of logons only.
+pub fn need_of(biggest_package: u64, log_text: u64) -> Need {
+    Need {
+        likely: biggest_package + biggest_package / 10 + log_text / 2,
+        at_most: biggest_package.saturating_mul(3).saturating_add(log_text.saturating_mul(8)),
+    }
+}
+
+/// What to say of `need` against the room of `dir`: the line, and whether
+/// it is a warning (the run may not fit).
+pub fn forecast(need: Need, dir: &Path) -> Option<(String, bool)> {
+    let (free, total) = free_and_total(dir)?;
+    Some(forecast_of(need, free, reserve(total), &dir.display().to_string()))
+}
+
+fn forecast_of(need: Need, free: u64, kept: u64, dir: &str) -> (String, bool) {
+    let usable = free.saturating_sub(kept);
+    let room = format!("{} has {} free, {} of them usable ({} always stay free)", dir, human(free), human(usable), human(kept));
+    if need.likely > usable {
+        (format!(
+            "The temporary folder will most likely run short: this run needs about {} there (up to {} if every line of the logs is a logon) and {}. Free room there or name another folder with --temp; started as it is, the files that find no room wait and are then left out of the timeline, named at the end.",
+            human(need.likely), human(need.at_most), room
+        ), true)
+    } else if need.at_most > usable {
+        (format!(
+            "The temporary folder may run short: this run needs about {} there, and up to {} if every line of the logs is a logon (a server under a brute force); {}. --temp names a folder with more room; files that find none wait and are then left out, named at the end.",
+            human(need.likely), human(need.at_most), room
+        ), true)
+    } else {
+        (format!("Temporary room: about {} needed, {} at the very most; {}", human(need.likely), human(need.at_most), room), false)
+    }
+}
+
 fn wait_limit() -> Duration {
     let min = std::env::var("MASSTIN_SPACE_WAIT_MIN").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(30);
     Duration::from_secs(min * 60)
@@ -505,5 +553,25 @@ mod tests {
         drop(g);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "room more");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_room_is_said_before_the_run() {
+        let g = 1u64 << 30;
+        // a 2 GB package and 10 GB of text logs
+        let need = need_of(2 * g, 10 * g);
+        assert_eq!(need.likely, 2 * g + 2 * g / 10 + 5 * g);
+        assert_eq!(need.at_most, 86 * g);
+        // room for the worst: said, no warning
+        let (line, warn) = forecast_of(need, 200 * g, 5 * g, "D:/t");
+        assert!(!warn && line.starts_with("Temporary room"), "{}", line);
+        // room for the usual, not for the worst
+        let (line, warn) = forecast_of(need, 50 * g, 5 * g, "D:/t");
+        assert!(warn && line.contains("may run short"), "{}", line);
+        // not even for the usual
+        let (line, warn) = forecast_of(need, 10 * g, 5 * g, "D:/t");
+        assert!(warn && line.contains("most likely run short") && line.contains("--temp"), "{}", line);
+        // nothing to write: nothing needed
+        assert_eq!(need_of(0, 0), Need { likely: 0, at_most: 0 });
     }
 }

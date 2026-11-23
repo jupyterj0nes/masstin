@@ -1800,7 +1800,15 @@ pub(crate) fn audit_connect_rows(mut connects: Vec<AuditConnect>, sessions: &[(S
 // only used as a fallback for files that carry no USER_LOGIN at all.
 // Repeats of one connection are collapsed by its audit session id.
 fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u32, String>) -> Vec<RawEvt> {
-    let mut out = Vec::new();
+    let mut all = Vec::new();
+    parse_audit_to(path, dst_host, filter_ip, passwd, &mut |batch| all.extend(batch));
+    all
+}
+
+/// [`parse_audit`], its rows handed to `sink` a batch at a time, in the
+/// file's order: an audit log left to grow is never held whole.
+fn parse_audit_to(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u32, String>, sink: &mut dyn FnMut(Vec<RawEvt>)) {
+    let mut out: Vec<RawEvt> = Vec::new();
     // USER_AUTH records with their `op=`, used only when the file has no
     // USER_LOGIN at all (see the fallback at the end).
     let mut auth_fallback: Vec<(RawEvt, String)> = Vec::new();
@@ -1814,7 +1822,7 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         Ok(l) => l,
         Err(e) => {
             eprintln!("[ERROR] cannot open {}: {}", path.display(), e);
-            return Vec::new();
+            return;
         }
     };
     // the `connect` of a login session waiting for the record with its address
@@ -1981,11 +1989,16 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
         };
         if evt_type == "USER_LOGIN" {
             has_login = true;
+            // (the USER_AUTH records are used only for a file with no USER_LOGIN)
+            auth_fallback = Vec::new();
             out.push(raw);
         } else if evt_type == "USER_END" {
             out.push(raw);
-        } else {
+        } else if !has_login {
             auth_fallback.push((raw, op));
+        }
+        if out.len() >= SYSLOG_BATCH {
+            sink(std::mem::take(&mut out));
         }
     }
     // No USER_LOGIN in the file: take from USER_AUTH only the records that
@@ -2019,7 +2032,9 @@ fn parse_audit(path: &Path, dst_host: &str, filter_ip: bool, passwd: &HashMap<u3
     if let Some(p) = lines.problem(path) {
         crate::banner::print_warning(&format!("  {}", p));
     }
-    out
+    if !out.is_empty() {
+        sink(out);
+    }
 }
 
 // ────────────────────────── audit uid resolution ─────────────────────────────
@@ -2618,14 +2633,9 @@ fn put_spill_row(w: &mut impl std::io::Write, origin: RowOrigin, r: &RawEvt) -> 
 }
 
 /// The bytes of rows on disk a piece of a host may hold to be reduced in
-/// memory (a row in memory is some eight times its bytes on disk): a 32nd of
-/// the memory free, 32 MiB at least and 512 MiB at most;
-/// `MASSTIN_ROW_BUDGET_MB` sets it.
+/// memory: the run's memory over what a row costs there (crate::threads).
 fn row_budget() -> u64 {
-    if let Some(mb) = std::env::var("MASSTIN_ROW_BUDGET_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&m| m >= 1) {
-        return mb << 20;
-    }
-    crate::threads::available_memory().map(|m| (m / 32).clamp(32 << 20, 512 << 20)).unwrap_or(256 << 20)
+    crate::threads::row_budget()
 }
 
 /// A host's rows split in `pieces` files by the source of each row: every
@@ -3652,6 +3662,41 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
         ));
     }
 
+    // the room this needs in the temporary folder, said before the work: the
+    // biggest package unpacked, and the rows of the logs (see space::need_of)
+    {
+        let packed = |name: &str| [".gz", ".tgz", ".zip", ".bz2", ".xz", ".zst"].iter().any(|x| name.ends_with(x));
+        let (mut biggest, mut text) = (0u64, 0u64);
+        for u in &units {
+            match u {
+                LinuxUnit::Archive { path, .. } => {
+                    let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let name = path.to_string_lossy().to_lowercase();
+                    // (text logs shrink some ten times packed)
+                    biggest = biggest.max(if packed(&name) { len.saturating_mul(10) } else { len });
+                }
+                LinuxUnit::Log(p) => {
+                    let len = crate::vfs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                    if name.ends_with(".journal") || name.ends_with(".journal~") || name.contains("wtmp") || name.contains("btmp") || name == "utmp" || name == "lastlog" {
+                        // binary: a small share of it becomes rows
+                        text += len / 10;
+                    } else {
+                        text += if packed(&name) { len.saturating_mul(10) } else { len };
+                    }
+                }
+            }
+        }
+        let need = crate::space::need_of(biggest, text);
+        if let Some((line, warn)) = crate::space::forecast(need, &temp_dir) {
+            if warn {
+                crate::banner::print_warning(&line);
+            } else if !quiet && need.at_most > (1 << 30) {
+                crate::banner::print_info(&line);
+            }
+        }
+    }
+
     // 2) hostname cache
     let mut root2host: HashMap<PathBuf, String> = HashMap::new();
     // Per-root local timezone (syslog lines are wall-clock) and uid map
@@ -3901,7 +3946,7 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 let passwd = root2passwd
                     .entry(root.clone())
                     .or_insert_with(|| load_passwd(&root));
-                take(parse_audit(path, &dst_host, true, passwd));
+                parse_audit_to(path, &dst_host, true, passwd, &mut take);
             } else if fname.ends_with(".journal") || fname.ends_with(".journal~") {
                 take(crate::parse_journal::parse_journal_file(path, &dst_host));
             }

@@ -40,14 +40,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// The bytes of rows held to be sorted before they go to disk as a sorted
-/// run (a row in memory is several times its text): a 32nd of the memory
-/// free, 32 MiB at least and 512 MiB at most; `MASSTIN_ROW_BUDGET_MB` sets
-/// it. A merge that fits is sorted in memory, as it always was.
+/// run: the run's memory over what a row costs there (crate::threads). A
+/// merge that fits is sorted in memory, as it always was.
 fn merge_budget() -> u64 {
-    if let Some(mb) = std::env::var("MASSTIN_ROW_BUDGET_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&m| m >= 1) {
-        return mb << 20;
-    }
-    crate::threads::available_memory().map(|m| (m / 32).clamp(32 << 20, 512 << 20)).unwrap_or(256 << 20)
+    crate::threads::row_budget()
 }
 
 /// A row waiting to be sorted: its instant, its place in what was read, its 19 columns.

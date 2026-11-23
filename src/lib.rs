@@ -488,6 +488,20 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     temp: Option<String>,
 
+    /// The memory a parse may use to hold rows while it removes duplicates,
+    /// pairs sessions and sorts: `8G`, `4096M`, `50%` (of the machine's), or
+    /// a bare number of MiB. Left out, three quarters of the machine's
+    /// memory. As long as the rows fit they are worked in memory, the
+    /// fastest there is; what does not fit is worked in pieces on disk (the
+    /// temporary folder), slower and with the same timeline. Each stage
+    /// asks, when it starts, what the machine has free at that moment and
+    /// never takes more than half of that, whatever was asked, so the
+    /// machine and what else runs on it keep the other half.
+    /// More memory: fewer pieces, a faster run. Less: a run that leaves
+    /// room for other work. `MASSTIN_MEMORY` does the same.
+    #[arg(long, value_name = "SIZE")]
+    memory: Option<String>,
+
     /// For `view`: the case file (`.masstin`) to open, or to start with the
     /// timelines given by `-f`. The saved views, the style, the merged hosts,
     /// the subnets, the presentation and the notes are kept in it instead of
@@ -696,6 +710,17 @@ pub async fn run(mut config: Cli) -> Result<(), Box<dyn Error>> {
             images
         ));
         crate::banner::print_info(&crate::space::choose(config.temp.as_deref(), config.output.as_deref()));
+        match crate::threads::set_memory(config.memory.as_deref()) {
+            Ok(line) => crate::banner::print_info(&line),
+            Err(e) => {
+                // a figure that cannot be read is not guessed: the default, said
+                crate::banner::print_warning(&format!("{}; the run takes its default", e));
+                std::env::remove_var("MASSTIN_MEMORY");
+                if let Ok(line) = crate::threads::set_memory(None) {
+                    crate::banner::print_info(&line);
+                }
+            }
+        }
         // what runs killed or cut short left behind
         let freed = crate::space::clean_stale();
         if freed > 0 {

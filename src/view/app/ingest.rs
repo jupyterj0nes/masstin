@@ -92,13 +92,15 @@ pub(super) struct Ingest {
     pub parallel_images: String,
     /// `--temp`: where the temporary files of the parse go
     pub temp: String,
+    /// `--memory`: the memory the parse may use (empty: three quarters of the machine's)
+    pub memory: String,
     pub skip_offsets: String,
     pub debug: bool,
 }
 
 impl Default for Ingest {
     fn default() -> Self {
-        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan_cancel: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), temp: String::new(), skip_offsets: String::new(), debug: false }
+        Ingest { open: false, step: 0, sources: Vec::new(), scan_rx: None, scan_cancel: None, scan: None, verdict: None, parser: P_MASSIVE, output: String::new(), add: false, append_to: String::new(), append_offered: false, open_here: true, open_table: false, open_external: false, log_open: false, carve: false, rules: String::new(), ignore_local: false, exclude_users: String::new(), exclude_hosts: String::new(), exclude_ips: String::new(), carve_only: false, threads: String::new(), parallel_images: String::new(), temp: String::new(), memory: String::new(), skip_offsets: String::new(), debug: false }
     }
 }
 
@@ -247,6 +249,10 @@ impl Ingest {
             args.push("--temp".into());
             args.push(self.temp.trim().to_string());
         }
+        if !self.memory.trim().is_empty() && crate::threads::parse_memory(&self.memory, crate::threads::total_memory()).is_ok() {
+            args.push("--memory".into());
+            args.push(self.memory.trim().replace(' ', ""));
+        }
         if self.debug {
             args.push("--debug".into());
         }
@@ -301,6 +307,7 @@ impl Viewer {
         self.ingest.threads.clear();
         self.ingest.parallel_images.clear();
         self.ingest.temp.clear();
+        self.ingest.memory.clear();
         self.ingest.skip_offsets.clear();
         self.ingest.debug = false;
         self.start_scan();
@@ -663,6 +670,7 @@ impl Viewer {
                 self.ingest.threads.clear();
                 self.ingest.parallel_images.clear();
                 self.ingest.temp.clear();
+                self.ingest.memory.clear();
                 self.ingest.skip_offsets.clear();
                 self.ingest.debug = false;
                 self.ingest.step = 0;
@@ -980,7 +988,7 @@ impl Viewer {
             field(ui, "Addresses", &mut self.ingest.exclude_ips, "10.0.0.5, 10.0.0.0/24, fe80::/10, @scanners.txt", "--exclude-ips: the origin address; single addresses or CIDR ranges; @file reads one per line");
             ui.label(egui::RichText::new("Commas between entries; * matches anything; @file.txt reads a list from a file, one entry a line. The console says how many rows each rule dropped.").color(theme::DIM).small());
         });
-        let advanced = self.ingest.debug || !(self.ingest.threads.trim().is_empty() && self.ingest.parallel_images.trim().is_empty() && self.ingest.skip_offsets.trim().is_empty() && self.ingest.temp.trim().is_empty());
+        let advanced = self.ingest.debug || !(self.ingest.threads.trim().is_empty() && self.ingest.parallel_images.trim().is_empty() && self.ingest.skip_offsets.trim().is_empty() && self.ingest.temp.trim().is_empty() && self.ingest.memory.trim().is_empty());
         egui::CollapsingHeader::new(theme::semibold(if advanced { "Advanced (on)" } else { "Advanced (optional)" }, 12.5)).id_salt("ingest-advanced").default_open(advanced).show(ui, |ui| {
             ui.label(egui::RichText::new("Left empty, masstin decides by itself; these are for a slow disk, a busy machine or an image that hangs.").color(theme::MUTED).size(12.0));
             ui.horizontal(|ui| {
@@ -1005,6 +1013,21 @@ impl Viewer {
                 }
             });
             ui.label(egui::RichText::new("Where the logs unpacked from images and packages go while they are read; 5 GB of that disk always stay free, a file that would eat into them waits for room (--temp).").color(theme::DIM).small());
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Memory").color(TEXT)));
+                ui.add(egui::TextEdit::singleline(&mut self.ingest.memory).desired_width(80.0).hint_text("75%"));
+                let machine = match (crate::threads::total_memory(), crate::threads::available_memory()) {
+                    (Some(t), Some(a)) => format!("this machine has {}, {} free now; ", crate::threads::human_bytes(t), crate::threads::human_bytes(a)),
+                    _ => String::new(),
+                };
+                ui.label(egui::RichText::new(format!("{}8G, 4096M or 50% (--memory)", machine)).color(theme::DIM).small());
+            });
+            ui.label(egui::RichText::new("What the parse may hold in memory to sort and pair the rows: three quarters of the machine's by default, and never more than half of what is free when each stage starts. What does not fit is worked on disk, slower, with the same timeline. Lower it to leave room for other work; raise it for speed.").color(theme::DIM).small());
+            if !self.ingest.memory.trim().is_empty() {
+                if let Err(e) = crate::threads::parse_memory(&self.ingest.memory, crate::threads::total_memory()) {
+                    ui.label(egui::RichText::new(format!("{}  {}; it is left out", ic::WARNING, e)).color(CANDIDATE).small());
+                }
+            }
             if self.ingest.carve_on() {
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 20.0], egui::Label::new(egui::RichText::new("Skip these offsets").color(TEXT)));
@@ -1835,5 +1858,11 @@ mod tests {
         i.temp = " E:/scratch ".into();
         let s = i.command().join(" ");
         assert!(s.contains("--parallel-images 1 --temp E:/scratch --debug -o out.csv"), "{}", s);
+        // the memory, as written; a figure that cannot be read is left out
+        i.memory = " 8 G ".into();
+        let s = i.command().join(" ");
+        assert!(s.contains("--temp E:/scratch --memory 8G --debug"), "{}", s);
+        i.memory = "lots".into();
+        assert!(!i.command().join(" ").contains("--memory"));
     }
 }

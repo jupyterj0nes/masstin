@@ -347,7 +347,9 @@ pub fn keeps_normal_priority() -> bool {
 /// 2 GiB when the machine does not say. A file bigger than the budget is
 /// read alone.
 pub fn file_budget() -> u64 {
-    available_memory().map(|m| (m / 4).max(512 << 20)).unwrap_or(2 << 30)
+    // (a quarter of what is free, as it always was, and never more than a
+    // third of the run's memory when that was set lower)
+    available_memory().map(|m| (m / 4).min(memory_limit() / 3).max(512 << 20)).unwrap_or(2 << 30)
 }
 
 /// `18.2 GB`, `640 MB`.
@@ -467,6 +469,13 @@ mod sys {
         (ok != 0 && m.avail_phys > 0).then_some(m.avail_phys)
     }
 
+    pub fn total_memory() -> Option<u64> {
+        let mut m = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, memory_load: 0, total_phys: 0, avail_phys: 0, total_page_file: 0, avail_page_file: 0, total_virtual: 0, avail_virtual: 0, avail_extended_virtual: 0 };
+        // SAFETY: a documented Win32 call that fills the struct whose size it is told.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
+        (ok != 0 && m.total_phys > 0).then_some(m.total_phys)
+    }
+
     /// The medium a path sits on: a UNC path or a remote drive is the
     /// network; a fixed drive is asked whether its device incurs a seek
     /// penalty (a spinning disk does); anything else is unknown.
@@ -572,6 +581,13 @@ mod sys {
         Some(kb * 1024)
     }
 
+    pub fn total_memory() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
+    }
+
     /// The medium under a path: the mount that holds it, its file system
     /// (a network one is the network) and its block device's `rotational`.
     pub fn medium_of(path: &str) -> Medium {
@@ -657,6 +673,11 @@ mod sys {
         None
     }
 
+    pub fn total_memory() -> Option<u64> {
+        // (half of it is what `available_memory` answers here)
+        available_memory().map(|half| half * 2)
+    }
+
     pub fn medium_of(_path: &str) -> Medium {
         Medium::Unknown
     }
@@ -684,6 +705,9 @@ mod sys {
     pub fn available_memory() -> Option<u64> {
         None
     }
+    pub fn total_memory() -> Option<u64> {
+        None
+    }
     pub fn medium_of(_path: &str) -> Medium {
         Medium::Unknown
     }
@@ -694,6 +718,123 @@ mod sys {
 /// Physical memory free right now, bytes, when the system tells.
 pub fn available_memory() -> Option<u64> {
     sys::available_memory()
+}
+
+/// The memory the machine has.
+pub fn total_memory() -> Option<u64> {
+    sys::total_memory()
+}
+
+// ───────────────────────── the memory of a run ─────────────────────────
+//
+// A parse holds rows in memory to remove the duplicates, pair the sessions
+// and sort: as long as they fit, that is the fastest there is. What does
+// not fit goes to disk in pieces (a host's rows by source, a merge in
+// sorted runs) and costs time. So the run takes what the machine can
+// give, three quarters of its memory unless told otherwise, and each
+// stage asks, when it starts, how much of that is really free.
+
+static MEMORY_ASKED: OnceLock<Option<u64>> = OnceLock::new();
+
+/// The share of the machine's memory a run may use when nothing is asked.
+pub const MEMORY_SHARE_PERCENT: u64 = 75;
+/// What a run may use on a machine that does not say what it has.
+const MEMORY_UNKNOWN: u64 = 2 << 30;
+/// The least a run is given, whatever is asked or free.
+const MEMORY_LEAST: u64 = 256 << 20;
+
+/// `8G`, `4096M`, `1.5G`, `50%`, or a bare number of MiB, as bytes
+/// (`total`: the machine's memory, for a percentage).
+pub fn parse_memory(s: &str, total: Option<u64>) -> Result<u64, String> {
+    let t = s.trim().to_ascii_lowercase().replace(' ', "");
+    let bad = || format!("`{}` is not an amount of memory: write 8G, 4096M or 50%", s.trim());
+    let (num, unit) = match t.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        Some(i) => (&t[..i], &t[i..]),
+        None => (t.as_str(), "m"),
+    };
+    let n: f64 = num.parse().map_err(|_| bad())?;
+    if !(n > 0.0) {
+        return Err(bad());
+    }
+    let bytes = match unit {
+        "%" => {
+            if n > 100.0 {
+                return Err(bad());
+            }
+            let total = total.ok_or_else(|| "this machine does not say how much memory it has: give an amount (8G), not a percentage".to_string())?;
+            (total as f64 * n / 100.0) as u64
+        }
+        "k" | "kb" | "kib" => (n * 1024.0) as u64,
+        "m" | "mb" | "mib" => (n * 1048576.0) as u64,
+        "g" | "gb" | "gib" => (n * 1073741824.0) as u64,
+        "t" | "tb" | "tib" => (n * 1099511627776.0) as u64,
+        _ => return Err(bad()),
+    };
+    Ok(bytes.max(MEMORY_LEAST))
+}
+
+/// Sets the memory of the run from `--memory` (else `MASSTIN_MEMORY`, else
+/// three quarters of the machine's); the line for the banner.
+pub fn set_memory(asked: Option<&str>) -> Result<String, String> {
+    let from_env = std::env::var("MASSTIN_MEMORY").ok().filter(|v| !v.trim().is_empty());
+    let (text, source) = match (asked, &from_env) {
+        (Some(a), _) => (Some(a.to_string()), "--memory"),
+        (None, Some(e)) => (Some(e.clone()), "MASSTIN_MEMORY"),
+        (None, None) => (None, ""),
+    };
+    let total = total_memory();
+    let parsed = match &text {
+        Some(t) => Some(parse_memory(t, total)?),
+        None => None,
+    };
+    let _ = MEMORY_ASKED.set(parsed);
+    let machine = match (total, available_memory()) {
+        (Some(t), Some(a)) => format!("the machine has {}, {} free now", human_bytes(t), human_bytes(a)),
+        (Some(t), None) => format!("the machine has {}", human_bytes(t)),
+        _ => "the machine does not say what it has".to_string(),
+    };
+    Ok(match parsed {
+        Some(b) => format!("Memory: up to {} (asked with {}; {}); never more than what is free when a stage starts, the rest is sorted on disk", human_bytes(b), source, machine),
+        None => format!("Memory: up to {} ({}% of the machine's; {}; --memory sets it); never more than what is free when a stage starts, the rest is sorted on disk", human_bytes(memory_limit()), MEMORY_SHARE_PERCENT, machine),
+    })
+}
+
+/// The memory the run may use: what was asked, else three quarters of the
+/// machine's.
+pub fn memory_limit() -> u64 {
+    if let Some(Some(b)) = MEMORY_ASKED.get() {
+        return *b;
+    }
+    total_memory().map(|t| t / 100 * MEMORY_SHARE_PERCENT).unwrap_or(MEMORY_UNKNOWN).max(MEMORY_LEAST)
+}
+
+/// What a stage that starts now may take: the run's memory, and never more
+/// than half of what the machine has free at this moment. The other half
+/// stays with everything else: measured on a 20 GB machine, a stage that
+/// planned to fill all but two gigabytes of what was free left the system
+/// critically short (other programs were closed by it) and was a tenth
+/// faster at best than one held to a fraction of that.
+pub fn memory_now() -> u64 {
+    memory_of(memory_limit(), available_memory())
+}
+
+fn memory_of(limit: u64, free: Option<u64>) -> u64 {
+    let usable = free.map(|f| f / 2);
+    usable.map_or(limit, |u| u.min(limit)).max(MEMORY_LEAST)
+}
+
+/// Rows held in memory take several times their bytes as text (a string a
+/// column, each with its own allocation): measured, three to four times.
+const ROWS_IN_MEMORY: u64 = 6;
+
+/// The bytes of rows, as text, a stage may hold at once to sort or reduce
+/// them: the memory it may take now over what a row costs in memory. What
+/// is past that goes to disk. `MASSTIN_ROW_BUDGET_MB` fixes it.
+pub fn row_budget() -> u64 {
+    if let Some(mb) = std::env::var("MASSTIN_ROW_BUDGET_MB").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&m| m >= 1) {
+        return mb << 20;
+    }
+    (memory_now() / ROWS_IN_MEMORY).max(32 << 20)
 }
 
 /// The share of the cores idle over `window`, when the system tells.
@@ -796,6 +937,7 @@ mod tests {
         assert!(b >= 512 << 20, "{}", b);
         if cfg!(any(windows, target_os = "linux")) {
             assert!(available_memory().unwrap() > 0);
+            assert!(total_memory().unwrap() >= available_memory().unwrap());
             let f = idle_fraction(Duration::from_millis(50)).unwrap();
             assert!((0.0..=1.0).contains(&f), "{}", f);
         }
@@ -853,5 +995,38 @@ mod tests {
         assert_eq!(rule(1 << 20, 11), 4);
         assert_eq!(rule(8 << 20, 11), 11);
         assert_eq!(rule(1 << 30, 11), 11);
+    }
+
+    #[test]
+    fn memory_is_read_as_written() {
+        let g = 1u64 << 30;
+        assert_eq!(parse_memory("8G", None).unwrap(), 8 * g);
+        assert_eq!(parse_memory(" 8 gb ", None).unwrap(), 8 * g);
+        assert_eq!(parse_memory("1.5G", None).unwrap(), g + g / 2);
+        assert_eq!(parse_memory("4096M", None).unwrap(), 4 * g);
+        assert_eq!(parse_memory("4096", None).unwrap(), 4 * g);
+        assert_eq!(parse_memory("50%", Some(32 * g)).unwrap(), 16 * g);
+        // too little to work with is brought up to the least
+        assert_eq!(parse_memory("10M", None).unwrap(), MEMORY_LEAST);
+        for bad in ["", "lots", "0", "-2G", "150%", "8X"] {
+            assert!(parse_memory(bad, Some(32 * g)).is_err(), "{}", bad);
+        }
+        assert!(parse_memory("50%", None).is_err());
+    }
+
+    #[test]
+    fn a_stage_takes_the_limit_or_what_is_free() {
+        let g = 1u64 << 30;
+        // plenty free: the limit
+        assert_eq!(memory_of(12 * g, Some(30 * g)), 12 * g);
+        assert_eq!(memory_of(24 * g, Some(48 * g)), 24 * g);
+        // half of what is free, whatever the limit
+        assert_eq!(memory_of(24 * g, Some(8 * g)), 4 * g);
+        assert_eq!(memory_of(24 * g, Some(20 * g)), 10 * g);
+        assert_eq!(memory_of(2 * g, Some(20 * g)), 2 * g);
+        // nearly nothing free: the least, never zero
+        assert_eq!(memory_of(24 * g, Some(100 << 20)), MEMORY_LEAST);
+        // a machine that does not say: the limit
+        assert_eq!(memory_of(2 * g, None), 2 * g);
     }
 }

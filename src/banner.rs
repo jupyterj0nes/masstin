@@ -174,17 +174,21 @@ fn print_art_line(line: &str) {
         return;
     }
 
+    // the line is put together and written once: standard error is not
+    // buffered, and a write a character (some 700 for the logo) took 50
+    // seconds when the output of a run went to a file from PowerShell
+    let mut out = String::with_capacity(trimmed.len() * 12);
     for (i, ch) in trimmed.chars().enumerate() {
         if ch == ' ' {
-            eprint!(" ");
+            out.push(' ');
         } else {
             // Absolute column position mapped to gradient
             let grad_idx = (i * (GRADIENT.len() - 1)) / BANNER_WIDTH;
             let grad_idx = grad_idx.min(GRADIENT.len() - 1);
-            eprint!("{}", style(ch).color256(GRADIENT[grad_idx]));
+            out.push_str(&style(ch).color256(GRADIENT[grad_idx]).to_string());
         }
     }
-    eprintln!();
+    eprintln!("{}", out);
 }
 
 pub fn print_banner(action: &str) {
