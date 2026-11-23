@@ -557,6 +557,81 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         }
     }
 
+    // A triage of a Windows host, as a folder, a zip or a tarball, holds more
+    // than its event logs: the UAL databases, the scheduled tasks and the
+    // users' NTUSER.DAT (MountPoints2). An image gave all of them; a triage
+    // gave its EVTX (and its UAL when it was a folder). What a zip or a
+    // tarball holds of them is taken out to the temporary folder, and every
+    // Windows tree found (a folder with Windows\System32 in it) gives its
+    // tasks and its hives like an image does.
+    if include_loose_artifacts {
+        let mut trees: Vec<String> = real_dirs.clone();
+        // the zip each folder of extras came out of: its logs name the machine
+        let mut zip_of: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut k = 0usize;
+        for root in &real_dirs {
+            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let lower = name.to_lowercase();
+                let (taken, kind, dest) = if crate::parse_linux::is_tar_archive(&lower) {
+                    let dest = base_temp.join(format!("{}_{}", k, name)).join("tar_extracted");
+                    (crate::parse_linux::windows_artifacts_of_tar(entry.path(), &dest), "tarball", dest)
+                } else if lower.ends_with(".zip") {
+                    let dest = base_temp.join(format!("{}_{}", k, name)).join("zip_extracted");
+                    (windows_extras_of_zip(entry.path(), &dest), "zip", dest)
+                } else {
+                    continue;
+                };
+                if taken > 0 {
+                    if kind == "tarball" {
+                        crate::banner::print_info(&format!("  {}: {} Windows artefact file(s) inside the tarball, read too", name, taken));
+                    } else if is_debug_mode() {
+                        eprintln!("[DEBUG] {}: {} file(s) of UAL, scheduled tasks or NTUSER.DAT taken out of the zip", name, taken);
+                    }
+                    let d = dest.to_string_lossy().to_string();
+                    extracted_dirs.push(d.clone());
+                    trees.push(d);
+                    if kind == "zip" {
+                        zip_of.push((dest.clone(), entry.path().to_path_buf()));
+                    }
+                    k += 1;
+                }
+            }
+        }
+        for (n, tree) in windows_trees(&trees).into_iter().enumerate() {
+            let mut names = names_of(&tree.join("Windows").join("System32").join("winevt"));
+            if names.is_empty() {
+                // out of a zip: the event logs stayed in the zip
+                if let Some((dest, zip)) = zip_of.iter().find(|(dest, _)| tree.starts_with(dest)) {
+                    let inside = tree.strip_prefix(dest).map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase()).unwrap_or_default();
+                    names = names_from_zip(zip, &inside, &base_temp.join(format!("n{}_names", n)));
+                }
+            }
+            let hostname = names.last().cloned().unwrap_or_else(|| tree_name(&tree));
+            if let Some(tasks) = child_ci(&tree, &["Windows", "System32", "Tasks"]) {
+                if names.is_empty() {
+                    // a task registered by an account of the machine itself is
+                    // no arrival from another one, and which is which is told
+                    // by the machine's name: without it every local task would
+                    // be a row
+                    crate::banner::print_info(&format!("  Scheduled tasks under {} are not read: no Security.evtx or System.evtx beside them names the machine", tree.display()));
+                } else {
+                    task_dirs.push((tasks.to_string_lossy().to_string(), hostname.clone(), names.clone()));
+                }
+            }
+            if let Some(users) = child_ci(&tree, &["Users"]) {
+                // laid out as an image's hives are, so its rows are named the same way
+                let out = base_temp.join(format!("t{}_{}", n, one_component(&hostname))).join("ntuser_extracted").join("partition_0");
+                if copy_ntuser_hives(&users, &out) > 0 {
+                    ntuser_dirs.push((out.to_string_lossy().to_string(), hostname));
+                }
+            }
+        }
+    }
+
     // Parse Scheduled Tasks for remote activity (silent — only shows if found)
     let mut all_task_events = Vec::new();
     if !task_dirs.is_empty() {
@@ -606,24 +681,6 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         (Vec::new(), Vec::new())
     };
     if include_loose_artifacts {
-        // a triage of a Windows host packed as a tarball: its EVTX, SYSTEM
-        // hive and UAL are taken out for the Windows walk (the Linux half
-        // takes only Linux logs from a tarball)
-        let mut k = 0usize;
-        for a in &loose_linux_archives {
-            let p = Path::new(a);
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("archive").to_string();
-            if !crate::parse_linux::is_tar_archive(&name.to_lowercase()) {
-                continue;
-            }
-            let dest = base_temp.join(format!("{}_{}", k, name)).join("tar_extracted");
-            let taken = crate::parse_linux::windows_artifacts_of_tar(p, &dest);
-            if taken > 0 {
-                crate::banner::print_info(&format!("  {}: {} Windows artefact file(s) inside the tarball, read too", name, taken));
-                extracted_dirs.push(dest.to_string_lossy().to_string());
-                k += 1;
-            }
-        }
         // archives of a kind masstin does not open: said, not passed by
         let unopened = crate::parse_linux::find_unopened_archives(&real_dirs);
         if !unopened.is_empty() {
@@ -1710,12 +1767,13 @@ fn extract_evtx_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<Extr
 
 /// Extract EVTX from a raw/dd image
 fn extract_evtx_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
-    let file = File::open(image_path)
+    let file = crate::raw_split::RawImage::open(image_path)
         .map_err(|e| format!("Cannot open raw image: {}", e))?;
 
-    let image_size = file.metadata()
-        .map_err(|e| format!("Cannot read file size: {}", e))?
-        .len();
+    let image_size = file.len();
+    if file.segments() > 1 {
+        crate::banner::print_info(&format!("    A raw image in {} segments, read as one", file.segments()));
+    }
 
     if is_debug_mode() {
         eprintln!("[DEBUG] Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0);
@@ -2111,6 +2169,203 @@ fn verify_bitlocker_signature<R: Read + Seek>(reader: &mut R, offset: u64) -> bo
 }
 
 /// Extract EVTX files from an NTFS partition at the given offset
+/// Whether an entry of an archive (its path lower-cased, with forward
+/// slashes) is one of the things a Windows triage holds beyond its event
+/// logs: a UAL database, a scheduled task, a user's NTUSER.DAT or its logs.
+pub(crate) fn is_windows_extra(lower: &str) -> bool {
+    if lower.ends_with('/') {
+        return false;
+    }
+    if lower.ends_with(".mdb") && lower.contains("logfiles/sum/") {
+        return true;
+    }
+    if lower.contains("windows/system32/tasks/") {
+        return true;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(lower);
+    matches!(base, "ntuser.dat" | "ntuser.dat.log1" | "ntuser.dat.log2" | "ntuser.dat.log") && lower.contains("users/")
+}
+
+/// The UAL databases, scheduled tasks and NTUSER.DAT of a zip, written
+/// under `dest` with their paths (the EVTX of a zip are read from the zip
+/// itself). Returns how many files were taken.
+fn windows_extras_of_zip(zip_path: &Path, dest: &Path) -> usize {
+    let Ok(file) = File::open(zip_path) else { return 0 };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else { return 0 };
+    let mut taken = 0usize;
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else { continue };
+        if entry.is_dir() || !is_windows_extra(&entry.name().replace('\\', "/").to_lowercase()) {
+            continue;
+        }
+        // (a path that would leave `dest` is not taken)
+        let Some(rel) = entry.enclosed_name().map(|p| p.to_path_buf()) else { continue };
+        let out = dest.join(rel);
+        if let Some(parent) = out.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(e) = crate::space::make_room(dest, entry.size()) {
+            crate::space::left_out(&format!("{} -> {}", zip_path.display(), entry.name()), &e.to_string());
+            continue;
+        }
+        let Ok(mut w) = crate::space::create(&out) else { continue };
+        if std::io::copy(&mut entry, &mut w).is_ok() {
+            taken += 1;
+        }
+    }
+    taken
+}
+
+/// The names the machine of a zip's Windows tree goes by, from its
+/// System.evtx (smaller) or its Security.evtx, taken out to `scratch` for
+/// the reading and deleted. `inside` is the tree's path in the zip (lower
+/// case, forward slashes; empty for the root).
+fn names_from_zip(zip_path: &Path, inside: &str, scratch: &Path) -> Vec<String> {
+    let Ok(file) = File::open(zip_path) else { return Vec::new() };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else { return Vec::new() };
+    let prefix = if inside.is_empty() { String::new() } else { format!("{}/", inside.trim_matches('/')) };
+    let logs = scratch.join("Logs");
+    for wanted in ["system.evtx", "security.evtx"] {
+        let target = format!("{}windows/system32/winevt/logs/{}", prefix, wanted);
+        for i in 0..archive.len() {
+            let Ok(mut entry) = archive.by_index(i) else { continue };
+            if entry.name().replace('\\', "/").to_lowercase() != target {
+                continue;
+            }
+            let _ = fs::create_dir_all(&logs);
+            if crate::space::make_room(&logs, entry.size()).is_err() {
+                break;
+            }
+            let out = logs.join(if wanted == "system.evtx" { "System.evtx" } else { "Security.evtx" });
+            let ok = crate::space::create(&out).ok().map_or(false, |mut w| std::io::copy(&mut entry, &mut w).is_ok());
+            let names = if ok { extract_hostnames_from_evtx_dir(scratch) } else { Vec::new() };
+            let _ = fs::remove_dir_all(scratch);
+            if !names.is_empty() {
+                return names;
+            }
+            break;
+        }
+    }
+    Vec::new()
+}
+
+/// The folder under `dir` reached by `names`, each matched in any case.
+fn child_ci(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    let mut at = dir.to_path_buf();
+    for name in names {
+        let next = fs::read_dir(&at).ok()?.flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name) && e.path().is_dir())?;
+        at = next.path();
+    }
+    Some(at)
+}
+
+/// The Windows trees under `dirs`: every folder that holds
+/// `Windows\System32` (the `C` of a KAPE triage, the root of a volume, a
+/// triage unpacked), found up to fourteen folders deep.
+fn windows_trees(dirs: &[String]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in dirs {
+        let mut it = walkdir::WalkDir::new(root).max_depth(14).into_iter();
+        while let Some(entry) = it.next() {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.eq_ignore_ascii_case("Windows") && child_ci(entry.path(), &["System32"]).is_some() {
+                if let Some(tree) = entry.path().parent() {
+                    if !out.iter().any(|t| t == tree) {
+                        out.push(tree.to_path_buf());
+                    }
+                }
+                // nothing of another machine lies under a Windows folder
+                it.skip_current_dir();
+            }
+        }
+    }
+    out
+}
+
+/// A name for the machine of a Windows tree whose logs do not say it: the
+/// folder's own name, or the one above a drive letter (`dc01-triage\C`).
+fn tree_name(tree: &Path) -> String {
+    let own = tree.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    if own.chars().count() <= 1 {
+        tree.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or(&own).to_string()
+    } else {
+        own
+    }
+}
+
+/// The NTUSER.DAT of each profile under `users`, with its logs, copied to
+/// `out` as `<user>_NTUSER.DAT[.LOG1]` (the names the MountPoints2 reader
+/// takes). Returns how many hives were copied.
+fn copy_ntuser_hives(users: &Path, out: &Path) -> usize {
+    let mut n = 0usize;
+    let Ok(profiles) = fs::read_dir(users) else { return 0 };
+    for profile in profiles.flatten() {
+        if !profile.path().is_dir() {
+            continue;
+        }
+        let user = profile.file_name().to_string_lossy().to_string();
+        let Ok(files) = fs::read_dir(profile.path()) else { continue };
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            let suffix = if name.eq_ignore_ascii_case("NTUSER.DAT") { "" }
+                else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG1") { ".LOG1" }
+                else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG2") { ".LOG2" }
+                else if name.eq_ignore_ascii_case("NTUSER.DAT.LOG") { ".LOG" }
+                else { continue };
+            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = fs::create_dir_all(out);
+            if crate::space::make_room(out, size).is_err() {
+                continue;
+            }
+            if fs::copy(f.path(), out.join(format!("{}_NTUSER.DAT{}", one_component(&user), suffix))).is_ok() && suffix.is_empty() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The EVTX of a `winevt\Logs` folder and of the folders under it (three
+/// deep), each with the name it is saved by. Windows moves a full log to
+/// `Logs\Archive` when the log is set to be archived, and some products
+/// keep theirs in a folder of their own: an image gave only the files of
+/// `Logs` itself, where a triage or a folder gave them all. A log of a
+/// subfolder is named `<folder>_<file>` (two folders may hold the same
+/// name), and is read by its records' channel like any renamed log.
+fn evtx_under<'n, T: Read + Seek>(ntfs: &'n ntfs::Ntfs, logs: ntfs::NtfsFile<'n>, fs: &mut T) -> Vec<(ntfs::NtfsFileReference, String)> {
+    let mut found = Vec::new();
+    let mut dirs: Vec<(ntfs::NtfsFile<'n>, String, u32)> = vec![(logs, String::new(), 0)];
+    while let Some((dir, prefix, depth)) = dirs.pop() {
+        let Ok(index) = dir.directory_index(fs) else { continue };
+        let mut entries = index.entries();
+        while let Some(entry) = entries.next(fs) {
+            let Ok(entry) = entry else { continue };
+            let Some(Ok(file_name)) = entry.key() else { continue };
+            // the 8.3 alias of a name listed in full
+            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos {
+                continue;
+            }
+            let name = file_name.name().to_string_lossy().to_string();
+            if file_name.is_directory() {
+                if depth < 3 && name != "." && name != ".." {
+                    if let Ok(sub) = entry.file_reference().to_file(ntfs, fs) {
+                        dirs.push((sub, format!("{}{}_", prefix, name), depth + 1));
+                    }
+                }
+                continue;
+            }
+            if name.to_lowercase().ends_with(".evtx") {
+                found.push((entry.file_reference(), format!("{}{}", prefix, name)));
+            }
+        }
+    }
+    found
+}
+
 fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -2157,35 +2412,14 @@ fn extract_evtx_from_ntfs_partition<R: Read + Seek>(
         }
     }
 
-    // We're now in the Logs directory — extract all .evtx files
-    let logs_index = current_dir.directory_index(&mut partition_reader)
-        .map_err(|e| format!("Cannot read Logs directory: {}", e))?;
-
+    // We're now in the Logs directory — every .evtx in it and under it
     let mut count = 0;
     let partition_dir = output_dir.join(format!("partition_{}", partition_index));
     let _ = fs::create_dir_all(&partition_dir);
 
-    let mut entries = logs_index.entries();
-    while let Some(entry) = entries.next(&mut partition_reader) {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if let Some(key) = entry.key() {
-            let file_name = match key {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
-
-            let name = file_name.name().to_string_lossy().to_string();
-            if !name.to_lowercase().ends_with(".evtx") {
-                continue;
-            }
-
+    {
+        for (file_ref, name) in evtx_under(&ntfs, current_dir, &mut partition_reader) {
             // Read this EVTX file
-            let file_ref = entry.file_reference();
             let ntfs_file = match file_ref.to_file(&ntfs, &mut partition_reader) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -2294,23 +2528,12 @@ fn extract_evtx_from_vss_store<R: Read + Seek>(
         }
     }
 
-    let logs_index = current_dir.directory_index(store_reader)
-        .map_err(|e| format!("Cannot read Logs directory from VSS: {}", e))?;
-
     let mut count = 0;
     let vss_dir = output_dir.join(format!("partition_{}_vss_{}", partition_index, store_index));
     let _ = fs::create_dir_all(&vss_dir);
 
-    let mut entries = logs_index.entries();
-    while let Some(entry) = entries.next(store_reader) {
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
-        if let Some(key) = entry.key() {
-            let file_name = match key { Ok(f) => f, Err(_) => continue };
-            if file_name.namespace() == ntfs::structured_values::NtfsFileNamespace::Dos { continue; } // the 8.3 alias of a name listed in full
-            let name = file_name.name().to_string_lossy().to_string();
-            if !name.to_lowercase().ends_with(".evtx") { continue; }
-
-            let file_ref = entry.file_reference();
+    {
+        for (file_ref, name) in evtx_under(&ntfs, current_dir, store_reader) {
             let ntfs_file = match file_ref.to_file(&ntfs, store_reader) { Ok(f) => f, Err(_) => continue };
             let data_item = match ntfs_file.data(store_reader, "") { Some(Ok(d)) => d, _ => continue };
             let data_attr = match data_item.to_attribute() { Ok(a) => a, Err(_) => continue };

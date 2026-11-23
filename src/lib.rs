@@ -62,6 +62,7 @@ pub use crate::parse_carve::validate_evtx_file;
 pub mod parse_custom;
 pub mod filter;
 pub mod vmdk;
+pub mod raw_split;
 pub mod vhd;
 pub mod timefmt;
 pub mod textlines;

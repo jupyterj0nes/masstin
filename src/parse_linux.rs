@@ -3778,7 +3778,7 @@ pub fn windows_artifacts_of_tar(tar_path: &Path, dest: &Path) -> usize {
             || name.ends_with("/config/system")
             || name.ends_with("/config/system.log1")
             || name.ends_with("/config/system.log2")
-            || (name.ends_with(".mdb") && name.contains("logfiles/sum/"))
+            || crate::parse_image_windows::is_windows_extra(&name)
             || name.ends_with(".zip");
         if !wanted {
             continue;
@@ -4073,8 +4073,16 @@ fn parse_linux_inner(files: &[String], archives: &[String], dirs: &[String], out
                 if found_log {
                     root_cand.to_path_buf()
                 } else {
-                    // Direct/flat per-host layout: path is .../<hostname>/<logfile>
-                    path.parent().unwrap_or(Path::new("/")).to_path_buf()
+                    let parent = path.parent().unwrap_or(Path::new("/"));
+                    if parent.file_name() == Some(OsStr::new("run")) {
+                        // <root>/var/run/utmp, <root>/run/utmp: no `log`
+                        // folder above it, and the host was named "run"
+                        let up = parent.parent().unwrap_or(parent);
+                        if up.file_name() == Some(OsStr::new("var")) { up.parent().unwrap_or(up).to_path_buf() } else { up.to_path_buf() }
+                    } else {
+                        // Direct/flat per-host layout: path is .../<hostname>/<logfile>
+                        parent.to_path_buf()
+                    }
                 }
             }
         };

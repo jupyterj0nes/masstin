@@ -66,6 +66,14 @@ fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str, own_names
     let parts: Vec<&str> = author.splitn(2, '\\').collect();
     let src_machine = parts[0];
     let src_user = parts[1];
+    // `MACHINE\user`, not any text with a backslash: Windows' own tasks
+    // name a resource as their author (`$(@%systemRoot%\System32\msdrm.dll,-6001)`)
+    // and a product a path, and each was a row of a logon from a machine
+    // called `$(@%systemRoot%`
+    let name_like = |s: &str| !s.is_empty() && s.len() <= 255 && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '$' | ' '));
+    if !name_like(src_machine) || src_machine.starts_with('$') || !name_like(src_user) {
+        return None;
+    }
 
     // Skip if source machine is the same as destination (local task with domain\user)
     let src_short = src_machine.split('.').next().unwrap_or(src_machine);
@@ -131,11 +139,7 @@ fn parse_single_task(path: &Path, base_dir: &str, computer_name: &str, own_names
         ip_address: src_machine.to_string(),
         logon_id: String::new(),
         filename: format!("{}:tasks:{}",
-            crate::parse::extract_image_name_from_extract_path(base_dir).unwrap_or_else(|| Path::new(base_dir).parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or(base_dir)
-                .to_string()),
+            crate::parse::extract_image_name_from_extract_path(base_dir).unwrap_or_else(|| base_dir.to_string()),
             task_name.trim_start_matches('\\').replace('\\', "/")),
         detail,
     })
@@ -229,5 +233,22 @@ mod tests {
         assert_eq!(r.len(), 1, "{:?}", r.iter().map(|x| &x.detail).collect::<Vec<_>>());
         assert_eq!(r[0].workstation_name, "OTHER-PC");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_a_task_registered_from_another_machine_is_a_row() {
+        let dir = std::env::temp_dir().join(format!("masstin_tasks_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        task(&dir, "Remote", r"ATTACKER-PC\evil.admin");
+        task(&dir, "Local", r"SRV01\admin");
+        task(&dir, "OldName", r"WIN-ABC123\admin");
+        // Windows' own tasks name a resource, a product a path
+        task(&dir, "Resource", r"$(@%systemRoot%\System32\msdrm.dll,-6001)");
+        task(&dir, "Path", r"C:\Program Files\Vendor\tool.exe");
+        task(&dir, "NoBackslash", "Microsoft Corporation");
+        let rows = parse_scheduled_tasks(&[dir.to_string_lossy().to_string()], "SRV01.corp.example", &["WIN-ABC123".to_string(), "SRV01".to_string()]);
+        let got: Vec<(String, String)> = rows.iter().map(|r| (r.target_domain_name.clone(), r.target_user_name.clone())).collect();
+        assert_eq!(got, vec![("ATTACKER-PC".to_string(), "evil.admin".to_string())]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

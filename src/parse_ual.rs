@@ -62,7 +62,8 @@ pub fn find_ual_databases(dir: &str) -> Vec<PathBuf> {
 }
 
 fn find_sum_dirs_recursive(dir: &Path, results: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 5 { return; }
+    // (a triage unpacked under a case folder is deeper than five: case/host/C/Windows/System32/LogFiles/Sum)
+    if depth > 12 { return; }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -263,8 +264,9 @@ fn ual_row_to_logdata_entries(
         return entries;
     }
 
+    // (in the form the event logs' addresses are written in: one host, one node)
     let ip_address = get_text(row, "Address")
-        .map(|s| parse_hex_ip(&s))
+        .map(|s| crate::parse::strip_ipv4_mapped(&parse_hex_ip(&s)))
         .unwrap_or_default();
 
     let insert_date = get_text(row, "InsertDate")

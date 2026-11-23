@@ -48,6 +48,14 @@ const EXACT_FILES: &[&str] = &[
     "/var/log/btmp",
     "/var/log/lastlog",
     "/etc/hostname",
+    // what a triage gives too: the zone the syslog times are in (they were
+    // taken as UTC for every image) and the names of the uids of lastlog
+    // and audit.log
+    "/etc/timezone",
+    "/etc/localtime",
+    "/etc/sysconfig/clock",
+    "/etc/sysconfig/network",
+    "/etc/passwd",
 ];
 
 /// The file systems a Linux volume can be in, as masstin reads them.
@@ -101,6 +109,29 @@ trait LogTree {
     fn stat(&self, path: &str) -> Option<(String, u64, Option<std::time::SystemTime>)>;
     /// `(name, is_dir, is_regular_file)`, without `.` and `..`
     fn list_dir(&self, path: &str) -> Vec<(String, bool, bool)>;
+}
+
+/// Where the link at `link` (a path from the root of its volume) points:
+/// `target` as it is when it starts at the root, else from the link's own
+/// folder, with its `.` and `..` worked out.
+fn link_target(link: &str, target: &str) -> String {
+    let mut parts: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        let mut v: Vec<&str> = link.split('/').filter(|s| !s.is_empty()).collect();
+        v.pop();
+        v
+    };
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// The size of the piece a log is copied by.
@@ -160,6 +191,19 @@ impl LogTree for XfsFilesystem {
                 (self.open(&alt).ok()?, alt)
             }
         };
+        // a link is followed to what it names (the driver opens the link
+        // itself): /etc/localtime is one on every current distribution, and
+        // on an XFS root (RHEL and its kin) the zone of the logs was never found
+        let (mut f, mut at) = (f, at);
+        let mut hops = 0;
+        while f.inode().is_symlink() && hops < 8 {
+            let mut buf = vec![0u8; (f.len() as usize).min(4096)];
+            let n = self.read_at(f.inode(), f.raw(), 0, &mut buf).ok()?;
+            let target = String::from_utf8_lossy(&buf[..n]).to_string();
+            at = link_target(&at, &target);
+            f = self.open(&at).ok()?;
+            hops += 1;
+        }
         if !f.is_regular_file() {
             return None;
         }
@@ -598,8 +642,8 @@ pub(crate) fn open_image_reader(image_path: &str) -> Result<(Box<dyn crate::vfs:
             Ok((Box::new(BufReader::new(r)), n))
         }
         ImageKind::Raw => {
-            let f = File::open(image_path).map_err(|e| format!("Cannot open raw image: {}", e))?;
-            let n = f.metadata().map_err(|e| e.to_string())?.len();
+            let f = crate::raw_split::RawImage::open(image_path).map_err(|e| format!("Cannot open raw image: {}", e))?;
+            let n = f.len();
             Ok((Box::new(BufReader::new(f)), n))
         }
     }
@@ -636,12 +680,10 @@ fn extract_logs_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<Path
 }
 
 fn extract_logs_from_image_raw(image_path: &str, temp_dir: &Path) -> Result<PathBuf, String> {
-    let file = File::open(image_path)
+    let file = crate::raw_split::RawImage::open(image_path)
         .map_err(|e| format!("Cannot open raw image: {}", e))?;
 
-    let image_size = file.metadata()
-        .map_err(|e| format!("Cannot read file size: {}", e))?
-        .len();
+    let image_size = file.len();
 
     crate::banner::print_info(&format!("Image size: {:.2} GB", image_size as f64 / 1_073_741_824.0));
 
@@ -1427,5 +1469,14 @@ mod xfs_tests {
         assert_eq!(n, 6);
         drop(reader);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_is_followed_from_its_own_folder() {
+        assert_eq!(link_target("/etc/localtime", "/usr/share/zoneinfo/Europe/Madrid"), "/usr/share/zoneinfo/Europe/Madrid");
+        assert_eq!(link_target("/etc/localtime", "../usr/share/zoneinfo/Europe/Madrid"), "/usr/share/zoneinfo/Europe/Madrid");
+        assert_eq!(link_target("/var/run", "../run"), "/run");
+        assert_eq!(link_target("/a/b/c", "./d/../e"), "/a/b/e");
+        assert_eq!(link_target("/x", "../../y"), "/y");
     }
 }

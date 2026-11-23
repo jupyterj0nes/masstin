@@ -825,7 +825,7 @@ impl Viewer {
     fn ingest_step_parser(&mut self, ui: &mut egui::Ui) {
         let rec = self.ingest.verdict.as_ref().and_then(|v| v.parser).map(pidx);
         let sure = self.ingest.verdict.as_ref().map_or(false, |v| v.sure);
-        ui.label(egui::RichText::new(if sure { "The parser masstin picked (masstin -a parse picks the same by itself), and the others in case you know better." } else { "masstin is not sure which parser this is for. Pick one." }).color(theme::MUTED));
+        ui.label(egui::RichText::new(if sure { "What masstin found, and the parser that reads it. Left as picked, masstin -a parse runs: one pass that reads every kind of evidence it knows, this one among them. Pick another card to run that parser by itself: it reads only its own kind." } else { "masstin is not sure which parser this is for. Pick one." }).color(theme::MUTED));
         // carving or rules make it `masstin -a parse`, whatever card is lit
         let overridden = self.ingest.uses_parse() && !self.ingest.is_auto();
         if overridden {

@@ -34,8 +34,13 @@ pub fn is_debug_mode() -> bool {
 
 /// Normalise IPv6 noise in the IpAddress field from Windows EVTX:
 ///   - `::ffff:192.168.10.32` → `192.168.10.32` (IPv4-mapped IPv6)
-///   - `fe80::...` → `""` (link-local, useless for lateral movement)
-/// Without this, each variant creates a separate node in the graph.
+///   - any other IPv6 address in its one short form, lower case, without its
+///     zone (`FE80:0000:0000:0000:B002:997C:F67C:BE4E`, as the UAL writes
+///     it, and `fe80::b002:997c:f67c:be4e%12` are `fe80::b002:997c:f67c:be4e`)
+/// Without this, each variant creates a separate node in the graph. A
+/// link-local address was dropped here as useless: it is the origin of a
+/// logon made from the same network segment, and for a share access (5140,
+/// 5145, which name no workstation) it was the only origin the row had.
 /// Infer logon_type for events that lack one natively.
 /// Kerberos (4768/4769/4770/4771), NTLM (4776), share access (5140),
 /// explicit creds (4648), and WinRM (6) are all network-based in a
@@ -172,12 +177,16 @@ fn channels_for_provider(provider: &str) -> &'static [&'static str] {
 }
 
 pub(crate) fn strip_ipv4_mapped(ip: &str) -> String {
-    if let Some(v4) = ip.strip_prefix("::ffff:") {
-        return v4.to_string();
-    }
-    let lower = ip.to_lowercase();
-    if lower.starts_with("fe80:") {
-        return String::new();
+    // (the zone of a link-local address, `fe80::1%12`, is the interface it
+    // was seen on, not part of the address)
+    let bare = ip.trim().split('%').next().unwrap_or("");
+    if bare.contains(':') {
+        if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+            return match v6.to_ipv4_mapped() {
+                Some(v4) => v4.to_string(),
+                None => v6.to_string(),
+            };
+        }
     }
     ip.to_string()
 }
@@ -935,7 +944,7 @@ pub(crate) fn display_source(path: &str) -> String {
         return out;
     }
     // a tarball's Windows artefacts: <tarball>/tar_extracted/<path inside>
-    if let Some(inside) = rest.strip_prefix("tar_extracted/") {
+    if let Some(inside) = rest.strip_prefix("tar_extracted/").or_else(|| rest.strip_prefix("zip_extracted/")) {
         return format!("{} -> {}", image, inside);
     }
     // Windows: <image>/ntuser_extracted/partition_N/<user>/NTUSER.DAT
@@ -1214,6 +1223,7 @@ fn evtx_rows(
     };
     let mut log_data: Vec<LogData> = Vec::new();
     let prefilter = !scan_all_evtx();
+    let seen: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
     let rows = rows_from_records(&mut parser, threads, |xml| {
         // the id read from the text first: a record of an id not wanted is
         // not deserialised. A record whose id the text does not give goes
@@ -1228,10 +1238,103 @@ fn evtx_rows(
         if !ids.contains(&rec.event_id.as_str()) {
             return None;
         }
-        map(&rec, file)
+        let row = map(&rec, file)?;
+        note_record(&seen, &row, xml);
+        Some(row)
     });
     log_data.extend(rows);
+    keep_twins(&mut log_data, seen.into_inner().unwrap_or_else(|e| e.into_inner()));
+    blank_own_link_local(&mut log_data);
     log_data
+}
+
+/// A link-local address (`fe80::…`) that is the machine's own is no origin:
+/// a domain controller logs hundreds of logons of its own machine account
+/// from its own link-local address, and each would be a connection from a
+/// host of that name to itself. Which address is its own is told by the
+/// log: one a logon of the machine's own account (`HOST$` on `HOST`) came
+/// from. Rows from such an address read as before, with no address; a
+/// link-local address of another machine stays (the origin of a logon
+/// from the same network segment).
+fn blank_own_link_local(rows: &mut [LogData]) {
+    let is_ll = |ip: &str| ip.len() > 5 && ip[..5].eq_ignore_ascii_case("fe80:");
+    let mut own: Vec<String> = Vec::new();
+    for r in rows.iter() {
+        if !is_ll(&r.ip_address) || own.contains(&r.ip_address) {
+            continue;
+        }
+        let host = r.computer.split('.').next().unwrap_or("");
+        let account = r.target_user_name.split('@').next().unwrap_or("");
+        if !host.is_empty() && account.strip_suffix('$').map_or(false, |a| a.eq_ignore_ascii_case(host)) {
+            own.push(r.ip_address.clone());
+        }
+    }
+    if own.is_empty() {
+        return;
+    }
+    for r in rows.iter_mut() {
+        if own.contains(&r.ip_address) {
+            r.ip_address.clear();
+        }
+    }
+}
+
+/// The 14 columns of a row as one number: two rows that read the same.
+fn row_number(r: &LogData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in [&r.time_created, &r.computer, &r.event_type, &r.event_id, &r.subject_user_name, &r.subject_domain_name, &r.target_user_name, &r.target_domain_name, &r.logon_type, &r.workstation_name, &r.ip_address, &r.logon_id, &r.filename, &r.detail] {
+        f.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The record a row came from, by what the row reads (see `keep_twins`).
+fn note_record(seen: &std::sync::Mutex<Vec<(u64, u64)>>, row: &LogData, xml: &str) {
+    if let Ok(id) = xml_tag_text(xml, "EventRecordID").trim().parse::<u64>() {
+        seen.lock().unwrap_or_else(|e| e.into_inner()).push((row_number(row), id));
+    }
+}
+
+/// Two records of one log that give the same row are two events: Windows
+/// stamps to a tenth of a microsecond and the timeline keeps microseconds,
+/// so two logons of the same account in the same microsecond read alike,
+/// and the step that leaves one copy of each row (it is there for the copy
+/// a shadow copy or another log holds of the same record) dropped one of
+/// them. The second and the next say so in their detail, with their record
+/// number: they are rows of their own, and the copy of each in a shadow
+/// copy still reads as its copy. (5145 is one row a session on a share by
+/// design, see `collapse_5145`.)
+fn keep_twins(rows: &mut [LogData], seen: Vec<(u64, u64)>) {
+    let mut ids: HashMap<u64, Vec<u64>> = HashMap::new();
+    for (k, id) in seen {
+        let v = ids.entry(k).or_default();
+        if !v.contains(&id) {
+            v.push(id);
+        }
+    }
+    ids.retain(|_, v| v.len() > 1);
+    if ids.is_empty() {
+        return;
+    }
+    for v in ids.values_mut() {
+        v.sort_unstable();
+    }
+    let mut met: HashMap<u64, usize> = HashMap::new();
+    for r in rows.iter_mut() {
+        if r.event_id == "5145" {
+            continue;
+        }
+        let k = row_number(r);
+        if let Some(v) = ids.get(&k) {
+            let n = met.entry(k).or_insert(0);
+            if *n > 0 && *n < v.len() {
+                let note = format!("another event of the same instant, record {}", v[*n]);
+                r.detail = if r.detail.is_empty() { note } else { format!("{} [{}]", r.detail, note) };
+            }
+            *n += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2269,6 +2372,7 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         Err(_) => return vec![],
     };
     let mut log_data: Vec<LogData> = Vec::new();
+    let seen: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
     let rows = rows_from_records(&mut parser, threads, |xml| {
         let event_id = xml_tag_text(xml, "EventID");
         if event_id.is_empty() {
@@ -2283,9 +2387,13 @@ pub fn parse_unknown(file: &str) -> Vec<LogData> {
         };
         let (build, map) = family?;
         let rec = build(xml)?;
-        map(&rec, file)
+        let row = map(&rec, file)?;
+        note_record(&seen, &row, xml);
+        Some(row)
     });
     log_data.extend(rows);
+    keep_twins(&mut log_data, seen.into_inner().unwrap_or_else(|e| e.into_inner()));
+    blank_own_link_local(&mut log_data);
     pair_openssh(collapse_5145(log_data))
 }
 
@@ -3846,6 +3954,52 @@ mod tests {
         assert!(wmi_row(&local, "f.evtx", &["5858"]).is_none());
         let svc = WMI_5858.replace(r"CORP\alice", r"NT AUTHORITY\SYSTEM");
         assert!(wmi_row(&svc, "f.evtx", &["5858"]).is_none());
+    }
+
+    #[test]
+    fn ipv6_addresses_are_written_one_way_and_link_local_ones_kept() {
+        // mapped IPv4, the long form the UAL writes, a zone, upper case
+        assert_eq!(strip_ipv4_mapped("::ffff:192.168.10.32"), "192.168.10.32");
+        assert_eq!(strip_ipv4_mapped("FE80:0000:0000:0000:B002:997C:F67C:BE4E"), "fe80::b002:997c:f67c:be4e");
+        assert_eq!(strip_ipv4_mapped("fe80::b002:997c:f67c:be4e%12"), "fe80::b002:997c:f67c:be4e");
+        assert_eq!(strip_ipv4_mapped("2001:DB8::1"), "2001:db8::1");
+        // what is no IPv6 address stays as it is
+        for v in ["10.0.0.5", "-", "", "WKS01", "::1"] {
+            assert_eq!(strip_ipv4_mapped(v), v);
+        }
+    }
+
+    #[test]
+    fn the_machines_own_link_local_address_is_no_origin() {
+        let row = |user: &str, ip: &str| LogData {
+            time_created: "2026-01-02T09:00:00Z".into(), computer: "DC01.corp.example".into(), event_type: "SUCCESSFUL_LOGON".into(), event_id: "4624".into(),
+            subject_user_name: String::new(), subject_domain_name: String::new(), target_user_name: user.into(), target_domain_name: "CORP".into(),
+            logon_type: "3".into(), workstation_name: String::new(), ip_address: ip.into(), logon_id: "0x1".into(), filename: "Security.evtx".into(), detail: String::new(),
+        };
+        // the controller's own account from its own address, an admin from the same one, a user from another machine's
+        let mut rows = vec![row("DC01$", "fe80::1"), row("admin", "fe80::1"), row("alice", "fe80::2"), row("bob", "10.0.0.9")];
+        blank_own_link_local(&mut rows);
+        let ips: Vec<&str> = rows.iter().map(|r| r.ip_address.as_str()).collect();
+        assert_eq!(ips, vec!["", "", "fe80::2", "10.0.0.9"]);
+    }
+
+    #[test]
+    fn two_records_that_read_the_same_are_two_rows() {
+        let row = || LogData {
+            time_created: "2026-01-02T09:00:00.123456Z".into(), computer: "SRV01".into(), event_type: "SUCCESSFUL_LOGON".into(), event_id: "4624".into(),
+            subject_user_name: String::new(), subject_domain_name: String::new(), target_user_name: "SYSTEM".into(), target_domain_name: "NT AUTHORITY".into(),
+            logon_type: "5".into(), workstation_name: "-".into(), ip_address: "-".into(), logon_id: "0x3e7".into(), filename: "Security.evtx".into(), detail: "services.exe".into(),
+        };
+        // records 12902 and 12903 read alike; record 500 was read twice (a carved copy of itself)
+        let mut rows = vec![row(), row(), row()];
+        let n = row_number(&rows[0]);
+        keep_twins(&mut rows, vec![(n, 12903), (n, 12902), (n, 12902)]);
+        let details: Vec<&str> = rows.iter().map(|r| r.detail.as_str()).collect();
+        assert_eq!(details, vec!["services.exe", "services.exe [another event of the same instant, record 12903]", "services.exe"]);
+        // one record: nothing is said
+        let mut one = vec![row()];
+        keep_twins(&mut one, vec![(n, 7)]);
+        assert_eq!(one[0].detail, "services.exe");
     }
 
     #[test]

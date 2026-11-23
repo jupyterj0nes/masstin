@@ -50,15 +50,17 @@ The same artefact can reach masstin in a disk image, in a folder (a triage unpac
 
 | Artefact | Disk image | Folder | Zip | Tarball (`.tar`, `.tar.gz`, `.tgz`) |
 |---|---|---|---|---|
-| EVTX | yes, from NTFS in place, the live volume and every shadow copy; the files of `winevt\Logs`, not its subfolders | yes, at any depth | yes, at any depth, zips inside zips too | yes |
-| UAL (`LogFiles\Sum\*.mdb`) | yes, live volume | yes, up to five folders deep | no | yes |
+| EVTX | yes, from NTFS in place, the live volume and every shadow copy; `winevt\Logs` and the folders under it (`Logs\Archive`) | yes, at any depth | yes, at any depth, zips inside zips too | yes |
+| UAL (`LogFiles\Sum\*.mdb`) | yes, live volume | yes | yes | yes |
+| Scheduled tasks (`System32\Tasks`) | yes, live volume | yes, of every Windows tree found | yes | yes |
+| MountPoints2 (the users' NTUSER.DAT) | yes, live volume | yes, of every Windows tree found | yes | yes |
 | SYSTEM hive (the machine's own addresses) | no | yes | yes | yes |
-| Scheduled tasks, MountPoints2 (NTUSER.DAT) | yes, live volume | no | no | no |
 | Linux logs (`auth.log`, `secure`, `messages`, `audit.log`, `wtmp`, `btmp`, `utmp`, `lastlog`, journals), rotated ones too | yes, from ext4 or XFS in place (LVM too); `/var/log`, `/var/log/audit` and the journal folder | yes, at any depth | yes | yes |
-| Linux host name | `/etc/hostname` | `etc/hostname`, `sysconfig/network`, `uac.log`, the logs' own header | as a folder | as a folder |
-| Linux time zone and `passwd` | no: syslog times are taken as UTC, uids of `lastlog` and `audit.log` are not named | yes | yes | yes |
+| Linux host name, time zone and `passwd` | yes (`/etc/hostname`, `/etc/timezone`, `/etc/localtime` and what it links to, `/etc/sysconfig`, `/etc/passwd`) | yes | yes | yes |
 
-Disk images: E01, VMDK, VHD and VHDX, raw (`dd`, `img`, `.001`) and images with no extension (cloud snapshots), known by their content; GPT and MBR, LVM volumes; NTFS, ext4 and XFS. A BitLocker volume is said and skipped. Other file systems are not read.
+A scheduled task is a row only when it was registered by an account of another machine, and which machine is "another" is told by the machine's name: the tasks of a Windows tree with no Security.evtx or System.evtx beside them (in the folder, or in the zip they came out of) are not read, and the run says so. What a zip or a tarball holds of UAL, tasks and NTUSER.DAT is taken out to the temporary folder; its rows are named `<archive> -> <path inside>` or `<archive>:tasks:<task>`.
+
+Disk images: E01, VMDK, VHD and VHDX, raw (`dd`, `img`, and split in segments `.001`, `.002`, … read as one image) and images with no extension (cloud snapshots), known by their content; GPT and MBR, LVM volumes; NTFS, ext4 and XFS. A BitLocker volume is said and skipped. Other file systems are not read.
 
 Archives of a kind masstin does not open (7z, rar, `tar.xz`, `tar.bz2`, `tar.zst`, cab) are named in a warning: nothing inside them is read. A zip whose entries are under a password is named too; the Linux half tries the passwords malware samples are usually packed with.
 
