@@ -780,8 +780,11 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
         match crate::merge::merge_files(&merge_files_list, output, None, None, None) {
             Ok(()) => {
                 crate::banner::print_phase_result(if windows_present { "Merged Windows + Linux timeline generated" } else { "Timeline generated" });
-                // the run's own count: the halves said theirs, not the timeline's
-                if let Some(out) = output {
+                // the run's own count: the halves said theirs, not the timeline's.
+                // When this pass is itself a part (a carve or custom rules
+                // follow and are merged in), the run says its count after
+                // that merge: said here, it was short of what the carve added
+                if let (Some(out), false) = (output, was_part) {
                     crate::banner::print_timeline_total(out);
                 }
             }

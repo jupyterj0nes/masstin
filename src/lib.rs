@@ -1440,6 +1440,8 @@ fn run_parse_plan(config: &Cli, steps: Vec<ParseStep>) -> Result<(), Box<dyn Err
         if let Some(out) = config.output.as_ref() {
             let rows = csv::Reader::from_path(out).map(|mut r| r.records().count()).unwrap_or(0);
             crate::banner::print_phase_result(&format!("Timeline: {} ({} events)", crate::banner::normalize_display_path(out), rows));
+            // the count of the whole run, after every part is in
+            crate::banner::print_timeline_total(out);
             crate::banner::print_load_hint(out);
         }
     }

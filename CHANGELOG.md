@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **The count of a parse with `--carve` or `--rules` is that of the timeline written.** The count of the timeline was said by the pass that reads the evidence, before the carved events or the rows of the custom rules were merged in: with a carve that recovered two events, the window's closing card said 30,773 and the timeline held 30,775. It is said after the last merge.
+
 ## v1.4.16 — 2026-11-24
 
 - **A triage gives what an image gives: UAL, scheduled tasks and MountPoints2 from folders, zips and tarballs.** Scheduled tasks and the users' NTUSER.DAT were read from disk images only, and UAL not from a zip. Every Windows tree found under the folders given (a folder holding `Windows\System32`: the `C` of a KAPE triage, a volume's root) now gives its tasks and its hives, and what a zip or a tarball holds of UAL, tasks and NTUSER.DAT is taken out to the temporary folder and read the same way. The machine's name comes from its own logs (from the zip's, for a zip); where no log names it the tasks are not read and the run says so, since a task is a row only when another machine's account registered it. On a triage with a UAL database and a task registered from another machine, as a folder, a zip and a tarball: the same rows from the three (2,573 of EVTX, 6 of UAL, the task), where the zip gave no UAL and none gave the task.
