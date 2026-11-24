@@ -3674,6 +3674,28 @@ impl Viewer {
             painter.set(node_slot, egui::Shape::mesh(node_mesh));
         }
         self.draw_subnets(&painter, canvas, true);
+        // the mastiff over the map while the hunt runs, as light: its picture
+        // is added to what is under it (nothing is covered, the map shows
+        // through), fading as the findings light up. Behind the hosts alone
+        // (above) it was lost under any map of more than a few
+        let front = if let Some(started) = self.hunt_sweep {
+            (started.elapsed().as_secs_f32() * 1.5).min(1.0)
+        } else if let Some(started) = self.hunt_reveal {
+            (1.0 - started.elapsed().as_secs_f32() / 1.2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if front > 0.01 {
+            if let Some(tex) = &self.logo_dog {
+                let w = (canvas.width().min(canvas.height()) * 0.62).clamp(160.0, 520.0);
+                let h = w * 280.0 / 448.0;
+                let beat = if motion { 1.0 + 0.02 * (now * 2.2).sin() } else { 1.0 };
+                let k = (255.0 * front * (0.50 + 0.08 * (now * 2.2).sin())) as u8;
+                // (a colour with no alpha is added, not laid over)
+                painter.image(tex.id(), Rect::from_center_size(canvas.center(), Vec2::new(w * beat, h * beat)), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_rgba_premultiplied(k, k, k, 0));
+                keep_moving = true;
+            }
+        }
         self.nodes_ms = t_nodes.elapsed().as_secs_f32() * 1000.0;
         if self.style.motion && !self.presenting {
             // the dust and the stars move on their own
