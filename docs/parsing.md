@@ -2,10 +2,7 @@
 
 `-a parse`, every `parse-*` action, what each one reads, noise filtering, triage detection, carving and merging. Back to the [README](../README.md).
 
-<!-- ======================================================================
-     VIDEO 2 of 6: drag  masstin-chapter-evidence.mp4  onto the empty line below
-     (chapter 1, the evidence dropped on the window). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 2 of 6: `masstin-chapter-evidence.mp4` goes here** (chapter 1, the evidence dropped on the window). Drag the file onto this line and delete it.
 
 
 

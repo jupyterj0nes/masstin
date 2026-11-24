@@ -28,10 +28,7 @@
 3. **How the attacker moved.** Hosts drawn as the machines they are, the accounts on the lines. Open a host's neighbourhood, ask for the time-respecting paths from one host to another or for everything a suspect host reached, and the route stands out of the whole picture hop by hop. The questions an analyst asks of a login graph are on a menu, and your verdicts and notes go back into the timeline. [The viewer →](docs/viewer.md)
 4. **A video for your client.** Tell each step in your own words and masstin replays the intrusion connection by connection, with the clock and your captions, and records it as an MP4 or a GIF next to the evidence. *Tools › Film the window* records the window itself as you work. [Presentation and recording →](docs/viewer.md#presentation-and-recording)
 
-<!-- ======================================================================
-     VIDEO 1 of 6: drag  masstin-teaser.mp4  onto the empty line below
-     (the 90-second teaser). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 1 of 6: `masstin-teaser.mp4` goes here** (the 90-second teaser). Drag the file onto this line and delete it.
 
 
 <div align="center">
@@ -85,9 +82,9 @@ Every source lands in the same CSV: 14 columns that describe the login and five 
 A connection is one origin logging in to one destination with one account on one day. Connections that already happened on a baseline day are habitual and never reported. For the new ones, what is new about the connection and what its origin did that day (first-time destination, an account the origin never used, a sweep of failures, a refused attempt followed by a login with another account, an account that belongs to another machine, a crossing between communities, a causal path through a pivot…) are measured against the baseline and combined into one empirical p-value per connection; Benjamini-Hochberg across the window controls the false discovery rate you asked for. [The statistics →](docs/graph-hunt-statistics.md)
 
 <div align="center">
-  <img src="resources/demo-hunt.gif" alt="graph-hunt-csv on the LANL authentication set: 21 million rows, 204 significant connections at FDR 5 %, the red-team machine at rank 1"/>
+  <img src="resources/masstin-hunt.gif" alt="the hunt in masstin's window: the date the investigation starts, the scan, the findings lighting up on the map, the ranked list with each finding's reason in words, and a verdict with a note saved into the timeline"/>
   <br>
-  <em>The public Los Alamos set, no seed, no hint: 21 million logins read, 204 connections survive the 5 % false discovery rate, and the first rows are the red-team machine switching credentials on hosts it had never reached. The minutes of computation are cut out of the recording.</em>
+  <em>The hunt in the window. It asks when the investigation starts and nothing else; what does not fit the network's own past lights up, most unusual first, each finding with its reason in words, and your verdict and note go into the timeline.</em>
 </div>
 
 | Case | What is known | What graph-hunt reports, no seed, no hint |

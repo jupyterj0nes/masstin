@@ -13,10 +13,7 @@ masstin -a view -f timeline.csv --focus SRV01 --start-time "2026-03-15 00:00:00"
 masstin -a view -f dc01.csv -f srv02.csv
 ```
 
-<!-- ======================================================================
-     VIDEO 3 of 6: drag  masstin-chapter-map.mp4  onto the empty line below
-     (the map as it opens). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 3 of 6: `masstin-chapter-map.mp4` goes here** (the map as it opens). Drag the file onto this line and delete it.
 
 
 ## What is drawn
@@ -97,10 +94,7 @@ In the View menu and on the toolbar:
 
 ## Paths, cones and questions
 
-<!-- ======================================================================
-     VIDEO 5 of 6: drag  masstin-chapter-paths.mp4  onto the empty line below
-     (chapter 3, the paths). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 5 of 6: `masstin-chapter-paths.mp4` goes here** (chapter 3, the paths). Drag the file onto this line and delete it.
 
 
 A path (and a cone) is shown one of two ways, chosen with **Show it** in the Paths window and changed at any time. **Alone**: the canvas is reduced to the path's hosts, in columns by hop, so it reads left to right. **Marked on the map**: nothing is taken away or moved; the path's connections are drawn thick over the map in the logo's run from cyan to magenta, its hosts are ringed and labelled *origin*, *hop 1*, *hop 2*…, and everything else is dimmed. Connections of the path that the filters had left out are drawn with it, and the chip above the canvas says how many. The chip takes the mark away.
@@ -157,10 +151,7 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 ## The hunt, from the window
 
-<!-- ======================================================================
-     VIDEO 4 of 6: drag  masstin-chapter-hunt.mp4  onto the empty line below
-     (chapter 2, the hunt: the same link as in graph-hunt.md). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 4 of 6: `masstin-chapter-hunt.mp4` goes here** (chapter 2, the hunt: the same link as in graph-hunt.md). Drag the file onto this line and delete it.
 
 
 While the hunt runs, a bar over the canvas says the stage it is on (of ten: reading the timeline, learning what is normal, weighing every connection, writing the result…), the percentage and the seconds. While the hunt runs, the mastiff and a sweep cross the canvas; they go on until the timeline it wrote has been read again (which happens away from the window, so nothing freezes), and the findings then light up one after another in time order.
@@ -173,10 +164,7 @@ When a timeline that is open **already carries a hunt**, Run does not write over
 
 ## Presentation and recording
 
-<!-- ======================================================================
-     VIDEO 6 of 6: drag  masstin-chapter-story.mp4  onto the empty line below
-     (chapter 4, the story). When its github.com/user-attachments link appears, delete this comment.
-     ====================================================================== -->
+> 🎬 **VIDEO 6 of 6: `masstin-chapter-story.mp4` goes here** (chapter 4, the story). Drag the file onto this line and delete it.
 
 
 The **Animation** window (Story and recording…) opens with what an animation is and how long this one would be, and says when that is too long for a video. **Fit it to** 30 s, 1 min, 2 min or 5 min sets the pace for that length: rows close in time are grouped into one step until every step can be seen, and each step takes the same time; nothing leaves the picture. Below it, **Pace** (timing, grouping, seconds per step, pauses), **On the picture** (title, clock, caption, counter, fading, anonymising, the cinematic look, the logo), **Stretches** and **Steps** each carry a **?** that explains them, as do the format, quality, size and frame rate of **Record…**.
