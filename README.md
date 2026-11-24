@@ -38,15 +38,45 @@ https://github.com/user-attachments/assets/fe6a9609-1ff0-4661-9da4-8e2ab356270d
 
 ## Quick start
 
-Download the binary for your platform from the [Releases page](https://github.com/jupyterj0nes/masstin/releases/latest), or `cargo install masstin`. No runtime dependencies.
+One file, no installer, no runtime dependencies. Get the one for your system from the [Releases page](https://github.com/jupyterj0nes/masstin/releases/latest).
 
-```bash
-masstin                    # the window: drop the evidence on it, hunt and look from there
+### Windows
+
+1. Download `masstin-vX.Y.Z-windows.exe`.
+2. **Double-click it.** The window opens: drop your evidence on it, and ingest, hunt and look from there. No terminal needed.
+
+If SmartScreen stops it the first time, *More info › Run anyway*.
+
+The same from PowerShell, for scripts and servers:
+
+```powershell
+.\masstin-vX.Y.Z-windows.exe                                      # the window
+.\masstin-vX.Y.Z-windows.exe -a parse -d D:\evidence\case -o timeline.csv
 ```
 
-Double-clicking `masstin.exe` does the same. The viewer writes nothing where it runs: a timeline's saved views, story and notes live next to the CSV with its name, the recent list under the user's configuration folder ([where things are kept →](docs/viewer.md#where-things-are-kept)).
+### Linux
 
-The first three steps from a terminal:
+1. Download `masstin-vX.Y.Z-linux`.
+2. Make it executable and run it. On a desktop, the window opens, the same as on Windows:
+
+```bash
+chmod +x masstin-vX.Y.Z-linux
+./masstin-vX.Y.Z-linux                                            # the window
+```
+
+On a server with no desktop, everything the window does is on the command line (below).
+
+### macOS
+
+Download `masstin-vX.Y.Z-macos-arm64` (Apple silicon) or `masstin-vX.Y.Z-macos-x86_64` (Intel), `chmod +x` it and run it. If Gatekeeper blocks it, run `xattr -d com.apple.quarantine masstin-*` once.
+
+### From source
+
+`cargo install masstin`, on stable Rust.
+
+The viewer writes nothing where it runs: a timeline's saved views, story and notes live next to the CSV with its name, the recent list under the user's configuration folder ([where things are kept →](docs/viewer.md#where-things-are-kept)).
+
+### The first three steps from a terminal
 
 ```bash
 # 1. the evidence folder (images, zips, triages, loose files): masstin says what it found
@@ -62,8 +92,6 @@ masstin -a view -f timeline.csv
 ```
 
 Known-bad host or account? `--seed 10.10.1.50` on the hunt reconstructs the chain from it. Neo4j or Memgraph wanted anyway? `load-memgraph` / `load-neo4j` export the graph ([Graph databases →](docs/graph-databases.md)).
-
-> **macOS first run:** if Gatekeeper blocks the binary, run `xattr -d com.apple.quarantine masstin-*` once.
 
 ## What it reads
 
