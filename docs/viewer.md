@@ -13,11 +13,11 @@ masstin -a view -f timeline.csv --focus SRV01 --start-time "2026-03-15 00:00:00"
 masstin -a view -f dc01.csv -f srv02.csv
 ```
 
-<div align="center">
-  <img src="../resources/viewer-window.png" alt="masstin -a view after the hunt: the candidate connections of a five-host lab glowing, the domain controller with its key badge, the servers as racks, the jump box as a workstation, the accounts on every edge, the filter pane on the left and the inspector on the right"/>
-  <br>
-  <em>After the hunt: the Findings view of a five-host lab, the filter pane on the left, the inspector on the right, the time strip below.</em>
-</div>
+<!-- ======================================================================
+     VIDEO 3 of 6: drag  masstin-chapter-map.mp4  onto the empty line below
+     (the map as it opens). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
 
 ## What is drawn
 
@@ -97,6 +97,12 @@ In the View menu and on the toolbar:
 
 ## Paths, cones and questions
 
+<!-- ======================================================================
+     VIDEO 5 of 6: drag  masstin-chapter-paths.mp4  onto the empty line below
+     (chapter 3, the paths). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
+
 A path (and a cone) is shown one of two ways, chosen with **Show it** in the Paths window and changed at any time. **Alone**: the canvas is reduced to the path's hosts, in columns by hop, so it reads left to right. **Marked on the map**: nothing is taken away or moved; the path's connections are drawn thick over the map in the logo's run from cyan to magenta, its hosts are ringed and labelled *origin*, *hop 1*, *hop 2*…, and everything else is dimmed. Connections of the path that the filters had left out are drawn with it, and the chip above the canvas says how many. The chip takes the mark away.
 
 **Paths…** finds the paths between two hosts: chains of logins where every hop happens after the previous one and no host is entered twice, up to a number of hops. The paths come shortest first, each as `A -(account HH:MM)-> B -(…)-> C`; clicking one shows it with the time of each arrival. *Reach from origin* draws the earliest-arrival cone (every host a chain of logins could have reached from the origin, with the hop and the time it was first reached); *Ways into destination* the same backwards. *Paths from here* / *Paths to here* on a host fill the form. *Back to the view* returns to the filter's graph.
@@ -151,6 +157,12 @@ The strip at the bottom is the whole timeline's events over time (a bar every th
 
 ## The hunt, from the window
 
+<!-- ======================================================================
+     VIDEO 4 of 6: drag  masstin-chapter-hunt.mp4  onto the empty line below
+     (chapter 2, the hunt: the same link as in graph-hunt.md). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
+
 While the hunt runs, a bar over the canvas says the stage it is on (of ten: reading the timeline, learning what is normal, weighing every connection, writing the result…), the percentage and the seconds. While the hunt runs, the mastiff and a sweep cross the canvas; they go on until the timeline it wrote has been read again (which happens away from the window, so nothing freezes), and the findings then light up one after another in time order.
 
 The last step has a tick box, **Read each address as the host it is**, with the level (Strict, Standard, Broad): the hunt then runs with `--merge-hosts`, one machine where the timeline has a name in some rows and an address in others. It is off unless you tick it.
@@ -160,6 +172,12 @@ When a timeline that is open **already carries a hunt**, Run does not write over
 **Hunt** on the toolbar (or the Hunt menu) runs `graph-hunt-csv` on the timeline(s) open: the start of the investigation (prefilled with the window's From, or the last third of the timeline), an optional end, alpha. It runs as a child masstin with the same command line you would type, its output in a log window, and while it runs the mastiff of the logo is on the scent in the middle of the canvas and a sweep crosses it. When it ends the timeline is read again, the view switches to Findings and **the findings appear one after another in time order, each with a flash**; then **the summary** opens: rows by state, the rarest connections with their scores, the spread of scores, and the score threshold with one-click bars (one in twenty, one in a hundred, one in a thousand) that apply at once. The slider in the filter pane does the same at any time. The verdicts and notes already written are kept. *Tools › Log of the last run…* brings the log back.
 
 ## Presentation and recording
+
+<!-- ======================================================================
+     VIDEO 6 of 6: drag  masstin-chapter-story.mp4  onto the empty line below
+     (chapter 4, the story). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
 
 The **Animation** window (Story and recording…) opens with what an animation is and how long this one would be, and says when that is too long for a video. **Fit it to** 30 s, 1 min, 2 min or 5 min sets the pace for that length: rows close in time are grouped into one step until every step can be seen, and each step takes the same time; nothing leaves the picture. Below it, **Pace** (timing, grouping, seconds per step, pauses), **On the picture** (title, clock, caption, counter, fading, anonymising, the cinematic look, the logo), **Stretches** and **Steps** each carry a **?** that explains them, as do the format, quality, size and frame rate of **Record…**.
 

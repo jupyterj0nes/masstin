@@ -2,6 +2,11 @@
 
 How the hunt decides, what it writes and how well it does on the public LANL set. The maths are in [graph-hunt-statistics.md](graph-hunt-statistics.md). Back to the [README](../README.md).
 
+<!-- ======================================================================
+     VIDEO 4 of 6: drag  masstin-chapter-hunt.mp4  onto the empty line below
+     (chapter 2, the hunt: the same link as in viewer.md). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
 
 Once the graph is loaded (with `--ungrouped`: the hunt needs per-event times), masstin looks for lateral-movement anomalies and reports them with **probabilities measured in the network itself** — no hand-picked weights, windows or thresholds. Three flavors, same engine:
 

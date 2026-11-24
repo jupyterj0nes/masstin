@@ -16,21 +16,26 @@
 </div>
 
 <div align="center">
-  <img src="resources/viewer-lateral-movement.gif" alt="masstin -a view replaying a lateral movement: a jump box logs in to three servers, an administrator hops from a server to the partner's domain controller and from there into the other domain; each connection draws itself at its time with the account on the line"/>
+  <img src="resources/masstin-hero.gif" alt="masstin in fifteen seconds: a case folder is dropped on the window and read in one pass, the network appears as a map, the hunt marks the connections this network had never made before, and from a suspect host everything it reached lights up"/>
   <br>
-  <em>An hour and a half of an intrusion in thirteen seconds. A jump box logs in to three servers with one account; an administrator hops from a server to the partner's domain controller, and from there into the other domain. Each connection draws itself at the moment it happened, with the account on the line. A five-host lab, parsed and hunted by masstin; the clock is the timeline's.</em>
+  <em>A case folder dropped on the window and read in one pass. The network appears, the hunt lights up what this network had never done before, and from a suspect host everything it reached is marked. A lab case, real clicks, sped up where the badge says so.</em>
 </div>
 
-## Three steps
+## From the evidence to the story
 
-1. **Give it the evidence.** Drop a folder of EVTX, a KAPE / Velociraptor / UAC triage, a disk image, Linux or macOS logs on the window (or run `masstin -a parse -d <folder>` in a terminal: one action for all of it). Masstin says what it is, parses it with its progress bars drawn in the window, and opens the timeline: one CSV, the same columns whatever the source. [Parsing →](docs/parsing.md)
-2. **Hunt.** `graph-hunt` tests every connection after the start of the investigation against what the network did before it, and keeps what survives a false-discovery-rate test. The only number you choose is the FDR; every finding comes with its reason in words. [graph-hunt →](docs/graph-hunt.md)
-3. **Look.** Hosts drawn as the machines they are, the accounts on the lines, the findings glowing. Neighbourhoods, time-respecting paths and reach cones between hosts, the questions an analyst asks of a login graph, marks and notes written back into the CSV, a replay you can present and record. [The viewer →](docs/viewer.md)
+1. **Any evidence, as it comes.** Drag the case folder onto the window: disk images, cloud snapshots, KAPE / Velociraptor / UAC triages, loose EVTX, Linux and macOS logs, mixed as they came. Nothing to mount, nothing to convert. Masstin looks inside, says what it found, reads file systems, shadow copies and deleted logs straight from the images, and writes one timeline with the same columns whatever the source. From a terminal it is one action, `masstin -a parse -d <folder>`. [Parsing →](docs/parsing.md)
+2. **It finds the intrusion for you.** No rules to write. Give `graph-hunt` the day the investigation starts: every connection after it is weighed against what the network did before, and what survives a false-discovery-rate test lights up, most unusual first, each finding with its reason in words. The only number you choose is the FDR. [graph-hunt →](docs/graph-hunt.md)
+3. **How the attacker moved.** Hosts drawn as the machines they are, the accounts on the lines. Open a host's neighbourhood, ask for the time-respecting paths from one host to another or for everything a suspect host reached, and the route stands out of the whole picture hop by hop. The questions an analyst asks of a login graph are on a menu, and your verdicts and notes go back into the timeline. [The viewer →](docs/viewer.md)
+4. **A video for your client.** Tell each step in your own words and masstin replays the intrusion connection by connection, with the clock and your captions, and records it as an MP4 or a GIF next to the evidence. *Tools › Film the window* records the window itself as you work. [Presentation and recording →](docs/viewer.md#presentation-and-recording)
 
-https://github.com/user-attachments/assets/1f28b074-1fe7-43c8-868a-64053b33c00b
+<!-- ======================================================================
+     VIDEO 1 of 6: drag  masstin-teaser.mp4  onto the empty line below
+     (the 90-second teaser). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
 
 <div align="center">
-  <em>The demo, 97 seconds: a case folder dropped on the window, the wizard saying what it holds, the parser's bars, the graph, the hunt and its report, the paths and the reach from the jump box, the replay. Filmed by masstin itself (Tools › Film the window), no hand on the mouse. <a href="resources/masstin-viewer-demo.mp4">MP4 to download</a>.</em>
+  <em>The four steps in ninety seconds. The long version walks through every one of them, with guides and case walkthroughs, at <a href="https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/">weinvestigateanything.com</a>.</em>
 </div>
 
 ## Quick start
@@ -43,7 +48,7 @@ masstin                    # the window: drop the evidence on it, hunt and look 
 
 Double-clicking `masstin.exe` does the same. The viewer writes nothing where it runs: a timeline's saved views, story and notes live next to the CSV with its name, the recent list under the user's configuration folder ([where things are kept →](docs/viewer.md#where-things-are-kept)).
 
-The same three steps from a terminal:
+The first three steps from a terminal:
 
 ```bash
 # 1. the evidence folder (images, zips, triages, loose files): masstin says what it found
@@ -67,10 +72,10 @@ Known-bad host or account? `--seed 10.10.1.50` on the hunt reconstructs the chai
 | Source | What masstin takes from it |
 |---|---|
 | **Windows** | 37 Event IDs across 12 EVTX channels (Security 4624/4625/4634/4648/4768/4769/4776/4778/5140/5145…, Terminal Services, RDP, SMB, WinRM, WMI, Sysmon 3, OpenSSH, Scheduled Tasks); UAL databases; MountPoints2 from NTUSER.DAT; Volume Shadow Copies; EVTX chunks carved from unallocated space. |
-| **Forensic images** | E01, VMDK, VHD / VHDX, dd / raw, mounted volumes, images packed inside zips. NTFS, ext4 and XFS walked, LVM volumes included; BitLocker detected and reported. |
+| **Forensic images** | E01, VMDK, VHD / VHDX, dd / raw (split in segments too), cloud snapshots with no extension (known by their content), mounted volumes, images packed inside zips. NTFS, ext4 and XFS walked, LVM volumes included; BitLocker detected and reported. |
 | **Linux** | `auth.log`, `secure`, `messages`, `wtmp` / `btmp` / `lastlog`, `audit.log`, binary journald. Session ends paired to their login, syslog times to UTC. |
 | **macOS** | The Unified Log, as a `.logarchive` (read directly on any OS) or a `log show` JSON export: SSH and Screen Sharing logons. |
-| **Triage packages and feeds** | KAPE, Velociraptor, UAC, Cortex XDR, plain zips and tarballs nested in each other; Winlogbeat JSON, Cortex XDR exports, Mordor / OTRF datasets. |
+| **Triage packages and feeds** | KAPE, Velociraptor, UAC, Cortex XDR, plain zips and tarballs nested in each other; a Cortex XDR tenant read through its API, Winlogbeat JSON, Cortex XDR exports, Mordor / OTRF datasets. |
 | **Anything else** | `-a parse --rules <rule>` with a YAML rule (csv, regex, key=value, JSON). Rules ship for Palo Alto, Cisco, Fortinet, Check Point, OpenVPN, Squid, Zscaler ZPA, Cloudflare Access. [Custom parsers →](docs/custom-parsers.md) |
 
 Every source lands in the same CSV: 14 columns that describe the login and five that the hunt and the analyst fill. The columns are in [docs/csv-format.md](docs/csv-format.md), the full artifact list in [ARTIFACTS.md](ARTIFACTS.md).

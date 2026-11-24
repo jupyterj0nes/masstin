@@ -2,11 +2,11 @@
 
 `-a parse`, every `parse-*` action, what each one reads, noise filtering, triage detection, carving and merging. Back to the [README](../README.md).
 
-<div align="center">
-  <img src="../resources/demo-parse.gif" alt="masstin parse-windows over a folder of EVTX samples: banner, discovery, per-folder breakdown and the timeline CSV"/>
-  <br>
-  <em>parse-windows over 293 EVTX samples from twelve providers: discovery, per-folder breakdown, duplicates removed, and the timeline at the end. The same run, with the same bars, happens inside the window when the evidence is dropped on it.</em>
-</div>
+<!-- ======================================================================
+     VIDEO 2 of 6: drag  masstin-chapter-evidence.mp4  onto the empty line below
+     (chapter 1, the evidence dropped on the window). When its github.com/user-attachments link appears, delete this comment.
+     ====================================================================== -->
+
 
 
 ## `-a parse`: one action for every kind of evidence
