@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["dfir", "forensics", "lateral-movement", "incident-response", "evtx"]
 categories = ["command-line-utilities", "visualization", "parser-implementations"]
 # The demos and screenshots stay on GitHub; the crate keeps the logo and the icons the build embeds.
-exclude = ["resources/*.gif", "resources/*.mp4", "resources/viewer-window.png", "neo4j-resources/*.png", "memgraph-resources/*.png", "scripts/"]
+exclude = ["resources/*.gif", "resources/*.mp4", "neo4j-resources/*.png", "memgraph-resources/*.png", "scripts/"]
 license = "AGPL-3.0-only"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
