@@ -28,7 +28,8 @@
 3. **How the attacker moved.** Hosts drawn as the machines they are, the accounts on the lines. Open a host's neighbourhood, ask for the time-respecting paths from one host to another or for everything a suspect host reached, and the route stands out of the whole picture hop by hop. The questions an analyst asks of a login graph are on a menu, and your verdicts and notes go back into the timeline. [The viewer →](docs/viewer.md)
 4. **A video for your client.** Tell each step in your own words and masstin replays the intrusion connection by connection, with the clock and your captions, and records it as an MP4 or a GIF next to the evidence. *Tools › Film the window* records the window itself as you work. [Presentation and recording →](docs/viewer.md#presentation-and-recording)
 
-> 🎬 **VIDEO 1 of 6: `masstin-teaser.mp4` goes here** (the 90-second teaser). Drag the file onto this line and delete it.
+
+https://github.com/user-attachments/assets/fe6a9609-1ff0-4661-9da4-8e2ab356270d
 
 
 <div align="center">
