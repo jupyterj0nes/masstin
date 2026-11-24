@@ -88,6 +88,7 @@ jobs:
         with:
           sparse-checkout: |
             CHANGELOG.md
+            .github/release_notes.py
           sparse-checkout-cone-mode: false
 
       - name: Download all artifacts
@@ -98,9 +99,15 @@ jobs:
       - name: List files
         run: ls -la
 
+      # The release says where the binaries are first and then what changed in this
+      # version alone: the whole changelog put the downloads a hundred screens down.
+      - name: Write the release notes
+        run: |
+          python3 .github/release_notes.py "${{ github.ref_name }}" masstin-* > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG.md
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: masstin-*
