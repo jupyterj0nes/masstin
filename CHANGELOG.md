@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.5.0 — 2026-11-24
 
+- **The README opens on the window at work.** A GIF of the opening (a case folder dropped in, the map, the hunt, everything a suspect host reached), the four steps from the evidence to the story, a 90-second video, and the hunt shown in the window. The pages of the docs carry the video of their chapter: the evidence going in (parsing), the map, the hunt, the paths and the story (viewer, graph-hunt).
+- **Quick start by system.** Windows first: download the `.exe` and double-click it, the window opens. Then Linux, macOS and building from source.
+- **A release says where the binaries are first.** The text of a release was the whole changelog, with the downloads under it. It is now a table of the files by system, each a link, how to build from source, and what changed in that version alone.
+- **The mastiff of the hunt shows over the map, as light.** While the hunt runs the dog of the logo was drawn behind the hosts, and under a map of more than a few hosts it was lost. It is now added over the map as light: nothing is covered, the map shows through it, and it fades as the findings light up.
 - **The count of a parse with `--carve` or `--rules` is that of the timeline written.** The count of the timeline was said by the pass that reads the evidence, before the carved events or the rows of the custom rules were merged in: with a carve that recovered two events, the window's closing card said 30,773 and the timeline held 30,775. It is said after the last merge.
 
 ## v1.4.16 — 2026-11-24
