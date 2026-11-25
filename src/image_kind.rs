@@ -3,7 +3,7 @@
 //! A disk image does not always carry an image extension: a cloud snapshot
 //! exported as `snap-web01_os_disk-20261116`, a copy renamed `.bin`, a fixed
 //! VHD named `.dd`. Whatever the name, the first 4 KiB and the last 512 bytes
-//! say what it is: a container by its magic (EWF, VHDX, VHD, sparse VMDK) or
+//! say what it is: a container by its magic (EWF, VHDX, VHD, sparse VMDK, QCOW2) or
 //! a raw copy of a disk or a volume by what a disk or a volume starts with
 //! (a GPT header, an MBR with a valid partition entry, an NTFS boot sector,
 //! an ext2/3/4 or XFS superblock, an LVM label). The same check as Faramir's.
@@ -28,6 +28,8 @@ pub enum ImageKind {
     Vhd,
     /// Microsoft virtual disk: VHDX
     Vhdx,
+    /// QEMU virtual disk (KVM, Proxmox, OpenStack): QCOW2
+    Qcow2,
     /// A plain byte-for-byte copy of a disk or a volume
     Raw,
 }
@@ -40,6 +42,7 @@ impl ImageKind {
             ImageKind::Vmdk => "VMDK",
             ImageKind::Vhd => "VHD",
             ImageKind::Vhdx => "VHDX",
+            ImageKind::Qcow2 => "QCOW2",
             ImageKind::Raw => "raw",
         }
     }
@@ -75,6 +78,9 @@ pub fn image_kind_from_bytes_of(head: &[u8], tail: &[u8], len: u64) -> Option<Im
     }
     if head.starts_with(b"KDMV") {
         return Some(ImageKind::Vmdk);
+    }
+    if head.starts_with(crate::qcow2::QCOW_MAGIC) {
+        return Some(ImageKind::Qcow2);
     }
     let boot_signature = head[510] == 0x55 && head[511] == 0xAA;
     if boot_signature && &head[512..520] == b"EFI PART" {
@@ -132,7 +138,7 @@ const NOT_IMAGES: &[&str] = &[
     "evtx", "etl", "evt", "zip", "7z", "rar", "gz", "tgz", "tar", "bz2", "xz", "zst", "lz4", "cab", "csv", "tsv", "json", "ndjson", "jsonl", "log", "txt", "xml", "html", "htm",
     "md", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf", "mdb", "edb", "db", "sqlite", "sqlite3", "dat", "hve", "reg", "pf", "lnk", "exe", "dll", "sys", "msi",
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "mp4", "mp3", "avi", "mkv", "mov", "wav", "journal", "masstin", "plist", "yaml", "yml", "toml", "ini", "cfg", "conf",
-    "py", "rs", "js", "ts", "c", "h", "go", "java", "class", "jar", "pcap", "pcapng", "lime", "mem", "dmp", "hiberfil", "pagefile", "iso", "ova", "ovf", "vdi", "qcow2",
+    "py", "rs", "js", "ts", "c", "h", "go", "java", "class", "jar", "pcap", "pcapng", "lime", "mem", "dmp", "hiberfil", "pagefile", "iso", "ova", "ovf", "vdi",
     "avhdx", "avhd", "mf", "nvram", "vmsn", "vmem", "vmss", "vmx", "vmxf", "vmsd", "ctk",
 ];
 
@@ -180,7 +186,7 @@ pub fn by_content(path: &Path) -> bool {
 /// extension, opens as a VHD.
 pub fn kind_of(path: &Path) -> ImageKind {
     let sniffed = sniff(path);
-    if let Some(k @ (ImageKind::Ewf | ImageKind::Vhd | ImageKind::Vhdx | ImageKind::Vmdk | ImageKind::Raw)) = sniffed {
+    if let Some(k @ (ImageKind::Ewf | ImageKind::Vhd | ImageKind::Vhdx | ImageKind::Qcow2 | ImageKind::Vmdk | ImageKind::Raw)) = sniffed {
         return k;
     }
     let lower = path.to_string_lossy().to_lowercase();
@@ -192,6 +198,8 @@ pub fn kind_of(path: &Path) -> ImageKind {
         ImageKind::Vhdx
     } else if lower.ends_with(".vhd") {
         ImageKind::Vhd
+    } else if lower.ends_with(".qcow2") || lower.ends_with(".qcow") {
+        ImageKind::Qcow2
     } else {
         ImageKind::Raw
     }
@@ -218,6 +226,9 @@ mod tests {
         let mut t = tail.clone();
         t[..8].copy_from_slice(b"conectix");
         assert_eq!(image_kind_from_bytes(&block(), &t), Some(ImageKind::Vhd), "a fixed VHD: its footer at the end");
+        let mut h = block();
+        h[..4].copy_from_slice(b"QFI\xfb");
+        assert_eq!(image_kind_from_bytes(&h, &tail), Some(ImageKind::Qcow2));
         let mut h = block();
         h[..4].copy_from_slice(b"KDMV");
         assert_eq!(image_kind_from_bytes(&h, &tail), Some(ImageKind::Vmdk));

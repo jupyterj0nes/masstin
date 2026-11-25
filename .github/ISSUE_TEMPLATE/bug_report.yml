@@ -23,7 +23,7 @@ body:
       description: What masstin was given
       options:
         - EVTX files
-        - Disk image (E01, VMDK, VHD/VHDX, raw)
+        - Disk image (E01, VMDK, VHD/VHDX, QCOW2, raw)
         - Triage package
         - Linux logs
         - macOS Unified Log

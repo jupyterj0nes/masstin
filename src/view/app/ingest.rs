@@ -30,7 +30,7 @@ pub(super) const PARSERS: [Parser; 6] = [
     Parser { action: "parse-windows", icon: ic::DESKTOP, title: "Windows", desc: "EVTX files, triage packages (KAPE, Velociraptor, a Cortex XDR offline collector) and User Access Logging databases (.mdb), loose or zipped" },
     Parser { action: "parse-linux", icon: ic::TERMINAL_WINDOW, title: "Linux", desc: "auth.log / secure, wtmp, btmp, lastlog, audit.log, journal files, a UAC archive" },
     Parser { action: "parse-mac", icon: ic::LAPTOP, title: "macOS", desc: "a .logarchive bundle (the Unified Log) or a `log show` JSON export" },
-    Parser { action: "parse-image", icon: ic::HARD_DRIVES, title: "Disk image", desc: "E01, dd / raw, VMDK, VHD / VHDX: the logs are read from the file system inside, shadow copies included" },
+    Parser { action: "parse-image", icon: ic::HARD_DRIVES, title: "Disk image", desc: "E01, dd / raw, VMDK, VHD / VHDX, QCOW2: the logs are read from the file system inside, shadow copies included" },
     Parser { action: "parse-massive", icon: ic::CIRCLES_THREE_PLUS, title: "Everything", desc: "A whole evidence folder: disk images, Windows and Linux triages, loose EVTX and Linux logs, read together into one timeline" },
     Parser { action: "parser-elastic", icon: ic::CLOUD, title: "Windows events as JSON", desc: "Windows events exported as JSON: Winlogbeat, evtx_dump, Velociraptor, or flat (NXLog, Sentinel)" },
 ];

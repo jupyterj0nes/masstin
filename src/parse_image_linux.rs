@@ -477,7 +477,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
     let mut all_image_files: Vec<String> = files.to_vec();
 
     // Scan directories for forensic images
-    let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "dd", "raw", "img", "001"];
+    let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "qcow2", "qcow", "dd", "raw", "img", "001"];
     for dir in directories {
         crate::banner::print_info(&format!("Scanning {} for forensic images...", dir));
         scan_for_images(Path::new(dir), &image_extensions, &mut all_image_files, 0);
@@ -561,7 +561,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
         use crate::image_kind::ImageKind;
         let kind = crate::image_kind::kind_of(Path::new(image_path.as_str()));
         let sniffed = crate::image_kind::sniff(Path::new(image_path.as_str())).is_some();
-        let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img" | "001");
+        let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "qcow2" | "qcow" | "dd" | "raw" | "img" | "001");
         let result = crate::vfs::with_image(image_path, || match kind {
             ImageKind::Ewf => {
                 crate::banner::print_info(&format!("Image format: E01 ({})", image_path));
@@ -571,7 +571,7 @@ pub fn parse_image_linux(files: &[String], directories: &[String], output: Optio
                 crate::banner::print_info(&format!("Image format: VMDK ({})", image_path));
                 extract_logs_from_image_vmdk(image_path, &temp_dir)
             }
-            ImageKind::Vhd | ImageKind::Vhdx => {
+            ImageKind::Vhd | ImageKind::Vhdx | ImageKind::Qcow2 => {
                 crate::banner::print_info(&format!("Image format: {} ({})", kind.label(), image_path));
                 extract_logs_from_image_vhd(image_path, &temp_dir)
             }
@@ -637,7 +637,7 @@ pub(crate) fn open_image_reader(image_path: &str) -> Result<(Box<dyn crate::vfs:
             let n = r.total_size();
             Ok((Box::new(BufReader::new(r)), n))
         }
-        ImageKind::Vhd | ImageKind::Vhdx => {
+        ImageKind::Vhd | ImageKind::Vhdx | ImageKind::Qcow2 => {
             let (r, n) = crate::vhd::open_virtual_disk(image_path).map_err(|e| format!("Cannot open virtual disk: {}", e))?;
             Ok((Box::new(BufReader::new(r)), n))
         }

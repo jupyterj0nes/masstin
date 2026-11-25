@@ -64,6 +64,7 @@ pub mod filter;
 pub mod vmdk;
 pub mod raw_split;
 pub mod vhd;
+pub mod qcow2;
 pub mod timefmt;
 pub mod textlines;
 pub use crate::vmdk::*;
@@ -89,7 +90,7 @@ pub struct Cli {
     #[arg(short, long)]
     directory: Vec<String>,
 
-    /// Individual files to process (EVTX, JSON, .mdb, E01, VMDK, VHD/VHDX, dd/raw)
+    /// Individual files to process (EVTX, JSON, .mdb, E01, VMDK, VHD/VHDX, QCOW2, dd/raw)
     #[arg(short, long)]
     file: Vec<String>,
 
@@ -557,7 +558,7 @@ enum ActionType {
     /// Advanced, a part of `parse` without its look first: macOS logs, a .logarchive bundle (binary Unified Log) or a `log show` JSON/NDJSON export: SSH and Screen Sharing / ARD remote logons
     #[value(alias = "parse-macos")]
     ParseMac,
-    /// Advanced, a part of `parse` without its look first: forensic images (E01/dd/VMDK/VHD/VHDX), mounted volumes (-d D:) or --all-volumes; NTFS gives EVTX + UAL + shadow copies, ext4 / XFS the Linux logs
+    /// Advanced, a part of `parse` without its look first: forensic images (E01/dd/VMDK/VHD/VHDX/QCOW2), mounted volumes (-d D:) or --all-volumes; NTFS gives EVTX + UAL + shadow copies, ext4 / XFS the Linux logs
     #[value(alias = "parse-image-windows", alias = "parse-image-linux")]
     ParseImage,
     /// Advanced, a part of `parse` without its look first: the massive pass on its own: forensic images, triage packages, loose EVTX and Linux logs, archives nested or not (no macOS, no Winlogbeat)
@@ -1529,7 +1530,7 @@ fn validate_folders(config: &Cli) -> Result<(), String> {
         ActionType::CarveImage => {
             if config.file.is_empty() {
                 return Err(String::from(
-                    "For carve-image, specify forensic image files with -f (E01/VMDK/VHD/VHDX/dd).",
+                    "For carve-image, specify forensic image files with -f (E01/VMDK/VHD/VHDX/QCOW2/dd).",
                 ));
             }
         }

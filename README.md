@@ -98,7 +98,7 @@ Known-bad host or account? `--seed 10.10.1.50` on the hunt reconstructs the chai
 | Source | What masstin takes from it |
 |---|---|
 | **Windows** | 37 Event IDs across 12 EVTX channels (Security 4624/4625/4634/4648/4768/4769/4776/4778/5140/5145…, Terminal Services, RDP, SMB, WinRM, WMI, Sysmon 3, OpenSSH, Scheduled Tasks); UAL databases; MountPoints2 from NTUSER.DAT; Volume Shadow Copies; EVTX chunks carved from unallocated space. |
-| **Forensic images** | E01, VMDK, VHD / VHDX, dd / raw (split in segments too), cloud snapshots with no extension (known by their content), mounted volumes, images packed inside zips. NTFS, ext4 and XFS walked, LVM volumes included; BitLocker detected and reported. |
+| **Forensic images** | E01, VMDK, VHD / VHDX, QCOW2, dd / raw (split in segments too), cloud snapshots with no extension (known by their content), mounted volumes, images packed inside zips. NTFS, ext4 and XFS walked, LVM volumes included; BitLocker detected and reported. |
 | **Linux** | `auth.log`, `secure`, `messages`, `wtmp` / `btmp` / `lastlog`, `audit.log`, binary journald. Session ends paired to their login, syslog times to UTC. |
 | **macOS** | The Unified Log, as a `.logarchive` (read directly on any OS) or a `log show` JSON export: SSH and Screen Sharing logons. |
 | **Triage packages and feeds** | KAPE, Velociraptor, UAC, Cortex XDR, plain zips and tarballs nested in each other; a Cortex XDR tenant read through its API, Winlogbeat JSON, Cortex XDR exports, Mordor / OTRF datasets. |

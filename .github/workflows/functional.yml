@@ -284,6 +284,25 @@ jobs:
           target/release/masstin -a parse-image -f img/evtx-samples.vhd -o out/vhd.csv --overwrite
           python3 .github/scripts/normalize_timeline.py out/image.csv evtx-samples.raw | tee out/hashes.txt
           python3 .github/scripts/normalize_timeline.py out/vhd.csv evtx-samples.vhd | tee -a out/hashes.txt
+      - name: The same image as QCOW2, written by qemu-img
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y -qq qemu-utils; else brew install qemu; fi
+          qemu-img convert -f raw -O qcow2 img/evtx-samples.raw img/q-plain.qcow2
+          qemu-img convert -f raw -O qcow2 -c -o compression_type=zstd img/evtx-samples.raw img/q-zstd.qcow2
+          qemu-img convert -f raw -O qcow2 -c -o compat=0.10,cluster_size=4k img/evtx-samples.raw img/q-v2.qcow2
+          # an overlay, as a snapshot leaves: nothing of its own, all from its backing file
+          qemu-img create -q -f qcow2 -b q-zstd.qcow2 -F qcow2 img/q-overlay.qcow2
+          rows=$(wc -l < out/image.csv)
+          [ "$rows" -gt 100 ] || { echo "::error::the raw image gave only $rows rows"; exit 1; }
+          want=$(sed 's/evtx-samples\.raw:/IMG:/g' out/image.csv | shasum -a 256 | cut -d' ' -f1)
+          for q in q-plain q-zstd q-v2 q-overlay; do
+            target/release/masstin -a parse-image -f img/$q.qcow2 -o out/$q.csv --overwrite
+            got=$(sed "s/$q\.qcow2:/IMG:/g" out/$q.csv | shasum -a 256 | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::$q.qcow2: its timeline differs from the raw image's"; exit 1; }
+            echo "$q.qcow2: the same $rows rows as the raw image"
+          done
       - name: Upload normalised timeline
         uses: actions/upload-artifact@v4
         with:

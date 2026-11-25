@@ -25,7 +25,7 @@ masstin -a parse -d /evidence/case-2026-03 --carve -o timeline.csv
 
 `-d` gives a folder, walked whole; `-f` gives one file, and only that file is read. Either way the evidence goes through the same pass: there is no parser to choose.
 
-1. **The look.** `parse` first counts what it was given, the same look the window's ingest wizard makes: EVTX files, ZIPs of EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images (E01, VMDK, VHD / VHDX, dd / raw), Linux logs and triages, macOS `.logarchive` bundles and `log show` exports, Winlogbeat JSON, masstin timelines. It says so in a line:
+1. **The look.** `parse` first counts what it was given, the same look the window's ingest wizard makes: EVTX files, ZIPs of EVTX, UAL databases, KAPE / Velociraptor / Cortex XDR / UAC triages, disk images (E01, VMDK, VHD / VHDX, QCOW2, dd / raw), Linux logs and triages, macOS `.logarchive` bundles and `log show` exports, Winlogbeat JSON, masstin timelines. It says so in a line:
 
    ```
            Found: 1 disk image, 4 triage packages (KAPE), 19 EVTX files, 2 Linux triages (26 files in 6 folders, 1.5 s)
@@ -58,7 +58,7 @@ The same artefact can reach masstin in a disk image, in a folder (a triage unpac
 
 A scheduled task is a row only when it was registered by an account of another machine, and which machine is "another" is told by the machine's name: the tasks of a Windows tree with no Security.evtx or System.evtx beside them (in the folder, or in the zip they came out of) are not read, and the run says so. What a zip or a tarball holds of UAL, tasks and NTUSER.DAT is taken out to the temporary folder; its rows are named `<archive> -> <path inside>` or `<archive>:tasks:<task>`.
 
-Disk images: E01, VMDK, VHD and VHDX, raw (`dd`, `img`, and split in segments `.001`, `.002`, … read as one image) and images with no extension (cloud snapshots), known by their content; GPT and MBR, LVM volumes; NTFS, ext4 and XFS. A BitLocker volume is said and skipped. Other file systems are not read.
+Disk images: E01, VMDK, VHD and VHDX, QCOW2, raw (`dd`, `img`, and split in segments `.001`, `.002`, … read as one image) and images with no extension (cloud snapshots), known by their content; GPT and MBR, LVM volumes; NTFS, ext4 and XFS. A BitLocker volume is said and skipped. Other file systems are not read.
 
 Archives of a kind masstin does not open (7z, rar, `tar.xz`, `tar.bz2`, `tar.zst`, cab) are named in a warning: nothing inside them is read. A zip whose entries are under a password is named too; the Linux half tries the passwords malware samples are usually packed with.
 
@@ -75,7 +75,7 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 | Loose EVTX files and directories | ✅ | ❌ | ✅ |
 | Recursive ZIP walk (unlimited nesting) | ✅ | ❌ | ✅ |
 | `Provider.Name` fallback for archived / renamed EVTX | ✅ | ✅ | ✅ |
-| Forensic disk images (E01, VMDK, VHD/VHDX, raw, dd, img) | ❌ | ✅ | ✅ |
+| Forensic disk images (E01, VMDK, VHD/VHDX, QCOW2, raw, dd, img) | ❌ | ✅ | ✅ |
 | NTFS walker → `winevt/Logs` + VSS recovery | ❌ | ✅ | ✅ |
 | UAL databases (`LogFiles/Sum/*.mdb`) | ✅ | ✅ | ✅ |
 | Scheduled Tasks XML (`System32/Tasks/`) | ❌ | ✅ | ✅ |
@@ -86,7 +86,7 @@ Quick reference. The three Windows actions differ by **what you feed them**, not
 Rule of thumb:
 
 - **Folder / ZIP / single EVTX** → `parse-windows`
-- **Forensic image** (`.e01`, `.vmdk`, `.vhd`, `.vhdx`, `.raw`) → `parse-image`
+- **Forensic image** (`.e01`, `.vmdk`, `.vhd`, `.vhdx`, `.qcow2`, `.raw`) → `parse-image`
 - **Mixed evidence** (image + zip + triage + loose files) → `parse-massive`
 - **Linux logs / UAC triage** → `parse-linux`; **macOS `.logarchive` or `log show` JSON** → `parse-mac`; **any other text / JSON log** → `parse-custom` with a YAML rule
 
@@ -206,7 +206,7 @@ Not yet read (see the roadmap): `smbd` share connections (the Unified Log messag
 
 All results are merged into a **single chronological CSV**, deduplicated across sources. This means a folder full of mixed Windows and Linux images — from a ransomware incident spanning dozens of servers — becomes a single unified timeline with one command.
 
-Supports **E01**, **dd/raw**, **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi) and **VHD / VHDX** (fixed and dynamic; differencing disks with a parent must be merged first). Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
+Supports **E01**, **dd/raw**, **VMDK** (sparse, flat, split sparse, streamOptimized, VMFS/ESXi) and **VHD / VHDX** (fixed and dynamic; differencing disks with a parent must be merged first), and **QCOW2**, the disks of KVM / libvirt, Proxmox, OpenStack and Nutanix AHV (versions 2 and 3, any cluster size, clusters compressed with deflate or zstd, extended L2 entries). A QCOW2 overlay, as a snapshot leaves, holds only the changes: masstin reads it together with its backing file, the whole chain, when the backing file is in the same folder (the path it had on the hypervisor does not matter). Encrypted QCOW2 images and those with an external data file are said and not read; internal snapshots are not read, the disk is its current state. Detects **BitLocker-encrypted** partitions and warns the analyst. Handles incomplete SFTP uploads (`.filepart` fallback). Pure Rust parsers for all formats. VSS recovery via [vshadow-rs](https://github.com/jupyterj0nes/vshadow-rs). [Full documentation →](https://weinvestigateanything.com/en/tools/masstin-vss-recovery/)
 
 ```bash
 # Single image — auto-detects OS
@@ -225,7 +225,7 @@ masstin -a parse-image -f DC01.e01 -f SRV-FILE.vmdk -f ubuntu-server.e01 -o inci
 
 ## Bulk evidence processing — one command, entire incident
 
-Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX and dd/raw files, **and for disk images whose name says nothing**: a cloud snapshot exported with no extension (`snap-web01_os_disk-20261116`), a copy renamed `.bin`, a fixed VHD named `.dd`. A file of 64 KiB or more whose name names neither an image nor anything else (an EVTX, an archive, a log, a hive…) is known by its first 4 KiB and last 512 bytes: EWF, VHDX, VHD (its footer at the start or at the end), sparse VMDK, or a raw copy of a disk or a volume (a GPT header, an MBR with a partition, an NTFS boot sector, an ext or XFS superblock, an LVM label), and opened with the reader its content names before the one its name suggests. Each image is opened, partitions are auto-detected (NTFS, ext4 or XFS), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
+Point `-d` at a folder containing forensic images and masstin recursively scans for all E01, VMDK, VHD/VHDX, QCOW2 and dd/raw files, **and for disk images whose name says nothing**: a cloud snapshot exported with no extension (`snap-web01_os_disk-20261116`), a copy renamed `.bin`, a fixed VHD named `.dd`. A file of 64 KiB or more whose name names neither an image nor anything else (an EVTX, an archive, a log, a hive…) is known by its first 4 KiB and last 512 bytes: EWF, VHDX, VHD (its footer at the start or at the end), sparse VMDK, or a raw copy of a disk or a volume (a GPT header, an MBR with a partition, an NTFS boot sector, an ext or XFS superblock, an LVM label), and opened with the reader its content names before the one its name suggests. Each image is opened, partitions are auto-detected (NTFS, ext4 or XFS), artifacts are extracted with the appropriate parser, and everything is merged into a single chronological timeline. **No need to separate Windows and Linux images** — masstin handles it all.
 
 ```bash
 # Scan an entire evidence folder — finds all images, any OS

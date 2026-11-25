@@ -425,7 +425,7 @@ impl BlockSource for SkipWindows {
 }
 
 /// Opens an image by extension: EWF through a guarded reader (a stuck read is
-/// abandoned and the reader reopened), VMDK, VHD/VHDX and raw files directly.
+/// abandoned and the reader reopened), VMDK, VHD/VHDX, QCOW2 and raw files directly.
 fn open_source(path: &str, ext: &str) -> Result<Box<dyn BlockSource>, String> {
     match ext {
         "e01" | "ex01" => {
@@ -441,7 +441,7 @@ fn open_source(path: &str, ext: &str) -> Result<Box<dyn BlockSource>, String> {
             let size = vmdk.total_size();
             Ok(Box::new(DirectSource::new(vmdk, size, path.to_string())))
         }
-        "vhd" | "vhdx" => {
+        "vhd" | "vhdx" | "qcow2" | "qcow" => {
             let (disk, size) = crate::vhd::open_virtual_disk(path).map_err(|e| format!("Cannot open virtual disk: {}", e))?;
             Ok(Box::new(DirectSource::new(disk, size, path.to_string())))
         }

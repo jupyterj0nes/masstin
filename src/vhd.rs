@@ -376,6 +376,11 @@ pub fn open_virtual_disk(path: &str) -> Result<(Box<dyn ReadSeek>, u64), String>
     let ext = Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
     let mut magic = [0u8; 8];
     let is_vhdx = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).map(|_| &magic == b"vhdxfile").unwrap_or(ext == "vhdx");
+    if &magic[..4] == crate::qcow2::QCOW_MAGIC || (&magic == &[0u8; 8] && (ext == "qcow2" || ext == "qcow")) {
+        let r = crate::qcow2::Qcow2Reader::open(path)?;
+        let n = r.total_size();
+        return Ok((Box::new(r), n));
+    }
     if is_vhdx {
         let r = VhdxReader::open(path)?;
         let n = r.total_size();

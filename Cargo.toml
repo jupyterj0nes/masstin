@@ -2,7 +2,7 @@
 name = "masstin"
 version = "1.5.0"
 edition = "2021"
-description = "Lateral movement tracker for anything: every login from Windows event logs, Linux and macOS logs, forensic images (E01, VMDK, VHDX, raw; no mounting) and triage packages in one timeline, a statistical hunt over it and a graph viewer. One binary for Windows, Linux and macOS."
+description = "Lateral movement tracker for anything: every login from Windows event logs, Linux and macOS logs, forensic images (E01, VMDK, VHDX, QCOW2, raw; no mounting) and triage packages in one timeline, a statistical hunt over it and a graph viewer. One binary for Windows, Linux and macOS."
 authors = ["Tono Diaz (@jupyterj0nes)"]
 repository = "https://github.com/jupyterj0nes/masstin"
 homepage = "https://weinvestigateanything.com/en/tools/masstin-lateral-movement-rust/"
@@ -35,6 +35,8 @@ console = "0.15"
 zip = "0.6"
 reqwest = { version = "0.11", default-features = false, features = ["json", "gzip", "rustls-tls-native-roots"] }
 flate2 = "1.0"
+# zstd-compressed clusters of QCOW2 images (already built for the journal reader)
+zstd = { version = "0.13", default-features = false }
 once_cell = "1"
 regex = "1"
 blockcarve = { version = "0.1.2", default-features = false }

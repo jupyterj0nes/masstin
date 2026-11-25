@@ -131,7 +131,7 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
     // with no extension, a fixed VHD named .dd)
     let kind = crate::image_kind::kind_of(Path::new(image_path));
     let sniffed = crate::image_kind::sniff(Path::new(image_path)).is_some();
-    let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img" | "001");
+    let named = matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "qcow2" | "qcow" | "dd" | "raw" | "img" | "001");
     let format_label = if named { ext.to_uppercase() } else { kind.label().to_string() };
 
     // For VMDK, the descriptor file is tiny (~1 KB) but the real virtual
@@ -146,6 +146,10 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
             .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
     } else if kind == crate::image_kind::ImageKind::Vhdx {
         crate::vhd::VhdxReader::probe_size(image_path)
+            .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
+    } else if kind == crate::image_kind::ImageKind::Qcow2 {
+        // a QCOW2 holds only the clusters that were written
+        crate::qcow2::Qcow2Reader::probe_size(image_path)
             .or_else(|| fs::metadata(image_path).ok().map(|m| m.len()))
     } else {
         fs::metadata(image_path).ok().map(|m| m.len())
@@ -173,7 +177,7 @@ fn extract_one_image_inner(img_idx: usize, total_images: usize, image_path: &str
     let result = crate::vfs::with_image(image_path, || match kind {
         ImageKind::Ewf => extract_evtx_from_image_ewf(image_path, &temp_dir),
         ImageKind::Vmdk => extract_evtx_from_image_vmdk(image_path, &temp_dir),
-        ImageKind::Vhd | ImageKind::Vhdx => extract_evtx_from_image_vhd(image_path, &temp_dir),
+        ImageKind::Vhd | ImageKind::Vhdx | ImageKind::Qcow2 => extract_evtx_from_image_vhd(image_path, &temp_dir),
         // nothing in the content and nothing in the name: raw, then E01
         ImageKind::Raw if !sniffed && !named => extract_evtx_from_image_raw(image_path, &temp_dir)
             .or_else(|_| extract_evtx_from_image_ewf(image_path, &temp_dir)),
@@ -368,7 +372,7 @@ pub fn parse_image(files: &[String], directories: &[String], all_volumes: bool, 
 
     // Scan real directories for forensic images (E01, VMDK, dd, raw)
     if !real_dirs.is_empty() {
-        let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "dd", "raw", "img", "001"];
+        let image_extensions = ["e01", "ex01", "vmdk", "vhd", "vhdx", "qcow2", "qcow", "dd", "raw", "img", "001"];
         let mut discovered: Vec<String> = Vec::new();
 
         let sp = crate::banner::create_spinner("Scanning for forensic images...");
@@ -1116,7 +1120,7 @@ fn is_ewf_segment_ext(ext: &str) -> bool {
 fn entry_is_image(name: &str) -> bool {
     let fname = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
     let ext = match fname.rsplit_once('.') { Some((_, e)) => e.to_ascii_lowercase(), None => return false };
-    matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "dd" | "raw" | "img")
+    matches!(ext.as_str(), "e01" | "ex01" | "vmdk" | "vhd" | "vhdx" | "qcow2" | "qcow" | "dd" | "raw" | "img")
         || is_ewf_segment_ext(&ext)
         || (ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit())) // split raw .001/.002/...
 }
@@ -1150,6 +1154,10 @@ pub(crate) fn is_first_image_segment(p: &Path) -> bool {
     }
     // Hyper-V / Azure disks: one file each (a differencing .avhdx is not one)
     if lower.ends_with(".vhd") || lower.ends_with(".vhdx") {
+        return true;
+    }
+    // QEMU disks: one file each (an overlay reads its backing file by itself)
+    if lower.ends_with(".qcow2") || lower.ends_with(".qcow") {
         return true;
     }
     // split-raw secondary piece (.002, .003, ...)
@@ -1757,7 +1765,7 @@ fn extract_evtx_from_image_vmdk(image_path: &str, temp_dir: &Path) -> Result<Ext
     extract_evtx_from_seekable(&mut buf_reader, image_size, temp_dir)
 }
 
-/// Extract EVTX from a VHD (fixed or dynamic) or VHDX (fixed or dynamic)
+/// Extract EVTX from a VHD (fixed or dynamic), a VHDX (fixed or dynamic) or a QCOW2
 fn extract_evtx_from_image_vhd(image_path: &str, temp_dir: &Path) -> Result<ExtractedArtifacts, String> {
     let (reader, image_size) = crate::vhd::open_virtual_disk(image_path)
         .map_err(|e| format!("Cannot open virtual disk: {}", e))?;
