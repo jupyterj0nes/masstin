@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.5.1 — 2026-11-25
 
 - **QCOW2 disk images are read.** The disks of KVM / libvirt, Proxmox, OpenStack and Nutanix AHV were not known as images: a `.qcow2` in a case folder was left out without a word. They are now read like any other image, by their content (a cloud image with no extension too): versions 2 and 3, any cluster size, clusters compressed with deflate or zstd, zero clusters, extended L2 entries. An overlay, as a snapshot leaves, is read together with its backing file, the whole chain, when the backing file is in the same folder; the path it had on the hypervisor does not matter. What is not read is said with its reason: encrypted images (AES, LUKS), images with an external data file, QCOW version 1, an overlay whose backing file is missing. Checked against images written by `qemu-img` in each of those forms, byte for byte with the raw disk.
 
